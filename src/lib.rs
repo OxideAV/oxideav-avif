@@ -1,53 +1,80 @@
-//! AVIF (AV1 Image File Format) codec — scaffold.
+//! AVIF (AV1 Image File Format) — pure-Rust container parser with
+//! AV1 hand-off to [`oxideav_av1`].
 //!
-//! AVIF wraps one or more AV1 keyframes in an ISOBMFF "heif" container
-//! (MIAF profile). The visual bitstream is AV1 proper, so a full
-//! implementation ultimately delegates bitstream decoding to
-//! `oxideav-av1` and only adds the container-side HEIF / `meta` / `ipco`
-//! / `ipma` handling plus the colour / alpha auxiliary-image plumbing.
+//! # Status
 //!
-//! This crate is currently a **registration scaffold**: it reserves the
-//! codec id `avif` so the aggregator surfaces the format in its listing,
-//! and lets a future implementation slot in without reshuffling the
-//! public surface. Both factories return [`Error::Unsupported`].
+//! * HEIF / ISOBMFF box walker: `ftyp`, `meta`, `hdlr`, `pitm`, `iinf`
+//!   (v0/v1) + `infe` (v2/v3), `iloc` (v0/v1/v2), `iprp` / `ipco` /
+//!   `ipma` (v0/v1, small + large indices), plus item properties
+//!   `av1C`, `ispe`, `colr` (nclx + ICC), `pixi`, `pasp`.
+//! * Primary item resolution via `pitm`, file-offset extent reads via
+//!   `iloc`, brand check accepting `avif` / `avis` / `mif1` / `msf1` /
+//!   `miaf`.
+//! * Primary item's AV1 OBU bitstream is handed to
+//!   [`oxideav_av1::Av1Decoder`] with `av1C` plumbed through as
+//!   `CodecParameters::extradata`. The inner decoder parses sequence
+//!   header + frame header through `tile_info()`, captures per-tile
+//!   byte ranges, and then stops at the tile body with
+//!   `Error::Unsupported` — expected, since AV1 pixel reconstruction
+//!   is still out of scope in that crate.
 //!
-//! Follow-up implementation notes (for the landing PR):
+//! [`AvifDecoder::receive_frame`] therefore returns
+//! `Error::Unsupported("avif pixel decode blocked by av1 decoder
+//! limitations: <av1 specific message>")` until the AV1 decoder gains
+//! partition / transform / prediction / loop-filter paths. Until then,
+//! [`AvifDecoder::info`] and [`inspect`] give callers dimensions, bit
+//! depth, colour info, and the extracted OBU bytes.
 //!
-//! * Container: a new sibling crate or a `container` submodule should
-//!   parse the HEIF meta-box layout (`ftyp` with `avif`/`avis` brands,
-//!   `meta` → `iloc`/`iinf`/`iref`/`iprp`/`pitm`). Emit one packet per
-//!   primary image + one per alpha auxl if present.
-//! * Bitstream: reuse `oxideav-av1`'s keyframe path. The only AVIF-
-//!   specific bits are ICC profile handling and colour-info boxes
-//!   (`colr`) feeding `CodecParameters::pixel_format` / primaries.
+//! # Encoder
+//!
+//! Not implemented — [`make_encoder`] returns `Error::Unsupported`.
+//! Writing an AVIF encoder requires an AV1 encoder, which oxideav
+//! does not have.
+//!
+//! [`inspect`]: decoder::inspect
 
-use oxideav_codec::{CodecRegistry, Decoder, Encoder};
+pub mod box_parser;
+pub mod decoder;
+pub mod meta;
+pub mod parser;
+
+pub use decoder::{inspect, make_decoder, AvifDecoder, AvifInfo};
+pub use meta::{Colr, Ispe, ItemInfo, ItemLocation, Meta, Pasp, Pixi, Property};
+pub use parser::{parse, AvifImage};
+
+use oxideav_codec::{CodecRegistry, Encoder};
 use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, Error, Result};
 
 /// Public codec id string. Matches the aggregator-crate Cargo feature `avif`.
 pub const CODEC_ID_STR: &str = "avif";
 
-/// Register the AVIF decoder + encoder stubs.
+/// Register the AVIF decoder + encoder factories with a registry. The
+/// decoder is declared `avif_heif_av1_parse` — we parse the HEIF
+/// container end to end and hand the AV1 bitstream to oxideav-av1,
+/// which today stops before pixel reconstruction.
 pub fn register(reg: &mut CodecRegistry) {
-    let caps = CodecCapabilities::video("avif_stub")
+    let caps = CodecCapabilities::video("avif_heif_av1_parse")
         .with_lossy(true)
         .with_intra_only(true);
     reg.register_decoder_impl(CodecId::new(CODEC_ID_STR), caps.clone(), make_decoder);
     reg.register_encoder_impl(CodecId::new(CODEC_ID_STR), caps, make_encoder);
 }
 
-fn make_decoder(_params: &CodecParameters) -> Result<Box<dyn Decoder>> {
+/// AVIF encoder factory — always errors. Writing AVIF requires an AV1
+/// encoder, which oxideav does not currently ship.
+pub fn make_encoder(_params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     Err(Error::unsupported(
-        "avif: decoder not yet implemented; see crate docs for the planned \
-         HEIF container + AV1 keyframe path",
+        "avif: encoder not implemented — requires an AV1 encoder (not available in oxideav)",
     ))
 }
 
-fn make_encoder(_params: &CodecParameters) -> Result<Box<dyn Encoder>> {
-    Err(Error::unsupported(
-        "avif: encoder not yet implemented; see crate docs for the planned \
-         HEIF container + AV1 keyframe path",
-    ))
+/// Convenience: register AVIF + its underlying AV1 decoder in one
+/// call. Useful when the registry is being built from scratch and the
+/// caller only wants AVIF — they don't have to remember that AVIF
+/// delegates to the AV1 codec.
+pub fn register_with_av1(reg: &mut CodecRegistry) {
+    register(reg);
+    oxideav_av1::register(reg);
 }
 
 #[cfg(test)]
@@ -55,14 +82,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn decoder_reports_unsupported() {
+    fn register_installs_factories() {
         let mut reg = CodecRegistry::new();
         register(&mut reg);
-        let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
-        match reg.make_decoder(&params) {
+        let id = CodecId::new(CODEC_ID_STR);
+        let params = CodecParameters::video(id);
+        // Encoder stays Unsupported.
+        match reg.make_encoder(&params) {
             Err(Error::Unsupported(_)) => {}
-            Err(other) => panic!("expected Error::Unsupported, got {other:?}"),
-            Ok(_) => panic!("expected Error::Unsupported, got a live decoder"),
+            Err(e) => panic!("encoder factory: expected Unsupported, got {e:?}"),
+            Ok(_) => panic!("encoder factory: expected Unsupported, got live encoder"),
         }
+        // Decoder factory succeeds; `send_packet` exercises the HEIF
+        // parse and stops at the AV1 tile decode gate.
+        let _ = reg.make_decoder(&params).expect("decoder factory");
     }
 }

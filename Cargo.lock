@@ -3,7 +3,7 @@
 version = 3
 
 [[package]]
-name = "oxideav-avif"
+name = "oxideav-av1"
 version = "0.0.3"
 dependencies = [
  "oxideav-codec",
@@ -11,10 +11,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "oxideav-avif"
+version = "0.0.3"
+dependencies = [
+ "oxideav-av1",
+ "oxideav-codec",
+ "oxideav-core",
+]
+
+[[package]]
 name = "oxideav-codec"
 version = "0.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "594f4f2bbd636179604dbf3d70612c07e8701c947a3cc42ede061d4c42fc8382"
 dependencies = [
  "oxideav-core",
 ]
@@ -22,8 +29,6 @@ dependencies = [
 [[package]]
 name = "oxideav-core"
 version = "0.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c911df9e299622ce782034f54a2872b6a153a62cc1c4c87d28a44e67a7c13b57"
 dependencies = [
  "thiserror",
 ]
