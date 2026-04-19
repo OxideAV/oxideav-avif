@@ -47,7 +47,7 @@ pub use meta::{
     AuxC, Clap, Colr, Imir, IrefEntry, Irot, Ispe, ItemInfo, ItemLocation, Meta, Pasp, Pixi,
     Property,
 };
-pub use parser::{parse, AvifImage};
+pub use parser::{parse, parse_header, AvifHeader, AvifImage};
 pub use transform::{apply_clap, apply_imir, apply_irot, crop_top_left};
 
 use oxideav_codec::{CodecInfo, CodecRegistry, Encoder};
