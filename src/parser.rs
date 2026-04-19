@@ -17,7 +17,8 @@ const BRAND_MIF1: BoxType = b(b"mif1");
 const BRAND_MSF1: BoxType = b(b"msf1");
 const BRAND_MIAF: BoxType = b(b"miaf");
 
-const ITEM_TYPE_AV01: BoxType = b(b"av01");
+pub const ITEM_TYPE_AV01: BoxType = b(b"av01");
+pub const ITEM_TYPE_GRID: BoxType = b(b"grid");
 
 /// Decoded AVIF file, ready for hand-off to an AV1 OBU decoder.
 #[derive(Clone, Debug)]
@@ -40,11 +41,19 @@ pub struct AvifImage<'a> {
     pub pasp: Option<Pasp>,
 }
 
-/// Parse an AVIF file, returning the bits needed to decode the primary
-/// image. The input must contain the whole file; box offsets in `iloc`
-/// are absolute.
-pub fn parse(file: &[u8]) -> Result<AvifImage<'_>> {
-    // Walk top-level boxes, collecting what we need.
+/// Header-only parse that stops after `ftyp` + `meta` have been walked.
+/// Used by callers (grid composition, AVIS) that need access to the
+/// full `Meta` without committing to the single-av01-item contract
+/// [`parse`] enforces.
+pub struct AvifHeader<'a> {
+    pub file: &'a [u8],
+    pub major_brand: BoxType,
+    pub minor_version: u32,
+    pub compatible_brands: Vec<BoxType>,
+    pub meta: Meta,
+}
+
+pub fn parse_header(file: &[u8]) -> Result<AvifHeader<'_>> {
     let mut ftyp_payload: Option<&[u8]> = None;
     let mut meta_payload: Option<&[u8]> = None;
     for hdr in iter_boxes(file) {
@@ -59,9 +68,6 @@ pub fn parse(file: &[u8]) -> Result<AvifImage<'_>> {
     }
     let ftyp = ftyp_payload.ok_or_else(|| Error::invalid("avif: missing ftyp"))?;
     let (major_brand, minor_version, compatible_brands) = parse_ftyp(ftyp)?;
-
-    // AVIF profile check — accept any file whose brand set contains at
-    // least one of the AVIF / HEIF image brands.
     if !is_avif_compatible(&major_brand, &compatible_brands) {
         return Err(Error::invalid(format!(
             "avif: ftyp major='{}' compatible_brands={} doesn't claim any AVIF/HEIF brand",
@@ -73,9 +79,38 @@ pub fn parse(file: &[u8]) -> Result<AvifImage<'_>> {
                 .join(",")
         )));
     }
-
     let meta_p = meta_payload.ok_or_else(|| Error::invalid("avif: missing meta"))?;
     let meta = Meta::parse(meta_p)?;
+    Ok(AvifHeader {
+        file,
+        major_brand,
+        minor_version,
+        compatible_brands,
+        meta,
+    })
+}
+
+/// Resolve an item's payload bytes via its `iloc` entry. Public so the
+/// grid / alpha paths can independently fetch tile + alpha items.
+pub fn item_bytes<'a>(file: &'a [u8], loc: &ItemLocation) -> Result<&'a [u8]> {
+    resolve_item_bytes(file, loc)
+}
+
+/// Parse an AVIF file, returning the bits needed to decode the primary
+/// image. The input must contain the whole file; box offsets in `iloc`
+/// are absolute.
+///
+/// This path errors out when the primary item type is not `av01` — use
+/// [`parse_header`] + the `grid` module to handle grid primaries.
+pub fn parse(file: &[u8]) -> Result<AvifImage<'_>> {
+    let hdr = parse_header(file)?;
+    let AvifHeader {
+        file: _,
+        major_brand,
+        minor_version,
+        compatible_brands,
+        meta,
+    } = hdr;
 
     let primary_id = meta
         .primary_item_id
