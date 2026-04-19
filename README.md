@@ -35,8 +35,8 @@ colour info, and the raw OBU slice.
 
 ```toml
 [dependencies]
-oxideav-core = "0.0"
-oxideav-codec = "0.0"
+oxideav-core = "0.1"
+oxideav-codec = "0.1"
 oxideav-av1 = "0.0"
 oxideav-avif = "0.0"
 ```
