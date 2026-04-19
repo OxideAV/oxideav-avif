@@ -42,7 +42,7 @@ pub use decoder::{inspect, make_decoder, AvifDecoder, AvifInfo};
 pub use meta::{Colr, Ispe, ItemInfo, ItemLocation, Meta, Pasp, Pixi, Property};
 pub use parser::{parse, AvifImage};
 
-use oxideav_codec::{CodecRegistry, Encoder};
+use oxideav_codec::{CodecInfo, CodecRegistry, Encoder};
 use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, Error, Result};
 
 /// Public codec id string. Matches the aggregator-crate Cargo feature `avif`.
@@ -56,8 +56,12 @@ pub fn register(reg: &mut CodecRegistry) {
     let caps = CodecCapabilities::video("avif_heif_av1_parse")
         .with_lossy(true)
         .with_intra_only(true);
-    reg.register_decoder_impl(CodecId::new(CODEC_ID_STR), caps.clone(), make_decoder);
-    reg.register_encoder_impl(CodecId::new(CODEC_ID_STR), caps, make_encoder);
+    reg.register(
+        CodecInfo::new(CodecId::new(CODEC_ID_STR))
+            .capabilities(caps)
+            .decoder(make_decoder)
+            .encoder(make_encoder),
+    );
 }
 
 /// AVIF encoder factory — always errors. Writing AVIF requires an AV1

@@ -111,12 +111,14 @@ pub fn parse_box_header(buf: &[u8], start: usize) -> Result<BoxHeader> {
         }
         (start + 8, s)
     };
-    let payload_len = total_len.checked_sub(payload_start - start).ok_or_else(|| {
-        Error::invalid(format!(
-            "avif: box '{}' header longer than total",
-            type_str(&box_type)
-        ))
-    })?;
+    let payload_len = total_len
+        .checked_sub(payload_start - start)
+        .ok_or_else(|| {
+            Error::invalid(format!(
+                "avif: box '{}' header longer than total",
+                type_str(&box_type)
+            ))
+        })?;
     Ok(BoxHeader {
         box_type,
         payload_start,

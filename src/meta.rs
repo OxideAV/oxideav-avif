@@ -291,7 +291,11 @@ fn parse_infe(payload: &[u8]) -> Result<ItemInfo> {
     // Remaining fields (content_type, URI, …) depend on item_type; we
     // don't need them for AVIF decoding.
     let _ = cursor;
-    Ok(ItemInfo { id, item_type, name })
+    Ok(ItemInfo {
+        id,
+        item_type,
+        name,
+    })
 }
 
 fn parse_iloc(payload: &[u8]) -> Result<Vec<ItemLocation>> {
@@ -379,8 +383,8 @@ fn parse_iloc(payload: &[u8]) -> Result<Vec<ItemLocation>> {
 
 fn parse_iprp(payload: &[u8]) -> Result<(Vec<Property>, Vec<ItemPropertyAssociation>)> {
     // iprp is a plain Box containing ipco then one or more ipma.
-    let (ipco_payload, _) = find_box(payload, &IPCO)?
-        .ok_or_else(|| Error::invalid("avif: iprp missing ipco"))?;
+    let (ipco_payload, _) =
+        find_box(payload, &IPCO)?.ok_or_else(|| Error::invalid("avif: iprp missing ipco"))?;
     let properties = parse_ipco(ipco_payload)?;
     let mut assocs = Vec::new();
     // Multiple ipma boxes may appear; walk them all.

@@ -154,7 +154,10 @@ fn parse_ftyp(payload: &[u8]) -> Result<(BoxType, u32, Vec<BoxType>)> {
 fn is_avif_compatible(major: &BoxType, compat: &[BoxType]) -> bool {
     let candidates = [major].into_iter().chain(compat.iter());
     for b in candidates {
-        if b == &BRAND_AVIF || b == &BRAND_AVIS || b == &BRAND_MIF1 || b == &BRAND_MSF1
+        if b == &BRAND_AVIF
+            || b == &BRAND_AVIS
+            || b == &BRAND_MIF1
+            || b == &BRAND_MSF1
             || b == &BRAND_MIAF
         {
             return true;
