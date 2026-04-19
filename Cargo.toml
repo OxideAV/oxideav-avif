@@ -14,6 +14,6 @@ keywords = ["multimedia", "image", "avif", "av1", "codec"]
 categories = ["multimedia::encoding", "multimedia::images"]
 
 [dependencies]
-oxideav-core = "0.0"
-oxideav-codec = "0.0"
+oxideav-core = "0.1"
+oxideav-codec = "0.1"
 oxideav-av1 = "0.0"
