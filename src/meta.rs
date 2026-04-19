@@ -26,12 +26,17 @@ const ILOC: BoxType = b(b"iloc");
 const IPRP: BoxType = b(b"iprp");
 const IPCO: BoxType = b(b"ipco");
 const IPMA: BoxType = b(b"ipma");
+const IREF: BoxType = b(b"iref");
 
 const AV1C: BoxType = b(b"av1C");
 const ISPE: BoxType = b(b"ispe");
 const COLR: BoxType = b(b"colr");
 const PIXI: BoxType = b(b"pixi");
 const PASP: BoxType = b(b"pasp");
+const IROT: BoxType = b(b"irot");
+const IMIR: BoxType = b(b"imir");
+const CLAP: BoxType = b(b"clap");
+const AUXC: BoxType = b(b"auxC");
 
 /// One `infe` entry.
 #[derive(Clone, Debug)]
@@ -108,7 +113,44 @@ pub enum Colr {
     Unknown(BoxType),
 }
 
-/// One property box, kept typed for the four AVIF cares about + a raw
+/// Image rotation (`irot`) — counter-clockwise, 0..3 × 90°.
+#[derive(Clone, Copy, Debug)]
+pub struct Irot {
+    pub angle: u8,
+}
+
+/// Image mirror (`imir`). `axis == 0` flips about the horizontal axis
+/// (top↔bottom); `axis == 1` flips about the vertical axis (left↔right).
+/// This follows AVIF 1.1 / HEIF convention.
+#[derive(Clone, Copy, Debug)]
+pub struct Imir {
+    pub axis: u8,
+}
+
+/// Clean aperture (`clap`). Eight 32-bit signed rationals (num/den pairs)
+/// describing crop width, crop height, horizontal offset, vertical offset.
+#[derive(Clone, Copy, Debug)]
+pub struct Clap {
+    pub clean_aperture_width_n: i32,
+    pub clean_aperture_width_d: i32,
+    pub clean_aperture_height_n: i32,
+    pub clean_aperture_height_d: i32,
+    pub horiz_off_n: i32,
+    pub horiz_off_d: i32,
+    pub vert_off_n: i32,
+    pub vert_off_d: i32,
+}
+
+/// Auxiliary item type (`auxC`) — carries a NUL-terminated URN identifying
+/// the auxiliary use. For AVIF alpha this is
+/// `urn:mpeg:mpegB:cicp:systems:auxiliary:alpha`.
+#[derive(Clone, Debug)]
+pub struct AuxC {
+    pub aux_type: String,
+    pub aux_subtype: Vec<u8>,
+}
+
+/// One property box, kept typed for the boxes AVIF cares about + a raw
 /// fallback so an unknown property still gets an index for association.
 #[derive(Clone, Debug)]
 pub enum Property {
@@ -117,6 +159,10 @@ pub enum Property {
     Colr(Colr),
     Pixi(Pixi),
     Pasp(Pasp),
+    Irot(Irot),
+    Imir(Imir),
+    Clap(Clap),
+    AuxC(AuxC),
     Other(BoxType, Vec<u8>),
 }
 
@@ -128,9 +174,23 @@ impl Property {
             Property::Colr(_) => COLR,
             Property::Pixi(_) => PIXI,
             Property::Pasp(_) => PASP,
+            Property::Irot(_) => IROT,
+            Property::Imir(_) => IMIR,
+            Property::Clap(_) => CLAP,
+            Property::AuxC(_) => AUXC,
             Property::Other(t, _) => *t,
         }
     }
+}
+
+/// One entry in `iref` — a typed reference whose `from_id` is the source
+/// item and `to_ids` is the list of target items (e.g. `dimg` -> tile
+/// items for a grid, `auxl` -> alpha item).
+#[derive(Clone, Debug)]
+pub struct IrefEntry {
+    pub reference_type: BoxType,
+    pub from_id: u32,
+    pub to_ids: Vec<u32>,
 }
 
 /// Everything we pulled out of `meta`.
@@ -142,6 +202,7 @@ pub struct Meta {
     pub locations: Vec<ItemLocation>,
     pub properties: Vec<Property>,
     pub associations: Vec<ItemPropertyAssociation>,
+    pub irefs: Vec<IrefEntry>,
 }
 
 impl Meta {
@@ -171,10 +232,37 @@ impl Meta {
                     me.properties = props;
                     me.associations = assocs;
                 }
+                x if x == &IREF => {
+                    me.irefs = parse_iref(payload)?;
+                }
                 _ => {}
             }
         }
         Ok(me)
+    }
+
+    /// Return the list of target item IDs referenced from `from_id` via
+    /// an iref entry of the given `reference_type` (e.g. `b"dimg"` for
+    /// grid tiles, `b"auxl"` for alpha auxiliaries).
+    pub fn iref_targets(&self, reference_type: &BoxType, from_id: u32) -> Vec<u32> {
+        for e in &self.irefs {
+            if &e.reference_type == reference_type && e.from_id == from_id {
+                return e.to_ids.clone();
+            }
+        }
+        Vec::new()
+    }
+
+    /// Return the source of the first iref of `reference_type` whose
+    /// `to_ids` contains `to_id`. Useful for finding the alpha auxiliary
+    /// that points at the primary item via `auxl`.
+    pub fn iref_source_of(&self, reference_type: &BoxType, to_id: u32) -> Option<u32> {
+        for e in &self.irefs {
+            if &e.reference_type == reference_type && e.to_ids.contains(&to_id) {
+                return Some(e.from_id);
+            }
+        }
+        None
     }
 
     pub fn item_by_id(&self, id: u32) -> Option<&ItemInfo> {
@@ -409,6 +497,10 @@ fn parse_ipco(payload: &[u8]) -> Result<Vec<Property>> {
             x if x == &COLR => Property::Colr(parse_colr(body)?),
             x if x == &PIXI => Property::Pixi(parse_pixi(body)?),
             x if x == &PASP => Property::Pasp(parse_pasp(body)?),
+            x if x == &IROT => Property::Irot(parse_irot(body)?),
+            x if x == &IMIR => Property::Imir(parse_imir(body)?),
+            x if x == &CLAP => Property::Clap(parse_clap(body)?),
+            x if x == &AUXC => Property::AuxC(parse_auxc(body)?),
             other => Property::Other(*other, body.to_vec()),
         };
         out.push(prop);
@@ -476,6 +568,97 @@ fn parse_pasp(body: &[u8]) -> Result<Pasp> {
         h_spacing: read_u32(body, 0)?,
         v_spacing: read_u32(body, 4)?,
     })
+}
+
+fn parse_irot(body: &[u8]) -> Result<Irot> {
+    if body.is_empty() {
+        return Err(Error::invalid("avif: irot empty"));
+    }
+    Ok(Irot {
+        angle: body[0] & 0x03,
+    })
+}
+
+fn parse_imir(body: &[u8]) -> Result<Imir> {
+    if body.is_empty() {
+        return Err(Error::invalid("avif: imir empty"));
+    }
+    Ok(Imir {
+        axis: body[0] & 0x01,
+    })
+}
+
+fn parse_clap(body: &[u8]) -> Result<Clap> {
+    if body.len() < 32 {
+        return Err(Error::invalid("avif: clap too short"));
+    }
+    Ok(Clap {
+        clean_aperture_width_n: read_u32(body, 0)? as i32,
+        clean_aperture_width_d: read_u32(body, 4)? as i32,
+        clean_aperture_height_n: read_u32(body, 8)? as i32,
+        clean_aperture_height_d: read_u32(body, 12)? as i32,
+        horiz_off_n: read_u32(body, 16)? as i32,
+        horiz_off_d: read_u32(body, 20)? as i32,
+        vert_off_n: read_u32(body, 24)? as i32,
+        vert_off_d: read_u32(body, 28)? as i32,
+    })
+}
+
+fn parse_auxc(body: &[u8]) -> Result<AuxC> {
+    let (_v, _f, rest) = parse_full_box(body)?;
+    let (aux_type, next) = read_cstr(rest, 0)?;
+    let aux_subtype = rest.get(next..).unwrap_or(&[]).to_vec();
+    Ok(AuxC {
+        aux_type,
+        aux_subtype,
+    })
+}
+
+/// Parse an `iref` box: FullBox header followed by a sequence of typed
+/// child boxes (`SingleItemTypeReferenceBox`), each carrying `from_item_ID`,
+/// `reference_count`, and `reference_count` × `to_item_ID`. v0 uses 16-bit
+/// item IDs; v1 uses 32-bit. Spec: ISO/IEC 14496-12 §8.11.12.
+fn parse_iref(payload: &[u8]) -> Result<Vec<IrefEntry>> {
+    let (version, _flags, body) = parse_full_box(payload)?;
+    if version != 0 && version != 1 {
+        return Err(Error::invalid(format!("avif: iref version {version}")));
+    }
+    let mut out = Vec::new();
+    for hdr in iter_boxes(body) {
+        let hdr = hdr?;
+        let child = &body[hdr.payload_start..hdr.end()];
+        let mut cursor = 0usize;
+        let from_id = if version == 0 {
+            let v = read_u16(child, cursor)? as u32;
+            cursor += 2;
+            v
+        } else {
+            let v = read_u32(child, cursor)?;
+            cursor += 4;
+            v
+        };
+        let ref_count = read_u16(child, cursor)? as usize;
+        cursor += 2;
+        let mut to_ids = Vec::with_capacity(ref_count);
+        for _ in 0..ref_count {
+            let v = if version == 0 {
+                let x = read_u16(child, cursor)? as u32;
+                cursor += 2;
+                x
+            } else {
+                let x = read_u32(child, cursor)?;
+                cursor += 4;
+                x
+            };
+            to_ids.push(v);
+        }
+        out.push(IrefEntry {
+            reference_type: hdr.box_type,
+            from_id,
+            to_ids,
+        });
+    }
+    Ok(out)
 }
 
 fn parse_ipma(payload: &[u8]) -> Result<Vec<ItemPropertyAssociation>> {
@@ -569,5 +752,59 @@ mod tests {
         let ispe = parse_ispe(&buf).unwrap();
         assert_eq!(ispe.width, 100);
         assert_eq!(ispe.height, 200);
+    }
+
+    #[test]
+    fn irot_imir_masks_reserved_bits() {
+        let irot = parse_irot(&[0xff]).unwrap();
+        assert_eq!(irot.angle, 3);
+        let imir = parse_imir(&[0xff]).unwrap();
+        assert_eq!(imir.axis, 1);
+    }
+
+    #[test]
+    fn clap_reads_all_fields() {
+        let mut buf = Vec::new();
+        for i in 0..8u32 {
+            buf.extend_from_slice(&i.to_be_bytes());
+        }
+        let c = parse_clap(&buf).unwrap();
+        assert_eq!(c.clean_aperture_width_n, 0);
+        assert_eq!(c.clean_aperture_width_d, 1);
+        assert_eq!(c.vert_off_d, 7);
+    }
+
+    #[test]
+    fn auxc_extracts_urn() {
+        let mut buf = vec![0u8; 4]; // FullBox v=0 flags=0
+        buf.extend_from_slice(b"urn:mpeg:mpegB:cicp:systems:auxiliary:alpha\0");
+        let a = parse_auxc(&buf).unwrap();
+        assert!(a
+            .aux_type
+            .starts_with("urn:mpeg:mpegB:cicp:systems:auxiliary:alpha"));
+    }
+
+    #[test]
+    fn iref_v0_round_trip() {
+        // FullBox(v=0, f=0) + one `auxl` child referencing from_id=2 to {1}.
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0u8; 4]); // fullbox
+                                           // Child box header: size(4) + type(4)
+        let child_payload: Vec<u8> = {
+            let mut cp = Vec::new();
+            cp.extend_from_slice(&2u16.to_be_bytes()); // from_id
+            cp.extend_from_slice(&1u16.to_be_bytes()); // ref_count
+            cp.extend_from_slice(&1u16.to_be_bytes()); // to_id = 1
+            cp
+        };
+        let child_size = (8 + child_payload.len()) as u32;
+        body.extend_from_slice(&child_size.to_be_bytes());
+        body.extend_from_slice(b"auxl");
+        body.extend_from_slice(&child_payload);
+        let refs = parse_iref(&body).unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(&refs[0].reference_type, b"auxl");
+        assert_eq!(refs[0].from_id, 2);
+        assert_eq!(refs[0].to_ids, vec![1]);
     }
 }

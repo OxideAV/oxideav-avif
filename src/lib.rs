@@ -1,46 +1,54 @@
 //! AVIF (AV1 Image File Format) — pure-Rust container parser with
-//! AV1 hand-off to [`oxideav_av1`].
+//! AV1 pixel decode delegated to [`oxideav_av1`].
 //!
 //! # Status
 //!
 //! * HEIF / ISOBMFF box walker: `ftyp`, `meta`, `hdlr`, `pitm`, `iinf`
-//!   (v0/v1) + `infe` (v2/v3), `iloc` (v0/v1/v2), `iprp` / `ipco` /
-//!   `ipma` (v0/v1, small + large indices), plus item properties
-//!   `av1C`, `ispe`, `colr` (nclx + ICC), `pixi`, `pasp`.
+//!   (v0/v1) + `infe` (v2/v3), `iloc` (v0/v1/v2), `iref`, `iprp` /
+//!   `ipco` / `ipma` (v0/v1, small + large indices), plus item
+//!   properties `av1C`, `ispe`, `colr` (nclx + ICC), `pixi`, `pasp`,
+//!   `irot`, `imir`, `clap`, `auxC`.
 //! * Primary item resolution via `pitm`, file-offset extent reads via
 //!   `iloc`, brand check accepting `avif` / `avis` / `mif1` / `msf1` /
 //!   `miaf`.
 //! * Primary item's AV1 OBU bitstream is handed to
-//!   [`oxideav_av1::Av1Decoder`] with `av1C` plumbed through as
-//!   `CodecParameters::extradata`. The inner decoder parses sequence
-//!   header + frame header through `tile_info()`, captures per-tile
-//!   byte ranges, and then stops at the tile body with
-//!   `Error::Unsupported` — expected, since AV1 pixel reconstruction
-//!   is still out of scope in that crate.
-//!
-//! [`AvifDecoder::receive_frame`] therefore returns
-//! `Error::Unsupported("avif pixel decode blocked by av1 decoder
-//! limitations: <av1 specific message>")` until the AV1 decoder gains
-//! partition / transform / prediction / loop-filter paths. Until then,
-//! [`AvifDecoder::info`] and [`inspect`] give callers dimensions, bit
-//! depth, colour info, and the extracted OBU bytes.
+//!   [`oxideav_av1::Av1Decoder`], which now returns real frames for
+//!   every intra still plus single-reference inter clips.
+//!   [`AvifDecoder::receive_frame`] composites the result:
+//!   * Grid items (HEIF §6.6.2) — decode each tile via `dimg` iref
+//!     and paste into the declared output rectangle (see [`grid`]).
+//!   * Alpha auxiliary — AV1-coded monochrome item referenced via
+//!     `auxl` + `auxC` URN (see [`alpha`]).
+//!   * `irot` / `imir` / `clap` post-transforms (see [`transform`]).
+//! * AVIS image sequences — sample table walk via [`avis::parse_avis`]
+//!   produces a flat frame-offset list; pair with [`oxideav_av1`] to
+//!   decode frames sequentially.
 //!
 //! # Encoder
 //!
 //! Not implemented — [`make_encoder`] returns `Error::Unsupported`.
-//! Writing an AVIF encoder requires an AV1 encoder, which oxideav
-//! does not have.
-//!
-//! [`inspect`]: decoder::inspect
+//! Writing an AVIF encoder requires an AV1 encoder, which oxideav does
+//! not have.
 
+pub mod alpha;
+pub mod avis;
 pub mod box_parser;
 pub mod decoder;
+pub mod grid;
 pub mod meta;
 pub mod parser;
+pub mod transform;
 
+pub use alpha::{composite_alpha, find_alpha_item_id, ALPHA_URN_PREFIX};
+pub use avis::{parse_avis, sample_table, AvisMeta, Sample};
 pub use decoder::{inspect, make_decoder, AvifDecoder, AvifInfo};
-pub use meta::{Colr, Ispe, ItemInfo, ItemLocation, Meta, Pasp, Pixi, Property};
-pub use parser::{parse, AvifImage};
+pub use grid::{composite_grid, ImageGrid};
+pub use meta::{
+    AuxC, Clap, Colr, Imir, IrefEntry, Irot, Ispe, ItemInfo, ItemLocation, Meta, Pasp, Pixi,
+    Property,
+};
+pub use parser::{parse, parse_header, AvifHeader, AvifImage};
+pub use transform::{apply_clap, apply_imir, apply_irot, crop_top_left};
 
 use oxideav_codec::{CodecInfo, CodecRegistry, Encoder};
 use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, Error, Result};
@@ -49,11 +57,12 @@ use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, Error, Result};
 pub const CODEC_ID_STR: &str = "avif";
 
 /// Register the AVIF decoder + encoder factories with a registry. The
-/// decoder is declared `avif_heif_av1_parse` — we parse the HEIF
-/// container end to end and hand the AV1 bitstream to oxideav-av1,
-/// which today stops before pixel reconstruction.
+/// decoder is declared `avif_heif_av1_decode` — we parse the HEIF
+/// container end to end, hand the AV1 bitstream to oxideav-av1, and
+/// composite grid / alpha / transform properties on the resulting
+/// frames.
 pub fn register(reg: &mut CodecRegistry) {
-    let caps = CodecCapabilities::video("avif_heif_av1_parse")
+    let caps = CodecCapabilities::video("avif_heif_av1_decode")
         .with_lossy(true)
         .with_intra_only(true);
     reg.register(
@@ -98,7 +107,7 @@ mod tests {
             Ok(_) => panic!("encoder factory: expected Unsupported, got live encoder"),
         }
         // Decoder factory succeeds; `send_packet` exercises the HEIF
-        // parse and stops at the AV1 tile decode gate.
+        // parse + AV1 decode pipeline.
         let _ = reg.make_decoder(&params).expect("decoder factory");
     }
 }

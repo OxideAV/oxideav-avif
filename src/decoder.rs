@@ -1,16 +1,32 @@
-//! AVIF `Decoder` implementation. Parses the HEIF container, extracts
-//! the primary item's AV1 OBU stream + `av1C` config, feeds everything
-//! to [`oxideav_av1::Av1Decoder`] and surfaces its `Unsupported` error
-//! unchanged. Once the AV1 crate grows pixel decode, this file should
-//! not need changes — it already forwards the `receive_frame` call.
+//! AVIF `Decoder` implementation.
+//!
+//! The decoder does the full container-side composition pass: it parses
+//! HEIF box hierarchy, decodes the primary item's AV1 OBU stream via
+//! [`oxideav_av1::Av1Decoder`], then stitches grid tiles (HEIF §6.6.2),
+//! applies `clap` / `irot` / `imir` post-transforms, and composites an
+//! auxiliary alpha plane when one is present. Decode errors from the
+//! underlying AV1 crate bubble up unchanged.
 
 use oxideav_codec::Decoder;
+use oxideav_core::frame::VideoFrame;
 use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, Result, TimeBase};
 
 use oxideav_av1::{Av1CodecConfig, Av1Decoder};
 
-use crate::meta::{Ispe, Pasp, Pixi};
-use crate::parser::{parse, AvifImage};
+use crate::alpha::{composite_alpha, find_alpha_item_id};
+use crate::box_parser::{b, BoxType};
+use crate::grid::{composite_grid, ImageGrid};
+use crate::meta::{Ispe, ItemLocation, Meta, Pasp, Pixi, Property};
+use crate::parser::{item_bytes, parse_header, AvifHeader, AvifImage, ITEM_TYPE_AV01, ITEM_TYPE_GRID};
+use crate::parser::parse;
+use crate::transform::{apply_clap, apply_imir, apply_irot, crop_top_left};
+
+const AV1C: BoxType = b(b"av1C");
+const ISPE: BoxType = b(b"ispe");
+const IROT: BoxType = b(b"irot");
+const IMIR: BoxType = b(b"imir");
+const CLAP: BoxType = b(b"clap");
+const DIMG: BoxType = b(b"dimg");
 
 /// High-level view of an AVIF file after the HEIF pass — useful for
 /// callers that want to inspect dimensions + colour info without
@@ -23,14 +39,32 @@ pub struct AvifInfo {
     pub pasp: Option<Pasp>,
     pub av1c: Vec<u8>,
     pub obu_bytes: Vec<u8>,
+    /// True when the primary item is a grid (composite) item.
+    pub is_grid: bool,
+    /// True when an alpha auxiliary is attached to the primary item.
+    pub has_alpha: bool,
 }
 
 pub fn inspect(file: &[u8]) -> Result<AvifInfo> {
-    let img = parse(file)?;
-    build_info(&img)
+    // Grid primaries fail parse() but succeed parse_header().
+    let hdr = parse_header(file)?;
+    let primary_id = hdr
+        .meta
+        .primary_item_id
+        .ok_or_else(|| Error::invalid("avif: missing pitm"))?;
+    let primary_info = hdr
+        .meta
+        .item_by_id(primary_id)
+        .ok_or_else(|| Error::invalid("avif: pitm references unknown item"))?;
+    if primary_info.item_type == ITEM_TYPE_GRID {
+        build_info_grid(&hdr, primary_id)
+    } else {
+        let img = parse(file)?;
+        build_info(&img, find_alpha_item_id(&hdr.meta, primary_id).is_some())
+    }
 }
 
-fn build_info(img: &AvifImage<'_>) -> Result<AvifInfo> {
+fn build_info(img: &AvifImage<'_>, has_alpha: bool) -> Result<AvifInfo> {
     let av1c = img
         .av1c
         .clone()
@@ -50,17 +84,63 @@ fn build_info(img: &AvifImage<'_>) -> Result<AvifInfo> {
         pasp: img.pasp,
         av1c,
         obu_bytes: img.primary_item_data.to_vec(),
+        is_grid: false,
+        has_alpha,
+    })
+}
+
+fn build_info_grid(hdr: &AvifHeader<'_>, primary_id: u32) -> Result<AvifInfo> {
+    // Pull grid item bytes, parse the descriptor.
+    let loc = hdr
+        .meta
+        .location_by_id(primary_id)
+        .ok_or_else(|| Error::invalid("avif: grid item missing in iloc"))?;
+    let grid_bytes = item_bytes(hdr.file, loc)?;
+    let grid = ImageGrid::parse(grid_bytes)?;
+    // Tile list.
+    let tile_ids = hdr.meta.iref_targets(&DIMG, primary_id);
+    if tile_ids.is_empty() {
+        return Err(Error::invalid("avif: grid item has no dimg iref"));
+    }
+    let first_tile_id = tile_ids[0];
+    // Pull the first tile's av1C + dimensions to report.
+    let av1c = match hdr.meta.property_for(first_tile_id, &AV1C) {
+        Some(Property::Av1C(bytes)) => bytes.clone(),
+        _ => {
+            return Err(Error::invalid(
+                "avif: first grid tile missing av1C property",
+            ))
+        }
+    };
+    let bits_per_channel = match hdr
+        .meta
+        .property_for(first_tile_id, b"pixi")
+    {
+        Some(Property::Pixi(pixi)) => pixi.bits_per_channel.clone(),
+        _ => Vec::new(),
+    };
+    let pasp = match hdr.meta.property_for(primary_id, b"pasp") {
+        Some(Property::Pasp(p)) => Some(*p),
+        _ => None,
+    };
+    Ok(AvifInfo {
+        width: grid.output_width,
+        height: grid.output_height,
+        bits_per_channel,
+        pasp,
+        av1c,
+        obu_bytes: Vec::new(),
+        is_grid: true,
+        has_alpha: find_alpha_item_id(&hdr.meta, primary_id).is_some(),
     })
 }
 
 /// `Decoder` trait impl registered under codec id `avif`.
 pub struct AvifDecoder {
     codec_id: CodecId,
-    inner: Option<Av1Decoder>,
-    /// AV1CodecConfigurationRecord captured from `av1C` — also used as
-    /// `CodecParameters::extradata` for the inner decoder so its
-    /// sequence-header bootstrap matches the container metadata.
-    av1c: Option<Vec<u8>>,
+    /// Frames ready to hand out via `receive_frame()`.
+    pending: Vec<Frame>,
+    /// The AvifInfo of the last decoded file, retained for `info()`.
     info: Option<AvifInfo>,
 }
 
@@ -68,52 +148,87 @@ impl AvifDecoder {
     pub fn new(codec_id: CodecId) -> Self {
         Self {
             codec_id,
-            inner: None,
-            av1c: None,
+            pending: Vec::new(),
             info: None,
         }
     }
 
-    /// Parse an AVIF file and prime the inner AV1 decoder with its
-    /// configuration record. `receive_frame()` will then error with
-    /// the AV1 decoder's `Unsupported` until AV1 pixel decode lands.
+    /// Parse an AVIF file and decode the primary item. Grid + alpha +
+    /// transform post-processing is applied before the frame is queued.
+    /// Returns the resolved `AvifInfo` on success.
     pub fn decode_file(&mut self, file: &[u8]) -> Result<AvifInfo> {
-        let img = parse(file)?;
-        let info = build_info(&img)?;
+        let hdr = parse_header(file)?;
+        let primary_id = hdr
+            .meta
+            .primary_item_id
+            .ok_or_else(|| Error::invalid("avif: missing pitm"))?;
+        let primary_info = hdr
+            .meta
+            .item_by_id(primary_id)
+            .ok_or_else(|| Error::invalid("avif: pitm references unknown item"))?
+            .clone();
 
-        // Build CodecParameters for the AV1 decoder. The av1C record
-        // lands verbatim in extradata — oxideav-av1's
-        // `Av1Decoder::new` consumes it and parses the embedded
-        // sequence header so the first frame_header OBU parses cleanly.
-        let mut params = CodecParameters::video(CodecId::new("av1"));
-        params.width = Some(info.width);
-        params.height = Some(info.height);
-        params.extradata = info.av1c.clone();
-        let mut av1 = Av1Decoder::new(params);
+        // Decode the primary frame, either via the grid path or the
+        // single-item path.
+        let (color_frame, info) = if primary_info.item_type == ITEM_TYPE_GRID {
+            let frame = decode_grid_primary(&hdr, primary_id)?;
+            let info = build_info_grid(&hdr, primary_id)?;
+            (frame, info)
+        } else if primary_info.item_type == ITEM_TYPE_AV01 {
+            let img = parse(file)?;
+            let frame = decode_av01_item(
+                img.primary_item_data,
+                img.av1c
+                    .as_deref()
+                    .ok_or_else(|| Error::invalid("avif: primary item missing av1C"))?,
+                img.ispe.map(|e| (e.width, e.height)),
+            )?;
+            let has_alpha = find_alpha_item_id(&hdr.meta, primary_id).is_some();
+            let info = build_info(&img, has_alpha)?;
+            (frame, info)
+        } else {
+            return Err(Error::unsupported(format!(
+                "avif: primary item type '{}' not supported",
+                String::from_utf8_lossy(&primary_info.item_type)
+            )));
+        };
 
-        // Eagerly validate av1C — mirrors what the AV1 decoder does on
-        // construction but gives us a crisp error before we start
-        // feeding packets.
-        let _cfg = Av1CodecConfig::parse(&info.av1c)?;
-
-        // Send the primary item's OBU stream as a single packet. The
-        // AV1 decoder walks OBUs, parses the frame_header through
-        // tile_info, records tile payload boundaries, and then
-        // surfaces `Unsupported` on reaching the tile body — that's
-        // the expected stopping point for a parse-only AV1 build.
-        let pkt = Packet::new(0, TimeBase::new(1, 90_000), info.obu_bytes.clone());
-        match av1.send_packet(&pkt) {
-            Ok(()) => {}
-            Err(Error::Unsupported(_)) => {
-                // Expected for the current AV1 crate state — headers
-                // parsed, pixel decode unavailable. Keep the decoder so
-                // `receive_frame()` can re-surface the same error.
+        // Alpha composite, if an alpha auxiliary item is present.
+        let composited = match find_alpha_item_id(&hdr.meta, primary_id) {
+            Some(alpha_id) => {
+                let alpha_frame = decode_alpha_item(&hdr, alpha_id)?;
+                composite_alpha(&color_frame, &alpha_frame)?
             }
-            Err(other) => return Err(other),
+            None => color_frame,
+        };
+
+        // Post-transforms: clap -> irot -> imir, per §6.5.10 application
+        // order.
+        let mut frame = composited;
+        // ispe-based crop against coded dimensions: if the AV1 decoder
+        // emitted a padded frame the ispe width/height clamps it back
+        // to the declared display rect.
+        if let Some(Property::Ispe(ispe)) = hdr.meta.property_for(primary_id, &ISPE) {
+            if (ispe.width, ispe.height) != (frame.width, frame.height)
+                && ispe.width <= frame.width
+                && ispe.height <= frame.height
+                && ispe.width > 0
+                && ispe.height > 0
+            {
+                frame = crop_top_left(&frame, ispe.width, ispe.height)?;
+            }
+        }
+        if let Some(Property::Clap(clap)) = hdr.meta.property_for(primary_id, &CLAP) {
+            frame = apply_clap(&frame, clap)?;
+        }
+        if let Some(Property::Irot(irot)) = hdr.meta.property_for(primary_id, &IROT) {
+            frame = apply_irot(&frame, irot)?;
+        }
+        if let Some(Property::Imir(imir)) = hdr.meta.property_for(primary_id, &IMIR) {
+            frame = apply_imir(&frame, imir)?;
         }
 
-        self.inner = Some(av1);
-        self.av1c = Some(info.av1c.clone());
+        self.pending.push(Frame::Video(frame));
         self.info = Some(info.clone());
         Ok(info)
     }
@@ -123,33 +238,152 @@ impl AvifDecoder {
     }
 }
 
+/// Decode a single av01 item's OBU bitstream into a `VideoFrame`.
+fn decode_av01_item(
+    obu_bytes: &[u8],
+    av1c: &[u8],
+    ispe: Option<(u32, u32)>,
+) -> Result<VideoFrame> {
+    let _cfg = Av1CodecConfig::parse(av1c)?; // eagerly validate
+    let mut params = CodecParameters::video(CodecId::new("av1"));
+    if let Some((w, h)) = ispe {
+        params.width = Some(w);
+        params.height = Some(h);
+    }
+    params.extradata = av1c.to_vec();
+    let mut av1 = Av1Decoder::new(params);
+    let pkt = Packet::new(0, TimeBase::new(1, 90_000), obu_bytes.to_vec());
+    av1.send_packet(&pkt)?;
+    match av1.receive_frame()? {
+        Frame::Video(v) => Ok(v),
+        other => Err(Error::unsupported(format!(
+            "avif: AV1 decoder returned non-video frame: {other:?}"
+        ))),
+    }
+}
+
+/// Decode a grid-type primary item: decode each tile through the av01
+/// path, then composite into the declared output rectangle.
+fn decode_grid_primary(hdr: &AvifHeader<'_>, grid_id: u32) -> Result<VideoFrame> {
+    let loc = hdr
+        .meta
+        .location_by_id(grid_id)
+        .ok_or_else(|| Error::invalid("avif: grid item missing in iloc"))?;
+    let grid_bytes = item_bytes(hdr.file, loc)?;
+    let grid = ImageGrid::parse(grid_bytes)?;
+    let tile_ids = hdr.meta.iref_targets(&DIMG, grid_id);
+    if tile_ids.is_empty() {
+        return Err(Error::invalid("avif: grid item has no dimg iref"));
+    }
+    if tile_ids.len() != grid.expected_tile_count() {
+        return Err(Error::invalid(format!(
+            "avif: grid declares {} tiles but dimg lists {}",
+            grid.expected_tile_count(),
+            tile_ids.len()
+        )));
+    }
+    let mut tiles = Vec::with_capacity(tile_ids.len());
+    for (i, tid) in tile_ids.iter().enumerate() {
+        let tile_info = hdr
+            .meta
+            .item_by_id(*tid)
+            .ok_or_else(|| Error::invalid(format!("avif: grid tile {i} id {tid} unknown")))?;
+        if tile_info.item_type != ITEM_TYPE_AV01 {
+            return Err(Error::unsupported(format!(
+                "avif: grid tile {i} item_type '{}' != 'av01'",
+                String::from_utf8_lossy(&tile_info.item_type)
+            )));
+        }
+        let tile_loc = hdr
+            .meta
+            .location_by_id(*tid)
+            .ok_or_else(|| Error::invalid(format!("avif: grid tile {i} missing iloc")))?;
+        let tile_bytes = item_bytes(hdr.file, tile_loc)?;
+        let av1c = match hdr.meta.property_for(*tid, &AV1C) {
+            Some(Property::Av1C(bytes)) => bytes.clone(),
+            _ => {
+                return Err(Error::invalid(format!(
+                    "avif: grid tile {i} missing av1C property"
+                )))
+            }
+        };
+        let ispe_dims = match hdr.meta.property_for(*tid, &ISPE) {
+            Some(Property::Ispe(e)) => Some((e.width, e.height)),
+            _ => None,
+        };
+        let mut frame = decode_av01_item(tile_bytes, &av1c, ispe_dims)?;
+        // Clamp tile to ispe dims if the AV1 decoder emitted a padded
+        // output.
+        if let Some((iw, ih)) = ispe_dims {
+            if iw > 0
+                && ih > 0
+                && iw <= frame.width
+                && ih <= frame.height
+                && (iw != frame.width || ih != frame.height)
+            {
+                frame = crop_top_left(&frame, iw, ih)?;
+            }
+        }
+        tiles.push(frame);
+    }
+    composite_grid(&grid, &tiles)
+}
+
+/// Decode the alpha auxiliary item into a `VideoFrame`. The item must
+/// be an AV1-coded monochrome image; the returned frame's format is
+/// `PixelFormat::Gray8`.
+fn decode_alpha_item(hdr: &AvifHeader<'_>, alpha_id: u32) -> Result<VideoFrame> {
+    let loc: &ItemLocation = hdr
+        .meta
+        .location_by_id(alpha_id)
+        .ok_or_else(|| Error::invalid("avif: alpha item missing in iloc"))?;
+    let bytes = item_bytes(hdr.file, loc)?;
+    let av1c = match hdr.meta.property_for(alpha_id, &AV1C) {
+        Some(Property::Av1C(b)) => b.clone(),
+        _ => return Err(Error::invalid("avif: alpha item missing av1C property")),
+    };
+    let ispe = match hdr.meta.property_for(alpha_id, &ISPE) {
+        Some(Property::Ispe(e)) => Some((e.width, e.height)),
+        _ => None,
+    };
+    decode_av01_item(bytes, &av1c, ispe)
+}
+
+/// Walk a `Meta` and extract every transform + auxiliary signal the
+/// decoder applies, in the order they should run. Useful for external
+/// callers that want to mirror the pipeline.
+pub fn transforms_for(meta: &Meta, item_id: u32) -> Vec<&Property> {
+    let mut out = Vec::new();
+    let Some(assoc) = meta.assoc_by_id(item_id) else {
+        return out;
+    };
+    for pa in &assoc.entries {
+        let Some(prop) = meta.properties.get(pa.index as usize) else {
+            continue;
+        };
+        match prop {
+            Property::Clap(_) | Property::Irot(_) | Property::Imir(_) => out.push(prop),
+            _ => {}
+        }
+    }
+    out
+}
+
 impl Decoder for AvifDecoder {
     fn codec_id(&self) -> &CodecId {
         &self.codec_id
     }
 
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
-        // Every AVIF packet is a complete file. Feed it to the HEIF
-        // parser and stash the inner AV1 decoder.
+        // Every AVIF packet is a complete file.
         self.decode_file(&packet.data).map(|_| ())
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        // We reached AV1 land but stopped at the tile decode gate. The
-        // AV1 decoder's own `receive_frame()` already returns its
-        // canonical unsupported message; preserve that chain so the
-        // error points at the real blocker.
-        match self.inner.as_mut() {
-            Some(av1) => match av1.receive_frame() {
-                Err(Error::Unsupported(s)) => Err(Error::Unsupported(format!(
-                    "avif pixel decode blocked by av1 decoder limitations: {s}"
-                ))),
-                other => other,
-            },
-            None => Err(Error::unsupported(
-                "avif pixel decode blocked by av1 decoder limitations",
-            )),
+        if self.pending.is_empty() {
+            return Err(Error::NeedMore);
         }
+        Ok(self.pending.remove(0))
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -157,8 +391,7 @@ impl Decoder for AvifDecoder {
     }
 
     fn reset(&mut self) -> Result<()> {
-        self.inner = None;
-        self.av1c = None;
+        self.pending.clear();
         self.info = None;
         Ok(())
     }
@@ -175,32 +408,44 @@ mod tests {
     const FIXTURE: &[u8] = include_bytes!("../tests/fixtures/monochrome.avif");
 
     #[test]
-    fn decoder_surfaces_av1_unsupported() {
-        let mut d = AvifDecoder::new(CodecId::new(crate::CODEC_ID_STR));
-        let pkt = Packet::new(0, TimeBase::new(1, 1), FIXTURE.to_vec());
-        d.send_packet(&pkt).expect("send_packet");
-        let info = d.info().cloned().expect("info");
-        assert!(info.width > 0 && info.height > 0);
-        assert!(!info.av1c.is_empty());
-        assert!(!info.obu_bytes.is_empty());
-
-        match d.receive_frame() {
-            Err(Error::Unsupported(s)) => {
-                assert!(
-                    s.contains("avif pixel decode blocked by av1 decoder limitations"),
-                    "got: {s}"
-                );
-            }
-            Err(other) => panic!("expected Unsupported, got {other:?}"),
-            Ok(_) => panic!("expected Unsupported, got a frame"),
-        }
-    }
-
-    #[test]
     fn inspect_extracts_primary_item() {
         let info = inspect(FIXTURE).expect("inspect");
         assert!(info.width > 0 && info.height > 0);
         // av1C always starts with the marker/version byte 0x81.
         assert_eq!(info.av1c[0], 0x81);
+        assert!(!info.is_grid);
+        assert!(!info.has_alpha);
+    }
+
+    #[test]
+    fn decoder_surfaces_av1_errors_unwrapped() {
+        // When the underlying av1 crate can't decode the bitstream the
+        // decoder must surface its error verbatim — no "blocked by av1
+        // limitations" wrapping. Whether the fixture decodes cleanly
+        // depends on the av1 crate version on crates.io; both outcomes
+        // are legitimate.
+        let mut d = AvifDecoder::new(CodecId::new(crate::CODEC_ID_STR));
+        let pkt = Packet::new(0, TimeBase::new(1, 1), FIXTURE.to_vec());
+        match d.send_packet(&pkt) {
+            Ok(()) => {
+                let frame = d.receive_frame().expect("receive_frame after send_packet success");
+                let vf = match frame {
+                    Frame::Video(v) => v,
+                    other => panic!("expected VideoFrame, got {other:?}"),
+                };
+                assert!(vf.width > 0 && vf.height > 0);
+                assert!(!vf.planes.is_empty());
+            }
+            Err(Error::Unsupported(s)) => {
+                // Must NOT contain the old "blocked by av1 decoder
+                // limitations" wrapper — the whole point of Phase 8.1 is
+                // that avif surfaces av1's native error verbatim.
+                assert!(
+                    !s.contains("blocked by av1 decoder limitations"),
+                    "error should pass through raw, got: {s}"
+                );
+            }
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
     }
 }
