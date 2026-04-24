@@ -1,35 +1,64 @@
 # oxideav-avif
 
-Pure-Rust **AVIF** (AV1 Image File Format) container parser. Walks
-the HEIF / ISOBMFF box hierarchy, resolves the primary item via
-`pitm` + `iloc`, surfaces the `av1C` configuration record + `ispe` /
-`colr` / `pixi` / `pasp` item properties, and hands the AV1 OBU
-bitstream to [`oxideav-av1`](https://crates.io/crates/oxideav-av1)
-for further decoding. Zero C dependencies.
+Pure-Rust **AVIF** (AV1 Image File Format) decoder. Walks the HEIF /
+ISOBMFF box hierarchy, resolves the primary item via `pitm` + `iloc`,
+surfaces the `av1C` configuration record + `ispe` / `colr` / `pixi` /
+`pasp` item properties, then hands the AV1 OBU bitstream to
+[`oxideav-av1`](https://crates.io/crates/oxideav-av1) and composites
+the result (grid tiles, alpha auxiliary, `irot` / `imir` / `clap`
+post-transforms) into the frame returned to the caller. Zero C
+dependencies.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
 ## Status
 
-HEIF container parsed → AV1 bitstream extracted → decode blocked at
-AV1 tile decode. Concretely:
+End-to-end AVIF decode works: `AvifDecoder::send_packet` +
+`receive_frame` yield a `VideoFrame` whose dimensions match the
+primary item's `ispe`. Pixel fidelity tracks the current state of
+[`oxideav-av1`](https://crates.io/crates/oxideav-av1) — on simple
+flat / synthetic content the decoded samples are tight against the
+source; on rich content (natural photos) the intra-prediction path
+still loses significant signal.
 
 | Stage                                  | Coverage                                                                                                                                                   |
 |----------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `ftyp` brand check                     | accepts `avif` / `avis` / `mif1` / `msf1` / `miaf`                                                                                                         |
-| `meta` sub-boxes                       | `hdlr`, `pitm` (v0/v1), `iinf` (v0/v1) + `infe` (v2/v3), `iloc` (v0/v1/v2), `iprp` / `ipco` / `ipma` (v0/v1, small + large property indices)               |
-| Item properties                        | `av1C`, `ispe`, `colr` (nclx + ICC), `pixi`, `pasp`; other property boxes retained as `Property::Other` so association indices stay valid                  |
-| Primary item data                      | resolved via `iloc` construction_method 0 (file offset), single-extent items; multi-extent + idat / item-offset are currently rejected with `Unsupported`  |
-| AV1 hand-off                           | `av1C` plumbed through `CodecParameters::extradata`; OBU payload fed to `oxideav_av1::Av1Decoder` — sequence header + frame header + `tile_info` parse     |
-| Pixel decode                           | **not implemented**: `oxideav-av1` stops at the tile body, so `AvifDecoder::receive_frame()` returns `Error::Unsupported("avif pixel decode blocked …")`   |
+| `meta` sub-boxes                       | `hdlr`, `pitm` (v0/v1), `iinf` (v0/v1) + `infe` (v2/v3), `iloc` (v0/v1/v2), `iref`, `iprp` / `ipco` / `ipma` (v0/v1, small + large property indices)       |
+| Item properties                        | `av1C`, `ispe`, `colr` (nclx + ICC), `pixi`, `pasp`, `irot`, `imir`, `clap`, `auxC`; unknown boxes retained as `Property::Other` so indices stay valid      |
+| Primary item data                      | resolved via `iloc` construction_method 0 (file offset), single-extent items; multi-extent + idat / item-offset are rejected with `Unsupported`            |
+| Grid primary items (HEIF §6.6.2)       | grid descriptor parse + per-tile decode via `dimg` iref + composite into the declared output rectangle                                                     |
+| Alpha auxiliary                        | `auxl` + `auxC` URN detection, AV1-coded monochrome item decoded, composited onto the color frame (`Gray8 → YA8`, `Yuv → YuvA`)                            |
+| Post-transforms                        | `clap` (centre crop) → `irot` (90/180/270°) → `imir` (horizontal/vertical), applied in that order per §6.5.10                                              |
+| AV1 hand-off                           | `av1C` plumbed through `CodecParameters::extradata`; primary-item OBU payload fed to `oxideav_av1::Av1Decoder`; frame returned through `AvifDecoder`       |
+| AVIS image sequences                   | sample-table walk (`parse_avis` / `sample_table`) emits a flat frame-offset list; caller feeds each sample to `oxideav_av1` for sequential decode          |
 | Encoder                                | **not implemented**: no AV1 encoder exists in oxideav                                                                                                      |
 
-Until the AV1 crate grows partition / coefficient decode / prediction /
-loop filter / CDEF / loop restoration, `AvifDecoder` returns headers
-only. Use `AvifDecoder::info()` or the free function
-`oxideav_avif::inspect(&bytes)` to retrieve dimensions, bit depth,
-colour info, and the raw OBU slice.
+### What decodes
+
+- Tiny flat-content AVIFs (avifenc-produced 16x16..64x64 mono or
+  lossless 4:4:4) — sample means land within 1-2 units of the target
+  value. See `tests/fixtures/{gray32,midgray,white16,red,black420}.avif`
+  and the `decodes_flat_gray_to_mid_value` integration test.
+- The 1280×720 `monochrome.avif` conformance fixture —
+  `send_packet`/`receive_frame` succeed and return a full 1280×720
+  Gray8 plane with a plausible brightness histogram.
+
+### What fails / lossy
+
+- Rich / natural-image AVIFs — the decoded YUV planes collapse toward
+  mid-gray (intra edge filter + chroma intra still imperfect in the
+  av1 crate). For the `testsrc` intra baseline in `oxideav-av1` PSNR
+  hovers around 11 dB.
+- `bbb_alpha.avif` — the AV1 range-coder currently underflows
+  (`symbol.rs` subtract-with-overflow). The AVIF container handoff is
+  verified up to the av1 entry point; a tracked av1 bug.
+- `kimono_rotate90.avif` — rejected by av1 as "TX 64×18 not in the
+  AV1 set"; the AVIF container code surfaces the error verbatim.
+
+See `examples/diag_decode.rs` for a drop-in report of exactly which
+stage each input reaches.
 
 ## Installation
 
@@ -75,10 +104,14 @@ let pkt = Packet::new(0, TimeBase::new(1, 1), bytes);
 dec.send_packet(&pkt)?;
 
 match dec.receive_frame() {
-    Ok(_frame) => unreachable!("AV1 pixel decode not yet implemented"),
+    Ok(frame) => {
+        // Flat / simple inputs decode cleanly.
+        eprintln!("decoded frame: {frame:?}");
+    }
     Err(Error::Unsupported(msg)) => {
-        // Expected — the message names the AV1 stopping point.
-        eprintln!("as-expected: {msg}");
+        // Rich content still hits oxideav-av1 gaps — the message
+        // names which AV1 feature is unsupported.
+        eprintln!("av1 unsupported: {msg}");
     }
     Err(other) => return Err(other.into()),
 }
@@ -105,18 +138,25 @@ for item in &img.meta.items {
 ## Codec id
 
 - Codec: `"avif"`; capability name declared to the registry is
-  `avif_heif_av1_parse` (parsed container + AV1 headers, no pixels).
+  `avif_heif_av1_decode` — end-to-end pipeline: parsed container + AV1
+  frame decode + grid / alpha / transform composition.
 - `CodecParameters::extradata` is the `av1C` byte record; width /
   height reflect `ispe` from the primary item.
 
-## Test fixture
+## Test fixtures
 
 `tests/fixtures/monochrome.avif` is `Monochrome.avif` from
 [AOMediaCodec/av1-avif](https://github.com/AOMediaCodec/av1-avif/tree/main/testFiles/Microsoft)
-— 1280×720, monochrome, single 8-bit plane. Unit tests walk its
-complete HEIF hierarchy, extract the primary item, and feed it to the
-AV1 decoder to confirm the hand-off succeeds up to the tile-body
-stopping point.
+— 1280×720, monochrome, single 8-bit plane. Integration tests walk
+its complete HEIF hierarchy, extract the primary item, and decode it
+end-to-end through `oxideav-av1`.
+
+`tests/fixtures/{gray32,midgray,white16,red,black420}.avif` are tiny
+(16×16 … 64×64) AVIFs produced by libavif's `avifenc` in lossless
+mode (monochrome + 4:4:4) or q60 (4:2:0). They exist so the CI
+decode-gate covers every colour-plane layout we support without
+depending on an AV1 implementation that decodes rich photos
+perfectly.
 
 ## License
 

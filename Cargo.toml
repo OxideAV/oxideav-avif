@@ -6,7 +6,7 @@ rust-version = "1.80"
 license = "MIT"
 repository = "https://github.com/OxideAV/oxideav-avif"
 authors = ["Mark Karpeles"]
-description = "Pure-Rust AVIF (AV1 Image File Format) container parser — HEIF meta-box walk + primary-item / av1C extraction (AV1 pixel decode blocked on oxideav-av1)"
+description = "Pure-Rust AVIF (AV1 Image File Format) decoder — HEIF meta-box walk + primary-item / av1C extraction, handed to oxideav-av1 for end-to-end pixel decode; grid + alpha + irot/imir/clap composition"
 
 readme = "README.md"
 homepage = "https://github.com/OxideAV/oxideav-avif"
