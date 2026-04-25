@@ -424,7 +424,8 @@ fn decodes_small_fixtures_end_to_end() {
     // Plane count follows our PixelFormat:
     //   Gray8 / Yuv400 → 1 plane
     //   Yuv420P / Yuv444P → 3 planes
-    let cases: &[(&str, &[u8], (u32, u32), usize)] = &[
+    type DecodeCase = (&'static str, &'static [u8], (u32, u32), usize);
+    let cases: &[DecodeCase] = &[
         ("gray32", GRAY32, (32, 32), 1),
         ("midgray64", MIDGRAY64, (64, 64), 1),
         ("white16", WHITE16, (16, 16), 1),
