@@ -50,8 +50,8 @@ pub use meta::{
 pub use parser::{parse, parse_header, AvifHeader, AvifImage};
 pub use transform::{apply_clap, apply_imir, apply_irot, crop_top_left};
 
-use oxideav_codec::{CodecInfo, CodecRegistry, Encoder};
 use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, Error, Result};
+use oxideav_core::{CodecInfo, CodecRegistry, Encoder};
 
 /// Public codec id string. Matches the aggregator-crate Cargo feature `avif`.
 pub const CODEC_ID_STR: &str = "avif";

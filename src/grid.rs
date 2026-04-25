@@ -39,9 +39,7 @@ impl ImageGrid {
         }
         let version = payload[0];
         if version != 0 {
-            return Err(Error::InvalidData(format!(
-                "avif grid: version {version}"
-            )));
+            return Err(Error::InvalidData(format!("avif grid: version {version}")));
         }
         let flags = payload[1];
         let wide = (flags & 1) != 0;
@@ -114,9 +112,7 @@ pub fn composite_grid(grid: &ImageGrid, tiles: &[VideoFrame]) -> Result<VideoFra
         )));
     }
     if tiles.is_empty() {
-        return Err(Error::InvalidData(
-            "avif grid: empty tile list".to_string(),
-        ));
+        return Err(Error::InvalidData("avif grid: empty tile list".to_string()));
     }
     let format = tiles[0].format;
     let tile_w = tiles[0].width;
@@ -192,8 +188,8 @@ pub fn composite_grid(grid: &ImageGrid, tiles: &[VideoFrame]) -> Result<VideoFra
             let plane_copy_w = (copy_w >> plane_shift_x).max(1);
             let plane_copy_h = (copy_h >> plane_shift_y).max(1);
             for row_i in 0..plane_copy_h as usize {
-                let dst_row_start = (plane_dst_y as usize + row_i) * dst.stride
-                    + plane_dst_x as usize;
+                let dst_row_start =
+                    (plane_dst_y as usize + row_i) * dst.stride + plane_dst_x as usize;
                 let src_row_start = row_i * src.stride;
                 let cw = plane_copy_w as usize;
                 if dst_row_start + cw > dst.data.len() || src_row_start + cw > src.data.len() {

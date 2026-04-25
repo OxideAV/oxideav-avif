@@ -69,7 +69,11 @@ pub fn composite_alpha(color: &VideoFrame, alpha: &VideoFrame) -> Result<VideoFr
     }
     // Pack the alpha plane into a tightly-strided buffer — downstream
     // callers expect stride == width.
-    let alpha_packed = pack_plane(&alpha.planes[0], alpha.width as usize, alpha.height as usize)?;
+    let alpha_packed = pack_plane(
+        &alpha.planes[0],
+        alpha.width as usize,
+        alpha.height as usize,
+    )?;
 
     match color.format {
         PixelFormat::Yuv420P => {
@@ -81,7 +85,11 @@ pub fn composite_alpha(color: &VideoFrame, alpha: &VideoFrame) -> Result<VideoFr
             }
             let cw = color.width.div_ceil(2) as usize;
             let ch = color.height.div_ceil(2) as usize;
-            let y = pack_plane(&color.planes[0], color.width as usize, color.height as usize)?;
+            let y = pack_plane(
+                &color.planes[0],
+                color.width as usize,
+                color.height as usize,
+            )?;
             let u = pack_plane(&color.planes[1], cw, ch)?;
             let v = pack_plane(&color.planes[2], cw, ch)?;
             Ok(VideoFrame {
@@ -117,7 +125,11 @@ pub fn composite_alpha(color: &VideoFrame, alpha: &VideoFrame) -> Result<VideoFr
                     color.planes.len()
                 )));
             }
-            let y = pack_plane(&color.planes[0], color.width as usize, color.height as usize)?;
+            let y = pack_plane(
+                &color.planes[0],
+                color.width as usize,
+                color.height as usize,
+            )?;
             // Ya8 is packed Y A Y A ...
             let mut ya = Vec::with_capacity(y.len() * 2);
             for i in 0..y.len() {

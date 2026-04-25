@@ -161,10 +161,8 @@ pub fn apply_clap(frame: &VideoFrame, clap: &Clap) -> Result<VideoFrame> {
     }
     // Centre, as a float (matches goavif's rounding exactly; denominators
     // are 32-bit so f64 has enough precision).
-    let centre_x = (w - 1) as f64 / 2.0
-        + clap.horiz_off_n as f64 / clap.horiz_off_d as f64;
-    let centre_y = (h - 1) as f64 / 2.0
-        + clap.vert_off_n as f64 / clap.vert_off_d as f64;
+    let centre_x = (w - 1) as f64 / 2.0 + clap.horiz_off_n as f64 / clap.horiz_off_d as f64;
+    let centre_y = (h - 1) as f64 / 2.0 + clap.vert_off_n as f64 / clap.vert_off_d as f64;
     let mut x0 = (centre_x - (cw - 1) as f64 / 2.0 + 0.5).floor() as i64;
     let mut y0 = (centre_y - (ch - 1) as f64 / 2.0 + 0.5).floor() as i64;
     if x0 < 0 {
@@ -342,8 +340,12 @@ mod tests {
     fn make_yuv420(w: u32, h: u32) -> VideoFrame {
         assert!(w % 2 == 0 && h % 2 == 0);
         let y: Vec<u8> = (0..w * h).map(|i| (i & 0xff) as u8).collect();
-        let u: Vec<u8> = (0..(w / 2) * (h / 2)).map(|i| ((i + 40) & 0xff) as u8).collect();
-        let v: Vec<u8> = (0..(w / 2) * (h / 2)).map(|i| ((i + 80) & 0xff) as u8).collect();
+        let u: Vec<u8> = (0..(w / 2) * (h / 2))
+            .map(|i| ((i + 40) & 0xff) as u8)
+            .collect();
+        let v: Vec<u8> = (0..(w / 2) * (h / 2))
+            .map(|i| ((i + 80) & 0xff) as u8)
+            .collect();
         VideoFrame {
             format: PixelFormat::Yuv420P,
             width: w,

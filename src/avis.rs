@@ -140,8 +140,7 @@ fn find_tkhd_display_size(moov_payload: &[u8]) -> Option<(u32, u32)> {
             continue;
         }
         let w = u32::from_be_bytes([p[off], p[off + 1], p[off + 2], p[off + 3]]) >> 16;
-        let h =
-            u32::from_be_bytes([p[off + 4], p[off + 5], p[off + 6], p[off + 7]]) >> 16;
+        let h = u32::from_be_bytes([p[off + 4], p[off + 5], p[off + 6], p[off + 7]]) >> 16;
         return Some((w, h));
     }
     None
@@ -185,12 +184,12 @@ pub fn sample_table(stbl: &[u8]) -> Result<Vec<Sample>> {
             _ => {}
         }
     }
-    let stts_p = stts_payload
-        .ok_or_else(|| Error::InvalidData("avis: stbl missing stts".to_string()))?;
-    let stsc_p = stsc_payload
-        .ok_or_else(|| Error::InvalidData("avis: stbl missing stsc".to_string()))?;
-    let stsz_p = stsz_payload
-        .ok_or_else(|| Error::InvalidData("avis: stbl missing stsz".to_string()))?;
+    let stts_p =
+        stts_payload.ok_or_else(|| Error::InvalidData("avis: stbl missing stts".to_string()))?;
+    let stsc_p =
+        stsc_payload.ok_or_else(|| Error::InvalidData("avis: stbl missing stsc".to_string()))?;
+    let stsz_p =
+        stsz_payload.ok_or_else(|| Error::InvalidData("avis: stbl missing stsz".to_string()))?;
     let (sample_size, sizes) = parse_stsz(stsz_p)?;
     let stsc_entries = parse_stsc(stsc_p)?;
     let sample_deltas = parse_stts(stts_p)?;
@@ -275,7 +274,9 @@ fn parse_stts(payload: &[u8]) -> Result<Vec<u32>> {
     let mut out = Vec::new();
     for _ in 0..n {
         if cursor + 8 > body.len() {
-            return Err(Error::InvalidData("avis: stts entries truncated".to_string()));
+            return Err(Error::InvalidData(
+                "avis: stts entries truncated".to_string(),
+            ));
         }
         let count = read_u32(body, cursor)?;
         cursor += 4;
@@ -305,7 +306,9 @@ fn parse_stsc(payload: &[u8]) -> Result<Vec<StscEntry>> {
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
         if cursor + 12 > body.len() {
-            return Err(Error::InvalidData("avis: stsc entries truncated".to_string()));
+            return Err(Error::InvalidData(
+                "avis: stsc entries truncated".to_string(),
+            ));
         }
         out.push(StscEntry {
             first_chunk: read_u32(body, cursor)?,
@@ -350,7 +353,9 @@ fn parse_stco(payload: &[u8]) -> Result<Vec<u64>> {
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
         if cursor + 4 > body.len() {
-            return Err(Error::InvalidData("avis: stco entries truncated".to_string()));
+            return Err(Error::InvalidData(
+                "avis: stco entries truncated".to_string(),
+            ));
         }
         out.push(read_u32(body, cursor)? as u64);
         cursor += 4;
@@ -368,7 +373,9 @@ fn parse_co64(payload: &[u8]) -> Result<Vec<u64>> {
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
         if cursor + 8 > body.len() {
-            return Err(Error::InvalidData("avis: co64 entries truncated".to_string()));
+            return Err(Error::InvalidData(
+                "avis: co64 entries truncated".to_string(),
+            ));
         }
         out.push(read_u64(body, cursor)?);
         cursor += 8;
@@ -387,7 +394,9 @@ fn parse_stss(payload: &[u8]) -> Result<Vec<u32>> {
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
         if cursor + 4 > body.len() {
-            return Err(Error::InvalidData("avis: stss entries truncated".to_string()));
+            return Err(Error::InvalidData(
+                "avis: stss entries truncated".to_string(),
+            ));
         }
         out.push(read_u32(body, cursor)?);
         cursor += 4;

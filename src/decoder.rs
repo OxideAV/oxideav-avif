@@ -7,8 +7,8 @@
 //! auxiliary alpha plane when one is present. Decode errors from the
 //! underlying AV1 crate bubble up unchanged.
 
-use oxideav_codec::Decoder;
 use oxideav_core::frame::VideoFrame;
+use oxideav_core::Decoder;
 use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, Result, TimeBase};
 
 use oxideav_av1::{Av1CodecConfig, Av1Decoder};
@@ -17,8 +17,10 @@ use crate::alpha::{composite_alpha, find_alpha_item_id};
 use crate::box_parser::{b, BoxType};
 use crate::grid::{composite_grid, ImageGrid};
 use crate::meta::{Ispe, ItemLocation, Meta, Pasp, Pixi, Property};
-use crate::parser::{item_bytes, parse_header, AvifHeader, AvifImage, ITEM_TYPE_AV01, ITEM_TYPE_GRID};
 use crate::parser::parse;
+use crate::parser::{
+    item_bytes, parse_header, AvifHeader, AvifImage, ITEM_TYPE_AV01, ITEM_TYPE_GRID,
+};
 use crate::transform::{apply_clap, apply_imir, apply_irot, crop_top_left};
 
 const AV1C: BoxType = b(b"av1C");
@@ -112,10 +114,7 @@ fn build_info_grid(hdr: &AvifHeader<'_>, primary_id: u32) -> Result<AvifInfo> {
             ))
         }
     };
-    let bits_per_channel = match hdr
-        .meta
-        .property_for(first_tile_id, b"pixi")
-    {
+    let bits_per_channel = match hdr.meta.property_for(first_tile_id, b"pixi") {
         Some(Property::Pixi(pixi)) => pixi.bits_per_channel.clone(),
         _ => Vec::new(),
     };
@@ -239,11 +238,7 @@ impl AvifDecoder {
 }
 
 /// Decode a single av01 item's OBU bitstream into a `VideoFrame`.
-fn decode_av01_item(
-    obu_bytes: &[u8],
-    av1c: &[u8],
-    ispe: Option<(u32, u32)>,
-) -> Result<VideoFrame> {
+fn decode_av01_item(obu_bytes: &[u8], av1c: &[u8], ispe: Option<(u32, u32)>) -> Result<VideoFrame> {
     let _cfg = Av1CodecConfig::parse(av1c)?; // eagerly validate
     let mut params = CodecParameters::video(CodecId::new("av1"));
     if let Some((w, h)) = ispe {
@@ -428,7 +423,9 @@ mod tests {
         let pkt = Packet::new(0, TimeBase::new(1, 1), FIXTURE.to_vec());
         match d.send_packet(&pkt) {
             Ok(()) => {
-                let frame = d.receive_frame().expect("receive_frame after send_packet success");
+                let frame = d
+                    .receive_frame()
+                    .expect("receive_frame after send_packet success");
                 let vf = match frame {
                     Frame::Video(v) => v,
                     other => panic!("expected VideoFrame, got {other:?}"),

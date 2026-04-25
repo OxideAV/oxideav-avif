@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use oxideav_av1::{iter_obus, Av1CodecConfig, ObuType};
 use oxideav_avif::{inspect, parse, AvifDecoder};
-use oxideav_codec::Decoder;
+use oxideav_core::Decoder;
 use oxideav_core::{CodecId, Frame, Packet, TimeBase};
 
 fn main() {
@@ -58,7 +58,13 @@ fn probe(path: &PathBuf) {
     // 2. Decode the av1C record — print seq header summary.
     match Av1CodecConfig::parse(&info.av1c) {
         Ok(cfg) => {
-            let depth = if cfg.twelve_bit { 12 } else if cfg.high_bitdepth { 10 } else { 8 };
+            let depth = if cfg.twelve_bit {
+                12
+            } else if cfg.high_bitdepth {
+                10
+            } else {
+                8
+            };
             println!(
                 "  av1C: profile={} level={} tier={} depth={} mono={} chroma_sub=({},{}) has_seq_header={}",
                 cfg.seq_profile,
@@ -83,9 +89,7 @@ fn probe(path: &PathBuf) {
             match o {
                 Ok(obu) => {
                     count += 1;
-                    *by_type
-                        .entry(obu.header.obu_type as u8)
-                        .or_insert(0) += 1;
+                    *by_type.entry(obu.header.obu_type as u8).or_insert(0) += 1;
                 }
                 Err(e) => {
                     walk_err = Some(format!("{e}"));
@@ -99,7 +103,10 @@ fn probe(path: &PathBuf) {
             breakdown.push(format!("{}={}", name, n));
         }
         match walk_err {
-            Some(e) => println!("  obu walk FAILED after {count}: {e} ({})", breakdown.join(" ")),
+            Some(e) => println!(
+                "  obu walk FAILED after {count}: {e} ({})",
+                breakdown.join(" ")
+            ),
             None => println!("  obus: total={} {}", count, breakdown.join(" ")),
         }
     }
@@ -121,9 +128,8 @@ fn probe(path: &PathBuf) {
     //    exactly which stage returns what.
     let mut d = AvifDecoder::new(CodecId::new(oxideav_avif::CODEC_ID_STR));
     let pkt = Packet::new(0, TimeBase::new(1, 1), bytes.clone());
-    let send_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        d.send_packet(&pkt)
-    }));
+    let send_result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| d.send_packet(&pkt)));
     match send_result {
         Ok(Ok(())) => {
             println!("  decode: send_packet OK");
@@ -139,7 +145,11 @@ fn probe(path: &PathBuf) {
                         let mx = *p.data.iter().max().unwrap_or(&0);
                         plane_sums.push(format!(
                             "p{i}: stride={} bytes={} mean={:.1} range={}..{}",
-                            p.stride, p.data.len(), mean, mn, mx
+                            p.stride,
+                            p.data.len(),
+                            mean,
+                            mn,
+                            mx
                         ));
                     }
                     println!(

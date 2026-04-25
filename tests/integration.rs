@@ -13,10 +13,8 @@
 
 use oxideav_core::{CodecId, Error, Packet, TimeBase};
 
-use oxideav_avif::{
-    box_parser::b, inspect, parse_avis, parse_header, AvifDecoder, ImageGrid,
-};
-use oxideav_codec::Decoder;
+use oxideav_avif::{box_parser::b, inspect, parse_avis, parse_header, AvifDecoder, ImageGrid};
+use oxideav_core::Decoder;
 
 const MONO: &[u8] = include_bytes!("fixtures/monochrome.avif");
 const BBB_ALPHA: &[u8] = include_bytes!("fixtures/bbb_alpha.avif");
@@ -74,10 +72,7 @@ fn grid_descriptor_and_iref_resolved_from_meta() {
     // Parse the grid descriptor directly to confirm the meta layout.
     let hdr = parse_header(&file).expect("parse_header");
     let primary = hdr.meta.primary_item_id.expect("pitm");
-    let loc = hdr
-        .meta
-        .location_by_id(primary)
-        .expect("primary location");
+    let loc = hdr.meta.location_by_id(primary).expect("primary location");
     let grid_bytes = oxideav_avif::parser::item_bytes(&file, loc).expect("item bytes");
     let grid = ImageGrid::parse(grid_bytes).expect("parse grid");
     assert_eq!(grid.rows, 1);
@@ -259,7 +254,7 @@ fn build_synthetic_grid_avif() -> Vec<u8> {
     // ---- ipma: item 1 -> prop 1; items 2,3 -> props 2 + 3 (av1C) ----
     let mut ipma_body = Vec::new();
     ipma_body.extend_from_slice(&u32be(3)); // entry_count
-    // Item 1 (grid): only ispe(4x2)
+                                            // Item 1 (grid): only ispe(4x2)
     ipma_body.extend_from_slice(&1u16.to_be_bytes());
     ipma_body.push(1);
     ipma_body.push(1 & 0x7f);
@@ -297,13 +292,8 @@ fn build_synthetic_grid_avif() -> Vec<u8> {
     let ftyp_size = ftyp.len();
     let iloc_size = 8 + 4 + 1 + 1 + 2 + 3 * 14;
     // meta payload = fullbox(4) + hdlr + pitm + iinf + iref + iprp + iloc.
-    let meta_payload_size = 4
-        + hdlr.len()
-        + pitm.len()
-        + iinf.len()
-        + iref.len()
-        + iprp.len()
-        + iloc_size;
+    let meta_payload_size =
+        4 + hdlr.len() + pitm.len() + iinf.len() + iref.len() + iprp.len() + iloc_size;
     let meta_size = 8 + meta_payload_size;
     let mdat_payload_start = ftyp_size + meta_size + 8;
     let grid_off = mdat_payload_start;
@@ -324,7 +314,7 @@ fn build_synthetic_grid_avif() -> Vec<u8> {
     ] {
         iloc_inner.extend_from_slice(&id.to_be_bytes());
         iloc_inner.extend_from_slice(&u16be(0)); // data_reference_index
-        // base_offset (size=0) emits zero bytes — skip.
+                                                 // base_offset (size=0) emits zero bytes — skip.
         iloc_inner.extend_from_slice(&u16be(1)); // extent_count
         iloc_inner.extend_from_slice(&u32be(off));
         iloc_inner.extend_from_slice(&u32be(len));
@@ -382,9 +372,7 @@ fn decoder_pipes_through_av1_errors_cleanly() {
     ] {
         let mut d = AvifDecoder::new(CodecId::new(oxideav_avif::CODEC_ID_STR));
         let pkt = Packet::new(0, TimeBase::new(1, 1), bytes.to_vec());
-        let send = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            d.send_packet(&pkt)
-        }));
+        let send = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| d.send_packet(&pkt)));
         match send {
             Ok(Ok(())) => {
                 // If decode succeeded, frame must match the inspect dims.
@@ -452,7 +440,8 @@ fn decodes_small_fixtures_end_to_end() {
         let pkt = Packet::new(0, TimeBase::new(1, 1), bytes.to_vec());
         d.send_packet(&pkt)
             .unwrap_or_else(|e| panic!("{name}: send_packet failed: {e}"));
-        let frame = d.receive_frame()
+        let frame = d
+            .receive_frame()
             .unwrap_or_else(|e| panic!("{name}: receive_frame failed: {e}"));
         let vf = match frame {
             oxideav_core::Frame::Video(v) => v,
