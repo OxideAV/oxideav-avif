@@ -10,7 +10,9 @@
 use std::path::PathBuf;
 
 use oxideav_av1::{iter_obus, Av1CodecConfig, ObuType};
-use oxideav_avif::{inspect, parse, AvifDecoder};
+use oxideav_avif::meta::Property;
+use oxideav_avif::parser::item_bytes;
+use oxideav_avif::{find_alpha_item_id, inspect, parse, parse_header, AvifDecoder};
 use oxideav_core::Decoder;
 use oxideav_core::{CodecId, Frame, Packet, TimeBase};
 
@@ -111,6 +113,51 @@ fn probe(path: &PathBuf) {
         }
     }
 
+    // 3b. If the file carries an alpha auxiliary, probe its OBU stream too.
+    if info.has_alpha {
+        if let Ok(hdr) = parse_header(&bytes) {
+            if let Some(primary_id) = hdr.meta.primary_item_id {
+                if let Some(alpha_id) = find_alpha_item_id(&hdr.meta, primary_id) {
+                    if let Some(loc) = hdr.meta.location_by_id(alpha_id) {
+                        if let Ok(abytes) = item_bytes(&bytes, loc) {
+                            let aav1c = match hdr.meta.property_for(alpha_id, b"av1C") {
+                                Some(Property::Av1C(b)) => b.clone(),
+                                _ => Vec::new(),
+                            };
+                            let aispe = match hdr.meta.property_for(alpha_id, b"ispe") {
+                                Some(Property::Ispe(e)) => Some((e.width, e.height)),
+                                _ => None,
+                            };
+                            println!(
+                                "  alpha item id={alpha_id} bytes={} av1c_len={} ispe={:?}",
+                                abytes.len(),
+                                aav1c.len(),
+                                aispe
+                            );
+                            let mut a_count = 0usize;
+                            let mut a_by_type = std::collections::BTreeMap::<u8, usize>::new();
+                            for o in iter_obus(abytes) {
+                                match o {
+                                    Ok(obu) => {
+                                        a_count += 1;
+                                        *a_by_type.entry(obu.header.obu_type as u8).or_insert(0) +=
+                                            1;
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                            let mut bd = Vec::new();
+                            for (t, n) in &a_by_type {
+                                bd.push(format!("{}={}", ObuType::from_u8(*t).name(), n));
+                            }
+                            println!("  alpha obus: total={} {}", a_count, bd.join(" "));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // 4. Attempt to parse the AVIF image (primary bytes + parent iprp).
     match parse(&bytes) {
         Ok(img) => {
@@ -156,7 +203,7 @@ fn probe(path: &PathBuf) {
                     let inferred_h = vf
                         .planes
                         .first()
-                        .map(|p| if p.stride > 0 { p.data.len() / p.stride } else { 0 })
+                        .map(|p| p.data.len().checked_div(p.stride).unwrap_or(0))
                         .unwrap_or(0);
                     println!(
                         "  frame: {}x{} planes=[{}]",

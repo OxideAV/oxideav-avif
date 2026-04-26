@@ -202,9 +202,15 @@ mod tests {
     fn composite_yuv420_with_alpha() {
         let color = make_yuv420(4, 4);
         let alpha = make_gray(4, 4, 200);
-        let (out, fmt) =
-            composite_alpha(&color, PixelFormat::Yuv420P, 4, 4, &alpha, PixelFormat::Gray8)
-                .unwrap();
+        let (out, fmt) = composite_alpha(
+            &color,
+            PixelFormat::Yuv420P,
+            4,
+            4,
+            &alpha,
+            PixelFormat::Gray8,
+        )
+        .unwrap();
         assert_eq!(fmt, PixelFormat::Yuva420P);
         assert_eq!(out.planes.len(), 4);
         assert_eq!(out.planes[3].data.len(), 16);

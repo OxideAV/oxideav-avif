@@ -356,13 +356,15 @@ fn build_synthetic_grid_avif() -> Vec<u8> {
 /// surfaces `Error::Unsupported` without the pre-Phase-8 "blocked by
 /// av1 limitations" wrap.
 ///
-/// Round 5 notes: the underlying `oxideav-av1` crate still panics on
-/// a couple of rich-content fixtures (range-coder underflow in
-/// `symbol.rs` on `bbb_alpha`) and returns `Unsupported` on others
-/// (unsupported TX size on `kimono_rotate90`). This test wraps
-/// `send_packet` in `catch_unwind` so an av1 panic registers as a
-/// known-broken pair rather than failing the AVIF suite hard — the
-/// AVIF container code did its job before the panic.
+/// Round 17 notes: the previously-reported `bbb_alpha` panic
+/// (subtract-with-overflow in `symbol.rs:105`) is no longer
+/// reproducible — the underlying `oxideav-av1` crate now surfaces a
+/// clean `Unsupported` for the irregular-TX shape it can't decode
+/// (`TX 64×56` on this 3840×2160 4:2:0 file). Same for
+/// `kimono_rotate90` — `Unsupported` on `TX 32×41` for the 1024×722
+/// 4:2:0 frame. We still accept either Ok-with-frame or
+/// `Unsupported` so a future av1-side improvement that actually
+/// decodes these doesn't break the test.
 #[test]
 fn decoder_pipes_through_av1_errors_cleanly() {
     for (name, bytes) in [
@@ -372,9 +374,8 @@ fn decoder_pipes_through_av1_errors_cleanly() {
     ] {
         let mut d = AvifDecoder::new(CodecId::new(oxideav_avif::CODEC_ID_STR));
         let pkt = Packet::new(0, TimeBase::new(1, 1), bytes.to_vec());
-        let send = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| d.send_packet(&pkt)));
-        match send {
-            Ok(Ok(())) => {
+        match d.send_packet(&pkt) {
+            Ok(()) => {
                 // If decode succeeded, frame must match the inspect dims.
                 let info = d.info().cloned().expect("info after send");
                 let frame = d.receive_frame().expect("frame after send");
@@ -388,11 +389,7 @@ fn decoder_pipes_through_av1_errors_cleanly() {
                 assert!(!vf.planes.is_empty(), "{name}: no planes");
                 let y = &vf.planes[0];
                 assert_eq!(y.stride as u32, info.width, "{name}: width mismatch");
-                let inferred_h = if y.stride > 0 {
-                    (y.data.len() / y.stride) as u32
-                } else {
-                    0
-                };
+                let inferred_h = y.data.len().checked_div(y.stride).unwrap_or(0) as u32;
                 assert_eq!(inferred_h, info.height, "{name}: height mismatch");
                 for (pi, p) in vf.planes.iter().enumerate() {
                     assert!(
@@ -401,22 +398,13 @@ fn decoder_pipes_through_av1_errors_cleanly() {
                     );
                 }
             }
-            Ok(Err(Error::Unsupported(msg))) => {
+            Err(Error::Unsupported(msg)) => {
                 assert!(
                     !msg.contains("blocked by av1 decoder limitations"),
                     "{name}: error should not carry legacy wrap, got: {msg}"
                 );
             }
-            Ok(Err(other)) => panic!("{name}: unexpected error: {other:?}"),
-            Err(_panic) => {
-                // av1 crate panicked — record-and-continue. The AVIF
-                // side delivered parsed OBUs; the panic is an av1 bug
-                // not an avif contract violation. Surface the file
-                // name so the log makes the cause visible.
-                eprintln!(
-                    "{name}: oxideav-av1 panicked inside send_packet — known av1 bug, avif handoff verified upstream"
-                );
-            }
+            Err(other) => panic!("{name}: unexpected error: {other:?}"),
         }
     }
 }
@@ -461,17 +449,9 @@ fn decodes_small_fixtures_end_to_end() {
         // from data length / stride.
         let y = &vf.planes[0];
         assert_eq!(y.stride as u32, *w, "{name}: frame width");
-        let inferred_h = if y.stride > 0 {
-            (y.data.len() / y.stride) as u32
-        } else {
-            0
-        };
+        let inferred_h = y.data.len().checked_div(y.stride).unwrap_or(0) as u32;
         assert_eq!(inferred_h, *h, "{name}: frame height");
-        assert_eq!(
-            vf.planes.len(),
-            *nplanes,
-            "{name}: plane count"
-        );
+        assert_eq!(vf.planes.len(), *nplanes, "{name}: plane count");
         // Each plane must carry at least stride*h bytes.
         for (pi, p) in vf.planes.iter().enumerate() {
             assert!(
@@ -522,4 +502,133 @@ fn decodes_flat_gray_to_mid_value() {
         mx - mn <= 4,
         "flat gray should be quasi-constant, got range={mn}..{mx}"
     );
+}
+
+/// End-to-end decode + apply_irot pipeline. Decodes the small
+/// `red64.avif` fixture (a 64×64 4:4:4 lossless image), then rotates
+/// the resulting frame in 90° increments and verifies the geometry
+/// (dim swap on odd turns, no swap on even). Pixel content equality
+/// for a 4×64×64 turn cycle is the canonical irot conformance check
+/// — round-tripping through `apply_irot` four times at angle=1 must
+/// produce the original frame byte-for-byte (HEIF §6.5.10).
+#[test]
+fn end_to_end_decode_then_irot_roundtrips() {
+    use oxideav_avif::apply_irot;
+    use oxideav_avif::Irot;
+    use oxideav_core::PixelFormat;
+
+    let mut d = AvifDecoder::new(CodecId::new(oxideav_avif::CODEC_ID_STR));
+    let pkt = Packet::new(0, TimeBase::new(1, 1), RED64.to_vec());
+    d.send_packet(&pkt).expect("send_packet red64");
+    let vf = match d.receive_frame().expect("receive_frame red64") {
+        oxideav_core::Frame::Video(v) => v,
+        other => panic!("expected VideoFrame, got {other:?}"),
+    };
+    // red64 is 4:4:4 — three planes, all stride==64.
+    assert_eq!(vf.planes.len(), 3, "red64 expects 3 planes");
+    assert_eq!(vf.planes[0].stride, 64, "Y stride");
+    assert_eq!(vf.planes[1].stride, 64, "U stride (4:4:4)");
+    let original_y = vf.planes[0].data.clone();
+    // Apply four 90° turns — must return to the original buffer.
+    let mut frame = vf;
+    let (mut w, mut h) = (64u32, 64u32);
+    for turn in 0..4 {
+        let (next, nw, nh) =
+            apply_irot(&frame, PixelFormat::Yuv444P, w, h, &Irot { angle: 1 }).unwrap();
+        // Odd turn parity swaps dims; for a square 64x64 the swap is
+        // a no-op, but the property still holds.
+        assert_eq!(nw, h, "turn {turn}: width swap");
+        assert_eq!(nh, w, "turn {turn}: height swap");
+        frame = next;
+        w = nw;
+        h = nh;
+    }
+    assert_eq!(
+        frame.planes[0].data, original_y,
+        "four 90° turns must round-trip Y plane byte-for-byte"
+    );
+    // 180° rotation should equal angle=1 applied twice (covered by the
+    // round-trip above). Spot-check it explicitly so a regression in
+    // the angle-2 path can't slip past the round-trip alone.
+    let mut d2 = AvifDecoder::new(CodecId::new(oxideav_avif::CODEC_ID_STR));
+    d2.send_packet(&Packet::new(0, TimeBase::new(1, 1), RED64.to_vec()))
+        .unwrap();
+    let vf2 = match d2.receive_frame().unwrap() {
+        oxideav_core::Frame::Video(v) => v,
+        _ => unreachable!(),
+    };
+    let (rot180, _, _) =
+        apply_irot(&vf2, PixelFormat::Yuv444P, 64, 64, &Irot { angle: 2 }).unwrap();
+    // For a flat-color fixture (red), every pixel is identical, so
+    // 180° leaves the buffer numerically equal — but we still validate
+    // the plane geometry holds.
+    assert_eq!(rot180.planes.len(), 3);
+    for (i, p) in rot180.planes.iter().enumerate() {
+        assert_eq!(p.stride, 64, "rot180 plane {i} stride");
+        assert_eq!(p.data.len(), 64 * 64, "rot180 plane {i} len");
+    }
+}
+
+/// `transforms_for` walks the property-association table for a given
+/// item id and returns just the geometric transform / aperture
+/// properties (Clap, Irot, Imir) that the decoder applies after the
+/// AV1 pixel pass. Real fixture: `kimono_rotate90.avif` carries an
+/// `irot` on its primary item, so the helper must surface exactly one
+/// `Irot` entry for it.
+#[test]
+fn transforms_for_surfaces_kimono_irot() {
+    use oxideav_avif::decoder::transforms_for;
+    use oxideav_avif::Property;
+
+    let hdr = parse_header(KIMONO_ROT90).expect("parse_header kimono");
+    let primary = hdr.meta.primary_item_id.expect("pitm");
+    let xforms = transforms_for(&hdr.meta, primary);
+    let mut irot_count = 0;
+    for p in &xforms {
+        match p {
+            Property::Irot(i) => {
+                irot_count += 1;
+                assert!(
+                    (1..=3).contains(&i.angle),
+                    "kimono.rotate90 carries non-zero irot angle, got {}",
+                    i.angle
+                );
+            }
+            Property::Imir(_) | Property::Clap(_) => {}
+            other => panic!("transforms_for returned a non-transform property: {other:?}"),
+        }
+    }
+    assert_eq!(
+        irot_count, 1,
+        "kimono.rotate90 should expose exactly one irot transform"
+    );
+    // The primary item also carries non-transform properties (ispe,
+    // av1C, pixi, colr); none of those should appear in the transform
+    // filter result.
+    for p in &xforms {
+        assert!(
+            matches!(p, Property::Irot(_) | Property::Imir(_) | Property::Clap(_)),
+            "transforms_for must filter to transform-only properties, got {p:?}"
+        );
+    }
+}
+
+/// Sanity check: `find_alpha_item_id` returns `None` when the primary
+/// item has no alpha auxiliary. Spot-checks the negative path against
+/// `monochrome.avif` (single-item, no alpha) and `red64.avif` (lossless
+/// 4:4:4, no alpha) so a regression that always returns `Some` is
+/// caught.
+#[test]
+fn no_alpha_item_for_alpha_free_fixtures() {
+    for (name, bytes) in [("monochrome", MONO), ("red64", RED64), ("gray32", GRAY32)] {
+        let hdr = parse_header(bytes).unwrap_or_else(|e| panic!("{name}: parse_header: {e}"));
+        let primary = hdr
+            .meta
+            .primary_item_id
+            .unwrap_or_else(|| panic!("{name}: no pitm"));
+        assert!(
+            oxideav_avif::find_alpha_item_id(&hdr.meta, primary).is_none(),
+            "{name}: should not advertise an alpha auxiliary"
+        );
+    }
 }

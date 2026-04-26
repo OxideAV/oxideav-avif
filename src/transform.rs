@@ -293,7 +293,11 @@ pub fn apply_irot(
             data,
         });
     }
-    let (new_w, new_h) = if odd { (height, width) } else { (width, height) };
+    let (new_w, new_h) = if odd {
+        (height, width)
+    } else {
+        (width, height)
+    };
     Ok((
         VideoFrame {
             pts: frame.pts,

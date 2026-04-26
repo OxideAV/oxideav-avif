@@ -51,11 +51,19 @@ still loses significant signal.
   mid-gray (intra edge filter + chroma intra still imperfect in the
   av1 crate). For the `testsrc` intra baseline in `oxideav-av1` PSNR
   hovers around 11 dB.
-- `bbb_alpha.avif` — the AV1 range-coder currently underflows
-  (`symbol.rs` subtract-with-overflow). The AVIF container handoff is
-  verified up to the av1 entry point; a tracked av1 bug.
-- `kimono_rotate90.avif` — rejected by av1 as "TX 64×18 not in the
-  AV1 set"; the AVIF container code surfaces the error verbatim.
+- `bbb_alpha.avif` (3840×2160 4:2:0 + alpha) — the AV1 layer rejects
+  the bottom-edge `TX 64×56` shape (§5.11.27). The AVIF container
+  handoff is verified end-to-end (alpha auxiliary item is correctly
+  located and its OBU stream is well-formed) — the failure is in
+  the AV1 crate's TX-set coverage, not the AVIF wrapper. A previous
+  panic at `symbol.rs:105` is no longer reproducible — the av1 crate
+  now surfaces a clean `Unsupported`.
+- `kimono_rotate90.avif` (1024×722 4:2:0) — rejected by av1 as
+  "TX 32×41 not in the AV1 set"; the irregular bottom edge
+  (722 mod 64 = 18) lands on a TX size oxideav-av1 doesn't yet
+  emit. The AVIF container code surfaces the error verbatim, and the
+  `irot` property is exposed via `transforms_for` for callers that
+  want to apply it themselves.
 
 See `examples/diag_decode.rs` for a drop-in report of exactly which
 stage each input reaches.

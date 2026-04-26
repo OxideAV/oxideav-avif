@@ -43,11 +43,7 @@ fn infer_av1_pixmap(frame: &VideoFrame) -> Result<(PixelFormat, u32, u32)> {
             let u = &frame.planes[1];
             // 4:2:0 — chroma stride is half luma; chroma data len is
             // chroma_stride * (height / 2 ceil).
-            let chroma_h = if u.stride > 0 {
-                u.data.len() / u.stride
-            } else {
-                0
-            };
+            let chroma_h = u.data.len().checked_div(u.stride).unwrap_or(0);
             if u.stride * 2 == y.stride && chroma_h * 2 >= height as usize {
                 if chroma_h as u32 == height.div_ceil(2) {
                     PixelFormat::Yuv420P
