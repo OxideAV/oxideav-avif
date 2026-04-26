@@ -152,11 +152,16 @@ fn probe(path: &PathBuf) {
                             mx
                         ));
                     }
+                    let inferred_w = vf.planes.first().map(|p| p.stride).unwrap_or(0);
+                    let inferred_h = vf
+                        .planes
+                        .first()
+                        .map(|p| if p.stride > 0 { p.data.len() / p.stride } else { 0 })
+                        .unwrap_or(0);
                     println!(
-                        "  frame: {}x{} fmt={:?} planes=[{}]",
-                        vf.width,
-                        vf.height,
-                        vf.format,
+                        "  frame: {}x{} planes=[{}]",
+                        inferred_w,
+                        inferred_h,
                         plane_sums.join(" | "),
                     );
                 }

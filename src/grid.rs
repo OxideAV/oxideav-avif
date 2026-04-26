@@ -101,7 +101,17 @@ impl ImageGrid {
 /// frame inherits that format. The caller is responsible for decoding
 /// the tile items via the regular AV1 path and passing them in the same
 /// order as the `dimg` iref.
-pub fn composite_grid(grid: &ImageGrid, tiles: &[VideoFrame]) -> Result<VideoFrame> {
+///
+/// `format`, `tile_w`, `tile_h` describe every tile (per-frame metadata
+/// no longer rides on [`VideoFrame`]). The returned frame's display
+/// dimensions are `(grid.output_width, grid.output_height)`.
+pub fn composite_grid(
+    grid: &ImageGrid,
+    tiles: &[VideoFrame],
+    format: PixelFormat,
+    tile_w: u32,
+    tile_h: u32,
+) -> Result<VideoFrame> {
     let expected = grid.expected_tile_count();
     if tiles.len() != expected {
         return Err(Error::InvalidData(format!(
@@ -113,17 +123,6 @@ pub fn composite_grid(grid: &ImageGrid, tiles: &[VideoFrame]) -> Result<VideoFra
     }
     if tiles.is_empty() {
         return Err(Error::InvalidData("avif grid: empty tile list".to_string()));
-    }
-    let format = tiles[0].format;
-    let tile_w = tiles[0].width;
-    let tile_h = tiles[0].height;
-    for (i, t) in tiles.iter().enumerate().skip(1) {
-        if t.format != format || t.width != tile_w || t.height != tile_h {
-            return Err(Error::InvalidData(format!(
-                "avif grid: tile {i} size/format {:?} {}x{} differs from tile 0 {:?} {}x{}",
-                t.format, t.width, t.height, format, tile_w, tile_h
-            )));
-        }
     }
     let out_w = grid.output_width;
     let out_h = grid.output_height;
@@ -204,11 +203,7 @@ pub fn composite_grid(grid: &ImageGrid, tiles: &[VideoFrame]) -> Result<VideoFra
         }
     }
     Ok(VideoFrame {
-        format,
-        width: out_w,
-        height: out_h,
         pts: tiles[0].pts,
-        time_base: tiles[0].time_base,
         planes: out_planes,
     })
 }
@@ -237,15 +232,10 @@ fn plane_dims(w: u32, h: u32, plane: usize, sx: u32, sy: u32) -> (u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxideav_core::TimeBase;
 
     fn make_gray_tile(w: u32, h: u32, fill: u8) -> VideoFrame {
         VideoFrame {
-            format: PixelFormat::Gray8,
-            width: w,
-            height: h,
             pts: None,
-            time_base: TimeBase::new(1, 1),
             planes: vec![VideoPlane {
                 stride: w as usize,
                 data: vec![fill; (w * h) as usize],
@@ -303,9 +293,9 @@ mod tests {
             make_gray_tile(2, 2, 30),
             make_gray_tile(2, 2, 40),
         ];
-        let out = composite_grid(&grid, &tiles).unwrap();
-        assert_eq!(out.width, 4);
-        assert_eq!(out.height, 4);
+        let out = composite_grid(&grid, &tiles, PixelFormat::Gray8, 2, 2).unwrap();
+        assert_eq!(out.planes[0].stride, 4);
+        assert_eq!(out.planes[0].data.len() / out.planes[0].stride, 4);
         // Row 0: tile 0 at x=0 (10s), tile 1 at x=2 (20s).
         assert_eq!(&out.planes[0].data[0..2], &[10, 10]);
         assert_eq!(&out.planes[0].data[2..4], &[20, 20]);
@@ -325,7 +315,7 @@ mod tests {
             output_height: 4,
         };
         let tiles = [make_gray_tile(2, 2, 10)];
-        assert!(composite_grid(&grid, &tiles).is_err());
+        assert!(composite_grid(&grid, &tiles, PixelFormat::Gray8, 2, 2).is_err());
     }
 
     #[test]
@@ -346,9 +336,9 @@ mod tests {
             make_gray_tile(2, 2, 30),
             make_gray_tile(2, 2, 40),
         ];
-        let out = composite_grid(&grid, &tiles).unwrap();
-        assert_eq!(out.width, 3);
-        assert_eq!(out.height, 3);
+        let out = composite_grid(&grid, &tiles, PixelFormat::Gray8, 2, 2).unwrap();
+        assert_eq!(out.planes[0].stride, 3);
+        assert_eq!(out.planes[0].data.len() / out.planes[0].stride, 3);
         // Top-right tile contributes only a 1-pixel column.
         assert_eq!(out.planes[0].data[2], 20);
         assert_eq!(out.planes[0].data[5], 20);

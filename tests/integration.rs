@@ -382,9 +382,18 @@ fn decoder_pipes_through_av1_errors_cleanly() {
                     oxideav_core::Frame::Video(v) => v,
                     other => panic!("{name}: expected VideoFrame, got {other:?}"),
                 };
-                assert_eq!(vf.width, info.width, "{name}: width mismatch");
-                assert_eq!(vf.height, info.height, "{name}: height mismatch");
+                // Slim VideoFrame no longer carries width/height — derive
+                // from the Y plane stride/data and compare to inspect's
+                // ispe-driven dims.
                 assert!(!vf.planes.is_empty(), "{name}: no planes");
+                let y = &vf.planes[0];
+                assert_eq!(y.stride as u32, info.width, "{name}: width mismatch");
+                let inferred_h = if y.stride > 0 {
+                    (y.data.len() / y.stride) as u32
+                } else {
+                    0
+                };
+                assert_eq!(inferred_h, info.height, "{name}: height mismatch");
                 for (pi, p) in vf.planes.iter().enumerate() {
                     assert!(
                         p.data.len() >= p.stride,
@@ -448,13 +457,20 @@ fn decodes_small_fixtures_end_to_end() {
             oxideav_core::Frame::Video(v) => v,
             other => panic!("{name}: expected VideoFrame, got {other:?}"),
         };
-        assert_eq!(vf.width, *w, "{name}: frame width");
-        assert_eq!(vf.height, *h, "{name}: frame height");
+        // Slim VideoFrame: derive width from Y plane stride, height
+        // from data length / stride.
+        let y = &vf.planes[0];
+        assert_eq!(y.stride as u32, *w, "{name}: frame width");
+        let inferred_h = if y.stride > 0 {
+            (y.data.len() / y.stride) as u32
+        } else {
+            0
+        };
+        assert_eq!(inferred_h, *h, "{name}: frame height");
         assert_eq!(
             vf.planes.len(),
             *nplanes,
-            "{name}: plane count (fmt={:?})",
-            vf.format
+            "{name}: plane count"
         );
         // Each plane must carry at least stride*h bytes.
         for (pi, p) in vf.planes.iter().enumerate() {

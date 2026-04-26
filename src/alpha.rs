@@ -50,32 +50,31 @@ pub fn find_alpha_item_id(meta: &Meta, primary_id: u32) -> Option<u32> {
 /// frames must share `(width, height)`. The alpha frame must be
 /// `Gray8`; the colour frame must be `Yuv420P` or `Gray8`.
 ///
-/// The resulting frame's format is:
+/// `color_format` / `alpha_format` and the shared `(width, height)`
+/// describe the per-stream metadata that no longer rides on
+/// [`VideoFrame`]. The returned `(VideoFrame, PixelFormat)` carries the
+/// composited pixels and the new packed format:
 ///
 ///   * `Yuva420P` when the colour frame is `Yuv420P`.
 ///   * `Ya8`     when the colour frame is `Gray8`.
-pub fn composite_alpha(color: &VideoFrame, alpha: &VideoFrame) -> Result<VideoFrame> {
-    if color.width != alpha.width || color.height != alpha.height {
-        return Err(Error::invalid(format!(
-            "avif alpha: colour {}x{} != alpha {}x{}",
-            color.width, color.height, alpha.width, alpha.height
-        )));
-    }
-    if alpha.format != PixelFormat::Gray8 {
+pub fn composite_alpha(
+    color: &VideoFrame,
+    color_format: PixelFormat,
+    width: u32,
+    height: u32,
+    alpha: &VideoFrame,
+    alpha_format: PixelFormat,
+) -> Result<(VideoFrame, PixelFormat)> {
+    if alpha_format != PixelFormat::Gray8 {
         return Err(Error::unsupported(format!(
-            "avif alpha: alpha plane format {:?} != Gray8 (HBD alpha not yet supported)",
-            alpha.format
+            "avif alpha: alpha plane format {alpha_format:?} != Gray8 (HBD alpha not yet supported)"
         )));
     }
     // Pack the alpha plane into a tightly-strided buffer — downstream
     // callers expect stride == width.
-    let alpha_packed = pack_plane(
-        &alpha.planes[0],
-        alpha.width as usize,
-        alpha.height as usize,
-    )?;
+    let alpha_packed = pack_plane(&alpha.planes[0], width as usize, height as usize)?;
 
-    match color.format {
+    match color_format {
         PixelFormat::Yuv420P => {
             if color.planes.len() != 3 {
                 return Err(Error::invalid(format!(
@@ -83,40 +82,35 @@ pub fn composite_alpha(color: &VideoFrame, alpha: &VideoFrame) -> Result<VideoFr
                     color.planes.len()
                 )));
             }
-            let cw = color.width.div_ceil(2) as usize;
-            let ch = color.height.div_ceil(2) as usize;
-            let y = pack_plane(
-                &color.planes[0],
-                color.width as usize,
-                color.height as usize,
-            )?;
+            let cw = width.div_ceil(2) as usize;
+            let ch = height.div_ceil(2) as usize;
+            let y = pack_plane(&color.planes[0], width as usize, height as usize)?;
             let u = pack_plane(&color.planes[1], cw, ch)?;
             let v = pack_plane(&color.planes[2], cw, ch)?;
-            Ok(VideoFrame {
-                format: PixelFormat::Yuva420P,
-                width: color.width,
-                height: color.height,
-                pts: color.pts,
-                time_base: color.time_base,
-                planes: vec![
-                    VideoPlane {
-                        stride: color.width as usize,
-                        data: y,
-                    },
-                    VideoPlane {
-                        stride: cw,
-                        data: u,
-                    },
-                    VideoPlane {
-                        stride: cw,
-                        data: v,
-                    },
-                    VideoPlane {
-                        stride: color.width as usize,
-                        data: alpha_packed,
-                    },
-                ],
-            })
+            Ok((
+                VideoFrame {
+                    pts: color.pts,
+                    planes: vec![
+                        VideoPlane {
+                            stride: width as usize,
+                            data: y,
+                        },
+                        VideoPlane {
+                            stride: cw,
+                            data: u,
+                        },
+                        VideoPlane {
+                            stride: cw,
+                            data: v,
+                        },
+                        VideoPlane {
+                            stride: width as usize,
+                            data: alpha_packed,
+                        },
+                    ],
+                },
+                PixelFormat::Yuva420P,
+            ))
         }
         PixelFormat::Gray8 => {
             if color.planes.len() != 1 {
@@ -125,28 +119,23 @@ pub fn composite_alpha(color: &VideoFrame, alpha: &VideoFrame) -> Result<VideoFr
                     color.planes.len()
                 )));
             }
-            let y = pack_plane(
-                &color.planes[0],
-                color.width as usize,
-                color.height as usize,
-            )?;
+            let y = pack_plane(&color.planes[0], width as usize, height as usize)?;
             // Ya8 is packed Y A Y A ...
             let mut ya = Vec::with_capacity(y.len() * 2);
             for i in 0..y.len() {
                 ya.push(y[i]);
                 ya.push(alpha_packed[i]);
             }
-            Ok(VideoFrame {
-                format: PixelFormat::Ya8,
-                width: color.width,
-                height: color.height,
-                pts: color.pts,
-                time_base: color.time_base,
-                planes: vec![VideoPlane {
-                    stride: (color.width as usize) * 2,
-                    data: ya,
-                }],
-            })
+            Ok((
+                VideoFrame {
+                    pts: color.pts,
+                    planes: vec![VideoPlane {
+                        stride: (width as usize) * 2,
+                        data: ya,
+                    }],
+                },
+                PixelFormat::Ya8,
+            ))
         }
         other => Err(Error::unsupported(format!(
             "avif alpha: colour format {other:?} not supported by 8-bit composite path"
@@ -177,15 +166,10 @@ fn pack_plane(plane: &VideoPlane, w: usize, h: usize) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxideav_core::TimeBase;
 
     fn make_gray(w: u32, h: u32, fill: u8) -> VideoFrame {
         VideoFrame {
-            format: PixelFormat::Gray8,
-            width: w,
-            height: h,
             pts: None,
-            time_base: TimeBase::new(1, 1),
             planes: vec![VideoPlane {
                 stride: w as usize,
                 data: vec![fill; (w * h) as usize],
@@ -196,11 +180,7 @@ mod tests {
     fn make_yuv420(w: u32, h: u32) -> VideoFrame {
         assert!(w % 2 == 0 && h % 2 == 0);
         VideoFrame {
-            format: PixelFormat::Yuv420P,
-            width: w,
-            height: h,
             pts: None,
-            time_base: TimeBase::new(1, 1),
             planes: vec![
                 VideoPlane {
                     stride: w as usize,
@@ -222,8 +202,10 @@ mod tests {
     fn composite_yuv420_with_alpha() {
         let color = make_yuv420(4, 4);
         let alpha = make_gray(4, 4, 200);
-        let out = composite_alpha(&color, &alpha).unwrap();
-        assert_eq!(out.format, PixelFormat::Yuva420P);
+        let (out, fmt) =
+            composite_alpha(&color, PixelFormat::Yuv420P, 4, 4, &alpha, PixelFormat::Gray8)
+                .unwrap();
+        assert_eq!(fmt, PixelFormat::Yuva420P);
         assert_eq!(out.planes.len(), 4);
         assert_eq!(out.planes[3].data.len(), 16);
         assert!(out.planes[3].data.iter().all(|&v| v == 200));
@@ -233,17 +215,23 @@ mod tests {
     fn composite_gray_with_alpha_makes_ya8() {
         let color = make_gray(2, 2, 50);
         let alpha = make_gray(2, 2, 150);
-        let out = composite_alpha(&color, &alpha).unwrap();
-        assert_eq!(out.format, PixelFormat::Ya8);
+        let (out, fmt) =
+            composite_alpha(&color, PixelFormat::Gray8, 2, 2, &alpha, PixelFormat::Gray8).unwrap();
+        assert_eq!(fmt, PixelFormat::Ya8);
         // Interleaved Y A Y A …
         assert_eq!(out.planes[0].data, vec![50, 150, 50, 150, 50, 150, 50, 150]);
     }
 
     #[test]
-    fn composite_mismatched_dims_errors() {
+    fn composite_alpha_format_mismatch_errors() {
         let c = make_yuv420(4, 4);
-        let a = make_gray(2, 2, 0);
-        let err = composite_alpha(&c, &a).unwrap_err();
-        matches!(err, Error::InvalidData(_));
+        let a = make_gray(4, 4, 0);
+        // Pretend the alpha is not Gray8 to exercise the validation branch.
+        let err =
+            composite_alpha(&c, PixelFormat::Yuv420P, 4, 4, &a, PixelFormat::Yuv420P).unwrap_err();
+        match err {
+            Error::Unsupported(_) => {}
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
     }
 }

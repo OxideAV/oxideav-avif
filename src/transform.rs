@@ -10,12 +10,15 @@
 //!   3. Apply `irot`.
 //!   4. Apply `imir`.
 //!
-//! Each entry point returns a freshly-allocated frame whose planes have
-//! been rewritten — the source frame is left untouched. The `VideoFrame`
-//! layout matches what `oxideav-av1` emits: one 8-bit plane per channel
-//! (Y, U, V for YUV420P / Yuv422P / Yuv444P, single plane for Gray8).
-//! Higher bit-depth + RGB-packed formats are not produced by the
-//! underlying AV1 decoder today, so they land on a passthrough path.
+//! Each entry point takes the source frame plus the stream-level
+//! `(format, width, height)` triple (the slim [`VideoFrame`] no longer
+//! carries those fields) and returns a freshly-allocated frame plus its
+//! new `(width, height)` (the format is preserved). The source frame is
+//! left untouched. The `VideoFrame` layout matches what `oxideav-av1`
+//! emits: one 8-bit plane per channel (Y, U, V for YUV420P / Yuv422P /
+//! Yuv444P, single plane for Gray8). Higher bit-depth + RGB-packed
+//! formats are not produced by the underlying AV1 decoder today, so
+//! they land on a passthrough path.
 //!
 //! The transforms are strictly pixel-level operations — they do not
 //! understand chroma siting or BT.709 vs. full-range semantics, both of
@@ -50,14 +53,14 @@ fn plane_count(format: PixelFormat) -> usize {
     }
 }
 
-/// Per-plane pixel dimensions for a VideoFrame.
-fn plane_dims(frame: &VideoFrame, plane: usize) -> Result<(u32, u32)> {
-    let (sx, sy) = subsampling(frame.format)?;
+/// Per-plane pixel dimensions for a frame of the given format and dims.
+fn plane_dims(format: PixelFormat, width: u32, height: u32, plane: usize) -> Result<(u32, u32)> {
+    let (sx, sy) = subsampling(format)?;
     if plane == 0 {
-        Ok((frame.width, frame.height))
+        Ok((width, height))
     } else {
-        let w = (frame.width + (1 << sx) - 1) >> sx;
-        let h = (frame.height + (1 << sy) - 1) >> sy;
+        let w = (width + (1 << sx) - 1) >> sx;
+        let h = (height + (1 << sy) - 1) >> sy;
         Ok((w.max(1), h.max(1)))
     }
 }
@@ -65,34 +68,54 @@ fn plane_dims(frame: &VideoFrame, plane: usize) -> Result<(u32, u32)> {
 /// Crop every plane of `frame` to the top-left `out_w × out_h` pixels.
 /// Used both by `clap` application and by the ispe-vs-coded-size clamp
 /// on padded frames.
-pub fn crop_top_left(frame: &VideoFrame, out_w: u32, out_h: u32) -> Result<VideoFrame> {
+///
+/// Returns the cropped frame; the format is preserved, the new
+/// dimensions are `(out_w, out_h)`.
+pub fn crop_top_left(
+    frame: &VideoFrame,
+    format: PixelFormat,
+    width: u32,
+    height: u32,
+    out_w: u32,
+    out_h: u32,
+) -> Result<VideoFrame> {
     if out_w == 0 || out_h == 0 {
         return Err(Error::invalid("avif: crop to zero dims"));
     }
-    if out_w > frame.width || out_h > frame.height {
+    if out_w > width || out_h > height {
         return Err(Error::invalid(format!(
             "avif: crop {}x{} exceeds source {}x{}",
-            out_w, out_h, frame.width, frame.height
+            out_w, out_h, width, height
         )));
     }
-    if out_w == frame.width && out_h == frame.height {
+    if out_w == width && out_h == height {
         return Ok(frame.clone());
     }
-    crop_rect(frame, 0, 0, out_w, out_h)
+    crop_rect(frame, format, width, height, 0, 0, out_w, out_h)
 }
 
 /// Generic rectangular crop. Offsets and size are expressed in luma
 /// coordinates; chroma planes are scaled down by their subsampling.
 /// Every dimension must respect the chroma subsampling (i.e. on Yuv420P
 /// the offsets and sizes must be even).
-fn crop_rect(frame: &VideoFrame, x: u32, y: u32, w: u32, h: u32) -> Result<VideoFrame> {
-    let (sx, sy) = subsampling(frame.format)?;
-    let planes = plane_count(frame.format);
+#[allow(clippy::too_many_arguments)]
+fn crop_rect(
+    frame: &VideoFrame,
+    format: PixelFormat,
+    width: u32,
+    height: u32,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+) -> Result<VideoFrame> {
+    let (sx, sy) = subsampling(format)?;
+    let planes = plane_count(format);
     if frame.planes.len() != planes {
         return Err(Error::invalid(format!(
             "avif: frame has {} planes, expected {planes} for {:?}",
             frame.planes.len(),
-            frame.format
+            format
         )));
     }
     let mut out = Vec::with_capacity(planes);
@@ -104,7 +127,7 @@ fn crop_rect(frame: &VideoFrame, x: u32, y: u32, w: u32, h: u32) -> Result<Video
         };
         let src = &frame.planes[p];
         let src_stride = src.stride;
-        let (plane_w, _plane_h) = plane_dims(frame, p)?;
+        let (plane_w, _plane_h) = plane_dims(format, width, height, p)?;
         let mut data = Vec::with_capacity((pw as usize) * (ph as usize));
         for row in 0..ph as usize {
             let src_row = (py as usize + row) * src_stride + px as usize;
@@ -122,11 +145,7 @@ fn crop_rect(frame: &VideoFrame, x: u32, y: u32, w: u32, h: u32) -> Result<Video
         });
     }
     Ok(VideoFrame {
-        format: frame.format,
-        width: w,
-        height: h,
         pts: frame.pts,
-        time_base: frame.time_base,
         planes: out,
     })
 }
@@ -139,16 +158,24 @@ fn crop_rect(frame: &VideoFrame, x: u32, y: u32, w: u32, h: u32) -> Result<Video
 /// rationals. The spec defines the crop centre as
 /// `((W - 1) / 2 + horizOff, (H - 1) / 2 + vertOff)`, and the crop is
 /// `cleanApertureWidth × cleanApertureHeight` pixels.
-pub fn apply_clap(frame: &VideoFrame, clap: &Clap) -> Result<VideoFrame> {
+///
+/// Returns the cropped frame and its new `(width, height)`.
+pub fn apply_clap(
+    frame: &VideoFrame,
+    format: PixelFormat,
+    width: u32,
+    height: u32,
+    clap: &Clap,
+) -> Result<(VideoFrame, u32, u32)> {
     if clap.clean_aperture_width_d == 0
         || clap.clean_aperture_height_d == 0
         || clap.horiz_off_d == 0
         || clap.vert_off_d == 0
     {
-        return Ok(frame.clone());
+        return Ok((frame.clone(), width, height));
     }
-    let w = frame.width as i64;
-    let h = frame.height as i64;
+    let w = width as i64;
+    let h = height as i64;
     // Crop width / height rounded to nearest integer.
     let cw_num = clap.clean_aperture_width_n as i64;
     let cw_den = clap.clean_aperture_width_d as i64;
@@ -157,7 +184,7 @@ pub fn apply_clap(frame: &VideoFrame, clap: &Clap) -> Result<VideoFrame> {
     let cw = (cw_num + cw_den / 2) / cw_den;
     let ch = (ch_num + ch_den / 2) / ch_den;
     if cw <= 0 || ch <= 0 || cw > w || ch > h {
-        return Ok(frame.clone());
+        return Ok((frame.clone(), width, height));
     }
     // Centre, as a float (matches goavif's rounding exactly; denominators
     // are 32-bit so f64 has enough precision).
@@ -179,7 +206,7 @@ pub fn apply_clap(frame: &VideoFrame, clap: &Clap) -> Result<VideoFrame> {
     }
     // Subsampling requires even offsets / sizes on subsampled planes —
     // snap defensively so chroma cropping matches luma.
-    let (sx, sy) = subsampling(frame.format)?;
+    let (sx, sy) = subsampling(format)?;
     let align_x = 1i64 << sx;
     let align_y = 1i64 << sy;
     x0 -= x0 % align_x;
@@ -187,28 +214,40 @@ pub fn apply_clap(frame: &VideoFrame, clap: &Clap) -> Result<VideoFrame> {
     let cw_aligned = cw - (cw % align_x);
     let ch_aligned = ch - (ch % align_y);
     if cw_aligned <= 0 || ch_aligned <= 0 {
-        return Ok(frame.clone());
+        return Ok((frame.clone(), width, height));
     }
-    crop_rect(
+    let cropped = crop_rect(
         frame,
+        format,
+        width,
+        height,
         x0 as u32,
         y0 as u32,
         cw_aligned as u32,
         ch_aligned as u32,
-    )
+    )?;
+    Ok((cropped, cw_aligned as u32, ch_aligned as u32))
 }
 
 /// Apply an `irot` rotation (counter-clockwise, 0..3 × 90°). Rotating by
 /// 90° or 270° swaps the width and height. Chroma subsampling stays the
 /// same — a Yuv420P input returns a Yuv420P output with swapped chroma
 /// dims.
-pub fn apply_irot(frame: &VideoFrame, irot: &Irot) -> Result<VideoFrame> {
+///
+/// Returns the rotated frame and its new `(width, height)`.
+pub fn apply_irot(
+    frame: &VideoFrame,
+    format: PixelFormat,
+    width: u32,
+    height: u32,
+    irot: &Irot,
+) -> Result<(VideoFrame, u32, u32)> {
     let turns = irot.angle & 0x03;
     if turns == 0 {
-        return Ok(frame.clone());
+        return Ok((frame.clone(), width, height));
     }
-    let (sx, sy) = subsampling(frame.format)?;
-    let planes = plane_count(frame.format);
+    let (sx, sy) = subsampling(format)?;
+    let planes = plane_count(format);
     if frame.planes.len() != planes {
         return Err(Error::invalid(format!(
             "avif irot: frame has {} planes, expected {planes}",
@@ -224,12 +263,12 @@ pub fn apply_irot(frame: &VideoFrame, irot: &Irot) -> Result<VideoFrame> {
         return Err(Error::unsupported(format!(
             "avif irot: {}° rotation of {:?} requires symmetric subsampling",
             turns as u32 * 90,
-            frame.format
+            format
         )));
     }
     let mut out_planes = Vec::with_capacity(planes);
     for p in 0..planes {
-        let (pw, ph) = plane_dims(frame, p)?;
+        let (pw, ph) = plane_dims(format, width, height, p)?;
         let src = &frame.planes[p];
         let (ow, oh) = if odd { (ph, pw) } else { (pw, ph) };
         let mut data = vec![0u8; (ow as usize) * (oh as usize)];
@@ -254,27 +293,31 @@ pub fn apply_irot(frame: &VideoFrame, irot: &Irot) -> Result<VideoFrame> {
             data,
         });
     }
-    let (new_w, new_h) = if odd {
-        (frame.height, frame.width)
-    } else {
-        (frame.width, frame.height)
-    };
-    Ok(VideoFrame {
-        format: frame.format,
-        width: new_w,
-        height: new_h,
-        pts: frame.pts,
-        time_base: frame.time_base,
-        planes: out_planes,
-    })
+    let (new_w, new_h) = if odd { (height, width) } else { (width, height) };
+    Ok((
+        VideoFrame {
+            pts: frame.pts,
+            planes: out_planes,
+        },
+        new_w,
+        new_h,
+    ))
 }
 
 /// Apply an `imir` mirror. `axis == 0` flips top↔bottom, `axis == 1`
 /// flips left↔right. This matches the AVIF 1.1 / HEIF convention.
-pub fn apply_imir(frame: &VideoFrame, imir: &Imir) -> Result<VideoFrame> {
+///
+/// Width and height are unchanged; returned for caller convenience.
+pub fn apply_imir(
+    frame: &VideoFrame,
+    format: PixelFormat,
+    width: u32,
+    height: u32,
+    imir: &Imir,
+) -> Result<(VideoFrame, u32, u32)> {
     let axis = imir.axis & 0x01;
-    let _ = subsampling(frame.format)?; // validate format
-    let planes = plane_count(frame.format);
+    let _ = subsampling(format)?; // validate format
+    let planes = plane_count(format);
     if frame.planes.len() != planes {
         return Err(Error::invalid(format!(
             "avif imir: frame has {} planes, expected {planes}",
@@ -283,7 +326,7 @@ pub fn apply_imir(frame: &VideoFrame, imir: &Imir) -> Result<VideoFrame> {
     }
     let mut out_planes = Vec::with_capacity(planes);
     for p in 0..planes {
-        let (pw, ph) = plane_dims(frame, p)?;
+        let (pw, ph) = plane_dims(format, width, height, p)?;
         let src = &frame.planes[p];
         let mut data = vec![0u8; (pw as usize) * (ph as usize)];
         for y in 0..ph as usize {
@@ -302,20 +345,19 @@ pub fn apply_imir(frame: &VideoFrame, imir: &Imir) -> Result<VideoFrame> {
             data,
         });
     }
-    Ok(VideoFrame {
-        format: frame.format,
-        width: frame.width,
-        height: frame.height,
-        pts: frame.pts,
-        time_base: frame.time_base,
-        planes: out_planes,
-    })
+    Ok((
+        VideoFrame {
+            pts: frame.pts,
+            planes: out_planes,
+        },
+        width,
+        height,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxideav_core::TimeBase;
 
     fn make_gray(w: u32, h: u32, fill: impl Fn(u32, u32) -> u8) -> VideoFrame {
         let mut data = Vec::with_capacity((w * h) as usize);
@@ -325,11 +367,7 @@ mod tests {
             }
         }
         VideoFrame {
-            format: PixelFormat::Gray8,
-            width: w,
-            height: h,
             pts: None,
-            time_base: TimeBase::new(1, 1),
             planes: vec![VideoPlane {
                 stride: w as usize,
                 data,
@@ -347,11 +385,7 @@ mod tests {
             .map(|i| ((i + 80) & 0xff) as u8)
             .collect();
         VideoFrame {
-            format: PixelFormat::Yuv420P,
-            width: w,
-            height: h,
             pts: None,
-            time_base: TimeBase::new(1, 1),
             planes: vec![
                 VideoPlane {
                     stride: w as usize,
@@ -372,9 +406,9 @@ mod tests {
     #[test]
     fn irot_identity_on_zero_angle() {
         let f = make_gray(4, 2, |x, _| x as u8);
-        let out = apply_irot(&f, &Irot { angle: 0 }).unwrap();
-        assert_eq!(out.width, 4);
-        assert_eq!(out.height, 2);
+        let (out, ow, oh) = apply_irot(&f, PixelFormat::Gray8, 4, 2, &Irot { angle: 0 }).unwrap();
+        assert_eq!(ow, 4);
+        assert_eq!(oh, 2);
         assert_eq!(out.planes[0].data, f.planes[0].data);
     }
 
@@ -385,9 +419,9 @@ mod tests {
         //  2 3
         //  4 5
         let f = make_gray(2, 3, |x, y| (y * 2 + x) as u8);
-        let out = apply_irot(&f, &Irot { angle: 1 }).unwrap();
-        assert_eq!(out.width, 3);
-        assert_eq!(out.height, 2);
+        let (out, ow, oh) = apply_irot(&f, PixelFormat::Gray8, 2, 3, &Irot { angle: 1 }).unwrap();
+        assert_eq!(ow, 3);
+        assert_eq!(oh, 2);
         // 90° CCW of 2x3 -> 3x2. Top-right (1) lands at top-left,
         // bottom-right (5) at top-right, top-left (0) at bottom-left,
         // bottom-left (4) at bottom-right:
@@ -399,7 +433,7 @@ mod tests {
     #[test]
     fn irot_180_flips_both() {
         let f = make_gray(2, 2, |x, y| (y * 2 + x) as u8);
-        let out = apply_irot(&f, &Irot { angle: 2 }).unwrap();
+        let (out, _, _) = apply_irot(&f, PixelFormat::Gray8, 2, 2, &Irot { angle: 2 }).unwrap();
         // original: 0 1 / 2 3   -> 180°: 3 2 / 1 0
         assert_eq!(out.planes[0].data, vec![3, 2, 1, 0]);
     }
@@ -407,9 +441,9 @@ mod tests {
     #[test]
     fn irot_270_swaps_dims_clockwise() {
         let f = make_gray(2, 3, |x, y| (y * 2 + x) as u8);
-        let out = apply_irot(&f, &Irot { angle: 3 }).unwrap();
-        assert_eq!(out.width, 3);
-        assert_eq!(out.height, 2);
+        let (out, ow, oh) = apply_irot(&f, PixelFormat::Gray8, 2, 3, &Irot { angle: 3 }).unwrap();
+        assert_eq!(ow, 3);
+        assert_eq!(oh, 2);
         // 270° CCW (= 90° CW):
         //   4 2 0
         //   5 3 1
@@ -421,13 +455,12 @@ mod tests {
         // 4:2:2 has asymmetric subsampling (sx=1, sy=0) — 90° rotation
         // would turn it into 2:2:4, which isn't a legal layout.
         let mut f = make_yuv420(4, 4);
-        f.format = PixelFormat::Yuv422P;
         // Repoint chroma planes to match 4:2:2 dims (2x4).
         f.planes[1].stride = 2;
         f.planes[1].data = vec![0u8; 2 * 4];
         f.planes[2].stride = 2;
         f.planes[2].data = vec![0u8; 2 * 4];
-        let err = apply_irot(&f, &Irot { angle: 1 }).unwrap_err();
+        let err = apply_irot(&f, PixelFormat::Yuv422P, 4, 4, &Irot { angle: 1 }).unwrap_err();
         match err {
             Error::Unsupported(_) => {}
             other => panic!("expected Unsupported, got {other:?}"),
@@ -437,7 +470,7 @@ mod tests {
     #[test]
     fn imir_horizontal() {
         let f = make_gray(3, 2, |x, y| (y * 3 + x) as u8);
-        let out = apply_imir(&f, &Imir { axis: 1 }).unwrap();
+        let (out, _, _) = apply_imir(&f, PixelFormat::Gray8, 3, 2, &Imir { axis: 1 }).unwrap();
         // flip left↔right: each row reversed
         assert_eq!(out.planes[0].data, vec![2, 1, 0, 5, 4, 3]);
     }
@@ -445,7 +478,7 @@ mod tests {
     #[test]
     fn imir_vertical() {
         let f = make_gray(3, 2, |x, y| (y * 3 + x) as u8);
-        let out = apply_imir(&f, &Imir { axis: 0 }).unwrap();
+        let (out, _, _) = apply_imir(&f, PixelFormat::Gray8, 3, 2, &Imir { axis: 0 }).unwrap();
         // flip top↔bottom: rows swapped
         assert_eq!(out.planes[0].data, vec![3, 4, 5, 0, 1, 2]);
     }
@@ -453,9 +486,7 @@ mod tests {
     #[test]
     fn crop_top_left_yuv420() {
         let f = make_yuv420(4, 4);
-        let out = crop_top_left(&f, 2, 2).unwrap();
-        assert_eq!(out.width, 2);
-        assert_eq!(out.height, 2);
+        let out = crop_top_left(&f, PixelFormat::Yuv420P, 4, 4, 2, 2).unwrap();
         // Y: rows [0..2, 4..6]
         assert_eq!(out.planes[0].data, vec![0, 1, 4, 5]);
         // U/V: 1x1 chroma plane
@@ -476,7 +507,7 @@ mod tests {
             vert_off_n: 0,
             vert_off_d: 1,
         };
-        let out = apply_clap(&f, &clap).unwrap();
+        let (out, _, _) = apply_clap(&f, PixelFormat::Gray8, 4, 4, &clap).unwrap();
         assert_eq!(out.planes[0].data, f.planes[0].data);
     }
 
@@ -494,9 +525,9 @@ mod tests {
             vert_off_n: 0,
             vert_off_d: 1,
         };
-        let out = apply_clap(&f, &clap).unwrap();
-        assert_eq!(out.width, 2);
-        assert_eq!(out.height, 2);
+        let (out, ow, oh) = apply_clap(&f, PixelFormat::Gray8, 4, 4, &clap).unwrap();
+        assert_eq!(ow, 2);
+        assert_eq!(oh, 2);
         // Centre of 4x4 is (1.5, 1.5); crop top-left floor(1.5 - 0.5 + 0.5)=1.
         // So the crop is x=1, y=1, 2x2 -> pixels (1,1), (2,1), (1,2), (2,2).
         // Those are 5, 6, 9, 10.
