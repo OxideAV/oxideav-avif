@@ -47,7 +47,10 @@ pub use meta::{
     AuxC, Clap, Colr, Imir, IrefEntry, Irot, Ispe, ItemInfo, ItemLocation, Meta, Pasp, Pixi,
     Property,
 };
-pub use parser::{parse, parse_header, AvifHeader, AvifImage};
+pub use parser::{
+    classify_brands, parse, parse_header, AvifHeader, AvifImage, BrandClass, BRAND_AVIF,
+    BRAND_AVIO, BRAND_AVIS, BRAND_MA1A, BRAND_MA1B, BRAND_MIAF, BRAND_MIF1, BRAND_MSF1,
+};
 pub use transform::{apply_clap, apply_imir, apply_irot, crop_top_left};
 
 use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, Error, Result};

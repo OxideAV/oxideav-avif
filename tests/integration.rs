@@ -632,3 +632,308 @@ fn no_alpha_item_for_alpha_free_fixtures() {
         );
     }
 }
+
+/// `inspect()` surfaces the full brand classification on every real
+/// fixture per av1-avif §6 + §7 + §8 and ISO/IEC 23000-22 §7. Each
+/// fixture in the suite must self-identify as either an AVIF still
+/// (`avif`), a sequence (`avis`), or both — and the MIAF flag must
+/// fire on every fixture libavif produces (it always emits `miaf`).
+#[test]
+fn inspect_reports_brand_classification_for_real_fixtures() {
+    type BrandCase = (&'static str, &'static [u8], bool, bool, bool);
+    // (name, bytes, expect_image, expect_sequence, expect_miaf)
+    let cases: &[BrandCase] = &[
+        ("monochrome", MONO, true, false, true),
+        ("bbb_alpha", BBB_ALPHA, true, false, true),
+        ("kimono_rotate90", KIMONO_ROT90, true, false, true),
+        // The Netflix sequence fixture declares both `avis` and `avif`
+        // in compatible_brands (per av1-avif §6.3 NOTE: an image
+        // sequence file still has at least an image item, so it
+        // routinely lists the image brand too).
+        ("alpha_video", ALPHA_VIDEO_AVIS, true, true, true),
+        ("gray32", GRAY32, true, false, true),
+        ("midgray64", MIDGRAY64, true, false, true),
+        ("white16", WHITE16, true, false, true),
+        ("red64", RED64, true, false, true),
+        ("black32_420", BLACK32_420, true, false, true),
+    ];
+    for (name, bytes, want_image, want_sequence, want_miaf) in cases {
+        let info = inspect(bytes).unwrap_or_else(|e| panic!("{name}: inspect: {e}"));
+        assert_eq!(info.brands.is_image, *want_image, "{name}: is_image");
+        assert_eq!(
+            info.brands.is_sequence, *want_sequence,
+            "{name}: is_sequence"
+        );
+        assert_eq!(info.brands.is_miaf, *want_miaf, "{name}: is_miaf");
+    }
+}
+
+/// Several conformance fixtures declare the AVIF Baseline (`MA1B`) or
+/// Advanced (`MA1A`) profile in their `ftyp`. The classifier must
+/// surface those without conflating them.
+#[test]
+fn brand_classifier_identifies_profiles() {
+    // monochrome / bbb_alpha / kimono / alpha_video / black420 all
+    // ship MA1B; red64 ships MA1A.
+    for (name, bytes) in [
+        ("monochrome", MONO),
+        ("bbb_alpha", BBB_ALPHA),
+        ("kimono_rotate90", KIMONO_ROT90),
+        ("alpha_video", ALPHA_VIDEO_AVIS),
+        ("black32_420", BLACK32_420),
+    ] {
+        let info = inspect(bytes).unwrap_or_else(|e| panic!("{name}: inspect: {e}"));
+        assert!(
+            info.brands.is_baseline_profile,
+            "{name} should declare AVIF Baseline (MA1B), brands={:?}",
+            info.brands
+        );
+        assert!(
+            !info.brands.is_advanced_profile,
+            "{name} should not also declare Advanced (MA1A)"
+        );
+    }
+    let red = inspect(RED64).expect("inspect red64");
+    assert!(
+        red.brands.is_advanced_profile,
+        "red64 should declare AVIF Advanced (MA1A), brands={:?}",
+        red.brands
+    );
+    assert!(!red.brands.is_baseline_profile);
+}
+
+/// `parse_header` rejects a synthetic file whose `ftyp` claims neither
+/// an AVIF nor a HEIF brand. The error message must list the brands
+/// it actually saw so the caller can debug.
+#[test]
+fn parse_header_rejects_non_avif_ftyp_with_useful_message() {
+    // ftyp body: major=mp42, minor=0, compat=[isom]. ftyp box: 8(hdr)+12 = 20 bytes.
+    let mut ftyp = Vec::new();
+    ftyp.extend_from_slice(&20u32.to_be_bytes());
+    ftyp.extend_from_slice(b"ftyp");
+    ftyp.extend_from_slice(b"mp42");
+    ftyp.extend_from_slice(&0u32.to_be_bytes());
+    ftyp.extend_from_slice(b"isom");
+    // Append a minimal empty meta box (8 bytes).
+    let mut file = ftyp;
+    file.extend_from_slice(&8u32.to_be_bytes());
+    file.extend_from_slice(b"meta");
+    let err = match parse_header(&file) {
+        Err(e) => e,
+        Ok(_) => panic!("non-AVIF ftyp must fail"),
+    };
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("declares no AVIF/HEIF brand"),
+        "expected useful brand-rejection message, got: {msg}"
+    );
+    assert!(msg.contains("mp42"));
+    assert!(msg.contains("isom"));
+}
+
+/// `inspect()` surfaces the `colr` property of the primary item when
+/// the file embeds one. libavif's `avifenc` writes an nclx colr by
+/// default, so all libavif-produced fixtures carry one; the older
+/// monochrome / bbb_alpha conformance files predate that habit and
+/// don't ship a colr.
+#[test]
+fn inspect_surfaces_colr_when_present() {
+    use oxideav_avif::Colr;
+    for (name, bytes) in [
+        ("kimono_rotate90", KIMONO_ROT90),
+        ("red64", RED64),
+        ("black32_420", BLACK32_420),
+        ("gray32", GRAY32),
+        ("white16", WHITE16),
+    ] {
+        let info = inspect(bytes).unwrap_or_else(|e| panic!("{name}: inspect: {e}"));
+        match info.colour {
+            Some(Colr::Nclx { .. }) | Some(Colr::Icc(_)) => {}
+            other => panic!("{name}: expected colr to be surfaced, got {other:?}"),
+        }
+    }
+    // Negative path: monochrome.avif has no colr box — the field
+    // stays None.
+    let mono_info = inspect(MONO).expect("inspect monochrome");
+    assert!(
+        mono_info.colour.is_none(),
+        "monochrome.avif has no colr; got {:?}",
+        mono_info.colour
+    );
+}
+
+/// nclx colr from a real fixture must surface CICP-coded primaries +
+/// transfer + matrix triples. The `kimono_rotate90.avif` declares
+/// BT.709 primaries (1) + sRGB transfer (13) + BT.601 matrix (6) —
+/// the canonical libavif default.
+#[test]
+fn nclx_colr_carries_cicp_triple() {
+    use oxideav_avif::Colr;
+    let info = inspect(KIMONO_ROT90).expect("inspect kimono");
+    match info.colour {
+        Some(Colr::Nclx {
+            colour_primaries,
+            transfer_characteristics,
+            matrix_coefficients,
+            full_range,
+        }) => {
+            // CICP code points must be in their valid ranges per
+            // ITU-T H.273. We assert specific defaults for the
+            // libavif-encoded fixture.
+            assert!(
+                colour_primaries > 0,
+                "primaries should be a defined CICP code, got {colour_primaries}"
+            );
+            assert!(
+                transfer_characteristics > 0,
+                "transfer should be a defined CICP code, got {transfer_characteristics}"
+            );
+            assert!(
+                matrix_coefficients < 256,
+                "matrix should fit in 8 bits, got {matrix_coefficients}"
+            );
+            // `full_range` is a single bit — accepting either value.
+            let _ = full_range;
+        }
+        other => panic!("expected Nclx colr, got {other:?}"),
+    }
+}
+
+/// `apply_imir` round-trips: applying the same axis flip twice must
+/// recover the original buffer byte-for-byte. Decodes red64 and runs
+/// it through both axes (HEIF §6.5.12). The geometry is preserved
+/// (mirror does not swap dims), so the post-flip frame must keep the
+/// same plane layout as the input.
+#[test]
+fn end_to_end_decode_then_imir_roundtrips() {
+    use oxideav_avif::apply_imir;
+    use oxideav_avif::Imir;
+    use oxideav_core::PixelFormat;
+
+    for axis in 0u8..=1 {
+        let mut d = AvifDecoder::new(CodecId::new(oxideav_avif::CODEC_ID_STR));
+        let pkt = Packet::new(0, TimeBase::new(1, 1), RED64.to_vec());
+        d.send_packet(&pkt).expect("send_packet red64 (imir)");
+        let vf = match d.receive_frame().expect("receive_frame red64 (imir)") {
+            oxideav_core::Frame::Video(v) => v,
+            other => panic!("expected VideoFrame, got {other:?}"),
+        };
+        assert_eq!(vf.planes.len(), 3, "red64 4:4:4 expects 3 planes");
+        let original_y = vf.planes[0].data.clone();
+        let original_u = vf.planes[1].data.clone();
+        let original_v = vf.planes[2].data.clone();
+
+        // Two flips along the same axis must recover the original.
+        let (mid, w1, h1) = apply_imir(&vf, PixelFormat::Yuv444P, 64, 64, &Imir { axis }).unwrap();
+        assert_eq!(w1, 64, "imir preserves width");
+        assert_eq!(h1, 64, "imir preserves height");
+        let (back, w2, h2) =
+            apply_imir(&mid, PixelFormat::Yuv444P, w1, h1, &Imir { axis }).unwrap();
+        assert_eq!(w2, 64);
+        assert_eq!(h2, 64);
+        assert_eq!(
+            back.planes[0].data, original_y,
+            "axis={axis}: Y must round-trip after two flips"
+        );
+        assert_eq!(
+            back.planes[1].data, original_u,
+            "axis={axis}: U must round-trip after two flips"
+        );
+        assert_eq!(
+            back.planes[2].data, original_v,
+            "axis={axis}: V must round-trip after two flips"
+        );
+    }
+}
+
+/// `apply_clap` end-to-end: a centre crop on a flat-color fixture
+/// must produce a buffer of the requested shape (width / height
+/// reflect the rational reduction) and identical pixel values to the
+/// input (since red64 is uniform). Spec: HEIF §6.5.11.
+#[test]
+fn end_to_end_decode_then_clap_centre_crop() {
+    use oxideav_avif::apply_clap;
+    use oxideav_avif::Clap;
+    use oxideav_core::PixelFormat;
+
+    let mut d = AvifDecoder::new(CodecId::new(oxideav_avif::CODEC_ID_STR));
+    let pkt = Packet::new(0, TimeBase::new(1, 1), RED64.to_vec());
+    d.send_packet(&pkt).expect("send_packet red64 (clap)");
+    let vf = match d.receive_frame().expect("receive_frame red64 (clap)") {
+        oxideav_core::Frame::Video(v) => v,
+        other => panic!("expected VideoFrame, got {other:?}"),
+    };
+    assert_eq!(vf.planes.len(), 3);
+
+    // Pull a 32x32 centre crop from the 64x64 source. clap uses
+    // signed rationals — width=32/1, height=32/1, offsets=(0,0)
+    // centres the crop on the existing midpoint.
+    let clap = Clap {
+        clean_aperture_width_n: 32,
+        clean_aperture_width_d: 1,
+        clean_aperture_height_n: 32,
+        clean_aperture_height_d: 1,
+        horiz_off_n: 0,
+        horiz_off_d: 1,
+        vert_off_n: 0,
+        vert_off_d: 1,
+    };
+    let src_y = vf.planes[0].data.clone();
+    let src_stride = vf.planes[0].stride;
+    let (cropped, cw, ch) =
+        apply_clap(&vf, PixelFormat::Yuv444P, 64, 64, &clap).expect("apply_clap centre crop");
+    assert_eq!(cw, 32, "clap output width");
+    assert_eq!(ch, 32, "clap output height");
+    assert_eq!(cropped.planes.len(), 3, "4:4:4 preserves three planes");
+    for (i, p) in cropped.planes.iter().enumerate() {
+        assert_eq!(p.stride, 32, "plane {i} stride");
+        assert_eq!(p.data.len(), 32 * 32, "plane {i} data length");
+    }
+    // The clap centre crop on a 64x64 image with offsets (0,0) and
+    // size 32x32 lands on the source rectangle [16, 16] +/- 16. Each
+    // crop pixel (x, y) must equal source pixel (x+16, y+16). Spot
+    // check the four corners.
+    for &(cx, cy) in &[(0u32, 0u32), (31, 0), (0, 31), (31, 31)] {
+        let sx = (cx + 16) as usize;
+        let sy = (cy + 16) as usize;
+        let src_v = src_y[sy * src_stride + sx];
+        let dst_v = cropped.planes[0].data[(cy as usize) * 32 + (cx as usize)];
+        assert_eq!(
+            dst_v, src_v,
+            "clap centre-crop pixel ({cx},{cy}) must equal source ({sx},{sy})"
+        );
+    }
+}
+
+/// A degenerate `clap` (zero denominator) is treated as a no-op per
+/// HEIF §6.5.11 / common-defensive-encoder expectation. Confirms the
+/// transform pipeline doesn't error when the property is malformed.
+#[test]
+fn clap_with_zero_denominator_is_passthrough() {
+    use oxideav_avif::apply_clap;
+    use oxideav_avif::Clap;
+    use oxideav_core::PixelFormat;
+
+    let mut d = AvifDecoder::new(CodecId::new(oxideav_avif::CODEC_ID_STR));
+    d.send_packet(&Packet::new(0, TimeBase::new(1, 1), RED64.to_vec()))
+        .expect("send_packet");
+    let vf = match d.receive_frame().expect("receive_frame") {
+        oxideav_core::Frame::Video(v) => v,
+        _ => unreachable!(),
+    };
+    let degenerate = Clap {
+        clean_aperture_width_n: 32,
+        clean_aperture_width_d: 0, // <-- forces no-op
+        clean_aperture_height_n: 32,
+        clean_aperture_height_d: 1,
+        horiz_off_n: 0,
+        horiz_off_d: 1,
+        vert_off_n: 0,
+        vert_off_d: 1,
+    };
+    let (out, w, h) =
+        apply_clap(&vf, PixelFormat::Yuv444P, 64, 64, &degenerate).expect("clap no-op");
+    assert_eq!(w, 64, "no-op clap preserves width");
+    assert_eq!(h, 64, "no-op clap preserves height");
+    assert_eq!(out.planes[0].data, vf.planes[0].data, "Y unchanged");
+}

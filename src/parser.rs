@@ -11,11 +11,23 @@ const FTYP: BoxType = b(b"ftyp");
 const META: BoxType = b(b"meta");
 const MDAT: BoxType = b(b"mdat");
 
-const BRAND_AVIF: BoxType = b(b"avif");
-const BRAND_AVIS: BoxType = b(b"avis");
-const BRAND_MIF1: BoxType = b(b"mif1");
-const BRAND_MSF1: BoxType = b(b"msf1");
-const BRAND_MIAF: BoxType = b(b"miaf");
+/// `avif` — AV1 image / image collection brand (av1-avif §6.2).
+pub const BRAND_AVIF: BoxType = b(b"avif");
+/// `avis` — AV1 image sequence brand (av1-avif §6.3).
+pub const BRAND_AVIS: BoxType = b(b"avis");
+/// `avio` — AV1 image / sequence intra-only profile (av1-avif §6.2 / §6.3).
+pub const BRAND_AVIO: BoxType = b(b"avio");
+/// `mif1` — HEIF image-item structural brand (HEIF §10.2.2).
+pub const BRAND_MIF1: BoxType = b(b"mif1");
+/// `msf1` — HEIF image-sequence structural brand (HEIF §10.3.2).
+pub const BRAND_MSF1: BoxType = b(b"msf1");
+/// `miaf` — Multi-image Application Format compatibility brand
+/// (ISO/IEC 23000-22 §7).
+pub const BRAND_MIAF: BoxType = b(b"miaf");
+/// `MA1B` — AVIF Baseline Profile (av1-avif §8.2).
+pub const BRAND_MA1B: BoxType = b(b"MA1B");
+/// `MA1A` — AVIF Advanced Profile (av1-avif §8.3).
+pub const BRAND_MA1A: BoxType = b(b"MA1A");
 
 pub const ITEM_TYPE_AV01: BoxType = b(b"av01");
 pub const ITEM_TYPE_GRID: BoxType = b(b"grid");
@@ -68,17 +80,7 @@ pub fn parse_header(file: &[u8]) -> Result<AvifHeader<'_>> {
     }
     let ftyp = ftyp_payload.ok_or_else(|| Error::invalid("avif: missing ftyp"))?;
     let (major_brand, minor_version, compatible_brands) = parse_ftyp(ftyp)?;
-    if !is_avif_compatible(&major_brand, &compatible_brands) {
-        return Err(Error::invalid(format!(
-            "avif: ftyp major='{}' compatible_brands={} doesn't claim any AVIF/HEIF brand",
-            type_str(&major_brand),
-            compatible_brands
-                .iter()
-                .map(type_str)
-                .collect::<Vec<_>>()
-                .join(",")
-        )));
-    }
+    classify_brands(&major_brand, &compatible_brands)?;
     let meta_p = meta_payload.ok_or_else(|| Error::invalid("avif: missing meta"))?;
     let meta = Meta::parse(meta_p)?;
     Ok(AvifHeader {
@@ -186,19 +188,79 @@ fn parse_ftyp(payload: &[u8]) -> Result<(BoxType, u32, Vec<BoxType>)> {
     Ok((major, minor, brands))
 }
 
-fn is_avif_compatible(major: &BoxType, compat: &[BoxType]) -> bool {
-    let candidates = [major].into_iter().chain(compat.iter());
-    for b in candidates {
-        if b == &BRAND_AVIF
-            || b == &BRAND_AVIS
-            || b == &BRAND_MIF1
-            || b == &BRAND_MSF1
-            || b == &BRAND_MIAF
-        {
-            return true;
+/// Classification of an AVIF / HEIF `ftyp` box per av1-avif §6 + §7 +
+/// §8 and ISO/IEC 23000-22 (MIAF) §7. Surfaces both the structural
+/// brand the file claims and the optional AVIF profile.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BrandClass {
+    /// File declares an AV1 image / image-collection (`avif`) brand.
+    pub is_image: bool,
+    /// File declares an AV1 image sequence (`avis`) brand.
+    pub is_sequence: bool,
+    /// File declares the intra-only profile (`avio`).
+    pub is_intra_only: bool,
+    /// File declares the MIAF compatibility brand (`miaf`,
+    /// ISO/IEC 23000-22 §7).
+    pub is_miaf: bool,
+    /// HEIF structural brand: image-item (`mif1`).
+    pub has_mif1: bool,
+    /// HEIF structural brand: image-sequence (`msf1`).
+    pub has_msf1: bool,
+    /// AVIF Baseline Profile brand (`MA1B`).
+    pub is_baseline_profile: bool,
+    /// AVIF Advanced Profile brand (`MA1A`).
+    pub is_advanced_profile: bool,
+}
+
+/// Classify the brand set of a parsed `ftyp` box. Errors when the file
+/// claims neither `avif` nor `avis` nor any HEIF structural brand
+/// (`mif1` / `msf1`) — without one of those there is nothing AVIF /
+/// HEIF can do with the file. The error string lists every brand seen
+/// so the caller doesn't have to dig the bytes back out.
+///
+/// Spec references:
+///
+/// * av1-avif §6.2 — `avif` for AV1 image / image collection
+/// * av1-avif §6.3 — `avis` for AV1 image sequences
+/// * av1-avif §6.2 / §6.3 — `avio` intra-only
+/// * av1-avif §7 General constraints — file shall list `miaf`
+/// * av1-avif §8.2 / §8.3 — `MA1B` Baseline / `MA1A` Advanced profile
+/// * HEIF §10.2.2 — `mif1` image-item structural brand
+/// * HEIF §10.3.2 — `msf1` image-sequence structural brand
+/// * ISO/IEC 23000-22 §7 — `miaf` compatibility brand
+pub fn classify_brands(major: &BoxType, compat: &[BoxType]) -> Result<BrandClass> {
+    let mut cls = BrandClass::default();
+    let candidates: Vec<&BoxType> = std::iter::once(major).chain(compat.iter()).collect();
+    for brand in &candidates {
+        match **brand {
+            x if x == BRAND_AVIF => cls.is_image = true,
+            x if x == BRAND_AVIS => cls.is_sequence = true,
+            x if x == BRAND_AVIO => cls.is_intra_only = true,
+            x if x == BRAND_MIAF => cls.is_miaf = true,
+            x if x == BRAND_MIF1 => cls.has_mif1 = true,
+            x if x == BRAND_MSF1 => cls.has_msf1 = true,
+            x if x == BRAND_MA1B => cls.is_baseline_profile = true,
+            x if x == BRAND_MA1A => cls.is_advanced_profile = true,
+            _ => {}
         }
     }
-    false
+    // Files in the wild often omit `miaf` even though av1-avif §7
+    // requires it. We accept any combination that includes either
+    // an AVIF brand (`avif`/`avis`) or a HEIF structural brand
+    // (`mif1`/`msf1`) — anything less can't be a real AVIF / HEIF
+    // file. Strict MIAF compliance can be checked via the returned
+    // `BrandClass.is_miaf` flag.
+    let usable =
+        cls.is_image || cls.is_sequence || cls.has_mif1 || cls.has_msf1 || cls.is_intra_only;
+    if !usable {
+        return Err(Error::invalid(format!(
+            "avif: ftyp major='{}' compatible_brands=[{}] declares no AVIF/HEIF brand \
+             (need one of avif, avis, avio, mif1, msf1)",
+            type_str(major),
+            compat.iter().map(type_str).collect::<Vec<_>>().join(",")
+        )));
+    }
+    Ok(cls)
 }
 
 fn resolve_item_bytes<'a>(file: &'a [u8], loc: &ItemLocation) -> Result<&'a [u8]> {
@@ -242,6 +304,80 @@ mod tests {
     use super::*;
 
     const FIXTURE: &[u8] = include_bytes!("../tests/fixtures/monochrome.avif");
+
+    #[test]
+    fn classify_brands_baseline_profile() {
+        // Real `monochrome.avif` ftyp: major=avif compat=[mif1,avif,miaf,MA1B].
+        let cls = classify_brands(
+            &BRAND_AVIF,
+            &[BRAND_MIF1, BRAND_AVIF, BRAND_MIAF, BRAND_MA1B],
+        )
+        .unwrap();
+        assert!(cls.is_image);
+        assert!(cls.is_miaf);
+        assert!(cls.has_mif1);
+        assert!(cls.is_baseline_profile);
+        assert!(!cls.is_sequence);
+        assert!(!cls.is_advanced_profile);
+    }
+
+    #[test]
+    fn classify_brands_advanced_profile() {
+        let cls = classify_brands(&BRAND_AVIF, &[BRAND_MIF1, BRAND_MIAF, BRAND_MA1A]).unwrap();
+        assert!(cls.is_advanced_profile);
+        assert!(!cls.is_baseline_profile);
+        assert!(cls.is_image);
+    }
+
+    #[test]
+    fn classify_brands_sequence_with_intra_only() {
+        // Per av1-avif §6.3 + §8.2: avis + avio + msf1 + miaf + MA1B.
+        let cls = classify_brands(
+            &BRAND_AVIS,
+            &[BRAND_AVIO, BRAND_MSF1, BRAND_MIAF, BRAND_MA1B],
+        )
+        .unwrap();
+        assert!(cls.is_sequence);
+        assert!(cls.is_intra_only);
+        assert!(cls.has_msf1);
+        assert!(cls.is_miaf);
+        assert!(cls.is_baseline_profile);
+        assert!(!cls.is_image);
+    }
+
+    #[test]
+    fn classify_brands_rejects_no_avif_or_heif_brand() {
+        // `mp42` + `isom` is a valid generic ISOBMFF ftyp but says
+        // nothing about AVIF/HEIF.
+        let err = classify_brands(b"mp42", &[*b"isom"]).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("declares no AVIF/HEIF brand"),
+            "expected AVIF/HEIF rejection, got: {msg}"
+        );
+        // Error must list the brands seen so the caller can debug.
+        assert!(msg.contains("mp42"));
+        assert!(msg.contains("isom"));
+    }
+
+    #[test]
+    fn classify_brands_accepts_mif1_only() {
+        // Pure HEIF file with no AVIF brand still parses: caller can
+        // inspect the meta to find out whether it carries an `av01` item.
+        let cls = classify_brands(&BRAND_MIF1, &[]).unwrap();
+        assert!(cls.has_mif1);
+        assert!(!cls.is_image);
+        assert!(!cls.is_sequence);
+    }
+
+    #[test]
+    fn classify_brands_lone_miaf_without_anchor_is_rejected() {
+        // `miaf` alone isn't enough — a file must also claim either an
+        // AVIF brand (`avif` / `avis` / `avio`) or a HEIF structural
+        // brand (`mif1` / `msf1`).
+        let err = classify_brands(&BRAND_MIAF, &[]).unwrap_err();
+        assert!(format!("{err}").contains("declares no AVIF/HEIF brand"));
+    }
 
     #[test]
     fn parses_monochrome_fixture() {

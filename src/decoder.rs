@@ -16,10 +16,11 @@ use oxideav_av1::{Av1CodecConfig, Av1Decoder};
 use crate::alpha::{composite_alpha, find_alpha_item_id};
 use crate::box_parser::{b, BoxType};
 use crate::grid::{composite_grid, ImageGrid};
-use crate::meta::{Ispe, ItemLocation, Meta, Pasp, Pixi, Property};
+use crate::meta::{Colr, Ispe, ItemLocation, Meta, Pasp, Pixi, Property};
 use crate::parser::parse;
 use crate::parser::{
-    item_bytes, parse_header, AvifHeader, AvifImage, ITEM_TYPE_AV01, ITEM_TYPE_GRID,
+    classify_brands, item_bytes, parse_header, AvifHeader, AvifImage, BrandClass, ITEM_TYPE_AV01,
+    ITEM_TYPE_GRID,
 };
 use crate::transform::{apply_clap, apply_imir, apply_irot, crop_top_left};
 
@@ -70,6 +71,7 @@ fn infer_av1_pixmap(frame: &VideoFrame) -> Result<(PixelFormat, u32, u32)> {
 
 const AV1C: BoxType = b(b"av1C");
 const ISPE: BoxType = b(b"ispe");
+const COLR: BoxType = b(b"colr");
 const IROT: BoxType = b(b"irot");
 const IMIR: BoxType = b(b"imir");
 const CLAP: BoxType = b(b"clap");
@@ -90,6 +92,14 @@ pub struct AvifInfo {
     pub is_grid: bool,
     /// True when an alpha auxiliary is attached to the primary item.
     pub has_alpha: bool,
+    /// Brand classification from the file's `ftyp` box (av1-avif §6 +
+    /// §8, ISO/IEC 23000-22 §7).
+    pub brands: BrandClass,
+    /// Colour information attached to the primary item, if any
+    /// (`colr` box: nclx CICP triple or ICC payload). For grid
+    /// primaries we surface the property attached to the grid item if
+    /// present, falling back to the first tile's `colr`.
+    pub colour: Option<Colr>,
 }
 
 pub fn inspect(file: &[u8]) -> Result<AvifInfo> {
@@ -103,15 +113,20 @@ pub fn inspect(file: &[u8]) -> Result<AvifInfo> {
         .meta
         .item_by_id(primary_id)
         .ok_or_else(|| Error::invalid("avif: pitm references unknown item"))?;
+    let brands = classify_brands(&hdr.major_brand, &hdr.compatible_brands)?;
     if primary_info.item_type == ITEM_TYPE_GRID {
-        build_info_grid(&hdr, primary_id)
+        build_info_grid(&hdr, primary_id, brands)
     } else {
         let img = parse(file)?;
-        build_info(&img, find_alpha_item_id(&hdr.meta, primary_id).is_some())
+        build_info(
+            &img,
+            find_alpha_item_id(&hdr.meta, primary_id).is_some(),
+            brands,
+        )
     }
 }
 
-fn build_info(img: &AvifImage<'_>, has_alpha: bool) -> Result<AvifInfo> {
+fn build_info(img: &AvifImage<'_>, has_alpha: bool, brands: BrandClass) -> Result<AvifInfo> {
     let av1c = img
         .av1c
         .clone()
@@ -133,10 +148,12 @@ fn build_info(img: &AvifImage<'_>, has_alpha: bool) -> Result<AvifInfo> {
         obu_bytes: img.primary_item_data.to_vec(),
         is_grid: false,
         has_alpha,
+        brands,
+        colour: img.colr.clone(),
     })
 }
 
-fn build_info_grid(hdr: &AvifHeader<'_>, primary_id: u32) -> Result<AvifInfo> {
+fn build_info_grid(hdr: &AvifHeader<'_>, primary_id: u32, brands: BrandClass) -> Result<AvifInfo> {
     // Pull grid item bytes, parse the descriptor.
     let loc = hdr
         .meta
@@ -167,6 +184,15 @@ fn build_info_grid(hdr: &AvifHeader<'_>, primary_id: u32) -> Result<AvifInfo> {
         Some(Property::Pasp(p)) => Some(*p),
         _ => None,
     };
+    // Per HEIF: a `colr` may be attached to the grid item or to its
+    // tiles. Prefer the grid-level association; fall back to tile 0.
+    let colour = match hdr.meta.property_for(primary_id, &COLR) {
+        Some(Property::Colr(c)) => Some(c.clone()),
+        _ => match hdr.meta.property_for(first_tile_id, &COLR) {
+            Some(Property::Colr(c)) => Some(c.clone()),
+            _ => None,
+        },
+    };
     Ok(AvifInfo {
         width: grid.output_width,
         height: grid.output_height,
@@ -176,6 +202,8 @@ fn build_info_grid(hdr: &AvifHeader<'_>, primary_id: u32) -> Result<AvifInfo> {
         obu_bytes: Vec::new(),
         is_grid: true,
         has_alpha: find_alpha_item_id(&hdr.meta, primary_id).is_some(),
+        brands,
+        colour,
     })
 }
 
@@ -214,10 +242,11 @@ impl AvifDecoder {
 
         // Decode the primary frame, either via the grid path or the
         // single-item path.
+        let brands = classify_brands(&hdr.major_brand, &hdr.compatible_brands)?;
         let (color_frame, color_format, mut width, mut height, info) =
             if primary_info.item_type == ITEM_TYPE_GRID {
                 let (f, fmt, w, h) = decode_grid_primary(&hdr, primary_id)?;
-                let info = build_info_grid(&hdr, primary_id)?;
+                let info = build_info_grid(&hdr, primary_id, brands)?;
                 (f, fmt, w, h, info)
             } else if primary_info.item_type == ITEM_TYPE_AV01 {
                 let img = parse(file)?;
@@ -229,7 +258,7 @@ impl AvifDecoder {
                     img.ispe.map(|e| (e.width, e.height)),
                 )?;
                 let has_alpha = find_alpha_item_id(&hdr.meta, primary_id).is_some();
-                let info = build_info(&img, has_alpha)?;
+                let info = build_info(&img, has_alpha, brands)?;
                 (f, fmt, w, h, info)
             } else {
                 return Err(Error::unsupported(format!(
