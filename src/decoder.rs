@@ -84,7 +84,14 @@ const DIMG: BoxType = b(b"dimg");
 pub struct AvifInfo {
     pub width: u32,
     pub height: u32,
+    /// Per-channel bit depth from the `pixi` property (HEIF §6.5.6).
+    /// Empty when no `pixi` is associated with the primary item — in
+    /// that case callers can fall back to the AV1 sequence-header bit
+    /// depth.
     pub bits_per_channel: Vec<u8>,
+    /// Pixel aspect ratio from the `pasp` property (HEIF §6.5.4 /
+    /// ISO/IEC 14496-12 §8.5.2.1.1). `None` when absent (square pixel
+    /// is the implicit default).
     pub pasp: Option<Pasp>,
     pub av1c: Vec<u8>,
     pub obu_bytes: Vec<u8>,
@@ -100,6 +107,37 @@ pub struct AvifInfo {
     /// primaries we surface the property attached to the grid item if
     /// present, falling back to the first tile's `colr`.
     pub colour: Option<Colr>,
+}
+
+impl AvifInfo {
+    /// Number of channels per pixel — `bits_per_channel.len()`. Returns
+    /// 0 when the primary item lacks a `pixi` property.
+    pub fn num_channels(&self) -> usize {
+        self.bits_per_channel.len()
+    }
+
+    /// Maximum bit depth across all channels, or 0 when no `pixi` is
+    /// attached. Useful for readers picking an output buffer width
+    /// (8 vs 16 bit) without parsing `av1C`.
+    pub fn max_bit_depth(&self) -> u8 {
+        self.bits_per_channel.iter().copied().max().unwrap_or(0)
+    }
+
+    /// True when the file declares a single-channel pixi — the typical
+    /// signal for an AVIF monochrome image.
+    pub fn is_monochrome(&self) -> bool {
+        self.num_channels() == 1
+    }
+
+    /// True when the `pasp` property is either absent or declares
+    /// `1:1` (or any equal-spacing) pixels. Callers that ignore non-
+    /// square pixels can branch on this single check.
+    pub fn has_square_pixels(&self) -> bool {
+        match self.pasp {
+            None => true,
+            Some(p) => p.is_square(),
+        }
+    }
 }
 
 pub fn inspect(file: &[u8]) -> Result<AvifInfo> {

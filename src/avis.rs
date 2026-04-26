@@ -89,6 +89,26 @@ pub fn sample_duration_seconds(duration: u32, timescale: u32) -> (u32, u32) {
     }
 }
 
+/// Resolve the byte slice of an AVIS sample inside the source file.
+/// Returns `Err(InvalidData)` when the declared `(offset, size)`
+/// doesn't fit inside the file. Callers feed this slice to the AV1
+/// decoder per sample.
+pub fn sample_bytes<'a>(file: &'a [u8], sample: &Sample) -> Result<&'a [u8]> {
+    let start = sample.offset as usize;
+    let end = sample
+        .offset
+        .checked_add(sample.size as u64)
+        .ok_or_else(|| Error::InvalidData("avis: sample range overflow".to_string()))?
+        as usize;
+    if end > file.len() {
+        return Err(Error::InvalidData(format!(
+            "avis: sample {start}..{end} exceeds file length {}",
+            file.len()
+        )));
+    }
+    Ok(&file[start..end])
+}
+
 /// Find mvhd's timescale. Payload starts with a FullBox header; the
 /// timescale lives at payload offset 12 (v0) or 20 (v1).
 fn find_mvhd_timescale(moov_payload: &[u8]) -> Option<u32> {

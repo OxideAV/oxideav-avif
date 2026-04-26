@@ -318,6 +318,266 @@ mod tests {
         assert!(composite_grid(&grid, &tiles, PixelFormat::Gray8, 2, 2).is_err());
     }
 
+    /// HEIF §6.6.2.3.1 says: "tile_width*columns is greater than or
+    /// equal to output_width and tile_height*rows is greater than or
+    /// equal to output_height". A grid whose tiles can't cover the
+    /// output rectangle must error.
+    #[test]
+    fn composite_undersized_grid_rejected() {
+        // 2x2 grid of 2x2 tiles claims 5x5 output (needs at least
+        // 6x6). Should error.
+        let grid = ImageGrid {
+            version: 0,
+            flags: 0,
+            rows: 2,
+            columns: 2,
+            output_width: 5,
+            output_height: 5,
+        };
+        let tiles = [
+            make_gray_tile(2, 2, 10),
+            make_gray_tile(2, 2, 20),
+            make_gray_tile(2, 2, 30),
+            make_gray_tile(2, 2, 40),
+        ];
+        let err = composite_grid(&grid, &tiles, PixelFormat::Gray8, 2, 2).unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)));
+    }
+
+    /// Non-square 1x4 grid (single row, four tiles) — exercises the
+    /// row-major paste with rows=1.
+    #[test]
+    fn composite_1x4_horizontal_strip() {
+        let grid = ImageGrid {
+            version: 0,
+            flags: 0,
+            rows: 1,
+            columns: 4,
+            output_width: 8,
+            output_height: 2,
+        };
+        let tiles = [
+            make_gray_tile(2, 2, 11),
+            make_gray_tile(2, 2, 22),
+            make_gray_tile(2, 2, 33),
+            make_gray_tile(2, 2, 44),
+        ];
+        let out = composite_grid(&grid, &tiles, PixelFormat::Gray8, 2, 2).unwrap();
+        assert_eq!(out.planes[0].stride, 8);
+        // First row cells: 11,11,22,22,33,33,44,44.
+        assert_eq!(&out.planes[0].data[..8], &[11, 11, 22, 22, 33, 33, 44, 44]);
+        // Second row, same content.
+        assert_eq!(
+            &out.planes[0].data[8..16],
+            &[11, 11, 22, 22, 33, 33, 44, 44]
+        );
+    }
+
+    /// Non-square 4x1 grid (single column, four tiles).
+    #[test]
+    fn composite_4x1_vertical_strip() {
+        let grid = ImageGrid {
+            version: 0,
+            flags: 0,
+            rows: 4,
+            columns: 1,
+            output_width: 2,
+            output_height: 8,
+        };
+        let tiles = [
+            make_gray_tile(2, 2, 1),
+            make_gray_tile(2, 2, 2),
+            make_gray_tile(2, 2, 3),
+            make_gray_tile(2, 2, 4),
+        ];
+        let out = composite_grid(&grid, &tiles, PixelFormat::Gray8, 2, 2).unwrap();
+        assert_eq!(out.planes[0].stride, 2);
+        // 4 row blocks of 2 rows each, fills 1,1,2,2,3,3,4,4 per column.
+        for r in 0..8 {
+            let block = (r / 2) + 1;
+            assert_eq!(
+                &out.planes[0].data[r * 2..r * 2 + 2],
+                &[block as u8, block as u8]
+            );
+        }
+    }
+
+    /// 1x1 degenerate grid: one tile, no compositing — output equals
+    /// the single tile cropped to the declared output size.
+    #[test]
+    fn composite_1x1_degenerate_grid() {
+        let grid = ImageGrid {
+            version: 0,
+            flags: 0,
+            rows: 1,
+            columns: 1,
+            output_width: 3,
+            output_height: 3,
+        };
+        let tiles = [make_gray_tile(4, 4, 99)];
+        let out = composite_grid(&grid, &tiles, PixelFormat::Gray8, 4, 4).unwrap();
+        assert_eq!(out.planes[0].stride, 3);
+        assert_eq!(out.planes[0].data.len(), 9);
+        for &v in &out.planes[0].data {
+            assert_eq!(v, 99);
+        }
+    }
+
+    /// Output rectangle that only fits part of the bottom-most row of
+    /// tiles — those bottom tiles must be cropped to a single row each.
+    #[test]
+    fn composite_crops_bottom_row_to_one_pixel() {
+        // 2x2 grid of 2x2 tiles, output is 4x3 — bottom row tiles
+        // contribute exactly 1 pixel of height.
+        let grid = ImageGrid {
+            version: 0,
+            flags: 0,
+            rows: 2,
+            columns: 2,
+            output_width: 4,
+            output_height: 3,
+        };
+        let tiles = [
+            make_gray_tile(2, 2, 10),
+            make_gray_tile(2, 2, 20),
+            make_gray_tile(2, 2, 30),
+            make_gray_tile(2, 2, 40),
+        ];
+        let out = composite_grid(&grid, &tiles, PixelFormat::Gray8, 2, 2).unwrap();
+        assert_eq!(out.planes[0].stride, 4);
+        assert_eq!(out.planes[0].data.len(), 12);
+        // Row 2 (last visible row) takes the first row of tiles 2 + 3.
+        assert_eq!(&out.planes[0].data[8..12], &[30, 30, 40, 40]);
+    }
+
+    /// 4:2:0 grid composition: each tile carries Y(2x2) + U(1x1) + V(1x1).
+    /// Confirms the chroma-plane shift logic correctly stitches the
+    /// subsampled planes at half-resolution offsets.
+    #[test]
+    fn composite_2x2_grid_yuv420() {
+        let make_tile = |yfill: u8, ufill: u8, vfill: u8| VideoFrame {
+            pts: None,
+            planes: vec![
+                VideoPlane {
+                    stride: 2,
+                    data: vec![yfill; 4],
+                },
+                VideoPlane {
+                    stride: 1,
+                    data: vec![ufill; 1],
+                },
+                VideoPlane {
+                    stride: 1,
+                    data: vec![vfill; 1],
+                },
+            ],
+        };
+        let grid = ImageGrid {
+            version: 0,
+            flags: 0,
+            rows: 2,
+            columns: 2,
+            output_width: 4,
+            output_height: 4,
+        };
+        let tiles = [
+            make_tile(10, 100, 200),
+            make_tile(20, 110, 210),
+            make_tile(30, 120, 220),
+            make_tile(40, 130, 230),
+        ];
+        let out = composite_grid(&grid, &tiles, PixelFormat::Yuv420P, 2, 2).unwrap();
+        assert_eq!(out.planes.len(), 3);
+        // Y plane: 4x4.
+        let y = &out.planes[0];
+        assert_eq!(y.stride, 4);
+        assert_eq!(y.data.len(), 16);
+        // Y rows 0-1 hold tiles 0,1 luma; rows 2-3 hold tiles 2,3.
+        assert_eq!(&y.data[0..4], &[10, 10, 20, 20]);
+        assert_eq!(&y.data[8..12], &[30, 30, 40, 40]);
+        // U plane: 2x2 (each tile contributes one chroma pixel).
+        let u = &out.planes[1];
+        assert_eq!(u.stride, 2);
+        assert_eq!(u.data.len(), 4);
+        assert_eq!(u.data, vec![100, 110, 120, 130]);
+        // V plane: same shape.
+        let v = &out.planes[2];
+        assert_eq!(v.data, vec![200, 210, 220, 230]);
+    }
+
+    /// Reject mismatched plane counts — a tile passed in with the wrong
+    /// number of planes for the requested PixelFormat must return
+    /// `InvalidData`.
+    #[test]
+    fn composite_plane_count_mismatch_rejected() {
+        let grid = ImageGrid {
+            version: 0,
+            flags: 0,
+            rows: 1,
+            columns: 1,
+            output_width: 2,
+            output_height: 2,
+        };
+        // Single Gray8 tile passed in for a 4:2:0 grid — yuv420p
+        // expects 3 planes per tile.
+        let tile = make_gray_tile(2, 2, 50);
+        let err = composite_grid(&grid, &[tile], PixelFormat::Yuv420P, 2, 2).unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)));
+    }
+
+    /// Reject zero output dimensions — neither width nor height may be 0.
+    #[test]
+    fn composite_zero_output_rejected() {
+        let grid = ImageGrid {
+            version: 0,
+            flags: 0,
+            rows: 1,
+            columns: 1,
+            output_width: 0,
+            output_height: 4,
+        };
+        let tile = make_gray_tile(2, 2, 5);
+        assert!(composite_grid(&grid, &[tile], PixelFormat::Gray8, 2, 2).is_err());
+    }
+
+    /// Maximum-size descriptor: rows and columns each at 0xFF (after the
+    /// `+1` they become 256), with tiny tile dimensions so the data
+    /// stays bounded. Confirms the parser doesn't underflow / overflow
+    /// at the edge of `rows_minus_one` / `columns_minus_one`.
+    #[test]
+    fn parse_max_rows_cols() {
+        let buf = [0u8, 0, 0xff, 0xff, 0x00, 0x10, 0x00, 0x10];
+        let g = ImageGrid::parse(&buf).unwrap();
+        assert_eq!(g.rows, 256);
+        assert_eq!(g.columns, 256);
+        assert_eq!(g.expected_tile_count(), 256 * 256);
+        assert_eq!(g.output_width, 16);
+    }
+
+    /// `expected_tile_count` must match `rows * columns`, including the
+    /// trivial 1x1 case.
+    #[test]
+    fn expected_tile_count_basic() {
+        let g = ImageGrid {
+            version: 0,
+            flags: 0,
+            rows: 1,
+            columns: 1,
+            output_width: 2,
+            output_height: 2,
+        };
+        assert_eq!(g.expected_tile_count(), 1);
+        let g = ImageGrid {
+            version: 0,
+            flags: 0,
+            rows: 7,
+            columns: 5,
+            output_width: 70,
+            output_height: 50,
+        };
+        assert_eq!(g.expected_tile_count(), 35);
+    }
+
     #[test]
     fn composite_crops_trailing_tiles() {
         // 2x2 tiles of 2x2 but output is only 3x3 — right column and

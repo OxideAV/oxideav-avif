@@ -21,8 +21,14 @@
 //!     `auxl` + `auxC` URN (see [`alpha`]).
 //!   * `irot` / `imir` / `clap` post-transforms (see [`transform`]).
 //! * AVIS image sequences — sample table walk via [`avis::parse_avis`]
-//!   produces a flat frame-offset list; pair with [`oxideav_av1`] to
-//!   decode frames sequentially.
+//!   produces a flat frame-offset list with `(timescale, display_dims,
+//!   samples)`. [`avis::sample_bytes`] resolves a sample's byte slice
+//!   inside the source file; pair with [`oxideav_av1`] to decode frames
+//!   sequentially.
+//! * `pixi` (HEIF §6.5.6) and `pasp` (HEIF §6.5.4 / ISO/IEC 14496-12
+//!   §8.5.2.1.1) are surfaced through [`AvifInfo`] — see
+//!   [`AvifInfo::num_channels`], [`AvifInfo::max_bit_depth`],
+//!   [`AvifInfo::is_monochrome`] and [`AvifInfo::has_square_pixels`].
 //!
 //! # Encoder
 //!
@@ -40,7 +46,7 @@ pub mod parser;
 pub mod transform;
 
 pub use alpha::{composite_alpha, find_alpha_item_id, ALPHA_URN_PREFIX};
-pub use avis::{parse_avis, sample_table, AvisMeta, Sample};
+pub use avis::{parse_avis, sample_bytes, sample_table, AvisMeta, Sample};
 pub use decoder::{inspect, make_decoder, AvifDecoder, AvifInfo};
 pub use grid::{composite_grid, ImageGrid};
 pub use meta::{

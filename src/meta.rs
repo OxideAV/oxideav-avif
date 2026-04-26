@@ -88,16 +88,70 @@ pub struct Ispe {
 }
 
 /// Pixel information (`pixi`) — per-channel bit depth.
-#[derive(Clone, Debug)]
+///
+/// Spec: HEIF §6.5.6. Carries `num_channels` followed by
+/// `bits_per_channel` for each channel. Common AVIF values:
+///
+///   * monochrome 8-bit: `[8]`
+///   * RGB / Y'CbCr 8-bit: `[8, 8, 8]`
+///   * 10-bit HDR: `[10, 10, 10]`
+///   * 12-bit HDR: `[12, 12, 12]`
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Pixi {
     pub bits_per_channel: Vec<u8>,
 }
 
-/// Pixel aspect ratio (`pasp`).
-#[derive(Clone, Copy, Debug)]
+impl Pixi {
+    /// `num_channels` field — equivalent to `bits_per_channel.len()`.
+    pub fn num_channels(&self) -> usize {
+        self.bits_per_channel.len()
+    }
+
+    /// Maximum bit depth across all channels. Returns 0 when the
+    /// channel list is empty.
+    pub fn max_bit_depth(&self) -> u8 {
+        self.bits_per_channel.iter().copied().max().unwrap_or(0)
+    }
+
+    /// True when every channel reports the same bit depth — the common
+    /// AVIF case. Mixed-depth pixi values are legal per HEIF §6.5.6.3
+    /// but vanishingly rare in the wild.
+    pub fn is_uniform_depth(&self) -> bool {
+        match self.bits_per_channel.first() {
+            None => false,
+            Some(&first) => self.bits_per_channel.iter().all(|&b| b == first),
+        }
+    }
+}
+
+/// Pixel aspect ratio (`pasp`). Spec: ISO/IEC 14496-12 §8.5.2.1.1
+/// (PixelAspectRatioBox), referenced from HEIF §6.5.4. The ratio
+/// `h_spacing / v_spacing` is the *horizontal-to-vertical* sample spacing
+/// of a single pixel in display geometry. A square-pixel image has
+/// `h_spacing == v_spacing` (most commonly `1:1`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Pasp {
     pub h_spacing: u32,
     pub v_spacing: u32,
+}
+
+impl Pasp {
+    /// True when h_spacing equals v_spacing — the canonical square-pixel
+    /// case. A `pasp` declaring `(0, 0)` (meaningless per the spec) is
+    /// reported as non-square so callers don't divide by zero downstream.
+    pub fn is_square(&self) -> bool {
+        self.h_spacing != 0 && self.v_spacing != 0 && self.h_spacing == self.v_spacing
+    }
+
+    /// Pixel aspect ratio as an `f64`. Returns `None` if v_spacing is 0
+    /// (would otherwise divide by zero).
+    pub fn ratio(&self) -> Option<f64> {
+        if self.v_spacing == 0 {
+            None
+        } else {
+            Some(self.h_spacing as f64 / self.v_spacing as f64)
+        }
+    }
 }
 
 /// Colour information (`colr`): NCLX or ICC bytes as-is.
@@ -782,6 +836,98 @@ mod tests {
         assert!(a
             .aux_type
             .starts_with("urn:mpeg:mpegB:cicp:systems:auxiliary:alpha"));
+    }
+
+    #[test]
+    fn pixi_parses_3_channel_8bit() {
+        // FullBox(v=0, f=0) + num_channels=3 + [8,8,8].
+        let mut buf = vec![0u8; 4];
+        buf.push(3);
+        buf.extend_from_slice(&[8, 8, 8]);
+        let pixi = parse_pixi(&buf).unwrap();
+        assert_eq!(pixi.num_channels(), 3);
+        assert_eq!(pixi.bits_per_channel, vec![8, 8, 8]);
+        assert_eq!(pixi.max_bit_depth(), 8);
+        assert!(pixi.is_uniform_depth());
+    }
+
+    #[test]
+    fn pixi_parses_10bit_hdr() {
+        let mut buf = vec![0u8; 4];
+        buf.push(3);
+        buf.extend_from_slice(&[10, 10, 10]);
+        let pixi = parse_pixi(&buf).unwrap();
+        assert_eq!(pixi.max_bit_depth(), 10);
+        assert!(pixi.is_uniform_depth());
+    }
+
+    #[test]
+    fn pixi_handles_mixed_depth() {
+        let mut buf = vec![0u8; 4];
+        buf.push(3);
+        buf.extend_from_slice(&[8, 10, 12]);
+        let pixi = parse_pixi(&buf).unwrap();
+        assert_eq!(pixi.max_bit_depth(), 12);
+        assert!(!pixi.is_uniform_depth());
+    }
+
+    #[test]
+    fn pixi_rejects_truncated_channel_list() {
+        // Declares 4 channels but only ships 2 bytes.
+        let mut buf = vec![0u8; 4];
+        buf.push(4);
+        buf.extend_from_slice(&[8, 8]);
+        assert!(parse_pixi(&buf).is_err());
+    }
+
+    #[test]
+    fn pixi_zero_channels_parses_empty() {
+        // num_channels=0 is degenerate but technically encodable. The
+        // parser should not panic; downstream consumers can detect the
+        // empty list.
+        let mut buf = vec![0u8; 4];
+        buf.push(0);
+        let pixi = parse_pixi(&buf).unwrap();
+        assert_eq!(pixi.num_channels(), 0);
+        assert_eq!(pixi.max_bit_depth(), 0);
+        assert!(!pixi.is_uniform_depth());
+    }
+
+    #[test]
+    fn pasp_parses_square_and_anamorphic() {
+        // 1:1 square pixels.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        let p = parse_pasp(&buf).unwrap();
+        assert!(p.is_square());
+        assert_eq!(p.ratio(), Some(1.0));
+        // 16:11 anamorphic (DV NTSC widescreen).
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&16u32.to_be_bytes());
+        buf.extend_from_slice(&11u32.to_be_bytes());
+        let p = parse_pasp(&buf).unwrap();
+        assert!(!p.is_square());
+        let r = p.ratio().unwrap();
+        assert!((r - 16.0 / 11.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pasp_zero_v_spacing_is_safe() {
+        // (4, 0) is malformed but must not divide-by-zero. ratio=None,
+        // is_square=false.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&4u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        let p = parse_pasp(&buf).unwrap();
+        assert_eq!(p.ratio(), None);
+        assert!(!p.is_square());
+    }
+
+    #[test]
+    fn pasp_rejects_truncated() {
+        let buf = vec![0u8; 4]; // need 8
+        assert!(parse_pasp(&buf).is_err());
     }
 
     #[test]
