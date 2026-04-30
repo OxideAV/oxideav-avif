@@ -27,6 +27,7 @@ still loses significant signal.
 | `ftyp` brand check                     | accepts `avif` / `avis` / `mif1` / `msf1` / `miaf`                                                                                                         |
 | `meta` sub-boxes                       | `hdlr`, `pitm` (v0/v1), `iinf` (v0/v1) + `infe` (v2/v3), `iloc` (v0/v1/v2), `iref`, `iprp` / `ipco` / `ipma` (v0/v1, small + large property indices)       |
 | Item properties                        | `av1C`, `ispe`, `colr` (nclx + ICC), `pixi`, `pasp`, `irot`, `imir`, `clap`, `auxC`; unknown boxes retained as `Property::Other` so indices stay valid      |
+| CICP color signalling                  | `colr` nclx → `CicpTriple` (primaries / transfer / matrix / full_range) with H.273 defaults (`Unspecified` = `2/2/2/false`); ICC + Unknown fall back to Unspecified; alpha auxiliary CICP constant carries `full_range = true` per av1-avif §4.1 |
 | Primary item data                      | resolved via `iloc` construction_method 0 (file offset), single-extent items; multi-extent + idat / item-offset are rejected with `Unsupported`            |
 | Grid primary items (HEIF §6.6.2)       | grid descriptor parse + per-tile decode via `dimg` iref + composite into the declared output rectangle                                                     |
 | Alpha auxiliary                        | `auxl` + `auxC` URN detection, AV1-coded monochrome item decoded, composited onto the color frame (`Gray8 → YA8`, `Yuv → YuvA`)                            |
@@ -67,6 +68,33 @@ still loses significant signal.
 
 See `examples/diag_decode.rs` for a drop-in report of exactly which
 stage each input reaches.
+
+### Round 20 — CICP color path
+
+Per av1-avif §4.2.3.1 ("No color space conversion, matrix coefficients,
+or transfer characteristics function shall be applied to the input
+samples"), AVIF readers do **not** transform decoded pixels. The CICP
+triple is signalling: it tells downstream consumers which colour space
+the samples occupy. The crate now exposes a resolved
+`(primaries, transfer, matrix, full_range)` quadruple via
+`AvifInfo::effective_cicp() -> CicpTriple`:
+
+* `Some(Colr::Nclx { .. })` → fields surfaced verbatim.
+* `Some(Colr::Icc(_))` → ICC bytes are authoritative; CICP folds to
+  the spec-mandated `Unspecified (2, 2, 2, false)`.
+* `None` (no `colr` property) → `Unspecified (2, 2, 2, false)`.
+
+`CicpTriple` ships predicates for the common decision points
+(`is_unspecified`, `is_identity_matrix` for matrix=0 RGB AVIFs,
+`is_libavif_srgb_default` for the `(1, 13, 6)` libavif default,
+`has_reserved` flagging any axis in an ITU-T H.273 reserved range)
+plus three name lookup helpers (`primaries_name`, `transfer_name`,
+`matrix_name`) covering BT.709, BT.2020, Display P3, sRGB, PQ, HLG,
+identity matrix, BT.601, BT.2020 NCL, ICtCp.
+
+For alpha auxiliary items, av1-avif §4.1 mandates `color_range = 1`
+and instructs readers to ignore any attached `colr`. The crate
+exposes that as `CicpTriple::ALPHA` / `CicpTriple::for_alpha()`.
 
 ## Installation
 

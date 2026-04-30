@@ -39,6 +39,7 @@
 pub mod alpha;
 pub mod avis;
 pub mod box_parser;
+pub mod cicp;
 pub mod decoder;
 pub mod grid;
 pub mod meta;
@@ -47,6 +48,10 @@ pub mod transform;
 
 pub use alpha::{composite_alpha, find_alpha_item_id, ALPHA_URN_PREFIX};
 pub use avis::{parse_avis, sample_bytes, sample_table, AvisMeta, Sample};
+pub use cicp::{
+    effective_cicp, is_matrix_reserved, is_primaries_reserved, is_transfer_reserved, matrix_name,
+    primaries_name, transfer_name, CicpTriple,
+};
 pub use decoder::{inspect, make_decoder, AvifDecoder, AvifInfo};
 pub use grid::{composite_grid, ImageGrid};
 pub use meta::{

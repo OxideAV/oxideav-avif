@@ -1448,3 +1448,380 @@ fn clap_with_zero_denominator_is_passthrough() {
     assert_eq!(h, 64, "no-op clap preserves height");
     assert_eq!(out.planes[0].data, vf.planes[0].data, "Y unchanged");
 }
+
+// ---------------------------------------------------------------------
+// CICP color path — av1-avif §2.1, §4.1, §4.2.3.1; ITU-T H.273 §8.
+//
+// AVIF readers do NOT apply colour transforms to decoded samples. The
+// CICP triple is signalling: it tells downstream consumers the colour
+// space they're seeing. The decoder's job is to surface the resolved
+// quadruple `(primaries, transfer, matrix, full_range)` with proper
+// defaults applied per the spec.
+// ---------------------------------------------------------------------
+
+/// `AvifInfo::effective_cicp` returns a sane CICP triple for fixtures
+/// that ship a `colr` box. `kimono_rotate90` declares BT.709 primaries
+/// (1) + sRGB transfer (13). The matrix is encoder-dependent — Link-U's
+/// build chose BT.2020 NCL (9), libavif picks BT.601 (6) for 4:2:0 SDR.
+/// We assert the parsed value is in the spec-defined range and not a
+/// reserved code point; the round-trip is what the path validates.
+#[test]
+fn effective_cicp_surfaces_libavif_srgb_default() {
+    use oxideav_avif::CicpTriple;
+    let info = inspect(KIMONO_ROT90).expect("inspect kimono");
+    let cicp = info.effective_cicp();
+    assert_eq!(
+        cicp.colour_primaries, 1,
+        "kimono primaries: expected BT.709 (1)"
+    );
+    assert_eq!(
+        cicp.transfer_characteristics, 13,
+        "kimono transfer: expected sRGB (13)"
+    );
+    // Matrix is encoder-dependent — assert it's a known H.273 value
+    // and not in the reserved range.
+    assert!(
+        oxideav_avif::matrix_name(cicp.matrix_coefficients).is_some(),
+        "kimono matrix should be a defined H.273 code point, got {}",
+        cicp.matrix_coefficients
+    );
+    assert!(!oxideav_avif::is_matrix_reserved(cicp.matrix_coefficients));
+    assert!(!cicp.is_unspecified());
+    assert!(!cicp.has_reserved());
+    assert!(!cicp.is_identity_matrix());
+    let _ = CicpTriple::UNSPECIFIED; // keep the import live
+}
+
+/// Fixtures that omit the `colr` box (the older AOM/Microsoft / Netflix
+/// conformance files) must surface the spec-mandated `Unspecified`
+/// quadruple `(2, 2, 2, false)`. ITU-T H.273 §8.1.1.
+#[test]
+fn effective_cicp_falls_back_to_unspecified_when_colr_missing() {
+    let info = inspect(MONO).expect("inspect mono");
+    assert!(info.colour.is_none(), "monochrome.avif has no colr");
+    let cicp = info.effective_cicp();
+    assert!(
+        cicp.is_unspecified(),
+        "no colr → all axes Unspecified, got {cicp:?}"
+    );
+    assert_eq!(cicp.colour_primaries, 2);
+    assert_eq!(cicp.transfer_characteristics, 2);
+    assert_eq!(cicp.matrix_coefficients, 2);
+    assert!(!cicp.full_range);
+}
+
+/// `red64.avif` is libavif lossless 4:4:4 — the canonical AVIF
+/// Advanced Profile (MA1A) shape that uses the **identity matrix**
+/// (`matrix_coefficients == 0`) so the AV1 stream stores RGB samples
+/// directly. The CICP path must surface that.
+#[test]
+fn effective_cicp_red64_identity_matrix_signals_rgb() {
+    let info = inspect(RED64).expect("inspect red64");
+    let cicp = info.effective_cicp();
+    // libavif lossless 4:4:4 emits identity (0) matrix + sRGB transfer
+    // (13) + BT.709 primaries (1).
+    assert_eq!(
+        cicp.matrix_coefficients, 0,
+        "red64 should use identity matrix, got {}",
+        cicp.matrix_coefficients
+    );
+    assert!(
+        cicp.is_identity_matrix(),
+        "red64 lossless 4:4:4 must flag identity matrix"
+    );
+    assert!(
+        info.brands.is_advanced_profile,
+        "red64 self-declares MA1A; identity matrix is its signature"
+    );
+}
+
+/// CICP code-point names cover the major HDR / SDR / wide-gamut
+/// triples we expect to encounter in the wild — spot check sRGB, PQ,
+/// HLG, BT.709, BT.2020.
+#[test]
+fn cicp_code_point_names_cover_known_triples() {
+    use oxideav_avif::{matrix_name, primaries_name, transfer_name};
+    // Primaries
+    assert_eq!(primaries_name(1), Some("BT.709"));
+    assert_eq!(primaries_name(9), Some("BT.2020 / BT.2100"));
+    assert_eq!(primaries_name(12), Some("SMPTE EG 432-1 (Display P3)"));
+    // Transfer
+    assert_eq!(transfer_name(13), Some("sRGB / IEC 61966-2-1"));
+    assert_eq!(transfer_name(16), Some("SMPTE ST 2084 (PQ)"));
+    assert_eq!(transfer_name(18), Some("ARIB STD-B67 (HLG)"));
+    // Matrix
+    assert_eq!(matrix_name(0), Some("Identity (RGB / YCgCo)"));
+    assert_eq!(matrix_name(9), Some("BT.2020 NCL"));
+}
+
+/// Synthetic AVIF with a custom `colr` nclx triple — confirms the
+/// container parser surfaces the CICP fields verbatim and that
+/// `effective_cicp` propagates them through the [`AvifInfo`] surface.
+/// We test three real-world combinations: BT.2020 / PQ / BT.2020 NCL
+/// (HDR10), Display P3 / sRGB / Identity (Apple-style RGB AVIF), and
+/// reserved code points (which must round-trip and be flagged via
+/// `has_reserved`).
+#[test]
+fn synthetic_cicp_triples_round_trip_through_inspect() {
+    type CicpCase = (&'static str, u16, u16, u16, bool);
+    let cases: &[CicpCase] = &[
+        // (label, primaries, transfer, matrix, full_range)
+        ("HDR10 (BT.2020 / PQ / BT.2020 NCL)", 9, 16, 9, true),
+        ("HLG (BT.2020 / HLG / BT.2020 NCL)", 9, 18, 9, true),
+        ("Display P3 RGB lossless", 12, 13, 0, true),
+        ("Reserved primaries", 3, 13, 6, false),
+        ("Reserved transfer", 1, 19, 6, false),
+        ("Reserved matrix", 1, 13, 15, false),
+    ];
+    for &(label, p, t, m, fr) in cases {
+        let bytes = build_synthetic_av01_with_colr(p, t, m, fr);
+        let info = inspect(&bytes).unwrap_or_else(|e| panic!("{label}: inspect: {e}"));
+        let cicp = info.effective_cicp();
+        assert_eq!(cicp.colour_primaries, p, "{label}: primaries");
+        assert_eq!(cicp.transfer_characteristics, t, "{label}: transfer");
+        assert_eq!(cicp.matrix_coefficients, m, "{label}: matrix");
+        assert_eq!(cicp.full_range, fr, "{label}: full_range");
+        // Reserved-triple cases must flag has_reserved; non-reserved
+        // ones must not.
+        let any_reserved = oxideav_avif::is_primaries_reserved(p)
+            || oxideav_avif::is_transfer_reserved(t)
+            || oxideav_avif::is_matrix_reserved(m);
+        assert_eq!(
+            cicp.has_reserved(),
+            any_reserved,
+            "{label}: has_reserved should match union of axis predicates"
+        );
+        // Identity matrix flagged for matrix=0.
+        assert_eq!(
+            cicp.is_identity_matrix(),
+            m == 0,
+            "{label}: identity-matrix flag"
+        );
+    }
+}
+
+/// CICP defaults for an alpha auxiliary item: per av1-avif §4.1, alpha
+/// AV1 streams shall encode `color_range = 1` (full range) and any
+/// `colr` shall be ignored. The crate's [`CicpTriple::ALPHA`] /
+/// [`CicpTriple::for_alpha`] reflects that.
+#[test]
+fn alpha_cicp_constant_carries_full_range_unspecified() {
+    use oxideav_avif::CicpTriple;
+    let alpha = CicpTriple::for_alpha();
+    assert_eq!(alpha, CicpTriple::ALPHA);
+    assert!(alpha.full_range, "alpha auxiliary must declare full range");
+    assert!(
+        alpha.is_unspecified(),
+        "alpha primaries/transfer/matrix should be Unspecified, got {alpha:?}"
+    );
+}
+
+/// `effective_cicp` for a grid primary item: the CICP triple should
+/// surface from a `colr` attached to the grid item itself (HEIF
+/// §6.5.5 — colour info should be on the master / output, with tile
+/// colour identical). The `bbb_alpha` fixture is not a grid; the
+/// `kimono_rotate90` is a single-item av01. We exercise this with the
+/// real fixtures already in the suite — `inspect()` consults the
+/// primary item's colr first, which covers both single-item and grid
+/// (since `build_info_grid` mirrors the same lookup).
+///
+/// This is a positive smoke test: every fixture that reports a colr
+/// must produce a non-Unspecified `effective_cicp`, and every fixture
+/// without one must produce Unspecified. Acts as a regression guard
+/// against a future refactor that drops the colr → CicpTriple wiring.
+#[test]
+fn effective_cicp_consistent_with_colour_field() {
+    type CicpCase = (&'static str, &'static [u8]);
+    let cases: &[CicpCase] = &[
+        ("monochrome", MONO),
+        ("kimono_rotate90", KIMONO_ROT90),
+        ("red64", RED64),
+        ("gray32", GRAY32),
+        ("midgray64", MIDGRAY64),
+        ("white16", WHITE16),
+        ("black32_420", BLACK32_420),
+    ];
+    for (name, bytes) in cases {
+        let info = inspect(bytes).unwrap_or_else(|e| panic!("{name}: inspect: {e}"));
+        let cicp = info.effective_cicp();
+        match info.colour.as_ref() {
+            Some(oxideav_avif::Colr::Nclx { .. }) => assert!(
+                !cicp.is_unspecified() || cicp.full_range,
+                "{name}: nclx colr must produce non-default CICP, got {cicp:?}"
+            ),
+            Some(_) => assert!(
+                cicp.is_unspecified(),
+                "{name}: ICC/Unknown colr should fall back to Unspecified"
+            ),
+            None => assert!(
+                cicp.is_unspecified(),
+                "{name}: missing colr should yield Unspecified, got {cicp:?}"
+            ),
+        }
+    }
+}
+
+/// Build a minimal AVIF container with a single av01 primary item
+/// carrying a custom `colr` nclx CICP triple. The OBU payload is a
+/// placeholder — `inspect()` does not run AV1 decode, only the meta
+/// walk + property surface — so the synthetic file is a pure
+/// container-side fixture.
+fn build_synthetic_av01_with_colr(
+    primaries: u16,
+    transfer: u16,
+    matrix: u16,
+    full_range: bool,
+) -> Vec<u8> {
+    fn u32be(v: u32) -> [u8; 4] {
+        v.to_be_bytes()
+    }
+    fn u16be(v: u16) -> [u8; 2] {
+        v.to_be_bytes()
+    }
+    fn box_bytes(btype: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let size = (8 + body.len()) as u32;
+        let mut out = size.to_be_bytes().to_vec();
+        out.extend_from_slice(btype);
+        out.extend_from_slice(body);
+        out
+    }
+    fn full_box(btype: &[u8; 4], version: u8, flags: u32, body: &[u8]) -> Vec<u8> {
+        let mut payload = vec![
+            version,
+            (flags >> 16) as u8,
+            (flags >> 8) as u8,
+            flags as u8,
+        ];
+        payload.extend_from_slice(body);
+        box_bytes(btype, &payload)
+    }
+    fn infe_v2(id: u16, item_type: &[u8; 4]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&id.to_be_bytes());
+        body.extend_from_slice(&[0u8, 0]); // protection_index
+        body.extend_from_slice(item_type);
+        body.push(0); // name null terminator
+        full_box(b"infe", 2, 0, &body)
+    }
+
+    // ---- ftyp ----
+    let mut ftyp_body = Vec::new();
+    ftyp_body.extend_from_slice(b"avif");
+    ftyp_body.extend_from_slice(&u32be(0));
+    ftyp_body.extend_from_slice(b"mif1");
+    ftyp_body.extend_from_slice(b"miaf");
+    let ftyp = box_bytes(b"ftyp", &ftyp_body);
+
+    // ---- hdlr ----
+    let mut hdlr_body = Vec::new();
+    hdlr_body.extend_from_slice(&[0u8; 4]); // pre_defined
+    hdlr_body.extend_from_slice(b"pict");
+    hdlr_body.extend_from_slice(&[0u8; 12]); // reserved
+    hdlr_body.extend_from_slice(b"\0"); // empty name
+    let hdlr = full_box(b"hdlr", 0, 0, &hdlr_body);
+
+    // ---- pitm ----
+    let pitm = full_box(b"pitm", 0, 0, &u16be(1));
+
+    // ---- iinf with one av01 item ----
+    let infe1 = infe_v2(1, b"av01");
+    let mut iinf_body = Vec::new();
+    iinf_body.extend_from_slice(&u16be(1));
+    iinf_body.extend_from_slice(&infe1);
+    let iinf = full_box(b"iinf", 0, 0, &iinf_body);
+
+    // ---- placeholder OBU bytes (8 bytes, won't decode but inspect() doesn't care) ----
+    let obu_data = vec![0xAAu8; 8];
+
+    // ---- ispe property ----
+    let mut ispe_body = Vec::new();
+    ispe_body.extend_from_slice(&u32be(8));
+    ispe_body.extend_from_slice(&u32be(8));
+    let ispe = full_box(b"ispe", 0, 0, &ispe_body);
+
+    // ---- av1C: minimal 4-byte body — marker 0x81 + zeros ----
+    let av1c_body = vec![0x81u8, 0, 0, 0];
+    let av1c = box_bytes(b"av1C", &av1c_body);
+
+    // ---- pixi (one channel, 8-bit) ----
+    let mut pixi_body = vec![0u8; 4]; // FullBox header
+    pixi_body.push(1);
+    pixi_body.push(8);
+    let pixi = box_bytes(b"pixi", &pixi_body);
+
+    // ---- colr nclx with the requested CICP triple ----
+    let colr = {
+        let mut body = Vec::new();
+        body.extend_from_slice(b"nclx");
+        body.extend_from_slice(&primaries.to_be_bytes());
+        body.extend_from_slice(&transfer.to_be_bytes());
+        body.extend_from_slice(&matrix.to_be_bytes());
+        body.push(if full_range { 0x80 } else { 0x00 });
+        box_bytes(b"colr", &body)
+    };
+
+    // ipco: ispe(1) + av1C(2) + pixi(3) + colr(4)
+    let mut ipco_body = Vec::new();
+    ipco_body.extend_from_slice(&ispe);
+    ipco_body.extend_from_slice(&av1c);
+    ipco_body.extend_from_slice(&pixi);
+    ipco_body.extend_from_slice(&colr);
+    let ipco = box_bytes(b"ipco", &ipco_body);
+
+    // ipma: item 1 -> [1, 2, 3, 4]
+    let mut ipma_body = Vec::new();
+    ipma_body.extend_from_slice(&u32be(1)); // entry_count
+    ipma_body.extend_from_slice(&1u16.to_be_bytes());
+    ipma_body.push(4); // assoc_count
+    ipma_body.push(1 & 0x7f);
+    ipma_body.push(2 & 0x7f);
+    ipma_body.push(3 & 0x7f);
+    ipma_body.push(4 & 0x7f);
+    let ipma = full_box(b"ipma", 0, 0, &ipma_body);
+
+    let mut iprp_body = Vec::new();
+    iprp_body.extend_from_slice(&ipco);
+    iprp_body.extend_from_slice(&ipma);
+    let iprp = box_bytes(b"iprp", &iprp_body);
+
+    // ---- compute mdat layout ----
+    // iloc v0 single-item: 14 bytes/item (id+data_ref+ext_count+offset+length)
+    let iloc_size = 8 + 4 + 1 + 1 + 2 + 14;
+    let ftyp_size = ftyp.len();
+    let meta_payload_size = 4 + hdlr.len() + pitm.len() + iinf.len() + iprp.len() + iloc_size;
+    let meta_size = 8 + meta_payload_size;
+    let mdat_payload_start = ftyp_size + meta_size + 8;
+    let item_off = mdat_payload_start;
+
+    // Build iloc.
+    let mut iloc_inner = Vec::new();
+    iloc_inner.push(0x44); // offset_size=4, length_size=4
+    iloc_inner.push(0x00); // base_offset_size=0, index_size=0
+    iloc_inner.extend_from_slice(&u16be(1)); // item_count
+    iloc_inner.extend_from_slice(&u16be(1)); // id
+    iloc_inner.extend_from_slice(&u16be(0)); // data_ref_idx
+    iloc_inner.extend_from_slice(&u16be(1)); // extent_count
+    iloc_inner.extend_from_slice(&u32be(item_off as u32));
+    iloc_inner.extend_from_slice(&u32be(obu_data.len() as u32));
+    let iloc = full_box(b"iloc", 0, 0, &iloc_inner);
+
+    // Assemble meta.
+    let mut meta_body = Vec::new();
+    meta_body.extend_from_slice(&[0u8; 4]); // fullbox header
+    meta_body.extend_from_slice(&hdlr);
+    meta_body.extend_from_slice(&pitm);
+    meta_body.extend_from_slice(&iinf);
+    meta_body.extend_from_slice(&iprp);
+    meta_body.extend_from_slice(&iloc);
+    let meta = box_bytes(b"meta", &meta_body);
+    assert_eq!(meta.len(), meta_size, "meta size recalc");
+
+    // mdat
+    let mdat = box_bytes(b"mdat", &obu_data);
+
+    let mut file = Vec::new();
+    file.extend_from_slice(&ftyp);
+    file.extend_from_slice(&meta);
+    file.extend_from_slice(&mdat);
+    file
+}

@@ -15,6 +15,7 @@ use oxideav_av1::{Av1CodecConfig, Av1Decoder};
 
 use crate::alpha::{composite_alpha, find_alpha_item_id};
 use crate::box_parser::{b, BoxType};
+use crate::cicp::{effective_cicp, CicpTriple};
 use crate::grid::{composite_grid, ImageGrid};
 use crate::meta::{Colr, Ispe, ItemLocation, Meta, Pasp, Pixi, Property};
 use crate::parser::parse;
@@ -137,6 +138,25 @@ impl AvifInfo {
             None => true,
             Some(p) => p.is_square(),
         }
+    }
+
+    /// Resolve the effective CICP signalling quadruple for the primary
+    /// item: parse the `colr` nclx triple if present, fold to the
+    /// spec-mandated `Unspecified` quadruple `(2, 2, 2, false)`
+    /// otherwise. Spec: av1-avif §2.1, ITU-T H.273 §8.
+    ///
+    /// Per av1-avif §4.2.3.1 AVIF readers do not apply colour
+    /// transforms to the decoded pixels — the CICP triple is purely
+    /// signalling. Use this to drive a downstream colour-managed
+    /// renderer or transcoder; do NOT use it as a license to insert
+    /// matrix / transfer adjustments into the decoded sample buffer.
+    ///
+    /// When the primary item carries an embedded ICC profile
+    /// ([`Colr::Icc`]) the triple folds to `Unspecified` — the ICC
+    /// profile is the authoritative colour description in that case
+    /// and the caller should consult `info.colour` for its bytes.
+    pub fn effective_cicp(&self) -> CicpTriple {
+        effective_cicp(self.colour.as_ref())
     }
 }
 
