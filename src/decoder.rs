@@ -234,16 +234,36 @@ fn build_info_grid(hdr: &AvifHeader<'_>, primary_id: u32, brands: BrandClass) ->
             ))
         }
     };
-    let bits_per_channel = match hdr.meta.property_for(first_tile_id, b"pixi") {
+    // HEIF §6.5.6 (`pixi`) and §6.5.4 (`pasp`) are descriptive
+    // properties that describe the **reconstructed** image — for a
+    // grid that's the assembled canvas, not any individual tile. The
+    // spec lets the writer attach them either to the grid item
+    // (canonical) or rely on the tile-0 association (the per-tile
+    // values are required to be uniform across tiles, so tile 0 is
+    // representative). We probe the grid item first and fall back to
+    // tile 0 — same fallback shape as `colr` below.
+    let bits_per_channel = match hdr.meta.property_for(primary_id, b"pixi") {
         Some(Property::Pixi(pixi)) => pixi.bits_per_channel.clone(),
-        _ => Vec::new(),
+        _ => match hdr.meta.property_for(first_tile_id, b"pixi") {
+            Some(Property::Pixi(pixi)) => pixi.bits_per_channel.clone(),
+            _ => Vec::new(),
+        },
     };
     let pasp = match hdr.meta.property_for(primary_id, b"pasp") {
         Some(Property::Pasp(p)) => Some(*p),
-        _ => None,
+        _ => match hdr.meta.property_for(first_tile_id, b"pasp") {
+            Some(Property::Pasp(p)) => Some(*p),
+            _ => None,
+        },
     };
-    // Per HEIF: a `colr` may be attached to the grid item or to its
-    // tiles. Prefer the grid-level association; fall back to tile 0.
+    // Per av1-avif §4.2.1 / HEIF §6.5.5: a `colr` describing a grid
+    // derived image item may be attached to the grid item itself
+    // (canonical placement — describes the reconstructed canvas) or,
+    // when the writer omitted it on the grid, inherited from tile 0.
+    // The av1-avif input-image-items uniformity rule
+    // (§4.2.3.1 — same color information across all inputs) applies
+    // to derived items broadly, so picking tile 0 when the grid lacks
+    // its own `colr` reproduces the writer's intent.
     let colour = match hdr.meta.property_for(primary_id, &COLR) {
         Some(Property::Colr(c)) => Some(c.clone()),
         _ => match hdr.meta.property_for(first_tile_id, &COLR) {

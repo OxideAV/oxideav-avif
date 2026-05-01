@@ -182,10 +182,43 @@ pub fn composite_grid(
             let (ppw_dst, _pph_dst) = plane_dims(out_w, out_h, p, sx, sy);
             let plane_shift_x = if p == 0 { 0 } else { sx };
             let plane_shift_y = if p == 0 { 0 } else { sy };
+            // dst_x / dst_y are luma coordinates; chroma offsets are the
+            // shift-divided values. tile_w / tile_h are even for any
+            // 4:2:x / 4:2:0 AV1 tile (AV1 §5.6.1 requires even coded
+            // dimensions for subsampled chroma), so dst_x >> sx and
+            // dst_y >> sy are exact whole chroma columns / rows.
             let plane_dst_x = dst_x >> plane_shift_x;
             let plane_dst_y = dst_y >> plane_shift_y;
-            let plane_copy_w = (copy_w >> plane_shift_x).max(1);
-            let plane_copy_h = (copy_h >> plane_shift_y).max(1);
+            // Chroma copy extents use **ceiling** division of the luma
+            // copy extents — when the right-most or bottom-most tile is
+            // trimmed to an odd luma count (HEIF §6.6.2.3.3 allows the
+            // last column / row to be partial), a plain `>> 1` would
+            // drop the trailing chroma sample. Example: 4:2:0 grid with
+            // tile_w=4 + output_w=7. tile 1 contributes copy_w=3 luma
+            // cols, which cover 2 chroma cols (cols 2 and 3), not 1.
+            // The `.max(1)` floor remains for the degenerate copy_w=0
+            // case (filtered out earlier by the `dst_x >= out_w`
+            // guard, but kept for defence in depth).
+            let plane_copy_w = ceil_shift(copy_w, plane_shift_x).max(1);
+            let plane_copy_h = ceil_shift(copy_h, plane_shift_y).max(1);
+            // Also clamp the chroma copy to the source tile's chroma
+            // plane width / height — when the tile happens to have
+            // fewer chroma samples than the luma-derived ceiling
+            // suggests (e.g. an encoder that rounded down), copying past
+            // the source row boundary would smear later luma data into
+            // chroma. ppw_src / chroma rows of source are the upper
+            // bound.
+            let src_chroma_h = (src.data.len() / src.stride.max(1)) as u32;
+            let plane_copy_w = plane_copy_w.min(ppw_src);
+            let plane_copy_h = plane_copy_h.min(src_chroma_h);
+            // And clamp again to the destination plane's available
+            // columns / rows so a tile that spills past the canvas
+            // edge silently truncates rather than walking off the
+            // buffer.
+            let plane_copy_w = plane_copy_w.min(ppw_dst.saturating_sub(plane_dst_x));
+            let plane_copy_h = plane_copy_h.min(
+                (dst.data.len() as u32 / dst.stride.max(1) as u32).saturating_sub(plane_dst_y),
+            );
             for row_i in 0..plane_copy_h as usize {
                 let dst_row_start =
                     (plane_dst_y as usize + row_i) * dst.stride + plane_dst_x as usize;
@@ -226,6 +259,21 @@ fn plane_dims(w: u32, h: u32, plane: usize, sx: u32, sy: u32) -> (u32, u32) {
         let pw = (w + (1 << sx) - 1) >> sx;
         let ph = (h + (1 << sy) - 1) >> sy;
         (pw.max(1), ph.max(1))
+    }
+}
+
+/// Ceiling shift — `ceil(v / 2^shift)`. Used to map a luma extent to
+/// the chroma extent that fully covers it. The reverse of the floor
+/// shift used to derive chroma plane *positions* (chroma-plane offsets
+/// always use plain `>>` because tile-edge alignment guarantees luma
+/// coordinates land on even chroma boundaries — see
+/// [`composite_grid`]).
+fn ceil_shift(v: u32, shift: u32) -> u32 {
+    if shift == 0 {
+        v
+    } else {
+        let unit = 1u32 << shift;
+        (v + unit - 1) >> shift
     }
 }
 
@@ -605,5 +653,280 @@ mod tests {
         // Bottom-left tile contributes only a 1-pixel row.
         assert_eq!(out.planes[0].data[6], 30);
         assert_eq!(out.planes[0].data[7], 30);
+    }
+
+    /// Build a 4:2:0 tile of luma `tile_w × tile_h` plus its (tile_w/2 ×
+    /// tile_h/2) chroma planes, every plane filled with the given fill
+    /// values. Used by the round-21 chroma-edge tests.
+    fn make_yuv420_tile(tile_w: u32, tile_h: u32, y: u8, u: u8, v: u8) -> VideoFrame {
+        let lw = tile_w as usize;
+        let lh = tile_h as usize;
+        let cw = (tile_w / 2) as usize;
+        let ch = (tile_h / 2) as usize;
+        VideoFrame {
+            pts: None,
+            planes: vec![
+                VideoPlane {
+                    stride: lw,
+                    data: vec![y; lw * lh],
+                },
+                VideoPlane {
+                    stride: cw,
+                    data: vec![u; cw * ch],
+                },
+                VideoPlane {
+                    stride: cw,
+                    data: vec![v; cw * ch],
+                },
+            ],
+        }
+    }
+
+    /// Round 21: chroma-edge sample handling for a 4:2:0 grid whose
+    /// output_width is odd. With `tile_w = 4`, `output_w = 7` the
+    /// right-most tile contributes 3 luma columns. A naive `copy_w >> 1`
+    /// gives 1 chroma column — which loses the trailing chroma sample
+    /// even though the chroma plane is 4 samples wide
+    /// (`(7 + 1) / 2 = 4`). The fix uses `ceil(copy_w / 2)` so the
+    /// right edge contributes 2 chroma cols, fully filling the canvas
+    /// chroma plane.
+    #[test]
+    fn composite_yuv420_odd_width_copies_full_chroma_edge() {
+        let grid = ImageGrid {
+            version: 0,
+            flags: 0,
+            rows: 1,
+            columns: 2,
+            output_width: 7,
+            output_height: 4,
+        };
+        let tiles = [
+            make_yuv420_tile(4, 4, 10, 100, 200),
+            make_yuv420_tile(4, 4, 20, 110, 210),
+        ];
+        let out = composite_grid(&grid, &tiles, PixelFormat::Yuv420P, 4, 4).unwrap();
+        // Y plane: 7×4. Tile 0 fills cols 0..=3, tile 1 fills cols 4..=6.
+        let y = &out.planes[0];
+        assert_eq!(y.stride, 7);
+        assert_eq!(y.data.len(), 28);
+        for row in 0..4 {
+            assert_eq!(&y.data[row * 7..row * 7 + 4], &[10, 10, 10, 10]);
+            assert_eq!(&y.data[row * 7 + 4..row * 7 + 7], &[20, 20, 20]);
+        }
+        // U plane: ceil(7/2)=4 cols × ceil(4/2)=2 rows.
+        let u = &out.planes[1];
+        assert_eq!(u.stride, 4);
+        assert_eq!(u.data.len(), 8);
+        // Tile 0 covers chroma cols 0..=1 (2 cols, full tile chroma);
+        // tile 1 covers chroma cols 2..=3 (2 cols — ceil(3/2)=2).
+        // Without the ceil-shift fix the right two cols would still be 0.
+        for row in 0..2 {
+            assert_eq!(
+                &u.data[row * 4..row * 4 + 4],
+                &[100, 100, 110, 110],
+                "row {row} chroma U trailing samples lost — chroma off-by-one at tile edge"
+            );
+        }
+        let v = &out.planes[2];
+        for row in 0..2 {
+            assert_eq!(&v.data[row * 4..row * 4 + 4], &[200, 200, 210, 210]);
+        }
+    }
+
+    /// Round 21: same off-by-one risk on the **bottom** edge. 1-column
+    /// 2-row grid of 4×4 4:2:0 tiles, output_height = 7 (odd). Bottom
+    /// tile contributes 3 luma rows; ceil(3/2) = 2 chroma rows. Without
+    /// the ceil-shift fix only 1 chroma row would be copied, leaving
+    /// the canvas chroma row 3 blank.
+    #[test]
+    fn composite_yuv420_odd_height_copies_full_chroma_edge() {
+        let grid = ImageGrid {
+            version: 0,
+            flags: 0,
+            rows: 2,
+            columns: 1,
+            output_width: 4,
+            output_height: 7,
+        };
+        let tiles = [
+            make_yuv420_tile(4, 4, 10, 100, 200),
+            make_yuv420_tile(4, 4, 20, 110, 210),
+        ];
+        let out = composite_grid(&grid, &tiles, PixelFormat::Yuv420P, 4, 4).unwrap();
+        // U plane: 2 cols × ceil(7/2)=4 rows.
+        let u = &out.planes[1];
+        assert_eq!(u.stride, 2);
+        assert_eq!(u.data.len(), 8);
+        // Rows 0-1 hold tile 0 chroma (100), rows 2-3 hold tile 1 (110).
+        assert_eq!(&u.data[0..2], &[100, 100]);
+        assert_eq!(&u.data[2..4], &[100, 100]);
+        assert_eq!(&u.data[4..6], &[110, 110]);
+        assert_eq!(
+            &u.data[6..8],
+            &[110, 110],
+            "bottom-most chroma row lost — chroma off-by-one at vertical tile edge"
+        );
+    }
+
+    /// Round 21: a grid with odd output **on both axes** simultaneously
+    /// — 2×2 tiles of 4×4, output 7×7. Verifies the corner tile (bottom
+    /// right) is trimmed to 3×3 luma + 2×2 chroma without dropping
+    /// either the trailing column or the trailing row.
+    #[test]
+    fn composite_yuv420_odd_both_axes_trims_corner_tile() {
+        let grid = ImageGrid {
+            version: 0,
+            flags: 0,
+            rows: 2,
+            columns: 2,
+            output_width: 7,
+            output_height: 7,
+        };
+        let tiles = [
+            make_yuv420_tile(4, 4, 10, 100, 200),
+            make_yuv420_tile(4, 4, 20, 110, 210),
+            make_yuv420_tile(4, 4, 30, 120, 220),
+            make_yuv420_tile(4, 4, 40, 130, 230),
+        ];
+        let out = composite_grid(&grid, &tiles, PixelFormat::Yuv420P, 4, 4).unwrap();
+        let u = &out.planes[1];
+        // U plane geometry: 4×4.
+        assert_eq!(u.stride, 4);
+        assert_eq!(u.data.len(), 16);
+        // Row layout: tile 0 (chroma 2×2) at top-left, tile 1 right,
+        // tile 2 below tile 0, tile 3 bottom-right (trimmed to 2×2 chroma
+        // — same as a full tile because (3+1)/2 == 2).
+        // Rows 0-1: [100,100,110,110] (tiles 0, 1).
+        for row in 0..2 {
+            assert_eq!(
+                &u.data[row * 4..row * 4 + 4],
+                &[100, 100, 110, 110],
+                "top half of chroma U canvas wrong on row {row}"
+            );
+        }
+        // Rows 2-3: [120,120,130,130] (tiles 2, 3) — bottom-right corner
+        // must contribute its full chroma tile (chroma extents 2×2).
+        for row in 2..4 {
+            assert_eq!(
+                &u.data[row * 4..row * 4 + 4],
+                &[120, 120, 130, 130],
+                "bottom half of chroma U canvas wrong on row {row}"
+            );
+        }
+    }
+
+    /// Round 21: 4:2:2 chroma subsampling — horizontal-only chroma
+    /// halving. An output_w of 5 with tile_w=4 means tile 1 contributes
+    /// 1 luma column; ceil(1/2) = 1 chroma column. Vertical chroma is
+    /// not subsampled, so a 4:2:2 tile contributes its full row count.
+    #[test]
+    fn composite_yuv422_odd_width_chroma_edge() {
+        let grid = ImageGrid {
+            version: 0,
+            flags: 0,
+            rows: 1,
+            columns: 2,
+            output_width: 5,
+            output_height: 4,
+        };
+        // 4:2:2 tile: Y(4×4), U(2×4), V(2×4).
+        let make_422 = |y, u, v| VideoFrame {
+            pts: None,
+            planes: vec![
+                VideoPlane {
+                    stride: 4,
+                    data: vec![y; 16],
+                },
+                VideoPlane {
+                    stride: 2,
+                    data: vec![u; 8],
+                },
+                VideoPlane {
+                    stride: 2,
+                    data: vec![v; 8],
+                },
+            ],
+        };
+        let tiles = [make_422(10, 100, 200), make_422(20, 110, 210)];
+        let out = composite_grid(&grid, &tiles, PixelFormat::Yuv422P, 4, 4).unwrap();
+        let u = &out.planes[1];
+        // Chroma plane: ceil(5/2)=3 cols × 4 rows.
+        assert_eq!(u.stride, 3);
+        assert_eq!(u.data.len(), 12);
+        for row in 0..4 {
+            assert_eq!(
+                &u.data[row * 3..row * 3 + 3],
+                &[100, 100, 110],
+                "4:2:2 trailing chroma column lost on row {row}"
+            );
+        }
+    }
+
+    /// Round 21: clamp regression — when a tile happens to ship an
+    /// undersized chroma plane (an encoder that rounded down rather
+    /// than up), the composite must not walk off the source buffer.
+    /// This reproduces the corner case: 4:2:0 tile with a 1-row chroma
+    /// plane being asked to fill a 2-row chroma destination region.
+    /// Expected behaviour: copy the available source row(s); leave the
+    /// rest of the destination untouched (zero).
+    #[test]
+    fn composite_yuv420_undersized_source_chroma_safely_clamps() {
+        let grid = ImageGrid {
+            version: 0,
+            flags: 0,
+            rows: 1,
+            columns: 1,
+            output_width: 4,
+            output_height: 4,
+        };
+        // Tile says 4×4 luma but its chroma plane only ships 1 row × 2
+        // cols (instead of the spec-compliant 2×2). composite_grid
+        // must clamp to that.
+        let tile = VideoFrame {
+            pts: None,
+            planes: vec![
+                VideoPlane {
+                    stride: 4,
+                    data: vec![10; 16],
+                },
+                VideoPlane {
+                    stride: 2,
+                    data: vec![100; 2], // 1 row only
+                },
+                VideoPlane {
+                    stride: 2,
+                    data: vec![200; 2],
+                },
+            ],
+        };
+        let out = composite_grid(&grid, &[tile], PixelFormat::Yuv420P, 4, 4).unwrap();
+        let u = &out.planes[1];
+        // Output U plane is 2×2; first row should be 100,100 (copied),
+        // second row should be 0,0 (untouched, since source had no data).
+        assert_eq!(u.stride, 2);
+        assert_eq!(u.data.len(), 4);
+        assert_eq!(&u.data[0..2], &[100, 100]);
+        assert_eq!(&u.data[2..4], &[0, 0]);
+    }
+
+    /// `ceil_shift` matches `ceil(v / 2^shift)` for the practical
+    /// range used by `composite_grid`: shift in {0, 1}.
+    #[test]
+    fn ceil_shift_matches_division_ceiling() {
+        // shift = 0 is the identity.
+        for v in [0u32, 1, 2, 3, 7, 100, 4096] {
+            assert_eq!(ceil_shift(v, 0), v);
+        }
+        // shift = 1 is `(v + 1) / 2`.
+        for v in 0..=33u32 {
+            let want = v.div_ceil(2);
+            assert_eq!(ceil_shift(v, 1), want, "ceil_shift({v}, 1)");
+        }
+        // shift = 2 (would arise for 4:1:0 — not currently emitted by
+        // composite_grid, but the helper should still match).
+        for v in 0..=33u32 {
+            let want = v.div_ceil(4);
+            assert_eq!(ceil_shift(v, 2), want, "ceil_shift({v}, 2)");
+        }
     }
 }

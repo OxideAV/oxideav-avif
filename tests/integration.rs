@@ -1825,3 +1825,477 @@ fn build_synthetic_av01_with_colr(
     file.extend_from_slice(&mdat);
     file
 }
+
+// ---------------------------------------------------------------------
+// Round 21 — grid hardening: tile-edge sample handling, grid stride
+// math (per-tile vs grid-derived `colr` / `pixi` / `pasp`), and CICP
+// triple resolution for grid primaries (av1-avif §4.2.1 + HEIF §6.5).
+// ---------------------------------------------------------------------
+
+/// Where to attach a per-property association in [`build_grid_with_props`]
+/// fixtures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PropPlacement {
+    /// Property is omitted entirely.
+    None,
+    /// Associated only with the grid item.
+    GridOnly,
+    /// Associated only with each tile item (the writer pattern that
+    /// libheif emits for HEIC siblings: per-tile `colr` rather than
+    /// grid-level — av1-avif §4.2.1 lets the reader inherit from
+    /// tile 0 in that case).
+    TilesOnly,
+    /// Associated with both grid and tiles. The grid-level value is
+    /// authoritative; tiles must agree.
+    Both,
+}
+
+/// Round 21 fixture builder: synthesises a 2-tile horizontal grid AVIF
+/// container with explicit control over where `colr` / `pixi` / `pasp`
+/// are attached. The CICP nclx triple is always `(1, 13, 6) full_range
+/// = false` (libavif sRGB default) so the test can assert against a
+/// known value.
+struct GridPropFixture {
+    colr: PropPlacement,
+    pixi: PropPlacement,
+    pasp: PropPlacement,
+}
+
+#[allow(clippy::too_many_lines)]
+fn build_grid_with_props(opts: GridPropFixture) -> Vec<u8> {
+    fn u32be(v: u32) -> [u8; 4] {
+        v.to_be_bytes()
+    }
+    fn u16be(v: u16) -> [u8; 2] {
+        v.to_be_bytes()
+    }
+    fn box_bytes(btype: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let size = (8 + body.len()) as u32;
+        let mut out = size.to_be_bytes().to_vec();
+        out.extend_from_slice(btype);
+        out.extend_from_slice(body);
+        out
+    }
+    fn full_box(btype: &[u8; 4], version: u8, flags: u32, body: &[u8]) -> Vec<u8> {
+        let mut payload = vec![
+            version,
+            (flags >> 16) as u8,
+            (flags >> 8) as u8,
+            flags as u8,
+        ];
+        payload.extend_from_slice(body);
+        box_bytes(btype, &payload)
+    }
+    fn infe_v2(id: u16, item_type: &[u8; 4]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&id.to_be_bytes());
+        body.extend_from_slice(&[0u8, 0]); // protection_index
+        body.extend_from_slice(item_type);
+        body.push(0); // name null terminator
+        full_box(b"infe", 2, 0, &body)
+    }
+
+    let n_tiles: usize = 2;
+
+    // ---- ftyp ----
+    let mut ftyp_body = Vec::new();
+    ftyp_body.extend_from_slice(b"avif");
+    ftyp_body.extend_from_slice(&u32be(0));
+    ftyp_body.extend_from_slice(b"mif1");
+    ftyp_body.extend_from_slice(b"miaf");
+    let ftyp = box_bytes(b"ftyp", &ftyp_body);
+
+    // ---- hdlr ----
+    let mut hdlr_body = Vec::new();
+    hdlr_body.extend_from_slice(&[0u8; 4]);
+    hdlr_body.extend_from_slice(b"pict");
+    hdlr_body.extend_from_slice(&[0u8; 12]);
+    hdlr_body.extend_from_slice(b"\0");
+    let hdlr = full_box(b"hdlr", 0, 0, &hdlr_body);
+
+    // ---- pitm ----
+    let pitm = full_box(b"pitm", 0, 0, &u16be(1));
+
+    // ---- iinf with grid + 2 tile items ----
+    let mut iinf_body = Vec::new();
+    iinf_body.extend_from_slice(&u16be(1 + n_tiles as u16));
+    iinf_body.extend_from_slice(&infe_v2(1, b"grid"));
+    for i in 0..n_tiles {
+        iinf_body.extend_from_slice(&infe_v2(2 + i as u16, b"av01"));
+    }
+    let iinf = full_box(b"iinf", 0, 0, &iinf_body);
+
+    // ---- iref dimg ----
+    let mut dimg_body = Vec::new();
+    dimg_body.extend_from_slice(&u16be(1));
+    dimg_body.extend_from_slice(&u16be(n_tiles as u16));
+    for i in 0..n_tiles {
+        dimg_body.extend_from_slice(&u16be(2 + i as u16));
+    }
+    let dimg_box = box_bytes(b"dimg", &dimg_body);
+    let iref = full_box(b"iref", 0, 0, &dimg_box);
+
+    // ---- grid descriptor (16-bit, 1×2, output 4×2) ----
+    let grid_desc = {
+        let mut b = vec![0u8, 0, 0, 1];
+        b.extend_from_slice(&u16be(4));
+        b.extend_from_slice(&u16be(2));
+        b
+    };
+    let tile_data: Vec<Vec<u8>> = (0..n_tiles)
+        .map(|i| vec![0xA0 | (i as u8 & 0x0f); 8])
+        .collect();
+
+    // ---- properties (ordered: ispe(grid), tile_ispe, av1C, then
+    //      optional colr / pixi / pasp; ipma indices below match) ----
+    let mut ipco_body = Vec::new();
+    let mut prop_idx: u8 = 0;
+    let mut next_idx = || -> u8 {
+        prop_idx += 1;
+        prop_idx
+    };
+
+    let mut grid_ispe_body = Vec::new();
+    grid_ispe_body.extend_from_slice(&u32be(4));
+    grid_ispe_body.extend_from_slice(&u32be(2));
+    let grid_ispe = full_box(b"ispe", 0, 0, &grid_ispe_body);
+    ipco_body.extend_from_slice(&grid_ispe);
+    let grid_ispe_idx = next_idx();
+
+    let mut tile_ispe_body = Vec::new();
+    tile_ispe_body.extend_from_slice(&u32be(2));
+    tile_ispe_body.extend_from_slice(&u32be(2));
+    let tile_ispe = full_box(b"ispe", 0, 0, &tile_ispe_body);
+    ipco_body.extend_from_slice(&tile_ispe);
+    let tile_ispe_idx = next_idx();
+
+    let av1c_body = vec![0x81u8, 0, 0, 0];
+    let av1c = box_bytes(b"av1C", &av1c_body);
+    ipco_body.extend_from_slice(&av1c);
+    let av1c_idx = next_idx();
+
+    // colr nclx (1, 13, 6) full_range=false — libavif's SDR sRGB triple.
+    let colr_idx = if opts.colr != PropPlacement::None {
+        let mut body = Vec::new();
+        body.extend_from_slice(b"nclx");
+        body.extend_from_slice(&1u16.to_be_bytes());
+        body.extend_from_slice(&13u16.to_be_bytes());
+        body.extend_from_slice(&6u16.to_be_bytes());
+        body.push(0x00);
+        ipco_body.extend_from_slice(&box_bytes(b"colr", &body));
+        Some(next_idx())
+    } else {
+        None
+    };
+
+    // pixi (3 channels, 8-bit).
+    let pixi_idx = if opts.pixi != PropPlacement::None {
+        let mut body = vec![0u8; 4]; // FullBox header
+        body.push(3);
+        body.extend_from_slice(&[8, 8, 8]);
+        ipco_body.extend_from_slice(&box_bytes(b"pixi", &body));
+        Some(next_idx())
+    } else {
+        None
+    };
+
+    // pasp (4:3 anamorphic).
+    let pasp_idx = if opts.pasp != PropPlacement::None {
+        let mut body = Vec::new();
+        body.extend_from_slice(&u32be(4));
+        body.extend_from_slice(&u32be(3));
+        ipco_body.extend_from_slice(&box_bytes(b"pasp", &body));
+        Some(next_idx())
+    } else {
+        None
+    };
+
+    let ipco = box_bytes(b"ipco", &ipco_body);
+
+    // ---- ipma ----
+    let mut ipma_body = Vec::new();
+    ipma_body.extend_from_slice(&u32be(1 + n_tiles as u32));
+
+    // Helper to append the assoc count + entries. Indices are always
+    // < 128 here, so the small-form (1 byte/entry) encoding is fine.
+    let push_assocs = |ipma_body: &mut Vec<u8>, item_id: u16, indices: &[u8]| {
+        ipma_body.extend_from_slice(&item_id.to_be_bytes());
+        ipma_body.push(indices.len() as u8);
+        for &idx in indices {
+            ipma_body.push(idx & 0x7f);
+        }
+    };
+
+    // Grid item: ispe(grid) + (colr,pixi,pasp if GridOnly/Both).
+    let mut grid_indices = vec![grid_ispe_idx];
+    if matches!(opts.colr, PropPlacement::GridOnly | PropPlacement::Both) {
+        grid_indices.push(colr_idx.unwrap());
+    }
+    if matches!(opts.pixi, PropPlacement::GridOnly | PropPlacement::Both) {
+        grid_indices.push(pixi_idx.unwrap());
+    }
+    if matches!(opts.pasp, PropPlacement::GridOnly | PropPlacement::Both) {
+        grid_indices.push(pasp_idx.unwrap());
+    }
+    push_assocs(&mut ipma_body, 1, &grid_indices);
+
+    // Tile items: tile_ispe + av1C + (colr,pixi,pasp if TilesOnly/Both).
+    for i in 0..n_tiles {
+        let mut tile_indices = vec![tile_ispe_idx, av1c_idx];
+        if matches!(opts.colr, PropPlacement::TilesOnly | PropPlacement::Both) {
+            tile_indices.push(colr_idx.unwrap());
+        }
+        if matches!(opts.pixi, PropPlacement::TilesOnly | PropPlacement::Both) {
+            tile_indices.push(pixi_idx.unwrap());
+        }
+        if matches!(opts.pasp, PropPlacement::TilesOnly | PropPlacement::Both) {
+            tile_indices.push(pasp_idx.unwrap());
+        }
+        push_assocs(&mut ipma_body, 2 + i as u16, &tile_indices);
+    }
+    let ipma = full_box(b"ipma", 0, 0, &ipma_body);
+
+    let mut iprp_body = Vec::new();
+    iprp_body.extend_from_slice(&ipco);
+    iprp_body.extend_from_slice(&ipma);
+    let iprp = box_bytes(b"iprp", &iprp_body);
+
+    // ---- iloc layout ----
+    let item_count = 1 + n_tiles;
+    let iloc_size = 8 + 4 + 1 + 1 + 2 + item_count * 14;
+    let ftyp_size = ftyp.len();
+    let meta_payload_size =
+        4 + hdlr.len() + pitm.len() + iinf.len() + iref.len() + iprp.len() + iloc_size;
+    let meta_size = 8 + meta_payload_size;
+    let mdat_payload_start = ftyp_size + meta_size + 8;
+    let grid_off = mdat_payload_start;
+    let mut tile_offs = Vec::with_capacity(n_tiles);
+    let mut cur = grid_off + grid_desc.len();
+    for td in &tile_data {
+        tile_offs.push(cur);
+        cur += td.len();
+    }
+
+    let mut iloc_inner = Vec::new();
+    iloc_inner.push(0x44);
+    iloc_inner.push(0x00);
+    iloc_inner.extend_from_slice(&u16be(item_count as u16));
+    iloc_inner.extend_from_slice(&u16be(1));
+    iloc_inner.extend_from_slice(&u16be(0));
+    iloc_inner.extend_from_slice(&u16be(1));
+    iloc_inner.extend_from_slice(&u32be(grid_off as u32));
+    iloc_inner.extend_from_slice(&u32be(grid_desc.len() as u32));
+    for (i, &off) in tile_offs.iter().enumerate() {
+        iloc_inner.extend_from_slice(&u16be(2 + i as u16));
+        iloc_inner.extend_from_slice(&u16be(0));
+        iloc_inner.extend_from_slice(&u16be(1));
+        iloc_inner.extend_from_slice(&u32be(off as u32));
+        iloc_inner.extend_from_slice(&u32be(tile_data[i].len() as u32));
+    }
+    let iloc = full_box(b"iloc", 0, 0, &iloc_inner);
+
+    let mut meta_body = Vec::new();
+    meta_body.extend_from_slice(&[0u8; 4]);
+    meta_body.extend_from_slice(&hdlr);
+    meta_body.extend_from_slice(&pitm);
+    meta_body.extend_from_slice(&iinf);
+    meta_body.extend_from_slice(&iref);
+    meta_body.extend_from_slice(&iprp);
+    meta_body.extend_from_slice(&iloc);
+    let meta = box_bytes(b"meta", &meta_body);
+    assert_eq!(meta.len(), meta_size, "meta size recalc");
+
+    let mut mdat_body = Vec::new();
+    mdat_body.extend_from_slice(&grid_desc);
+    for td in &tile_data {
+        mdat_body.extend_from_slice(td);
+    }
+    let mdat = box_bytes(b"mdat", &mdat_body);
+
+    let mut file = Vec::new();
+    file.extend_from_slice(&ftyp);
+    file.extend_from_slice(&meta);
+    file.extend_from_slice(&mdat);
+    file
+}
+
+/// Round 21: CICP triple for a grid primary item resolves through the
+/// HEIF property chain — grid-level `colr` is authoritative, but when
+/// the writer omits it the reader falls back to tile 0's `colr` (per
+/// av1-avif §4.2.1: derived items inherit the colour info of their
+/// inputs, which av1-avif §4.2.3 enforces to be uniform across all
+/// tiles). Both placements should yield the same `effective_cicp`.
+#[test]
+fn effective_cicp_grid_test() {
+    use oxideav_avif::{CicpTriple, Colr};
+
+    // Reference: a non-grid synthetic AV01 with the same CICP triple
+    // returns `(1, 13, 6) full_range=false`. Make sure all four
+    // grid-attachment placements match.
+    let want = CicpTriple {
+        colour_primaries: 1,
+        transfer_characteristics: 13,
+        matrix_coefficients: 6,
+        full_range: false,
+    };
+
+    for placement in [
+        PropPlacement::GridOnly,
+        PropPlacement::TilesOnly,
+        PropPlacement::Both,
+    ] {
+        let bytes = build_grid_with_props(GridPropFixture {
+            colr: placement,
+            pixi: PropPlacement::None,
+            pasp: PropPlacement::None,
+        });
+        let info =
+            inspect(&bytes).unwrap_or_else(|e| panic!("inspect with colr {placement:?}: {e}"));
+        assert!(info.is_grid, "{placement:?}: expected grid primary");
+        assert!(
+            info.colour.is_some(),
+            "{placement:?}: grid primary should expose a Colr (resolved via fallback)"
+        );
+        match info.colour.as_ref().unwrap() {
+            Colr::Nclx { .. } => {}
+            other => panic!("{placement:?}: expected nclx Colr, got {other:?}"),
+        }
+        let cicp = info.effective_cicp();
+        assert_eq!(cicp, want, "{placement:?}: effective_cicp mismatch");
+        assert!(
+            cicp.is_libavif_srgb_default(),
+            "{placement:?}: should match libavif default"
+        );
+    }
+
+    // Negative case: when no colr is attached anywhere on the grid or
+    // its tiles, effective_cicp folds to Unspecified.
+    let bytes = build_grid_with_props(GridPropFixture {
+        colr: PropPlacement::None,
+        pixi: PropPlacement::None,
+        pasp: PropPlacement::None,
+    });
+    let info = inspect(&bytes).expect("inspect colr-free grid");
+    assert!(info.is_grid);
+    assert!(info.colour.is_none(), "no colr should yield None");
+    let cicp = info.effective_cicp();
+    assert!(
+        cicp.is_unspecified(),
+        "missing colr on grid + tiles must yield Unspecified, got {cicp:?}"
+    );
+}
+
+/// Round 21: `pixi` (HEIF §6.5.6) on a grid primary may be attached to
+/// the grid item, the tile items, or both. `AvifInfo.bits_per_channel`
+/// must surface the value regardless of placement (av1-avif §4.2.1
+/// derived-image-item uniformity rule).
+#[test]
+fn pixi_resolves_via_grid_then_tile_fallback() {
+    for placement in [
+        PropPlacement::GridOnly,
+        PropPlacement::TilesOnly,
+        PropPlacement::Both,
+    ] {
+        let bytes = build_grid_with_props(GridPropFixture {
+            colr: PropPlacement::None,
+            pixi: placement,
+            pasp: PropPlacement::None,
+        });
+        let info = inspect(&bytes).unwrap_or_else(|e| panic!("inspect {placement:?}: {e}"));
+        assert!(info.is_grid);
+        assert_eq!(
+            info.bits_per_channel,
+            vec![8, 8, 8],
+            "{placement:?}: pixi must resolve via grid → tile-0 fallback"
+        );
+        assert_eq!(info.num_channels(), 3);
+        assert_eq!(info.max_bit_depth(), 8);
+        assert!(!info.is_monochrome());
+    }
+
+    // Negative: no pixi anywhere → bits_per_channel is empty.
+    let bytes = build_grid_with_props(GridPropFixture {
+        colr: PropPlacement::None,
+        pixi: PropPlacement::None,
+        pasp: PropPlacement::None,
+    });
+    let info = inspect(&bytes).expect("inspect pixi-free grid");
+    assert!(info.bits_per_channel.is_empty());
+    assert_eq!(info.num_channels(), 0);
+    assert_eq!(info.max_bit_depth(), 0);
+}
+
+/// Round 21: `pasp` (HEIF §6.5.4) follows the same fallback chain.
+/// Tile-only attachment is a real-world libheif pattern — the grid
+/// item is left propertyless and per-tile `pasp` describes the
+/// resampled display geometry. The reader should expose the value
+/// either way.
+#[test]
+fn pasp_resolves_via_grid_then_tile_fallback() {
+    for placement in [
+        PropPlacement::GridOnly,
+        PropPlacement::TilesOnly,
+        PropPlacement::Both,
+    ] {
+        let bytes = build_grid_with_props(GridPropFixture {
+            colr: PropPlacement::None,
+            pixi: PropPlacement::None,
+            pasp: placement,
+        });
+        let info = inspect(&bytes).unwrap_or_else(|e| panic!("inspect {placement:?}: {e}"));
+        let pasp = info
+            .pasp
+            .unwrap_or_else(|| panic!("{placement:?}: pasp should resolve"));
+        assert_eq!(pasp.h_spacing, 4, "{placement:?}: pasp h_spacing");
+        assert_eq!(pasp.v_spacing, 3, "{placement:?}: pasp v_spacing");
+        assert!(!info.has_square_pixels(), "{placement:?}: 4:3 isn't square");
+    }
+
+    // Negative: no pasp anywhere → has_square_pixels defaults to true.
+    let bytes = build_grid_with_props(GridPropFixture {
+        colr: PropPlacement::None,
+        pixi: PropPlacement::None,
+        pasp: PropPlacement::None,
+    });
+    let info = inspect(&bytes).expect("inspect pasp-free grid");
+    assert!(info.pasp.is_none());
+    assert!(
+        info.has_square_pixels(),
+        "missing pasp implies square pixels"
+    );
+}
+
+/// Round 21: tile-edge sample handling for a 4:2:0 grid composed of
+/// real-content tiles whose dimensions aren't a multiple of the
+/// chroma sampling step at the canvas edge. The fixture is purely
+/// container-level — the OBU bytes won't decode — but the
+/// `composite_grid` unit test in `src/grid.rs::composite_yuv420_*`
+/// exercises the actual chroma path. This integration test pins the
+/// container-side surface that the per-tile `ispe` describes the tile
+/// dimensions and the grid-level `ispe` describes the canvas — both
+/// must round-trip through `inspect()`.
+#[test]
+fn grid_tile_edge_geometry_round_trips() {
+    let bytes = build_synthetic_grid_avif();
+    let info = inspect(&bytes).expect("inspect synthetic grid");
+    // Grid-level ispe is the canvas: 4×2.
+    assert_eq!(info.width, 4);
+    assert_eq!(info.height, 2);
+    // The grid descriptor declares 1 row × 2 columns of 2×2 tiles —
+    // the composite path uses these to walk per-tile dst offsets. We
+    // re-parse the descriptor to assert the fixture is what the
+    // composite-path tests rely on.
+    let hdr = parse_header(&bytes).expect("parse_header");
+    let primary = hdr.meta.primary_item_id.expect("pitm");
+    let loc = hdr.meta.location_by_id(primary).expect("primary location");
+    let grid_bytes = oxideav_avif::parser::item_bytes(&bytes, loc).expect("item bytes");
+    let grid = ImageGrid::parse(grid_bytes).expect("parse grid");
+    assert_eq!(grid.rows, 1);
+    assert_eq!(grid.columns, 2);
+    assert_eq!(grid.output_width, 4);
+    assert_eq!(grid.output_height, 2);
+    // tile_w * columns >= output_width; tile_h * rows >= output_height
+    // (HEIF §6.6.2.3.1 covering constraint). Tile dims here are 2×2.
+    assert!((2u32 * grid.columns as u32) >= grid.output_width);
+    assert!((2u32 * grid.rows as u32) >= grid.output_height);
+}

@@ -69,6 +69,34 @@ still loses significant signal.
 See `examples/diag_decode.rs` for a drop-in report of exactly which
 stage each input reaches.
 
+### Round 21 — grid hardening
+
+Two correctness fixes for multi-tile MIAF AVIFs (HEIF §6.6.2.3 +
+av1-avif §4.2.1):
+
+* **Tile-edge chroma alignment**: `composite_grid` now uses ceiling
+  division of the trimmed luma copy extent when computing chroma copy
+  width / height, so a 4:2:0 grid whose right-most or bottom-most
+  tile is clipped to an odd luma column / row no longer drops the
+  trailing chroma sample. Previously a `tile_w=4`, `output_w=7`
+  grid lost the right-most chroma column. Same fix covers 4:2:2
+  horizontal-only chroma. Source-side and destination-side clamps
+  guard against tiles whose chroma plane is smaller than the
+  luma-derived ceiling, and against tiles that overhang the canvas.
+* **Grid `colr` / `pixi` / `pasp` resolution**: every descriptive
+  property now follows the canonical HEIF chain — grid item first
+  (describes the reconstructed canvas), tile-0 second (the libheif
+  writer pattern; av1-avif §4.2 keeps per-tile values uniform).
+  Previously only `colr` had the fallback wiring; `pixi` looked
+  only at tile 0 and `pasp` only at the grid item, so two real
+  encoder placement patterns went unread.
+
+`AvifInfo::effective_cicp()` consequently returns the same triple for
+a grid whether `colr` lives on the grid item, on each tile, or on
+both (av1-avif §4.2.1 — derived items inherit the colour signalling
+of their inputs). When the grid and its tiles all lack `colr`, the
+triple folds to `Unspecified` per ITU-T H.273.
+
 ### Round 20 — CICP color path
 
 Per av1-avif §4.2.3.1 ("No color space conversion, matrix coefficients,
