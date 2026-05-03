@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/OxideAV/oxideav-avif/compare/v0.0.4...v0.0.5) - 2026-05-03
+
+### Other
+
+- replace never-match regex with semver_check = false
+- migrate to centralized OxideAV/.github reusable workflows
+- grid hardening — chroma tile-edge alignment + colr/pixi/pasp fallback
+- round 20 — CICP color path
+- round 19 — pixi/pasp helpers, grid hardening, AVIS sample bytes
+- round 18 — MIAF brand validation + colr surface + imir/clap end-to-end tests
+- round 17 — drop obsolete panic catch_unwind, add irot end-to-end + transforms_for tests
+- adopt slim VideoFrame/AudioFrame shape
+- pin release-plz to patch-only bumps
+
 ### Added
 
 - r21: grid hardening for multi-tile MIAF AVIFs (HEIF §6.6.2.3 +
