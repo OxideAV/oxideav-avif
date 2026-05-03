@@ -1,0 +1,42 @@
+[package]
+name = "oxideav-avif-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+oxideav-core = "0.1"
+# libloading is the only libavif interop: the cross-decode harness
+# `dlopen`s the system-installed libavif at startup. No `*-sys` crate,
+# no libavif source pulled into the dep tree. Harnesses skip silently
+# when libavif isn't installed (see fuzz/src/lib.rs).
+libloading = "0.8"
+
+[dependencies.oxideav-avif]
+path = ".."
+
+[lib]
+name = "oxideav_avif_fuzz"
+path = "src/lib.rs"
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+# Only one cross-decode harness ships today: the oxideav-avif encoder
+# is a stub (lib.rs::make_encoder returns Error::Unsupported because
+# we lack an AV1 encoder), so the self-roundtrip and oxideav-encode
+# directions can't be wired up yet. Add them when oxideav-av1 grows
+# an encoder.
+[[bin]]
+name = "libavif_encode_oxideav_decode"
+path = "fuzz_targets/libavif_encode_oxideav_decode.rs"
+test = false
+doc = false

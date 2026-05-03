@@ -1,0 +1,25 @@
+name: Fuzz
+
+# Daily fuzz run for the cargo-fuzz harness under fuzz/. Currently
+# ships a single cross-decode harness (libavif encode -> oxideav
+# decode); the self-roundtrip and oxideav-encode directions are
+# blocked on oxideav-avif growing a real encoder (today
+# `make_encoder` returns Error::Unsupported because we lack an AV1
+# encoder).
+#
+# The harness dlopens libavif at runtime via libloading; the CI
+# runner needs `libavif-dev` so it actually validates instead of
+# silently skipping.
+
+on:
+  schedule:
+    - cron: "3 6 * * *"   # daily 06:03 UTC, jittered off the hour
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    uses: OxideAV/.github/.github/workflows/crate-fuzz.yml@master
+    with:
+      extra_packages_apt: "libavif-dev"
+      time_budget_seconds: 1800
+    secrets: inherit
