@@ -752,7 +752,13 @@ fn decoder_pipes_through_av1_errors_cleanly() {
         let pkt = Packet::new(0, TimeBase::new(1, 1), bytes.to_vec());
         match d.send_packet(&pkt) {
             Ok(()) => {
-                // If decode succeeded, frame must match the inspect dims.
+                // If decode succeeded, frame must match the inspect dims
+                // post-irot. `info.width` / `info.height` come from the
+                // primary item's `ispe` box, which records the
+                // pre-transform extent (HEIF §6.5.3). The decoder
+                // applies any associated `irot` before emitting the
+                // frame, so on a 90° / 270° rotation the displayed
+                // width/height swap relative to ispe.
                 let info = d.info().cloned().expect("info after send");
                 let frame = d.receive_frame().expect("frame after send");
                 let vf = match frame {
@@ -761,12 +767,25 @@ fn decoder_pipes_through_av1_errors_cleanly() {
                 };
                 // Slim VideoFrame no longer carries width/height — derive
                 // from the Y plane stride/data and compare to inspect's
-                // ispe-driven dims.
+                // ispe-driven dims rotated by the file's irot angle.
                 assert!(!vf.planes.is_empty(), "{name}: no planes");
+                let hdr = parse_header(bytes)
+                    .unwrap_or_else(|e| panic!("{name}: parse_header failed: {e}"));
+                let primary = hdr.meta.primary_item_id.expect("pitm");
+                let irot_angle = match hdr.meta.property_for(primary, b"irot") {
+                    Some(oxideav_avif::Property::Irot(i)) => i.angle & 0x3,
+                    _ => 0,
+                };
+                let (expected_w, expected_h) = if irot_angle % 2 == 1 {
+                    // 90° / 270° rotations swap the displayed extents.
+                    (info.height, info.width)
+                } else {
+                    (info.width, info.height)
+                };
                 let y = &vf.planes[0];
-                assert_eq!(y.stride as u32, info.width, "{name}: width mismatch");
+                assert_eq!(y.stride as u32, expected_w, "{name}: width mismatch");
                 let inferred_h = y.data.len().checked_div(y.stride).unwrap_or(0) as u32;
-                assert_eq!(inferred_h, info.height, "{name}: height mismatch");
+                assert_eq!(inferred_h, expected_h, "{name}: height mismatch");
                 for (pi, p) in vf.planes.iter().enumerate() {
                     assert!(
                         p.data.len() >= p.stride,
