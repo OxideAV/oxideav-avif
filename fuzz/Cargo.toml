@@ -30,13 +30,40 @@ members = ["."]
 [profile.release]
 debug = 1
 
-# Only one cross-decode harness ships today: the oxideav-avif encoder
-# is a stub (lib.rs::make_encoder returns Error::Unsupported because
-# we lack an AV1 encoder), so the self-roundtrip and oxideav-encode
-# directions can't be wired up yet. Add them when oxideav-av1 grows
-# an encoder.
+# Cross-decode harnesses. The oxideav-avif encoder is a stub
+# (lib.rs::make_encoder returns Error::Unsupported because we lack an
+# AV1 encoder), so the literal "oxideav encode" and self-roundtrip
+# directions of #304 round 2 can't be wired up. The two libavif-driven
+# round-2 harnesses below test the strongest properties the existing
+# decoder surface supports — pixel cross-validation against libavif's
+# decoder on the same input bitstream, and round-trip stability across
+# a libavif re-encode.
+
+# Round 1 (#345) — encode with libavif, decode with oxideav-avif,
+# tolerate decoder errors but assert dimensions on success.
 [[bin]]
 name = "libavif_encode_oxideav_decode"
 path = "fuzz_targets/libavif_encode_oxideav_decode.rs"
+test = false
+doc = false
+
+# Round 2 #304 (b) — encode with libavif lossless YUV444+IDENTITY,
+# decode with BOTH oxideav-avif and libavif, assert pixel match.
+# Skipped silently when libavif isn't installed.
+[[bin]]
+name = "libavif_encode_oxideav_libavif_decode_match"
+path = "fuzz_targets/libavif_encode_oxideav_libavif_decode_match.rs"
+test = false
+doc = false
+
+# Round 2 #304 (a) — closest realisable approximation of the literal
+# self-roundtrip task: oxideav decode → libavif re-encode → oxideav
+# decode → assert the two oxideav-decoded planes match. The literal
+# "oxideav-encode → oxideav-decode" path is blocked on the missing AV1
+# encoder; this harness validates oxideav-avif's decoder is bit-stable
+# under a re-encode by libavif.
+[[bin]]
+name = "libavif_oxideav_reencode_roundtrip"
+path = "fuzz_targets/libavif_oxideav_reencode_roundtrip.rs"
 test = false
 doc = false

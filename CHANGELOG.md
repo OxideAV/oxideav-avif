@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Fuzz round 2 (#304). Two libavif-driven cross-validation harnesses
+  added to `fuzz/`:
+  - `libavif_encode_oxideav_libavif_decode_match` — encode with
+    libavif lossless YUV444+IDENTITY, decode the resulting bitstream
+    with BOTH `oxideav-avif` and `libavif`, assert pixels match
+    plane-by-plane (Y=G, U=B, V=R per the IDENTITY-matrix lossless
+    contract). Catches decoder divergences from the libavif
+    reference.
+  - `libavif_oxideav_reencode_roundtrip` — closest realisable
+    approximation of the literal "self-roundtrip" task: oxideav
+    decodes → libavif re-encodes the decoded pixels → oxideav decodes
+    again → assert P₁ == P₂. Validates oxideav-avif's decoder is
+    bit-stable across a re-encode by libavif.
+  - The literal "fuzz-generated AVIF → decode → re-encode → decode
+    again" of the task spec is blocked on an oxideav AVIF encoder
+    (today `make_encoder` returns `Error::Unsupported` because
+    oxideav lacks an AV1 encoder). Both harnesses skip silently when
+    libavif isn't installed; the daily fuzz workflow installs
+    `libavif-dev` so CI exercises the assertions.
+
+### Added
+
 - Standalone-friendly retrofit (#360 sweep). New default-on `registry`
   Cargo feature gates the `oxideav-core` + `oxideav-av1` dependencies
   plus the `oxideav_core::Decoder` trait surface (`AvifDecoder`,
