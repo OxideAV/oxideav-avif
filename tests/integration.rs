@@ -1391,8 +1391,8 @@ fn end_to_end_decode_then_clap_centre_crop() {
     };
     let src_y = vf.planes[0].data.clone();
     let src_stride = vf.planes[0].stride;
-    let (cropped, cw, ch) = apply_clap(&vf, AvifPixelFormat::Yuv444P, 64, 64, &clap)
-        .expect("apply_clap centre crop");
+    let (cropped, cw, ch) =
+        apply_clap(&vf, AvifPixelFormat::Yuv444P, 64, 64, &clap).expect("apply_clap centre crop");
     assert_eq!(cw, 32, "clap output width");
     assert_eq!(ch, 32, "clap output height");
     assert_eq!(cropped.planes.len(), 3, "4:4:4 preserves three planes");
@@ -1441,8 +1441,8 @@ fn clap_with_zero_denominator_is_passthrough() {
         vert_off_n: 0,
         vert_off_d: 1,
     };
-    let (out, w, h) = apply_clap(&vf, AvifPixelFormat::Yuv444P, 64, 64, &degenerate)
-        .expect("clap no-op");
+    let (out, w, h) =
+        apply_clap(&vf, AvifPixelFormat::Yuv444P, 64, 64, &degenerate).expect("clap no-op");
     assert_eq!(w, 64, "no-op clap preserves width");
     assert_eq!(h, 64, "no-op clap preserves height");
     assert_eq!(out.planes[0].data, vf.planes[0].data, "Y unchanged");

@@ -13,7 +13,9 @@
 //! mismatches return `Error::InvalidData`.
 
 use crate::error::{AvifError as Error, Result};
-use crate::image::{AvifFrame as VideoFrame, AvifPixelFormat as PixelFormat, AvifPlane as VideoPlane};
+use crate::image::{
+    AvifFrame as VideoFrame, AvifPixelFormat as PixelFormat, AvifPlane as VideoPlane,
+};
 
 /// Parsed `ImageGridBox` payload. Dimensions may be 16-bit or 32-bit
 /// depending on `flags & 1` (bit 0 = 1 selects the 32-bit layout).

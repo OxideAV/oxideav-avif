@@ -6,6 +6,7 @@
 //! `registry` feature is enabled. The pixel-decoding [`crate::decoder`]
 //! module sits on top of this and adds the AV1 + composition pipeline.
 
+use crate::alpha::find_alpha_item_id;
 use crate::box_parser::{b, BoxType};
 use crate::cicp::{effective_cicp, CicpTriple};
 use crate::error::{AvifError as Error, Result};
@@ -15,7 +16,6 @@ use crate::parser::{
     classify_brands, item_bytes, parse, parse_header, AvifHeader, AvifImage, BrandClass,
     ITEM_TYPE_GRID,
 };
-use crate::{alpha::find_alpha_item_id};
 
 const AV1C: BoxType = b(b"av1C");
 const COLR: BoxType = b(b"colr");

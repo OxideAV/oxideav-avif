@@ -25,7 +25,9 @@
 //! which are orthogonal to geometric manipulation.
 
 use crate::error::{AvifError as Error, Result};
-use crate::image::{AvifFrame as VideoFrame, AvifPixelFormat as PixelFormat, AvifPlane as VideoPlane};
+use crate::image::{
+    AvifFrame as VideoFrame, AvifPixelFormat as PixelFormat, AvifPlane as VideoPlane,
+};
 
 use crate::meta::{Clap, Imir, Irot};
 

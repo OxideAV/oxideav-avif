@@ -18,9 +18,7 @@
 
 use oxideav_core::frame::{VideoFrame, VideoPlane};
 use oxideav_core::Decoder;
-use oxideav_core::{
-    CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Result, TimeBase,
-};
+use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Result, TimeBase};
 
 use oxideav_av1::{Av1CodecConfig, Av1Decoder};
 
@@ -380,8 +378,7 @@ fn decode_grid_primary(
             Some(Property::Ispe(e)) => Some((e.width, e.height)),
             _ => None,
         };
-        let (tile_core, fmt_core, mut fw, mut fh) =
-            decode_av01_item(tile_bytes, &av1c, ispe_dims)?;
+        let (tile_core, fmt_core, mut fw, mut fh) = decode_av01_item(tile_bytes, &av1c, ispe_dims)?;
         let mut tile = core_to_avif_frame(tile_core);
         let fmt = from_core_pix(fmt_core)?;
         // Clamp tile to ispe dims if the AV1 decoder emitted a padded

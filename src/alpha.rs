@@ -20,7 +20,9 @@
 //! Other layouts return `Error::Unsupported`.
 
 use crate::error::{AvifError as Error, Result};
-use crate::image::{AvifFrame as VideoFrame, AvifPixelFormat as PixelFormat, AvifPlane as VideoPlane};
+use crate::image::{
+    AvifFrame as VideoFrame, AvifPixelFormat as PixelFormat, AvifPlane as VideoPlane,
+};
 
 use crate::box_parser::{b, BoxType};
 use crate::meta::{Meta, Property};
