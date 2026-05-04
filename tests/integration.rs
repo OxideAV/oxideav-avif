@@ -10,6 +10,14 @@
 //! Where the published `oxideav-av1` crate cannot yet emit pixels for
 //! a given bitstream, the decode-stage assertions gracefully accept
 //! `Error::Unsupported` without masking the underlying cause.
+//!
+//! The whole file is gated on the default-on `registry` feature
+//! because every test exercises `AvifDecoder` (which lives behind
+//! `registry`) and uses the `oxideav_core::Decoder` trait. The
+//! container-parser surface that stays available with
+//! `--no-default-features` is covered by the unit tests in `src/`.
+
+#![cfg(feature = "registry")]
 
 use oxideav_core::{CodecId, Error, Packet, TimeBase};
 

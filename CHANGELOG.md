@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Standalone retrofit follow-up (#360). `cargo build/test/clippy
+  --no-default-features` now actually walks every target. The
+  `tests/integration.rs` suite is gated `#![cfg(feature = "registry")]`
+  (every test wraps `AvifDecoder` + `oxideav_core::Decoder`), and the
+  `examples/diag_decode.rs` example carries `required-features =
+  ["registry"]` in `Cargo.toml` so cargo skips it cleanly when the
+  feature is off. Without these gates the standalone build was green
+  but `cargo test --no-default-features` failed to compile the
+  integration target. `cargo tree --no-default-features` now shows
+  zero transitive deps.
+
 ### Added
 
 - Fuzz round 2 (#304). Two libavif-driven cross-validation harnesses

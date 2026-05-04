@@ -32,3 +32,10 @@ default = ["registry"]
 # `crate::image::AvifFrame`) plus `inspect` / `parse` /
 # `parse_header` / `parse_avis` are still exposed.
 registry = ["dep:oxideav-core", "dep:oxideav-av1"]
+
+# Diagnostic example needs the AV1 decoder + registry decoder trait —
+# only build it when the `registry` feature is on so
+# `cargo build --no-default-features` still walks every target.
+[[example]]
+name = "diag_decode"
+required-features = ["registry"]
