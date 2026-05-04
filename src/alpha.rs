@@ -19,8 +19,8 @@
 //!
 //! Other layouts return `Error::Unsupported`.
 
-use oxideav_core::frame::{VideoFrame, VideoPlane};
-use oxideav_core::{Error, PixelFormat, Result};
+use crate::error::{AvifError as Error, Result};
+use crate::image::{AvifFrame as VideoFrame, AvifPixelFormat as PixelFormat, AvifPlane as VideoPlane};
 
 use crate::box_parser::{b, BoxType};
 use crate::meta::{Meta, Property};

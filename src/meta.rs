@@ -11,7 +11,7 @@
 //!   associations. We surface the AVIF-relevant properties directly:
 //!   `av1C`, `ispe`, `colr`, `pixi`, `pasp`.
 
-use oxideav_core::{Error, Result};
+use crate::error::{AvifError as Error, Result};
 
 use crate::box_parser::{
     b, find_box, iter_boxes, parse_box_header, parse_full_box, read_cstr, read_u16, read_u32,

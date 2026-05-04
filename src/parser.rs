@@ -2,7 +2,7 @@
 //! resolve the primary item's payload inside `mdat` → return the AV1
 //! OBU byte slice + the properties the downstream decoder needs.
 
-use oxideav_core::{Error, Result};
+use crate::error::{AvifError as Error, Result};
 
 use crate::box_parser::{b, iter_boxes, read_u32, type_str, BoxType};
 use crate::meta::{Colr, Ispe, ItemInfo, ItemLocation, Meta, Pasp, Pixi, Property};

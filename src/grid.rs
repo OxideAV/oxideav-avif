@@ -12,8 +12,8 @@
 //! frames. All tiles must share the same pixel format and tile size;
 //! mismatches return `Error::InvalidData`.
 
-use oxideav_core::frame::{VideoFrame, VideoPlane};
-use oxideav_core::{Error, PixelFormat, Result};
+use crate::error::{AvifError as Error, Result};
+use crate::image::{AvifFrame as VideoFrame, AvifPixelFormat as PixelFormat, AvifPlane as VideoPlane};
 
 /// Parsed `ImageGridBox` payload. Dimensions may be 16-bit or 32-bit
 /// depending on `flags & 1` (bit 0 = 1 selects the 32-bit layout).

@@ -890,8 +890,7 @@ fn decodes_flat_gray_to_mid_value() {
 #[test]
 fn end_to_end_decode_then_irot_roundtrips() {
     use oxideav_avif::apply_irot;
-    use oxideav_avif::Irot;
-    use oxideav_core::PixelFormat;
+    use oxideav_avif::{AvifFrame, AvifPixelFormat, Irot};
 
     let mut d = AvifDecoder::new(CodecId::new(oxideav_avif::CODEC_ID_STR));
     let pkt = Packet::new(0, TimeBase::new(1, 1), RED64.to_vec());
@@ -905,12 +904,14 @@ fn end_to_end_decode_then_irot_roundtrips() {
     assert_eq!(vf.planes[0].stride, 64, "Y stride");
     assert_eq!(vf.planes[1].stride, 64, "U stride (4:4:4)");
     let original_y = vf.planes[0].data.clone();
-    // Apply four 90° turns — must return to the original buffer.
-    let mut frame = vf;
+    // Bridge to the crate-local frame type the composition layer
+    // consumes (the `From<VideoFrame> for AvifFrame` impl is a move,
+    // not a copy).
+    let mut frame: AvifFrame = vf.into();
     let (mut w, mut h) = (64u32, 64u32);
     for turn in 0..4 {
         let (next, nw, nh) =
-            apply_irot(&frame, PixelFormat::Yuv444P, w, h, &Irot { angle: 1 }).unwrap();
+            apply_irot(&frame, AvifPixelFormat::Yuv444P, w, h, &Irot { angle: 1 }).unwrap();
         // Odd turn parity swaps dims; for a square 64x64 the swap is
         // a no-op, but the property still holds.
         assert_eq!(nw, h, "turn {turn}: width swap");
@@ -929,12 +930,12 @@ fn end_to_end_decode_then_irot_roundtrips() {
     let mut d2 = AvifDecoder::new(CodecId::new(oxideav_avif::CODEC_ID_STR));
     d2.send_packet(&Packet::new(0, TimeBase::new(1, 1), RED64.to_vec()))
         .unwrap();
-    let vf2 = match d2.receive_frame().unwrap() {
-        oxideav_core::Frame::Video(v) => v,
+    let vf2: AvifFrame = match d2.receive_frame().unwrap() {
+        oxideav_core::Frame::Video(v) => v.into(),
         _ => unreachable!(),
     };
     let (rot180, _, _) =
-        apply_irot(&vf2, PixelFormat::Yuv444P, 64, 64, &Irot { angle: 2 }).unwrap();
+        apply_irot(&vf2, AvifPixelFormat::Yuv444P, 64, 64, &Irot { angle: 2 }).unwrap();
     // For a flat-color fixture (red), every pixel is identical, so
     // 180° leaves the buffer numerically equal — but we still validate
     // the plane geometry holds.
@@ -1183,15 +1184,14 @@ fn nclx_colr_carries_cicp_triple() {
 #[test]
 fn end_to_end_decode_then_imir_roundtrips() {
     use oxideav_avif::apply_imir;
-    use oxideav_avif::Imir;
-    use oxideav_core::PixelFormat;
+    use oxideav_avif::{AvifFrame, AvifPixelFormat, Imir};
 
     for axis in 0u8..=1 {
         let mut d = AvifDecoder::new(CodecId::new(oxideav_avif::CODEC_ID_STR));
         let pkt = Packet::new(0, TimeBase::new(1, 1), RED64.to_vec());
         d.send_packet(&pkt).expect("send_packet red64 (imir)");
-        let vf = match d.receive_frame().expect("receive_frame red64 (imir)") {
-            oxideav_core::Frame::Video(v) => v,
+        let vf: AvifFrame = match d.receive_frame().expect("receive_frame red64 (imir)") {
+            oxideav_core::Frame::Video(v) => v.into(),
             other => panic!("expected VideoFrame, got {other:?}"),
         };
         assert_eq!(vf.planes.len(), 3, "red64 4:4:4 expects 3 planes");
@@ -1200,11 +1200,12 @@ fn end_to_end_decode_then_imir_roundtrips() {
         let original_v = vf.planes[2].data.clone();
 
         // Two flips along the same axis must recover the original.
-        let (mid, w1, h1) = apply_imir(&vf, PixelFormat::Yuv444P, 64, 64, &Imir { axis }).unwrap();
+        let (mid, w1, h1) =
+            apply_imir(&vf, AvifPixelFormat::Yuv444P, 64, 64, &Imir { axis }).unwrap();
         assert_eq!(w1, 64, "imir preserves width");
         assert_eq!(h1, 64, "imir preserves height");
         let (back, w2, h2) =
-            apply_imir(&mid, PixelFormat::Yuv444P, w1, h1, &Imir { axis }).unwrap();
+            apply_imir(&mid, AvifPixelFormat::Yuv444P, w1, h1, &Imir { axis }).unwrap();
         assert_eq!(w2, 64);
         assert_eq!(h2, 64);
         assert_eq!(
@@ -1364,14 +1365,13 @@ fn undersized_grid_is_rejected_at_container_level() {
 #[test]
 fn end_to_end_decode_then_clap_centre_crop() {
     use oxideav_avif::apply_clap;
-    use oxideav_avif::Clap;
-    use oxideav_core::PixelFormat;
+    use oxideav_avif::{AvifFrame, AvifPixelFormat, Clap};
 
     let mut d = AvifDecoder::new(CodecId::new(oxideav_avif::CODEC_ID_STR));
     let pkt = Packet::new(0, TimeBase::new(1, 1), RED64.to_vec());
     d.send_packet(&pkt).expect("send_packet red64 (clap)");
-    let vf = match d.receive_frame().expect("receive_frame red64 (clap)") {
-        oxideav_core::Frame::Video(v) => v,
+    let vf: AvifFrame = match d.receive_frame().expect("receive_frame red64 (clap)") {
+        oxideav_core::Frame::Video(v) => v.into(),
         other => panic!("expected VideoFrame, got {other:?}"),
     };
     assert_eq!(vf.planes.len(), 3);
@@ -1391,8 +1391,8 @@ fn end_to_end_decode_then_clap_centre_crop() {
     };
     let src_y = vf.planes[0].data.clone();
     let src_stride = vf.planes[0].stride;
-    let (cropped, cw, ch) =
-        apply_clap(&vf, PixelFormat::Yuv444P, 64, 64, &clap).expect("apply_clap centre crop");
+    let (cropped, cw, ch) = apply_clap(&vf, AvifPixelFormat::Yuv444P, 64, 64, &clap)
+        .expect("apply_clap centre crop");
     assert_eq!(cw, 32, "clap output width");
     assert_eq!(ch, 32, "clap output height");
     assert_eq!(cropped.planes.len(), 3, "4:4:4 preserves three planes");
@@ -1422,14 +1422,13 @@ fn end_to_end_decode_then_clap_centre_crop() {
 #[test]
 fn clap_with_zero_denominator_is_passthrough() {
     use oxideav_avif::apply_clap;
-    use oxideav_avif::Clap;
-    use oxideav_core::PixelFormat;
+    use oxideav_avif::{AvifFrame, AvifPixelFormat, Clap};
 
     let mut d = AvifDecoder::new(CodecId::new(oxideav_avif::CODEC_ID_STR));
     d.send_packet(&Packet::new(0, TimeBase::new(1, 1), RED64.to_vec()))
         .expect("send_packet");
-    let vf = match d.receive_frame().expect("receive_frame") {
-        oxideav_core::Frame::Video(v) => v,
+    let vf: AvifFrame = match d.receive_frame().expect("receive_frame") {
+        oxideav_core::Frame::Video(v) => v.into(),
         _ => unreachable!(),
     };
     let degenerate = Clap {
@@ -1442,8 +1441,8 @@ fn clap_with_zero_denominator_is_passthrough() {
         vert_off_n: 0,
         vert_off_d: 1,
     };
-    let (out, w, h) =
-        apply_clap(&vf, PixelFormat::Yuv444P, 64, 64, &degenerate).expect("clap no-op");
+    let (out, w, h) = apply_clap(&vf, AvifPixelFormat::Yuv444P, 64, 64, &degenerate)
+        .expect("clap no-op");
     assert_eq!(w, 64, "no-op clap preserves width");
     assert_eq!(h, 64, "no-op clap preserves height");
     assert_eq!(out.planes[0].data, vf.planes[0].data, "Y unchanged");

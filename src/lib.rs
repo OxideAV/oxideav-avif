@@ -12,9 +12,10 @@
 //!   `iloc`, brand check accepting `avif` / `avis` / `mif1` / `msf1` /
 //!   `miaf`.
 //! * Primary item's AV1 OBU bitstream is handed to
-//!   [`oxideav_av1::Av1Decoder`], which now returns real frames for
-//!   every intra still plus single-reference inter clips.
-//!   [`AvifDecoder::receive_frame`] composites the result:
+//!   [`oxideav_av1::Av1Decoder`] (when the default-on `registry` feature
+//!   is enabled), which now returns real frames for every intra still
+//!   plus single-reference inter clips. [`AvifDecoder::receive_frame`]
+//!   composites the result:
 //!   * Grid items (HEIF §6.6.2) — decode each tile via `dimg` iref
 //!     and paste into the declared output rectangle (see [`grid`]).
 //!   * Alpha auxiliary — AV1-coded monochrome item referenced via
@@ -32,19 +33,47 @@
 //!
 //! # Encoder
 //!
-//! Not implemented — [`make_encoder`] returns `Error::Unsupported`.
-//! Writing an AVIF encoder requires an AV1 encoder, which oxideav does
-//! not have.
+//! Not implemented — [`make_encoder`] (registry-only) returns
+//! `Error::Unsupported`. Writing an AVIF encoder requires an AV1
+//! encoder, which oxideav does not have.
+//!
+//! # Standalone vs registry-integrated
+//!
+//! The crate's default-on `registry` Cargo feature pulls in
+//! `oxideav-core` + `oxideav-av1` and exposes the
+//! `oxideav_core::Decoder` trait surface plus the [`register`] entry
+//! point. Disable the feature (`default-features = false`) for an
+//! `oxideav-core`-free build that still exposes:
+//!
+//! * The HEIF box walker + meta parser ([`box_parser`], [`meta`],
+//!   [`parser`], [`parse`], [`parse_header`]).
+//! * The AVIS sample-table walker ([`avis::parse_avis`]).
+//! * The grid descriptor + composition layer ([`grid`]) operating on
+//!   crate-local [`image::AvifFrame`] / [`image::AvifPixelFormat`].
+//! * The alpha + transform composition helpers ([`alpha`],
+//!   [`transform`]) on the same crate-local image types.
+//! * Container-side inspection: [`inspect::inspect`],
+//!   [`inspect::AvifInfo`], [`inspect::transforms_for`].
+//! * The CICP signalling helpers ([`cicp`]).
+//!
+//! Standalone callers that want pixel decode must pair this surface
+//! with their own AV1 decoder — the in-tree one ([`oxideav_av1`]) is
+//! pulled in only when `registry` is on.
 
 pub mod alpha;
 pub mod avis;
 pub mod box_parser;
 pub mod cicp;
-pub mod decoder;
+pub mod error;
 pub mod grid;
+pub mod image;
+pub mod inspect;
 pub mod meta;
 pub mod parser;
 pub mod transform;
+
+#[cfg(feature = "registry")]
+pub mod decoder;
 
 pub use alpha::{composite_alpha, find_alpha_item_id, ALPHA_URN_PREFIX};
 pub use avis::{parse_avis, sample_bytes, sample_table, AvisMeta, Sample};
@@ -52,8 +81,10 @@ pub use cicp::{
     effective_cicp, is_matrix_reserved, is_primaries_reserved, is_transfer_reserved, matrix_name,
     primaries_name, transfer_name, CicpTriple,
 };
-pub use decoder::{inspect, make_decoder, AvifDecoder, AvifInfo};
+pub use error::{AvifError, Result};
 pub use grid::{composite_grid, ImageGrid};
+pub use image::{AvifFrame, AvifPixelFormat, AvifPlane};
+pub use inspect::{inspect, transforms_for, AvifInfo};
 pub use meta::{
     AuxC, Clap, Colr, Imir, IrefEntry, Irot, Ispe, ItemInfo, ItemLocation, Meta, Pasp, Pixi,
     Property,
@@ -64,49 +95,82 @@ pub use parser::{
 };
 pub use transform::{apply_clap, apply_imir, apply_irot, crop_top_left};
 
-use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, Error, Result};
-use oxideav_core::{CodecInfo, CodecRegistry, Encoder};
+#[cfg(feature = "registry")]
+pub use decoder::{make_decoder, AvifDecoder};
 
 /// Public codec id string. Matches the aggregator-crate Cargo feature `avif`.
 pub const CODEC_ID_STR: &str = "avif";
 
-/// Register the AVIF decoder + encoder factories with a registry. The
-/// decoder is declared `avif_heif_av1_decode` — we parse the HEIF
-/// container end to end, hand the AV1 bitstream to oxideav-av1, and
-/// composite grid / alpha / transform properties on the resulting
-/// frames.
-pub fn register(reg: &mut CodecRegistry) {
-    let caps = CodecCapabilities::video("avif_heif_av1_decode")
-        .with_lossy(true)
-        .with_intra_only(true);
-    reg.register(
-        CodecInfo::new(CodecId::new(CODEC_ID_STR))
-            .capabilities(caps)
-            .decoder(make_decoder)
-            .encoder(make_encoder),
-    );
+#[cfg(feature = "registry")]
+mod registry_glue {
+    //! Codec registry + AVIF encoder factory. Gated behind `registry`
+    //! because the entire framework integration depends on
+    //! `oxideav_core` + `oxideav_av1`.
+
+    use oxideav_core::{
+        CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry, Encoder, Error,
+        Result,
+    };
+
+    use crate::decoder::make_decoder;
+    use crate::error::AvifError;
+    use crate::CODEC_ID_STR;
+
+    /// Bridge crate-local errors into the framework error type. Mirrors
+    /// the conversion the decoder performs internally so external
+    /// callers using the standalone container API get the same mapping
+    /// when they wrap up their own framework integration.
+    impl From<AvifError> for Error {
+        fn from(e: AvifError) -> Self {
+            match e {
+                AvifError::InvalidData(s) => Error::InvalidData(s),
+                AvifError::Unsupported(s) => Error::Unsupported(s),
+            }
+        }
+    }
+
+    /// Register the AVIF decoder + encoder factories with a registry.
+    /// The decoder is declared `avif_heif_av1_decode` — we parse the
+    /// HEIF container end to end, hand the AV1 bitstream to
+    /// oxideav-av1, and composite grid / alpha / transform properties
+    /// on the resulting frames.
+    pub fn register(reg: &mut CodecRegistry) {
+        let caps = CodecCapabilities::video("avif_heif_av1_decode")
+            .with_lossy(true)
+            .with_intra_only(true);
+        reg.register(
+            CodecInfo::new(CodecId::new(CODEC_ID_STR))
+                .capabilities(caps)
+                .decoder(make_decoder)
+                .encoder(make_encoder),
+        );
+    }
+
+    /// AVIF encoder factory — always errors. Writing AVIF requires an
+    /// AV1 encoder, which oxideav does not currently ship.
+    pub fn make_encoder(_params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+        Err(Error::unsupported(
+            "avif: encoder not implemented — requires an AV1 encoder (not available in oxideav)",
+        ))
+    }
+
+    /// Convenience: register AVIF + its underlying AV1 decoder in one
+    /// call. Useful when the registry is being built from scratch and
+    /// the caller only wants AVIF — they don't have to remember that
+    /// AVIF delegates to the AV1 codec.
+    pub fn register_with_av1(reg: &mut CodecRegistry) {
+        register(reg);
+        oxideav_av1::register(reg);
+    }
 }
 
-/// AVIF encoder factory — always errors. Writing AVIF requires an AV1
-/// encoder, which oxideav does not currently ship.
-pub fn make_encoder(_params: &CodecParameters) -> Result<Box<dyn Encoder>> {
-    Err(Error::unsupported(
-        "avif: encoder not implemented — requires an AV1 encoder (not available in oxideav)",
-    ))
-}
+#[cfg(feature = "registry")]
+pub use registry_glue::{make_encoder, register, register_with_av1};
 
-/// Convenience: register AVIF + its underlying AV1 decoder in one
-/// call. Useful when the registry is being built from scratch and the
-/// caller only wants AVIF — they don't have to remember that AVIF
-/// delegates to the AV1 codec.
-pub fn register_with_av1(reg: &mut CodecRegistry) {
-    register(reg);
-    oxideav_av1::register(reg);
-}
-
-#[cfg(test)]
+#[cfg(all(test, feature = "registry"))]
 mod tests {
     use super::*;
+    use oxideav_core::{CodecId, CodecParameters, CodecRegistry, Error};
 
     #[test]
     fn register_installs_factories() {

@@ -24,8 +24,8 @@
 //! understand chroma siting or BT.709 vs. full-range semantics, both of
 //! which are orthogonal to geometric manipulation.
 
-use oxideav_core::frame::{VideoFrame, VideoPlane};
-use oxideav_core::{Error, PixelFormat, Result};
+use crate::error::{AvifError as Error, Result};
+use crate::image::{AvifFrame as VideoFrame, AvifPixelFormat as PixelFormat, AvifPlane as VideoPlane};
 
 use crate::meta::{Clap, Imir, Irot};
 

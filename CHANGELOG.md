@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Standalone-friendly retrofit (#360 sweep). New default-on `registry`
+  Cargo feature gates the `oxideav-core` + `oxideav-av1` dependencies
+  plus the `oxideav_core::Decoder` trait surface (`AvifDecoder`,
+  `make_decoder`, `register`, `register_with_av1`, `make_encoder`).
+  With the feature off the crate exposes the HEIF box walker
+  (`box_parser`, `meta`, `parser`), AVIS sample-table walker
+  (`avis::parse_avis`), grid + alpha + transform composition layer
+  (operating on crate-local `AvifFrame` / `AvifPixelFormat` /
+  `AvifPlane`), `inspect::AvifInfo` + container-side colour helpers
+  (`cicp::*`), and the `AvifError` / `Result` types — all without
+  pulling either framework dep into the dep tree.
+  - New crate-local types: `AvifError`, `AvifFrame`, `AvifPlane`,
+    `AvifPixelFormat`. With `registry` enabled, `From` /
+    `TryFrom` conversions to/from `oxideav_core::frame::VideoFrame` /
+    `VideoPlane` / `PixelFormat` are exposed for callers that bridge
+    both worlds.
+  - Module split: `inspect.rs` carries the standalone container-side
+    surface (`AvifInfo`, `inspect`, `transforms_for`,
+    `build_info`, `build_info_grid`); `decoder.rs` keeps the
+    registry-only AV1 + composition pipeline.
+  - Inline `ci-standalone` job builds and tests the lib with
+    `--no-default-features` so future regressions where a pipeline
+    module re-grows an `oxideav-core` import fail CI.
+
 ## [0.0.5](https://github.com/OxideAV/oxideav-avif/compare/v0.0.4...v0.0.5) - 2026-05-03
 
 ### Other

@@ -7,7 +7,7 @@
 //! `FullBox` additionally prefixes its payload with `version(1) +
 //! flags(3)`.
 
-use oxideav_core::{Error, Result};
+use crate::error::{AvifError as Error, Result};
 
 /// 4-character box type, compared as a big-endian `u32`.
 pub type BoxType = [u8; 4];

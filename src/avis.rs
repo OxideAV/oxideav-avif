@@ -12,7 +12,7 @@
 //! metadata. The caller pairs the table with a standard
 //! [`oxideav_av1::Av1Decoder`] to decode frames end-to-end.
 
-use oxideav_core::{Error, Result};
+use crate::error::{AvifError as Error, Result};
 
 use crate::box_parser::{b, find_box, iter_boxes, parse_full_box, read_u32, read_u64, BoxType};
 
