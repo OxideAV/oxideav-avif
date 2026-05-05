@@ -165,6 +165,8 @@ mod registry_glue {
         register_containers(&mut ctx.containers);
     }
 
+    oxideav_core::register!("avif", register);
+
     /// AVIF encoder factory — always errors. Writing AVIF requires an
     /// AV1 encoder, which oxideav does not currently ship.
     pub fn make_encoder(_params: &CodecParameters) -> Result<Box<dyn Encoder>> {

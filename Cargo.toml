@@ -21,6 +21,12 @@ categories = ["multimedia::encoding", "multimedia::images"]
 # either crate. See `src/lib.rs` for the standalone-vs-registry split.
 oxideav-core = { version = "0.1", optional = true }
 oxideav-av1 = { version = "0.1", optional = true }
+# Distributed-slice auto-registration into `oxideav_core::REGISTRARS`
+# via the `oxideav_core::register!` macro. Tiny crate, no transitive
+# deps; works on every target including wasm. Optional + gated behind
+# the `registry` feature so standalone image-library callers don't pull
+# it in.
+linkme = { version = "0.3", optional = true }
 
 [features]
 default = ["registry"]
@@ -31,7 +37,7 @@ default = ["registry"]
 # parser + grid/alpha/transform composition layer (operating on
 # `crate::image::AvifFrame`) plus `inspect` / `parse` /
 # `parse_header` / `parse_avis` are still exposed.
-registry = ["dep:oxideav-core", "dep:oxideav-av1"]
+registry = ["dep:oxideav-core", "dep:oxideav-av1", "dep:linkme"]
 
 # Diagnostic example needs the AV1 decoder + registry decoder trait —
 # only build it when the `registry` feature is on so
