@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- r22: HDR metadata pass-through (`mdcv` / `clli` / `cclv` item
+  properties). All three boxes are now parsed and surfaced through
+  `AvifInfo`:
+  - `mdcv` (`MasteringDisplayColourVolumeBox`, SMPTE ST 2086): display
+    primaries (R/G/B) in chromaticity × 50000, white point, and max/min
+    display luminance in 1/10000 cd/m² units. New `Mdcv` type in
+    `meta.rs`.
+  - `clli` (`ContentLightLevelBox`, ISO/IEC 14496-12 §12.1.5.4):
+    MaxCLL + MaxFALL in cd/m². New `Clli` type.
+  - `cclv` (draft av1-avif extension — same binary layout as `clli`).
+    New `Cclv` type.
+  - `AvifInfo` gains `mdcv: Option<Mdcv>`, `clli: Option<Clli>`,
+    `cclv: Option<Cclv>`, plus helpers `has_hdr_metadata()`,
+    `max_cll() -> Option<u16>`, `max_fall() -> Option<u16>`.
+  - Grid primaries resolve HDR properties with the same fallback
+    chain as `colr`/`pixi`/`pasp`: grid item first, tile 0 second.
+  - New unit tests: `mdcv_round_trip`, `mdcv_rejects_truncated`,
+    `clli_round_trip`, `clli_rejects_truncated`, `cclv_round_trip`,
+    `cclv_rejects_truncated` (meta.rs); `inspect_sdr_fixture_has_no_hdr_metadata` (inspect.rs).
+
+- r22: AV1 wrap pass-through — `bit_depth`, `monochrome`,
+  `chroma_subsampling` decoded from `av1C` and stored on `AvifInfo`:
+  - `bit_depth: Option<u8>` — 8 / 10 / 12 derived from
+    `(high_bitdepth, twelve_bit)` flags in the `av1C` record. `None`
+    when `av1c` is empty (< 3 bytes).
+  - `monochrome: bool` — mirrors the `av1C` monochrome bit.
+  - `chroma_subsampling: Option<(bool, bool)>` — `(subsampling_x,
+    subsampling_y)` for colour streams; `None` for monochrome.
+  - New `decode_av1c_flags()` internal helper (also tested directly).
+  - New tests: `inspect_av1c_flags_decoded`,
+    `decode_av1c_flags_hdr_bit_depths` (inspect.rs).
+
+- r22: Multi-extent `iloc` item support — new public `item_bytes_owned`
+  helper concatenates all extents for items that span more than one
+  `iloc` extent entry (HEIF §8.11.3.3). The existing zero-copy
+  `item_bytes` fast path is preserved for the common single-extent case.
+  `item_bytes` now returns a descriptive `Unsupported` error for
+  multi-extent items so callers know to use `item_bytes_owned`. New
+  tests: `item_bytes_owned_single_extent_matches_item_bytes`,
+  `item_bytes_owned_multi_extent_concatenates`,
+  `item_bytes_owned_rejects_idat_method` (parser.rs).
+
 ## [0.0.6](https://github.com/OxideAV/oxideav-avif/compare/v0.0.5...v0.0.6) - 2026-05-04
 
 ### Other

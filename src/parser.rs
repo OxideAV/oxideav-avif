@@ -5,7 +5,9 @@
 use crate::error::{AvifError as Error, Result};
 
 use crate::box_parser::{b, iter_boxes, read_u32, type_str, BoxType};
-use crate::meta::{Colr, Ispe, ItemInfo, ItemLocation, Meta, Pasp, Pixi, Property};
+use crate::meta::{
+    Cclv, Clli, Colr, Ispe, ItemInfo, ItemLocation, Mdcv, Meta, Pasp, Pixi, Property,
+};
 
 const FTYP: BoxType = b(b"ftyp");
 const META: BoxType = b(b"meta");
@@ -51,6 +53,12 @@ pub struct AvifImage<'a> {
     pub colr: Option<Colr>,
     pub pixi: Option<Pixi>,
     pub pasp: Option<Pasp>,
+    /// Mastering display colour volume (SMPTE ST 2086 / CTA-861-G HDR).
+    pub mdcv: Option<Mdcv>,
+    /// Content light level info (MaxCLL / MaxFALL in cd/m²).
+    pub clli: Option<Clli>,
+    /// Colour volume luminance (`cclv` draft extension, same semantics as `clli`).
+    pub cclv: Option<Cclv>,
 }
 
 /// Header-only parse that stops after `ftyp` + `meta` have been walked.
@@ -153,6 +161,18 @@ pub fn parse(file: &[u8]) -> Result<AvifImage<'_>> {
         Some(Property::Pasp(v)) => Some(*v),
         _ => None,
     };
+    let mdcv = match meta.property_for(primary_id, b"mdcv") {
+        Some(Property::Mdcv(v)) => Some(*v),
+        _ => None,
+    };
+    let clli = match meta.property_for(primary_id, b"clli") {
+        Some(Property::Clli(v)) => Some(*v),
+        _ => None,
+    };
+    let cclv = match meta.property_for(primary_id, b"cclv") {
+        Some(Property::Cclv(v)) => Some(*v),
+        _ => None,
+    };
 
     Ok(AvifImage {
         major_brand,
@@ -167,6 +187,9 @@ pub fn parse(file: &[u8]) -> Result<AvifImage<'_>> {
         colr,
         pixi,
         pasp,
+        mdcv,
+        clli,
+        cclv,
     })
 }
 
@@ -270,12 +293,10 @@ fn resolve_item_bytes<'a>(file: &'a [u8], loc: &ItemLocation) -> Result<&'a [u8]
             loc.construction_method
         )));
     }
-    // AVIF primary items normally carry a single extent; if they don't
-    // we'd need to concatenate. Surface a clean error until a real file
-    // exercises that path.
     match loc.extents.len() {
         0 => Err(Error::invalid("avif: iloc entry has no extents")),
         1 => {
+            // Fast path: single extent — return a slice directly with no allocation.
             let e = &loc.extents[0];
             let start = loc
                 .base_offset
@@ -293,10 +314,73 @@ fn resolve_item_bytes<'a>(file: &'a [u8], loc: &ItemLocation) -> Result<&'a [u8]
             }
             Ok(&file[start..end])
         }
-        _ => Err(Error::unsupported(
-            "avif: multi-extent items not yet handled",
-        )),
+        _ => {
+            // Multi-extent items: concatenate all extents. HEIF §8.11.3.3
+            // requires that the decoder assemble the item data by appending
+            // extents in order. The caller gets a fresh allocation — the
+            // returned `&[u8]` is a reference to the owned buffer stored in
+            // a leak-safe place (see `item_bytes_owned`).
+            //
+            // We surface this as an error and provide a separate
+            // `item_bytes_owned` helper that returns a `Vec<u8>`. Callers
+            // that handle multi-extent items call `item_bytes_owned` directly.
+            //
+            // The single caller of `resolve_item_bytes` that may encounter
+            // multi-extent items is `item_bytes` which is used in the grid
+            // and alpha paths. Grid tile items in the wild are always
+            // single-extent (each tile is one contiguous mdat run), so this
+            // path is extremely rare. Surface Unsupported until a real file
+            // exercises the path in production.
+            Err(Error::unsupported(format!(
+                "avif: item {} has {} extents; multi-extent items require item_bytes_owned()",
+                loc.id,
+                loc.extents.len()
+            )))
+        }
     }
+}
+
+/// Resolve an item's payload bytes, concatenating multiple extents when
+/// necessary. This may allocate when the item spans more than one extent.
+///
+/// For the common single-extent case this calls [`item_bytes`] internally
+/// and returns the slice as an owned copy — a small allocation to keep the
+/// API uniform. Callers that want zero-copy access for single-extent items
+/// should use [`item_bytes`] directly.
+pub fn item_bytes_owned(file: &[u8], loc: &ItemLocation) -> Result<Vec<u8>> {
+    if loc.construction_method != 0 {
+        return Err(Error::unsupported(format!(
+            "avif: iloc construction_method {} not supported",
+            loc.construction_method
+        )));
+    }
+    if loc.extents.is_empty() {
+        return Err(Error::invalid("avif: iloc entry has no extents"));
+    }
+    if loc.extents.len() == 1 {
+        // Common path: single extent — delegate to slice resolver.
+        return item_bytes(file, loc).map(|s| s.to_vec());
+    }
+    // Multi-extent: concatenate all extents in order (HEIF §8.11.3.3).
+    let mut out = Vec::new();
+    for (i, e) in loc.extents.iter().enumerate() {
+        let start = loc
+            .base_offset
+            .checked_add(e.offset)
+            .ok_or_else(|| Error::invalid(format!("avif: iloc extent {i} offset overflow")))?;
+        let end = start
+            .checked_add(e.length)
+            .ok_or_else(|| Error::invalid(format!("avif: iloc extent {i} length overflow")))?;
+        let (start, end) = (start as usize, end as usize);
+        if end > file.len() {
+            return Err(Error::invalid(format!(
+                "avif: iloc extent {i} {start}..{end} exceeds file length {}",
+                file.len()
+            )));
+        }
+        out.extend_from_slice(&file[start..end]);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -402,5 +486,81 @@ mod tests {
         // Monochrome file has a pixi with one 8-bit channel.
         let pixi = img.pixi.as_ref().expect("pixi");
         assert_eq!(pixi.bits_per_channel, vec![8]);
+        // SDR fixture carries no HDR metadata.
+        assert!(img.mdcv.is_none(), "SDR fixture must not have mdcv");
+        assert!(img.clli.is_none(), "SDR fixture must not have clli");
+        assert!(img.cclv.is_none(), "SDR fixture must not have cclv");
+    }
+
+    /// `item_bytes_owned` on a single-extent iloc returns the same data
+    /// as `item_bytes`. This path allocates but produces equal bytes.
+    #[test]
+    fn item_bytes_owned_single_extent_matches_item_bytes() {
+        use crate::meta::{IlocExtent, ItemLocation};
+        let data = b"hello world";
+        // Synthetic loc: base_offset 0, extent offset=0, length=11.
+        let loc = ItemLocation {
+            id: 1,
+            construction_method: 0,
+            data_reference_index: 0,
+            base_offset: 0,
+            extents: vec![IlocExtent {
+                offset: 0,
+                length: 11,
+            }],
+        };
+        let slice = item_bytes(data, &loc).unwrap();
+        let owned = item_bytes_owned(data, &loc).unwrap();
+        assert_eq!(slice, owned.as_slice());
+        assert_eq!(owned, b"hello world");
+    }
+
+    /// `item_bytes_owned` on a multi-extent iloc concatenates all extents.
+    #[test]
+    fn item_bytes_owned_multi_extent_concatenates() {
+        use crate::meta::{IlocExtent, ItemLocation};
+        let data = b"AAAA____BBBB"; // 12 bytes; extents at 0..4 and 8..12
+        let loc = ItemLocation {
+            id: 1,
+            construction_method: 0,
+            data_reference_index: 0,
+            base_offset: 0,
+            extents: vec![
+                IlocExtent {
+                    offset: 0,
+                    length: 4,
+                },
+                IlocExtent {
+                    offset: 8,
+                    length: 4,
+                },
+            ],
+        };
+        let owned = item_bytes_owned(data, &loc).unwrap();
+        assert_eq!(owned, b"AAAABBBB");
+        // item_bytes must return Unsupported for multi-extent.
+        let err = item_bytes(data, &loc).unwrap_err();
+        assert!(
+            matches!(err, crate::error::AvifError::Unsupported(_)),
+            "item_bytes must return Unsupported for multi-extent: {err:?}"
+        );
+    }
+
+    /// `item_bytes_owned` rejects construction_method != 0.
+    #[test]
+    fn item_bytes_owned_rejects_idat_method() {
+        use crate::meta::{IlocExtent, ItemLocation};
+        let loc = ItemLocation {
+            id: 1,
+            construction_method: 1, // idat-based
+            data_reference_index: 0,
+            base_offset: 0,
+            extents: vec![IlocExtent {
+                offset: 0,
+                length: 4,
+            }],
+        };
+        let err = item_bytes_owned(b"data", &loc).unwrap_err();
+        assert!(matches!(err, crate::error::AvifError::Unsupported(_)));
     }
 }

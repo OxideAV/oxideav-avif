@@ -37,6 +37,9 @@ const IROT: BoxType = b(b"irot");
 const IMIR: BoxType = b(b"imir");
 const CLAP: BoxType = b(b"clap");
 const AUXC: BoxType = b(b"auxC");
+const MDCV: BoxType = b(b"mdcv");
+const CLLI: BoxType = b(b"clli");
+const CCLV: BoxType = b(b"cclv");
 
 /// One `infe` entry.
 #[derive(Clone, Debug)]
@@ -204,6 +207,52 @@ pub struct AuxC {
     pub aux_subtype: Vec<u8>,
 }
 
+/// Mastering display colour volume (`mdcv`) — SMPTE ST 2086 / CTA-861-G
+/// HDR metadata. Spec: ISO/IEC 14496-12 §12.1.5.3 (MasteringDisplayColourVolumeBox).
+///
+/// `display_primaries_xy` is `[(Rx,Ry), (Gx,Gy), (Bx,By)]` in
+/// `u16` units of `1/50000` (CIE 1931). `white_point_xy` is the
+/// white-point in the same units. Luminance values are in `u32` units
+/// of `1/10000 cd/m²`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Mdcv {
+    /// Display primaries (R, G, B) in chromaticity units × 50000.
+    pub display_primaries_xy: [(u16, u16); 3],
+    /// White point in chromaticity units × 50000.
+    pub white_point_xy: (u16, u16),
+    /// Maximum display luminance in units of 1/10000 cd/m².
+    pub max_display_mastering_luminance: u32,
+    /// Minimum display luminance in units of 1/10000 cd/m².
+    pub min_display_mastering_luminance: u32,
+}
+
+/// Content light level info (`clli`) — maximum frame-average and
+/// maximum content light levels. Spec: ISO/IEC 14496-12 §12.1.5.4
+/// (ContentLightLevelBox). Both values are in cd/m².
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Clli {
+    /// Max content light level (MaxCLL) in cd/m².
+    pub max_content_light_level: u16,
+    /// Max frame-average light level (MaxFALL) in cd/m².
+    pub max_pic_average_light_level: u16,
+}
+
+/// Colour volume luminance (`cclv`) — supplemental HDR luminance hint.
+/// Spec: AOM AV1 Metadata OBU HDR dynamic metadata / AVIF extension
+/// (draft av1-avif §9.4). Carries `max_cll` + `max_fall` in the same
+/// binary layout as `clli` but in the `ipco` item-property plane.
+///
+/// Encoders that implement the draft sometimes write `cclv` alongside
+/// or in place of `clli`; both carry identical semantics — treat them
+/// the same downstream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cclv {
+    /// Max content light level in cd/m².
+    pub max_content_light_level: u16,
+    /// Max frame-average light level in cd/m².
+    pub max_pic_average_light_level: u16,
+}
+
 /// One property box, kept typed for the boxes AVIF cares about + a raw
 /// fallback so an unknown property still gets an index for association.
 #[derive(Clone, Debug)]
@@ -217,6 +266,12 @@ pub enum Property {
     Imir(Imir),
     Clap(Clap),
     AuxC(AuxC),
+    /// Mastering display colour volume (SMPTE ST 2086 HDR metadata).
+    Mdcv(Mdcv),
+    /// Content light level info (MaxCLL / MaxFALL in cd/m²).
+    Clli(Clli),
+    /// Colour volume luminance — draft AVIF supplement equivalent to `clli`.
+    Cclv(Cclv),
     Other(BoxType, Vec<u8>),
 }
 
@@ -232,6 +287,9 @@ impl Property {
             Property::Imir(_) => IMIR,
             Property::Clap(_) => CLAP,
             Property::AuxC(_) => AUXC,
+            Property::Mdcv(_) => MDCV,
+            Property::Clli(_) => CLLI,
+            Property::Cclv(_) => CCLV,
             Property::Other(t, _) => *t,
         }
     }
@@ -555,6 +613,9 @@ fn parse_ipco(payload: &[u8]) -> Result<Vec<Property>> {
             x if x == &IMIR => Property::Imir(parse_imir(body)?),
             x if x == &CLAP => Property::Clap(parse_clap(body)?),
             x if x == &AUXC => Property::AuxC(parse_auxc(body)?),
+            x if x == &MDCV => Property::Mdcv(parse_mdcv(body)?),
+            x if x == &CLLI => Property::Clli(parse_clli(body)?),
+            x if x == &CCLV => Property::Cclv(parse_cclv(body)?),
             other => Property::Other(*other, body.to_vec()),
         };
         out.push(prop);
@@ -665,6 +726,66 @@ fn parse_auxc(body: &[u8]) -> Result<AuxC> {
     Ok(AuxC {
         aux_type,
         aux_subtype,
+    })
+}
+
+/// Parse `mdcv` (MasteringDisplayColourVolumeBox). Layout per ISO/IEC 14496-12
+/// §12.1.5.3: 6 × u16 chromaticity values (Rx,Ry,Gx,Gy,Bx,By in units of
+/// 1/50000 CIE 1931) + 2 × u16 white point + 2 × u32 luminance (max/min in
+/// units of 1/10000 cd/m²). Total: 24 bytes, no FullBox header.
+fn parse_mdcv(body: &[u8]) -> Result<Mdcv> {
+    if body.len() < 24 {
+        return Err(Error::invalid(format!(
+            "avif: mdcv too short ({} < 24)",
+            body.len()
+        )));
+    }
+    let rx = read_u16(body, 0)?;
+    let ry = read_u16(body, 2)?;
+    let gx = read_u16(body, 4)?;
+    let gy = read_u16(body, 6)?;
+    let bx = read_u16(body, 8)?;
+    let by_ = read_u16(body, 10)?;
+    let wx = read_u16(body, 12)?;
+    let wy = read_u16(body, 14)?;
+    let max_lum = read_u32(body, 16)?;
+    let min_lum = read_u32(body, 20)?;
+    Ok(Mdcv {
+        display_primaries_xy: [(rx, ry), (gx, gy), (bx, by_)],
+        white_point_xy: (wx, wy),
+        max_display_mastering_luminance: max_lum,
+        min_display_mastering_luminance: min_lum,
+    })
+}
+
+/// Parse `clli` (ContentLightLevelBox). Layout per ISO/IEC 14496-12
+/// §12.1.5.4: two u16 values — MaxCLL and MaxFALL in cd/m². No FullBox header.
+fn parse_clli(body: &[u8]) -> Result<Clli> {
+    if body.len() < 4 {
+        return Err(Error::invalid(format!(
+            "avif: clli too short ({} < 4)",
+            body.len()
+        )));
+    }
+    Ok(Clli {
+        max_content_light_level: read_u16(body, 0)?,
+        max_pic_average_light_level: read_u16(body, 2)?,
+    })
+}
+
+/// Parse `cclv` (ColourVolumeLuminanceBox — draft av1-avif extension).
+/// Same binary layout as `clli`: two u16 values (MaxCLL, MaxFALL). Some
+/// encoders write this instead of or in addition to `clli`.
+fn parse_cclv(body: &[u8]) -> Result<Cclv> {
+    if body.len() < 4 {
+        return Err(Error::invalid(format!(
+            "avif: cclv too short ({} < 4)",
+            body.len()
+        )));
+    }
+    Ok(Cclv {
+        max_content_light_level: read_u16(body, 0)?,
+        max_pic_average_light_level: read_u16(body, 2)?,
     })
 }
 
@@ -952,5 +1073,78 @@ mod tests {
         assert_eq!(&refs[0].reference_type, b"auxl");
         assert_eq!(refs[0].from_id, 2);
         assert_eq!(refs[0].to_ids, vec![1]);
+    }
+
+    /// `mdcv` round-trip: 6 × u16 primaries + 2 × u16 white point +
+    /// 2 × u32 luminance values (no FullBox header).
+    #[test]
+    fn mdcv_round_trip() {
+        let mut buf = Vec::new();
+        // Rx=13250, Ry=34500  (BT.2020 red primary × 50000)
+        buf.extend_from_slice(&13250u16.to_be_bytes());
+        buf.extend_from_slice(&34500u16.to_be_bytes());
+        // Gx=7500, Gy=40000  (BT.2020 green primary × 50000)
+        buf.extend_from_slice(&7500u16.to_be_bytes());
+        buf.extend_from_slice(&40000u16.to_be_bytes());
+        // Bx=3000, By=1000   (BT.2020 blue primary × 50000)
+        buf.extend_from_slice(&3000u16.to_be_bytes());
+        buf.extend_from_slice(&1000u16.to_be_bytes());
+        // White point: D65 = (15635, 16450)
+        buf.extend_from_slice(&15635u16.to_be_bytes());
+        buf.extend_from_slice(&16450u16.to_be_bytes());
+        // Max luminance = 10000000 (1000 cd/m² × 10000 units)
+        buf.extend_from_slice(&10_000_000u32.to_be_bytes());
+        // Min luminance = 50 (0.005 cd/m² × 10000 units)
+        buf.extend_from_slice(&50u32.to_be_bytes());
+        let m = parse_mdcv(&buf).unwrap();
+        assert_eq!(m.display_primaries_xy[0], (13250, 34500)); // R
+        assert_eq!(m.display_primaries_xy[1], (7500, 40000)); // G
+        assert_eq!(m.display_primaries_xy[2], (3000, 1000)); // B
+        assert_eq!(m.white_point_xy, (15635, 16450));
+        assert_eq!(m.max_display_mastering_luminance, 10_000_000);
+        assert_eq!(m.min_display_mastering_luminance, 50);
+    }
+
+    /// `mdcv` rejects truncated input (< 24 bytes).
+    #[test]
+    fn mdcv_rejects_truncated() {
+        let buf = vec![0u8; 23];
+        assert!(parse_mdcv(&buf).is_err());
+    }
+
+    /// `clli` round-trip: MaxCLL + MaxFALL as two u16 values.
+    #[test]
+    fn clli_round_trip() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1000u16.to_be_bytes()); // MaxCLL = 1000 cd/m²
+        buf.extend_from_slice(&400u16.to_be_bytes()); // MaxFALL = 400 cd/m²
+        let c = parse_clli(&buf).unwrap();
+        assert_eq!(c.max_content_light_level, 1000);
+        assert_eq!(c.max_pic_average_light_level, 400);
+    }
+
+    /// `clli` rejects truncated input (< 4 bytes).
+    #[test]
+    fn clli_rejects_truncated() {
+        let buf = vec![0u8; 3];
+        assert!(parse_clli(&buf).is_err());
+    }
+
+    /// `cclv` has identical layout to `clli`.
+    #[test]
+    fn cclv_round_trip() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&2000u16.to_be_bytes()); // MaxCLL
+        buf.extend_from_slice(&800u16.to_be_bytes()); // MaxFALL
+        let c = parse_cclv(&buf).unwrap();
+        assert_eq!(c.max_content_light_level, 2000);
+        assert_eq!(c.max_pic_average_light_level, 800);
+    }
+
+    /// `cclv` rejects truncated input.
+    #[test]
+    fn cclv_rejects_truncated() {
+        let buf = vec![0u8; 1];
+        assert!(parse_cclv(&buf).is_err());
     }
 }

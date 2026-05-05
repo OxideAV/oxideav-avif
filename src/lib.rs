@@ -7,7 +7,7 @@
 //!   (v0/v1) + `infe` (v2/v3), `iloc` (v0/v1/v2), `iref`, `iprp` /
 //!   `ipco` / `ipma` (v0/v1, small + large indices), plus item
 //!   properties `av1C`, `ispe`, `colr` (nclx + ICC), `pixi`, `pasp`,
-//!   `irot`, `imir`, `clap`, `auxC`.
+//!   `irot`, `imir`, `clap`, `auxC`, `mdcv`, `clli`, `cclv`.
 //! * Primary item resolution via `pitm`, file-offset extent reads via
 //!   `iloc`, brand check accepting `avif` / `avis` / `mif1` / `msf1` /
 //!   `miaf`.
@@ -86,12 +86,12 @@ pub use grid::{composite_grid, ImageGrid};
 pub use image::{AvifFrame, AvifPixelFormat, AvifPlane};
 pub use inspect::{inspect, transforms_for, AvifInfo};
 pub use meta::{
-    AuxC, Clap, Colr, Imir, IrefEntry, Irot, Ispe, ItemInfo, ItemLocation, Meta, Pasp, Pixi,
-    Property,
+    AuxC, Cclv, Clap, Clli, Colr, Imir, IrefEntry, Irot, Ispe, ItemInfo, ItemLocation, Mdcv, Meta,
+    Pasp, Pixi, Property,
 };
 pub use parser::{
-    classify_brands, parse, parse_header, AvifHeader, AvifImage, BrandClass, BRAND_AVIF,
-    BRAND_AVIO, BRAND_AVIS, BRAND_MA1A, BRAND_MA1B, BRAND_MIAF, BRAND_MIF1, BRAND_MSF1,
+    classify_brands, item_bytes_owned, parse, parse_header, AvifHeader, AvifImage, BrandClass,
+    BRAND_AVIF, BRAND_AVIO, BRAND_AVIS, BRAND_MA1A, BRAND_MA1B, BRAND_MIAF, BRAND_MIF1, BRAND_MSF1,
 };
 pub use transform::{apply_clap, apply_imir, apply_irot, crop_top_left};
 

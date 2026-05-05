@@ -26,13 +26,16 @@ still loses significant signal.
 |----------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `ftyp` brand check                     | accepts `avif` / `avis` / `mif1` / `msf1` / `miaf`                                                                                                         |
 | `meta` sub-boxes                       | `hdlr`, `pitm` (v0/v1), `iinf` (v0/v1) + `infe` (v2/v3), `iloc` (v0/v1/v2), `iref`, `iprp` / `ipco` / `ipma` (v0/v1, small + large property indices)       |
-| Item properties                        | `av1C`, `ispe`, `colr` (nclx + ICC), `pixi`, `pasp`, `irot`, `imir`, `clap`, `auxC`; unknown boxes retained as `Property::Other` so indices stay valid      |
+| Item properties                        | `av1C`, `ispe`, `colr` (nclx + ICC), `pixi`, `pasp`, `irot`, `imir`, `clap`, `auxC`, `mdcv`, `clli`, `cclv`; unknown boxes retained as `Property::Other` so indices stay valid |
 | CICP color signalling                  | `colr` nclx → `CicpTriple` (primaries / transfer / matrix / full_range) with H.273 defaults (`Unspecified` = `2/2/2/false`); ICC + Unknown fall back to Unspecified; alpha auxiliary CICP constant carries `full_range = true` per av1-avif §4.1 |
-| Primary item data                      | resolved via `iloc` construction_method 0 (file offset), single-extent items; multi-extent + idat / item-offset are rejected with `Unsupported`            |
+| HDR metadata                           | `mdcv` (SMPTE ST 2086 mastering display primaries + luminance), `clli` (MaxCLL / MaxFALL cd/m²), `cclv` (draft av1-avif extension, same layout as `clli`); surfaced via `AvifInfo::{mdcv, clli, cclv, has_hdr_metadata(), max_cll(), max_fall()}` |
+| AV1 wrap pass-through                  | `av1C`-derived bit depth (8/10/12-bit), monochrome flag, and chroma subsampling `(x, y)` decoded and surfaced via `AvifInfo::{bit_depth, monochrome, chroma_subsampling}`; callers no longer need to re-parse `av1C` |
+| Primary item data                      | resolved via `iloc` construction_method 0 (file offset); single-extent items return a zero-copy slice; multi-extent items are concatenated via `item_bytes_owned()` (HEIF §8.11.3.3) |
 | Grid primary items (HEIF §6.6.2)       | grid descriptor parse + per-tile decode via `dimg` iref + composite into the declared output rectangle                                                     |
 | Alpha auxiliary                        | `auxl` + `auxC` URN detection, AV1-coded monochrome item decoded, composited onto the color frame (`Gray8 → YA8`, `Yuv → YuvA`)                            |
 | Post-transforms                        | `clap` (centre crop) → `irot` (90/180/270°) → `imir` (horizontal/vertical), applied in that order per §6.5.10                                              |
 | AV1 hand-off                           | `av1C` plumbed through `CodecParameters::extradata`; primary-item OBU payload fed to `oxideav_av1::Av1Decoder`; frame returned through `AvifDecoder`       |
+| MIAF profile dispatch                  | `BrandClass` flags `is_baseline_profile` (MA1B) + `is_advanced_profile` (MA1A) + `is_miaf`; surfaced through `AvifInfo::brands`                            |
 | AVIS image sequences                   | sample-table walk (`parse_avis` / `sample_table`) emits a flat frame-offset list; caller feeds each sample to `oxideav_av1` for sequential decode          |
 | Encoder                                | **not implemented**: no AV1 encoder exists in oxideav                                                                                                      |
 
@@ -68,6 +71,38 @@ still loses significant signal.
 
 See `examples/diag_decode.rs` for a drop-in report of exactly which
 stage each input reaches.
+
+### Round 22 — HDR metadata + AV1 wrap pass-through + multi-extent items
+
+Three headroom items addressed for the 60% → 75% coverage push:
+
+* **HDR metadata (`mdcv` / `clli` / `cclv`)**: All three HDR-signalling
+  item property boxes are now parsed and surfaced through `AvifInfo`.
+  `mdcv` (MasteringDisplayColourVolumeBox — SMPTE ST 2086) carries
+  display primaries + white point + max/min luminance; `clli`
+  (ContentLightLevelBox — ISO/IEC 14496-12 §12.1.5.4) carries MaxCLL +
+  MaxFALL in cd/m²; `cclv` is a draft av1-avif extension with the same
+  layout as `clli`. Grid primaries follow the same fallback chain as
+  `colr`/`pixi`/`pasp` (grid item first, tile 0 second). Helper methods
+  `has_hdr_metadata()`, `max_cll()`, and `max_fall()` provide convenient
+  gates for downstream consumers.
+
+* **AV1 wrap pass-through** (`bit_depth`, `monochrome`,
+  `chroma_subsampling`): The `av1C` record's three key subsampling/depth
+  fields are now decoded inline in `decode_av1c_flags()` and stored
+  directly on `AvifInfo` — callers no longer need to re-parse the record.
+  `bit_depth` maps `(high_bitdepth, twelve_bit)` → `(8, 10, 12)`;
+  `monochrome` mirrors the `av1C` mono bit; `chroma_subsampling` carries
+  `(subsampling_x, subsampling_y)` or `None` for monochrome streams
+  (subsampling is undefined for 4:0:0).
+
+* **Multi-extent `iloc` items** (`item_bytes_owned`): A new public
+  helper `item_bytes_owned(file, loc) -> Result<Vec<u8>>` concatenates
+  all extents when an item spans more than one `iloc` extent entry (HEIF
+  §8.11.3.3). The existing `item_bytes` fast path is preserved for the
+  common single-extent case; only the new helper allocates. The old
+  `Unsupported` error from `item_bytes` on multi-extent items remains
+  so callers can decide when to use the slower path.
 
 ### Round 21 — grid hardening
 
