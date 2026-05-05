@@ -213,14 +213,14 @@ mod tests {
         let id = CodecId::new(CODEC_ID_STR);
         let params = CodecParameters::video(id);
         // Encoder stays Unsupported.
-        match reg.make_encoder(&params) {
+        match reg.first_encoder(&params) {
             Err(Error::Unsupported(_)) => {}
             Err(e) => panic!("encoder factory: expected Unsupported, got {e:?}"),
             Ok(_) => panic!("encoder factory: expected Unsupported, got live encoder"),
         }
         // Decoder factory succeeds; `send_packet` exercises the HEIF
         // parse + AV1 decode pipeline.
-        let _ = reg.make_decoder(&params).expect("decoder factory");
+        let _ = reg.first_decoder(&params).expect("decoder factory");
     }
 
     #[test]
@@ -240,7 +240,7 @@ mod tests {
         let params = CodecParameters::video(id);
         let _dec = ctx
             .codecs
-            .make_decoder(&params)
+            .first_decoder(&params)
             .expect("avif decoder factory");
         // The unified entry point also wires the .avif / .avifs
         // extension hints through the same call.
