@@ -108,8 +108,8 @@ mod registry_glue {
     //! `oxideav_core` + `oxideav_av1`.
 
     use oxideav_core::{
-        CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry, Encoder, Error,
-        Result,
+        CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry, ContainerRegistry,
+        Encoder, Error, Result,
     };
 
     use crate::decoder::make_decoder;
@@ -162,15 +162,24 @@ mod registry_glue {
         register(reg);
         oxideav_av1::register(reg);
     }
+
+    /// Register the `.avif` / `.avifs` extensions against the codec id
+    /// `"avif"` so consumers (cli-convert, pipeline output probing) can
+    /// resolve a `.avif` output path through the central
+    /// [`ContainerRegistry`] without a hard-coded extension list.
+    pub fn register_containers(reg: &mut ContainerRegistry) {
+        reg.register_extension("avif", CODEC_ID_STR);
+        reg.register_extension("avifs", CODEC_ID_STR);
+    }
 }
 
 #[cfg(feature = "registry")]
-pub use registry_glue::{make_encoder, register, register_with_av1};
+pub use registry_glue::{make_encoder, register, register_containers, register_with_av1};
 
 #[cfg(all(test, feature = "registry"))]
 mod tests {
     use super::*;
-    use oxideav_core::{CodecId, CodecParameters, CodecRegistry, Error};
+    use oxideav_core::{CodecId, CodecParameters, CodecRegistry, ContainerRegistry, Error};
 
     #[test]
     fn register_installs_factories() {
@@ -187,5 +196,14 @@ mod tests {
         // Decoder factory succeeds; `send_packet` exercises the HEIF
         // parse + AV1 decode pipeline.
         let _ = reg.make_decoder(&params).expect("decoder factory");
+    }
+
+    #[test]
+    fn avif_extension_resolves_to_avif_container() {
+        let mut reg = ContainerRegistry::new();
+        register_containers(&mut reg);
+        assert_eq!(reg.container_for_extension("avif"), Some(CODEC_ID_STR));
+        assert_eq!(reg.container_for_extension("AVIF"), Some(CODEC_ID_STR));
+        assert_eq!(reg.container_for_extension("avifs"), Some(CODEC_ID_STR));
     }
 }
