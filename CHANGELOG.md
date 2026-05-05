@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/OxideAV/oxideav-avif/compare/v0.0.5...v0.0.6) - 2026-05-04
+
+### Other
+
+- standalone retrofit follow-up: gate integration tests + diag_decode example on `registry`
+- handle irot dim swap in decoder_pipes_through_av1_errors_cleanly
+- rustfmt sweep on standalone-retrofit + fuzz round 2 commits
+- fuzz round 2: pixel cross-validation + oxideav<->libavif re-encode roundtrip ([#304](https://github.com/OxideAV/oxideav-avif/pull/304))
+- standalone retrofit: gate oxideav-core + oxideav-av1 behind `registry` feature
+- cargo-fuzz harness with libavif as cross-decode oracle
+
 ### Fixed
 
 - Standalone retrofit follow-up (#360). `cargo build/test/clippy
