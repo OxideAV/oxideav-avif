@@ -109,7 +109,7 @@ mod registry_glue {
 
     use oxideav_core::{
         CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry, ContainerRegistry,
-        Encoder, Error, Result,
+        Encoder, Error, Result, RuntimeContext,
     };
 
     use crate::decoder::make_decoder;
@@ -134,7 +134,7 @@ mod registry_glue {
     /// HEIF container end to end, hand the AV1 bitstream to
     /// oxideav-av1, and composite grid / alpha / transform properties
     /// on the resulting frames.
-    pub fn register(reg: &mut CodecRegistry) {
+    pub fn register_codecs(reg: &mut CodecRegistry) {
         let caps = CodecCapabilities::video("avif_heif_av1_decode")
             .with_lossy(true)
             .with_intra_only(true);
@@ -144,6 +144,25 @@ mod registry_glue {
                 .decoder(make_decoder)
                 .encoder(make_encoder),
         );
+    }
+
+    /// Unified registration entry point: install both the AVIF codec
+    /// factories and the `.avif` / `.avifs` extension hints into a
+    /// [`RuntimeContext`].
+    ///
+    /// Note this does **not** also register the underlying AV1 codec —
+    /// callers that want both in one call should use
+    /// [`register_with_av1`] (which itself only touches the codec
+    /// sub-registry, since neither AVIF nor AV1 have container hooks
+    /// beyond `.avif*`).
+    ///
+    /// This is the preferred entry point for new code — it matches the
+    /// convention every sibling crate now follows. Direct callers that
+    /// only need one of the two sub-registries can keep using
+    /// [`register_codecs`] / [`register_containers`].
+    pub fn register(ctx: &mut RuntimeContext) {
+        register_codecs(&mut ctx.codecs);
+        register_containers(&mut ctx.containers);
     }
 
     /// AVIF encoder factory — always errors. Writing AVIF requires an
@@ -159,8 +178,8 @@ mod registry_glue {
     /// the caller only wants AVIF — they don't have to remember that
     /// AVIF delegates to the AV1 codec.
     pub fn register_with_av1(reg: &mut CodecRegistry) {
-        register(reg);
-        oxideav_av1::register(reg);
+        register_codecs(reg);
+        oxideav_av1::register_codecs(reg);
     }
 
     /// Register the `.avif` / `.avifs` extensions against the codec id
@@ -174,17 +193,21 @@ mod registry_glue {
 }
 
 #[cfg(feature = "registry")]
-pub use registry_glue::{make_encoder, register, register_containers, register_with_av1};
+pub use registry_glue::{
+    make_encoder, register, register_codecs, register_containers, register_with_av1,
+};
 
 #[cfg(all(test, feature = "registry"))]
 mod tests {
     use super::*;
-    use oxideav_core::{CodecId, CodecParameters, CodecRegistry, ContainerRegistry, Error};
+    use oxideav_core::{
+        CodecId, CodecParameters, CodecRegistry, ContainerRegistry, Error, RuntimeContext,
+    };
 
     #[test]
     fn register_installs_factories() {
         let mut reg = CodecRegistry::new();
-        register(&mut reg);
+        register_codecs(&mut reg);
         let id = CodecId::new(CODEC_ID_STR);
         let params = CodecParameters::video(id);
         // Encoder stays Unsupported.
@@ -205,5 +228,27 @@ mod tests {
         assert_eq!(reg.container_for_extension("avif"), Some(CODEC_ID_STR));
         assert_eq!(reg.container_for_extension("AVIF"), Some(CODEC_ID_STR));
         assert_eq!(reg.container_for_extension("avifs"), Some(CODEC_ID_STR));
+    }
+
+    #[test]
+    fn register_via_runtime_context_installs_codec_factory() {
+        let mut ctx = RuntimeContext::new();
+        register(&mut ctx);
+        let id = CodecId::new(CODEC_ID_STR);
+        let params = CodecParameters::video(id);
+        let _dec = ctx
+            .codecs
+            .make_decoder(&params)
+            .expect("avif decoder factory");
+        // The unified entry point also wires the .avif / .avifs
+        // extension hints through the same call.
+        assert_eq!(
+            ctx.containers.container_for_extension("avif"),
+            Some(CODEC_ID_STR)
+        );
+        assert_eq!(
+            ctx.containers.container_for_extension("avifs"),
+            Some(CODEC_ID_STR)
+        );
     }
 }
