@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/OxideAV/oxideav-avif/compare/v0.0.6...v0.0.7) - 2026-05-06
+
+### Other
+
+- drop dead `linkme` dep
+- re-export __oxideav_entry from registry_glue sub-module
+- HDR metadata + AV1 wrap pass-through + multi-extent iloc
+- registry calls: rename make_decoder/make_encoder → first_decoder/first_encoder
+- auto-register via oxideav_core::register! macro (linkme distributed slice)
+- unify entry point on register(&mut RuntimeContext) ([#502](https://github.com/OxideAV/oxideav-avif/pull/502))
+- add register_containers for .avif / .avifs extension lookup
+
 ### Added
 
 - r22: HDR metadata pass-through (`mdcv` / `clli` / `cclv` item
