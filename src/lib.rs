@@ -98,6 +98,9 @@ pub use transform::{apply_clap, apply_imir, apply_irot, crop_top_left};
 #[cfg(feature = "registry")]
 pub use decoder::{make_decoder, AvifDecoder};
 
+#[cfg(feature = "registry")]
+pub use registry_glue::__oxideav_entry;
+
 /// Public codec id string. Matches the aggregator-crate Cargo feature `avif`.
 pub const CODEC_ID_STR: &str = "avif";
 
