@@ -43,6 +43,9 @@ use libfuzzer_sys::fuzz_target;
 use oxideav_avif::AvifDecoder;
 use oxideav_avif_fuzz::libavif;
 use oxideav_core::{CodecId, Decoder, Frame, Packet, TimeBase};
+use std::io::Write;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Cap on input size to keep each fuzz iteration cheap. AV1 encoder
 /// startup time dominates for small inputs; capping at 64×64 keeps the
@@ -134,6 +137,24 @@ fuzz_target!(|data: &[u8]| {
                 for x in 0..cmp_w as usize {
                     let g = lib_pixels[y * lib_row + x * 4 + 1];
                     let oy = oxi_y.data[y * oxi_y.stride + x];
+                    if oy != g {
+                        dump_diagnostic_bundle(
+                            "libavif_encode_oxideav_libavif_decode_match",
+                            data,
+                            &encoded,
+                            oxi_w,
+                            oxi_h,
+                            oxi_y.stride,
+                            0,
+                            0,
+                            &oxi_y.data,
+                            &[],
+                            &[],
+                            libavif_rgba.width,
+                            libavif_rgba.height,
+                            lib_pixels,
+                        );
+                    }
                     assert_eq!(
                         oy, g,
                         "Y plane mismatch at ({x},{y}): oxi={oy} libavif G={g}"
@@ -153,6 +174,24 @@ fuzz_target!(|data: &[u8]| {
                     let oy = oxi_y.data[y * oxi_y.stride + x];
                     let ou = oxi_u.data[y * oxi_u.stride + x];
                     let ov = oxi_v.data[y * oxi_v.stride + x];
+                    if oy != g || ou != b || ov != r {
+                        dump_diagnostic_bundle(
+                            "libavif_encode_oxideav_libavif_decode_match",
+                            data,
+                            &encoded,
+                            oxi_w,
+                            oxi_h,
+                            oxi_y.stride,
+                            oxi_u.stride,
+                            oxi_v.stride,
+                            &oxi_y.data,
+                            &oxi_u.data,
+                            &oxi_v.data,
+                            libavif_rgba.width,
+                            libavif_rgba.height,
+                            lib_pixels,
+                        );
+                    }
                     assert_eq!(
                         oy, g,
                         "Y plane mismatch at ({x},{y}): oxi={oy} libavif G={g}"
@@ -177,6 +216,117 @@ fuzz_target!(|data: &[u8]| {
         _ => return,
     }
 });
+
+/// Write a self-describing diagnostic bundle (`divergence.txt`,
+/// `divergence.avif`, `divergence.oxi.planes`,
+/// `divergence.libavif.rgba`) under
+/// `fuzz/artifacts/diagnostics/<harness>/` so a CI run that ends in an
+/// assertion failure ships the actual divergent bitstream as an
+/// artifact alongside the libfuzzer `crash-*` input.
+///
+/// This addresses the env-divergence problem flagged by AVIF round-42:
+/// the macOS libavif (1.4.x + aom 3.x) produces a different lossless
+/// AV1 bitstream than the Linux libavif (1.0.4 + libgav1) used in CI.
+/// Re-running the fuzz `crash-*` input on a developer's macOS host
+/// silently passes because libavif emits a bitstream that oxideav-av1
+/// happens to handle correctly. With the diagnostic bundle uploaded as
+/// a CI artifact we recover the actual Linux-libavif AV1 stream that
+/// triggers the divergence and can replay it directly against
+/// `oxideav_av1::Av1Decoder` offline.
+///
+/// Only the FIRST divergence per fuzz invocation is dumped — once the
+/// flag latches, subsequent calls are no-ops. The libfuzzer harness
+/// abort on the assertion that follows ensures a single bundle per
+/// process lifetime regardless.
+#[allow(clippy::too_many_arguments)]
+fn dump_diagnostic_bundle(
+    harness: &str,
+    fuzz_input: &[u8],
+    encoded_avif: &[u8],
+    oxi_w: u32,
+    oxi_h: u32,
+    luma_stride: usize,
+    u_stride: usize,
+    v_stride: usize,
+    oxi_y: &[u8],
+    oxi_u: &[u8],
+    oxi_v: &[u8],
+    lib_w: u32,
+    lib_h: u32,
+    lib_rgba: &[u8],
+) {
+    static DUMPED: AtomicBool = AtomicBool::new(false);
+    if DUMPED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    let mut dir = PathBuf::from("fuzz/artifacts/diagnostics");
+    dir.push(harness);
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+
+    let avif_path = dir.join("divergence.avif");
+    let _ = std::fs::write(&avif_path, encoded_avif);
+
+    let input_path = dir.join("divergence.fuzz_input");
+    let _ = std::fs::write(&input_path, fuzz_input);
+
+    let planes_path = dir.join("divergence.oxi.planes");
+    if let Ok(mut f) = std::fs::File::create(&planes_path) {
+        // Tiny header: u32 width, u32 height, u32 luma_stride, u32
+        // u_stride, u32 v_stride, u32 plane_count then concatenated
+        // plane data. Little-endian. Plain enough to read back with a
+        // 30-line Rust harness.
+        let plane_count: u32 = if oxi_u.is_empty() && oxi_v.is_empty() {
+            1
+        } else {
+            3
+        };
+        let _ = f.write_all(&oxi_w.to_le_bytes());
+        let _ = f.write_all(&oxi_h.to_le_bytes());
+        let _ = f.write_all(&(luma_stride as u32).to_le_bytes());
+        let _ = f.write_all(&(u_stride as u32).to_le_bytes());
+        let _ = f.write_all(&(v_stride as u32).to_le_bytes());
+        let _ = f.write_all(&plane_count.to_le_bytes());
+        let _ = f.write_all(oxi_y);
+        let _ = f.write_all(oxi_u);
+        let _ = f.write_all(oxi_v);
+    }
+
+    let lib_path = dir.join("divergence.libavif.rgba");
+    if let Ok(mut f) = std::fs::File::create(&lib_path) {
+        let _ = f.write_all(&lib_w.to_le_bytes());
+        let _ = f.write_all(&lib_h.to_le_bytes());
+        let _ = f.write_all(lib_rgba);
+    }
+
+    let txt_path = dir.join("divergence.txt");
+    if let Ok(mut f) = std::fs::File::create(&txt_path) {
+        let _ = writeln!(
+            f,
+            "harness:        {harness}\n\
+             fuzz_input_len: {} bytes (saved to divergence.fuzz_input)\n\
+             encoded_avif:   {} bytes (saved to divergence.avif)\n\
+             oxi_w x oxi_h:  {oxi_w} x {oxi_h}\n\
+             luma_stride:    {luma_stride}\n\
+             u_stride:       {u_stride}\n\
+             v_stride:       {v_stride}\n\
+             plane_count:    {}\n\
+             lib_w x lib_h:  {lib_w} x {lib_h}\n\
+             lib_rgba_len:   {} bytes (saved to divergence.libavif.rgba)\n\
+             \n\
+             To replay against oxideav-av1 directly, extract the AV1\n\
+             OBU stream from divergence.avif's `mdat` box and pass it\n\
+             to Av1Decoder::send_packet — bypasses the AVIF container\n\
+             so divergence is isolated to the AV1 layer.\n",
+            fuzz_input.len(),
+            encoded_avif.len(),
+            if oxi_u.is_empty() { 1 } else { 3 },
+            lib_rgba.len(),
+        );
+    }
+}
 
 fn image_from_fuzz_input(data: &[u8]) -> Option<(u32, u32, &[u8])> {
     let (&shape, rgba) = data.split_first()?;

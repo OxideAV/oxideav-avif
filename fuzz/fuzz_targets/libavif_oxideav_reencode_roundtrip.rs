@@ -46,6 +46,9 @@ use libfuzzer_sys::fuzz_target;
 use oxideav_avif::AvifDecoder;
 use oxideav_avif_fuzz::libavif;
 use oxideav_core::{CodecId, Decoder, Frame, Packet, TimeBase};
+use std::io::Write;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const MAX_WIDTH: usize = 64;
 const MAX_PIXELS: usize = 4096;
@@ -111,18 +114,21 @@ fuzz_target!(|data: &[u8]| {
         for xx in 0..width as usize {
             let i1 = yy * p1.luma_stride + xx;
             let i2 = yy * p2.luma_stride + xx;
+            let u1 = yy * p1.u_stride + xx;
+            let u2 = yy * p2.u_stride + xx;
+            let v1 = yy * p1.v_stride + xx;
+            let v2 = yy * p2.v_stride + xx;
+            if p1.y[i1] != p2.y[i2] || p1.u[u1] != p2.u[u2] || p1.v[v1] != p2.v[v2] {
+                dump_roundtrip_diagnostic(data, &avif1, &avif2, &p1, &p2);
+            }
             assert_eq!(
                 p1.y[i1], p2.y[i2],
                 "Y plane unstable under round-trip at ({xx},{yy})"
             );
-            let u1 = yy * p1.u_stride + xx;
-            let u2 = yy * p2.u_stride + xx;
             assert_eq!(
                 p1.u[u1], p2.u[u2],
                 "U plane unstable under round-trip at ({xx},{yy})"
             );
-            let v1 = yy * p1.v_stride + xx;
-            let v2 = yy * p2.v_stride + xx;
             assert_eq!(
                 p1.v[v1], p2.v[v2],
                 "V plane unstable under round-trip at ({xx},{yy})"
@@ -130,6 +136,71 @@ fuzz_target!(|data: &[u8]| {
         }
     }
 });
+
+/// Persist both round-trip AVIF bitstreams + their decoded YUV planes to
+/// `fuzz/artifacts/diagnostics/libavif_oxideav_reencode_roundtrip/`
+/// before the libfuzzer assertion fires the process abort. CI then
+/// uploads them as artifacts so we recover the actual Linux-libavif
+/// encoded streams that triggered the round-trip instability — the
+/// macOS libavif silently encodes differently and reproduction-on-host
+/// fails (see AVIF round-42 notes).
+///
+/// Latched: only the FIRST mismatch per process is dumped.
+fn dump_roundtrip_diagnostic(
+    fuzz_input: &[u8],
+    avif1: &[u8],
+    avif2: &[u8],
+    p1: &DecodedYuv444,
+    p2: &DecodedYuv444,
+) {
+    static DUMPED: AtomicBool = AtomicBool::new(false);
+    if DUMPED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let dir = PathBuf::from("fuzz/artifacts/diagnostics/libavif_oxideav_reencode_roundtrip");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let _ = std::fs::write(dir.join("divergence.fuzz_input"), fuzz_input);
+    let _ = std::fs::write(dir.join("divergence.avif1"), avif1);
+    let _ = std::fs::write(dir.join("divergence.avif2"), avif2);
+
+    fn write_planes(path: PathBuf, p: &DecodedYuv444) {
+        if let Ok(mut f) = std::fs::File::create(path) {
+            let _ = f.write_all(&(p.luma_stride as u32).to_le_bytes());
+            let _ = f.write_all(&(p.u_stride as u32).to_le_bytes());
+            let _ = f.write_all(&(p.v_stride as u32).to_le_bytes());
+            let _ = f.write_all(&p.y);
+            let _ = f.write_all(&p.u);
+            let _ = f.write_all(&p.v);
+        }
+    }
+    write_planes(dir.join("divergence.p1.planes"), p1);
+    write_planes(dir.join("divergence.p2.planes"), p2);
+
+    if let Ok(mut f) = std::fs::File::create(dir.join("divergence.txt")) {
+        let _ = writeln!(
+            f,
+            "harness:        libavif_oxideav_reencode_roundtrip\n\
+             fuzz_input_len: {} bytes (saved to divergence.fuzz_input)\n\
+             avif1_len:      {} bytes (saved to divergence.avif1; libavif encode of fuzz RGBA)\n\
+             avif2_len:      {} bytes (saved to divergence.avif2; libavif re-encode of P1's planes)\n\
+             p1 planes:      luma_stride={} u_stride={} v_stride={} (saved to divergence.p1.planes)\n\
+             p2 planes:      luma_stride={} u_stride={} v_stride={} (saved to divergence.p2.planes)\n\
+             \n\
+             Round-trip is unstable: oxideav-avif decoded avif1 -> P1,\n\
+             libavif re-encoded P1 (RGBA via R=V/G=Y/B=U) -> avif2,\n\
+             oxideav-avif decoded avif2 -> P2, but P1 != P2.\n\
+             The bug is in oxideav-av1's decode path (avif is just the\n\
+             container around AV1).\n",
+            fuzz_input.len(),
+            avif1.len(),
+            avif2.len(),
+            p1.luma_stride, p1.u_stride, p1.v_stride,
+            p2.luma_stride, p2.u_stride, p2.v_stride,
+        );
+    }
+}
 
 /// Tightly-packed YUV444 planes returned by [`oxideav_decode_yuv444`].
 /// `*_stride` is the source-buffer stride (may exceed plane width when
