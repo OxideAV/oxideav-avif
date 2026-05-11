@@ -10,7 +10,10 @@
 //! This module's job is strictly container-side: it does not feed the
 //! AV1 decoder, it just produces a flat [`Sample`] table + presentation
 //! metadata. The caller pairs the table with a standard
-//! [`oxideav_av1::Av1Decoder`] to decode frames end-to-end.
+//! [`oxideav_av1::Av1Decoder`] to decode frames end-to-end. The
+//! decoder needs the track's `AV1CodecConfigurationRecord` to seed its
+//! sequence header — that record is extracted from `stsd` → `av01` →
+//! `av1C` and surfaced as [`AvisMeta::av1_codec_config`].
 
 use crate::error::{AvifError as Error, Result};
 
@@ -29,6 +32,9 @@ const STSZ: BoxType = b(b"stsz");
 const STCO: BoxType = b(b"stco");
 const CO64: BoxType = b(b"co64");
 const STSS: BoxType = b(b"stss");
+const STSD: BoxType = b(b"stsd");
+const AV01: BoxType = b(b"av01");
+const AV1C: BoxType = b(b"av1C");
 
 /// One sample in the AVIS track. `offset` is absolute inside the source
 /// file; `size` is the sample's byte length; `duration` is expressed in
@@ -53,6 +59,12 @@ pub struct AvisMeta {
     pub display_dims: Option<(u32, u32)>,
     /// Ordered list of sample byte-ranges + durations + sync flags.
     pub samples: Vec<Sample>,
+    /// Raw `AV1CodecConfigurationRecord` bytes extracted from the
+    /// track's `stsd` → `av01` → `av1C` chain. `None` when the AVIS
+    /// track is not AV1-coded or the config record is missing.
+    /// Required by the AV1 decoder to bootstrap the sequence header.
+    /// Spec: AV1-AVIF §2.2.1, ISO/IEC 14496-12 §8.5.2 (`stsd`).
+    pub av1_codec_config: Option<Vec<u8>>,
 }
 
 /// Walk the container and build a sample table. The input buffer must
@@ -71,10 +83,12 @@ pub fn parse_avis(file: &[u8]) -> Result<AvisMeta> {
     let stbl = find_first_track_stbl(moov_payload)
         .ok_or_else(|| Error::InvalidData("avis: missing trak/mdia/minf/stbl".to_string()))?;
     let samples = sample_table(stbl)?;
+    let av1_codec_config = find_av1c_in_stbl(stbl);
     Ok(AvisMeta {
         timescale,
         display_dims,
         samples,
+        av1_codec_config,
     })
 }
 
@@ -162,6 +176,48 @@ fn find_tkhd_display_size(moov_payload: &[u8]) -> Option<(u32, u32)> {
         let w = u32::from_be_bytes([p[off], p[off + 1], p[off + 2], p[off + 3]]) >> 16;
         let h = u32::from_be_bytes([p[off + 4], p[off + 5], p[off + 6], p[off + 7]]) >> 16;
         return Some((w, h));
+    }
+    None
+}
+
+/// Walk `stbl` → `stsd` → first `av01` SampleEntry → `av1C` and return
+/// the raw `AV1CodecConfigurationRecord` byte slice.
+///
+/// `stsd` layout (ISO/IEC 14496-12 §8.5.2): FullBox header (4 bytes) +
+/// `entry_count`(u32) + N SampleEntry boxes packed contiguously. For an
+/// AVIS track each SampleEntry is `av01` (a `VisualSampleEntry`,
+/// §12.1.3). `VisualSampleEntry` reserves a fixed 78-byte header before
+/// any child boxes — `reserved(6) + data_reference_index(2) +
+/// pre_defined(2) + reserved(2) + pre_defined(12) + width(2) +
+/// height(2) + horizresolution(4) + vertresolution(4) + reserved(4) +
+/// frame_count(2) + compressorname(32) + depth(2) + pre_defined(2)`.
+/// After that header, child boxes (`av1C`, `pasp`, `colr`, etc.) follow.
+fn find_av1c_in_stbl(stbl: &[u8]) -> Option<Vec<u8>> {
+    let (stsd_payload, _) = find_box(stbl, &STSD).ok()??;
+    let (_v, _f, body) = parse_full_box(stsd_payload).ok()?;
+    if body.len() < 4 {
+        return None;
+    }
+    let entry_count = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
+    if entry_count == 0 {
+        return None;
+    }
+    // Walk the SampleEntry boxes packed after the entry_count.
+    let entries = &body[4..];
+    for hdr in iter_boxes(entries) {
+        let hdr = hdr.ok()?;
+        if hdr.box_type != AV01 {
+            continue;
+        }
+        let entry_payload = &entries[hdr.payload_start..hdr.end()];
+        // Skip the 78-byte VisualSampleEntry fixed header.
+        const VISUAL_HEADER_LEN: usize = 78;
+        if entry_payload.len() <= VISUAL_HEADER_LEN {
+            return None;
+        }
+        let children = &entry_payload[VISUAL_HEADER_LEN..];
+        let (av1c_payload, _) = find_box(children, &AV1C).ok()??;
+        return Some(av1c_payload.to_vec());
     }
     None
 }
@@ -567,5 +623,132 @@ mod tests {
             .collect();
         let samples = sample_table(&stbl_no_stss).unwrap();
         assert!(samples.iter().all(|s| s.is_sync));
+    }
+
+    /// Synthesize a tiny stbl-with-stsd-with-av01-with-av1C box chain
+    /// and confirm `find_av1c_in_stbl` extracts the av1C body. This
+    /// guards the AVIS sequence decode path against silent regressions
+    /// in the stsd → av01 → av1C walk (av1-avif §2.2.1).
+    #[test]
+    fn stsd_av01_av1c_extraction_round_trip() {
+        // Build a minimal av1C body — 4 bytes is enough that
+        // `find_av1c_in_stbl` returns it verbatim; full
+        // AV1CodecConfigurationRecord parsing is exercised by
+        // oxideav-av1's own tests.
+        let av1c_body: &[u8] = &[0x81, 0x04, 0x0c, 0x00];
+
+        // av1C box: size(4) + type(4) + body
+        let mut av1c_box = Vec::new();
+        av1c_box.extend_from_slice(&((8 + av1c_body.len()) as u32).to_be_bytes());
+        av1c_box.extend_from_slice(b"av1C");
+        av1c_box.extend_from_slice(av1c_body);
+
+        // VisualSampleEntry header — 78 bytes of mostly-zero plus
+        // data_reference_index = 1 (offset 6..8).
+        let mut visual_header = vec![0u8; 78];
+        visual_header[6] = 0;
+        visual_header[7] = 1;
+
+        // av01 SampleEntry box: size(4) + type(4) + visual_header(78) +
+        // av1C box.
+        let av01_payload_len = visual_header.len() + av1c_box.len();
+        let mut av01_box = Vec::new();
+        av01_box.extend_from_slice(&((8 + av01_payload_len) as u32).to_be_bytes());
+        av01_box.extend_from_slice(b"av01");
+        av01_box.extend_from_slice(&visual_header);
+        av01_box.extend_from_slice(&av1c_box);
+
+        // stsd FullBox: version(1) + flags(3) + entry_count(4) + N
+        // SampleEntries. Box header: size(4) + type(4) + body.
+        let mut stsd_body = Vec::new();
+        stsd_body.extend_from_slice(&[0, 0, 0, 0]); // version + flags
+        stsd_body.extend_from_slice(&1u32.to_be_bytes()); // entry_count
+        stsd_body.extend_from_slice(&av01_box);
+
+        let mut stsd_box = Vec::new();
+        stsd_box.extend_from_slice(&((8 + stsd_body.len()) as u32).to_be_bytes());
+        stsd_box.extend_from_slice(b"stsd");
+        stsd_box.extend_from_slice(&stsd_body);
+
+        // Pretend stbl == stsd_box for this targeted unit test.
+        let extracted = find_av1c_in_stbl(&stsd_box).expect("av1C must be extracted");
+        assert_eq!(
+            extracted, av1c_body,
+            "extracted av1C body must match the synthesized payload byte-for-byte"
+        );
+    }
+
+    /// `find_av1c_in_stbl` returns `None` when stsd has zero
+    /// SampleEntries — the AVIS decoder must surface an explicit error
+    /// instead of seeding the AV1 decoder with an empty extradata
+    /// buffer.
+    #[test]
+    fn stsd_missing_av01_returns_none() {
+        let mut stsd_body = Vec::new();
+        stsd_body.extend_from_slice(&[0, 0, 0, 0]); // version + flags
+        stsd_body.extend_from_slice(&0u32.to_be_bytes()); // entry_count = 0
+        let mut stsd_box = Vec::new();
+        stsd_box.extend_from_slice(&((8 + stsd_body.len()) as u32).to_be_bytes());
+        stsd_box.extend_from_slice(b"stsd");
+        stsd_box.extend_from_slice(&stsd_body);
+
+        assert!(
+            find_av1c_in_stbl(&stsd_box).is_none(),
+            "empty entry_count must produce no av1C"
+        );
+    }
+
+    /// `find_av1c_in_stbl` returns `None` when the av01 SampleEntry
+    /// payload is shorter than the 78-byte VisualSampleEntry fixed
+    /// header — a malformed file must not panic on the
+    /// VISUAL_HEADER_LEN bounds slice.
+    #[test]
+    fn stsd_truncated_av01_payload_returns_none() {
+        // av01 box body is only 32 bytes — far less than 78.
+        let mut av01_box = Vec::new();
+        av01_box.extend_from_slice(&((8 + 32) as u32).to_be_bytes());
+        av01_box.extend_from_slice(b"av01");
+        av01_box.extend_from_slice(&[0u8; 32]);
+
+        let mut stsd_body = Vec::new();
+        stsd_body.extend_from_slice(&[0, 0, 0, 0]);
+        stsd_body.extend_from_slice(&1u32.to_be_bytes());
+        stsd_body.extend_from_slice(&av01_box);
+
+        let mut stsd_box = Vec::new();
+        stsd_box.extend_from_slice(&((8 + stsd_body.len()) as u32).to_be_bytes());
+        stsd_box.extend_from_slice(b"stsd");
+        stsd_box.extend_from_slice(&stsd_body);
+
+        assert!(
+            find_av1c_in_stbl(&stsd_box).is_none(),
+            "truncated av01 payload must not panic and must not yield an av1C"
+        );
+    }
+
+    /// `parse_avis` on the Netflix `alpha_video.avif` fixture surfaces
+    /// the track's av1C so the AVIS decode pipeline can seed the AV1
+    /// decoder with the sequence header. Empirical: the fixture's
+    /// av1C is 4 bytes (marker + profile + flags), all defined by
+    /// av1-avif §2.2.1.
+    #[test]
+    fn alpha_video_avis_exposes_av1c() {
+        let bytes = include_bytes!("../tests/fixtures/alpha_video.avif");
+        let meta = parse_avis(bytes).expect("parse_avis alpha_video");
+        let av1c = meta
+            .av1_codec_config
+            .expect("alpha_video.avif must surface an av1C from stsd");
+        assert!(
+            av1c.len() >= 4,
+            "av1C must carry at least the 4-byte AV1CodecConfigurationRecord prefix, got {} bytes",
+            av1c.len()
+        );
+        // Top bit of byte 0 is `marker` and must be 1 (AV1-AVIF §2.2.1).
+        assert_eq!(
+            av1c[0] & 0x80,
+            0x80,
+            "av1C[0] marker bit must be set, got {:#04x}",
+            av1c[0]
+        );
     }
 }

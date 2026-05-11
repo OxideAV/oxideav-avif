@@ -23,6 +23,7 @@ use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, 
 use oxideav_av1::{Av1CodecConfig, Av1Decoder};
 
 use crate::alpha::{composite_alpha, find_alpha_item_id};
+use crate::avis::{parse_avis, sample_bytes};
 use crate::box_parser::{b, BoxType};
 use crate::grid::{composite_grid, ImageGrid};
 use crate::image::{AvifFrame, AvifPixelFormat, AvifPlane};
@@ -279,6 +280,104 @@ impl AvifDecoder {
     pub fn info(&self) -> Option<&AvifInfo> {
         self.info.as_ref()
     }
+
+    /// Decode every frame of an AVIF Image Sequence (AVIS) — av1-avif
+    /// §6.3 + ISO/IEC 14496-12 §8 (movie / track / sample-table boxes).
+    ///
+    /// Walks the track's `stbl` to recover the sample byte ranges and
+    /// `(duration, is_sync)` per sample, lifts the
+    /// `AV1CodecConfigurationRecord` from `stsd` → `av01` → `av1C`, and
+    /// fans every sample through a single shared [`Av1Decoder`]
+    /// instance so inter-prediction across samples is preserved (when
+    /// the underlying av1 crate supports it).
+    ///
+    /// Each successfully decoded sample is queued on `pending` with a
+    /// `pts` derived from the cumulative `stts` duration so the
+    /// `Decoder::receive_frame` consumer can pull frames in
+    /// presentation order. Samples that the av1 decoder rejects are
+    /// surfaced as the first error returned by this function — the
+    /// caller can then `flush` and re-try, or treat the sequence as
+    /// partially-decodable. Returns the count of frames queued.
+    ///
+    /// AVIS files that lack a `moov` (and thus look like still images
+    /// with no sequence track) bubble up `Error::InvalidData` from
+    /// [`parse_avis`]; callers detecting this should fall back to the
+    /// still-image [`decode_file`] path.
+    pub fn decode_avis_file(&mut self, file: &[u8]) -> Result<usize> {
+        let meta = parse_avis(file).map_err(core_err)?;
+        if meta.samples.is_empty() {
+            return Err(Error::invalid("avis: track has zero samples"));
+        }
+        let av1c = meta.av1_codec_config.ok_or_else(|| {
+            Error::invalid(
+                "avis: track stsd → av01 → av1C is missing — cannot seed AV1 decoder \
+                 (av1-avif §2.2.1)",
+            )
+        })?;
+        // Eagerly validate the codec config — same shape as the
+        // still-image path uses for the av1C item property.
+        let _ = Av1CodecConfig::parse(&av1c)?;
+
+        let timescale = if meta.timescale == 0 {
+            1
+        } else {
+            meta.timescale
+        };
+        let mut params = CodecParameters::video(CodecId::new("av1"));
+        if let Some((w, h)) = meta.display_dims {
+            params.width = Some(w);
+            params.height = Some(h);
+        }
+        params.extradata = av1c.clone();
+
+        let mut av1 = Av1Decoder::new(params);
+        let mut frames_queued = 0usize;
+        let mut cumulative_pts: u64 = 0;
+        for (i, s) in meta.samples.iter().enumerate() {
+            let bytes = sample_bytes(file, s).map_err(core_err)?;
+            // Build a packet on stream 0 with the movie timescale so
+            // the framework consumer recovers presentation order
+            // without an extra remapping step.
+            let pkt = Packet::new(0, TimeBase::new(1, timescale as i64), bytes.to_vec())
+                .with_pts(cumulative_pts as i64);
+            cumulative_pts = cumulative_pts.saturating_add(s.duration as u64);
+            av1.send_packet(&pkt).map_err(|e| {
+                Error::invalid(format!(
+                    "avis: av1 decoder rejected sample {i} (offset={}, size={}, sync={}): {e}",
+                    s.offset, s.size, s.is_sync
+                ))
+            })?;
+            // Drain frames after every packet — most AV1 packets emit a
+            // single decoded frame, but show-existing-frame OBUs can
+            // produce zero, and a single packet can occasionally yield
+            // more than one display frame.
+            loop {
+                match av1.receive_frame() {
+                    Ok(frame) => {
+                        self.pending.push(frame);
+                        frames_queued += 1;
+                    }
+                    Err(Error::NeedMore) => break,
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        // Flush any frames the decoder buffered past the last packet
+        // (re-ordering in standard AV1 is rare for AVIS, but the trait
+        // contract requires the call).
+        let _ = av1.flush();
+        loop {
+            match av1.receive_frame() {
+                Ok(frame) => {
+                    self.pending.push(frame);
+                    frames_queued += 1;
+                }
+                Err(Error::NeedMore) => break,
+                Err(_) => break,
+            }
+        }
+        Ok(frames_queued)
+    }
 }
 
 /// Bridge: convert a crate-local [`crate::error::AvifError`] into the
@@ -450,8 +549,30 @@ impl Decoder for AvifDecoder {
     }
 
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
-        // Every AVIF packet is a complete file.
-        self.decode_file(&packet.data).map(|_| ())
+        // Every AVIF packet is a complete file. We dispatch to the
+        // sequence (`avis`) path when the brand classification flags
+        // it; otherwise fall through to the still-image path. The
+        // still-image path is also used when the file claims `avis`
+        // but lacks a `moov` (rare malformed-encoder output) — that
+        // way we don't lose access to a valid `meta`-only image just
+        // because the brand label was wrong.
+        let hdr = parse_header(&packet.data).map_err(core_err)?;
+        let brands = classify_brands(&hdr.major_brand, &hdr.compatible_brands).map_err(core_err)?;
+        if brands.is_sequence || brands.has_msf1 {
+            // Probe for moov; fall back to still-image path when the
+            // sequence claim is bogus.
+            if crate::box_parser::find_box(&packet.data, &b(b"moov"))
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                self.decode_avis_file(&packet.data).map(|_| ())
+            } else {
+                self.decode_file(&packet.data).map(|_| ())
+            }
+        } else {
+            self.decode_file(&packet.data).map(|_| ())
+        }
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {

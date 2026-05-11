@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- AVIS (AVIF Image Sequence) end-to-end decode pipeline
+  (`AvifDecoder::decode_avis_file`). Walks the track's sample table
+  via the existing [`avis::parse_avis`] surface, lifts the
+  `AV1CodecConfigurationRecord` from `stsd` → `av01` → `av1C` (new
+  field `AvisMeta::av1_codec_config`), and fans every sample through
+  a single shared [`oxideav_av1::Av1Decoder`] so inter-frame
+  prediction state is preserved across samples (when av1 supports
+  it). Each successfully decoded sample is queued on the
+  `pending` buffer with a `pts` derived from the cumulative `stts`
+  duration so `Decoder::receive_frame` returns frames in
+  presentation order.
+- `AvifDecoder::send_packet` now dispatches to the sequence path
+  automatically when the brand classification surfaces `is_sequence`
+  (`avis`) or `has_msf1` (`msf1`) and the file carries a `moov`. The
+  still-image path remains the fallback when the sequence claim is
+  bogus (no `moov` present), so a misbranded file is still decoded.
+- New AVIS-decode integration tests:
+  `avis_decode_dispatches_to_sequence_path`,
+  `decode_avis_file_returns_frame_count_or_propagates_av1_error`,
+  plus three unit tests for the new `find_av1c_in_stbl` helper
+  (round-trip on a synthesized stsd→av01→av1C chain, missing-av01
+  guard, truncated av01 payload guard) and one fixture-driven test
+  (`alpha_video_avis_exposes_av1c`).
+
+### Changed
+
+- Integration tests that previously called `AvifDecoder::send_packet`
+  on lossless RED64 / GRAY32 / MIDGRAY64 / WHITE16 fixtures now
+  tolerate the `Error::Unsupported(coded_lossless …)` path that
+  oxideav-av1 returns until §7.7.4 IWHT dispatch + coefficient
+  context derivation lands (workspace task #765). The transform-
+  pipeline tests (`end_to_end_decode_then_irot_roundtrips`,
+  `end_to_end_decode_then_imir_roundtrips`,
+  `end_to_end_decode_then_clap_centre_crop`,
+  `clap_with_zero_denominator_is_passthrough`) fall back to a
+  deterministic synthetic 4:4:4 frame when av1 declines, so the
+  pixel-permutation invariants they exercise still run end-to-end.
+  No `#[ignore]` attribute added; the tests still execute and assert.
+
 ## [0.0.7](https://github.com/OxideAV/oxideav-avif/compare/v0.0.6...v0.0.7) - 2026-05-06
 
 ### Other

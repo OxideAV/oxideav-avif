@@ -23,9 +23,14 @@
 //!   * `irot` / `imir` / `clap` post-transforms (see [`transform`]).
 //! * AVIS image sequences — sample table walk via [`avis::parse_avis`]
 //!   produces a flat frame-offset list with `(timescale, display_dims,
-//!   samples)`. [`avis::sample_bytes`] resolves a sample's byte slice
-//!   inside the source file; pair with [`oxideav_av1`] to decode frames
-//!   sequentially.
+//!   samples, av1_codec_config)`. [`avis::sample_bytes`] resolves a
+//!   sample's byte slice inside the source file. The registry-gated
+//!   decoder ([`decoder::AvifDecoder::decode_avis_file`]) walks the
+//!   table end to end, lifts the `AV1CodecConfigurationRecord` from
+//!   `stsd` → `av01` → `av1C`, and fans every sample through a shared
+//!   [`oxideav_av1::Av1Decoder`] so inter-frame state is preserved.
+//!   `Decoder::send_packet` dispatches to this path automatically
+//!   when the file's brand classification flags it as a sequence.
 //! * `pixi` (HEIF §6.5.6) and `pasp` (HEIF §6.5.4 / ISO/IEC 14496-12
 //!   §8.5.2.1.1) are surfaced through [`AvifInfo`] — see
 //!   [`AvifInfo::num_channels`], [`AvifInfo::max_bit_depth`],
