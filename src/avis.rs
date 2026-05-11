@@ -301,6 +301,21 @@ pub fn sample_table(stbl: &[u8]) -> Result<Vec<Sample>> {
             *c = e.samples_per_chunk;
         }
     }
+    // Soft cap on the total number of samples we are willing to expand
+    // from stsc/stsz. Adversarial files often inflate `samples_per_chunk`
+    // to `0xFFFF_FFFF`, which would otherwise spin in this loop or OOM
+    // the per-sample Vec for hours. AVIS streams in the wild stay well
+    // below this cap (a 60fps hour-long sequence is ~216K samples).
+    const MAX_TOTAL_SAMPLES: usize = 16 * 1024 * 1024;
+    let total_expected: u64 = per_chunk
+        .iter()
+        .map(|&n| n as u64)
+        .fold(0u64, u64::saturating_add);
+    if total_expected > MAX_TOTAL_SAMPLES as u64 {
+        return Err(Error::InvalidData(format!(
+            "avis: stsc expands to {total_expected} samples, soft cap is {MAX_TOTAL_SAMPLES}"
+        )));
+    }
     let mut out = Vec::new();
     let mut sample_idx: u32 = 0;
     for c in 0..chunk_count {
@@ -540,6 +555,66 @@ mod tests {
         out.extend_from_slice(&wrap(b"stco", &full_box(0, 0, &stco_body)));
         out.extend_from_slice(&wrap(b"stss", &full_box(0, 0, &stss_body)));
         out
+    }
+
+    /// `sample_table` refuses an stsc whose declared `samples_per_chunk`
+    /// would expand to more than the soft cap (`MAX_TOTAL_SAMPLES`).
+    /// Without this guard the per-chunk loop spins on an adversarial
+    /// `0xFFFF_FFFF` until the process OOMs.
+    #[test]
+    fn sample_table_rejects_oversized_stsc_expansion() {
+        fn wrap(t: &[u8; 4], p: &[u8]) -> Vec<u8> {
+            let size = (8 + p.len()) as u32;
+            let mut out = size.to_be_bytes().to_vec();
+            out.extend_from_slice(t);
+            out.extend_from_slice(p);
+            out
+        }
+        fn full_box(v: u8, flags: u32, body: &[u8]) -> Vec<u8> {
+            let mut out = vec![v, (flags >> 16) as u8, (flags >> 8) as u8, flags as u8];
+            out.extend_from_slice(body);
+            out
+        }
+        // stts: 1 entry, count=1, delta=1.
+        let stts_body = {
+            let mut b = 1u32.to_be_bytes().to_vec();
+            b.extend_from_slice(&1u32.to_be_bytes());
+            b.extend_from_slice(&1u32.to_be_bytes());
+            b
+        };
+        // stsc: 1 entry, first_chunk=1, samples_per_chunk=0xFFFF_FFFF.
+        let stsc_body = {
+            let mut b = 1u32.to_be_bytes().to_vec();
+            b.extend_from_slice(&1u32.to_be_bytes());
+            b.extend_from_slice(&u32::MAX.to_be_bytes());
+            b.extend_from_slice(&1u32.to_be_bytes());
+            b
+        };
+        // stsz: sample_size=1 sample_count=1 (so size lookup never runs out).
+        let stsz_body = {
+            let mut b = 1u32.to_be_bytes().to_vec();
+            b.extend_from_slice(&1u32.to_be_bytes());
+            b
+        };
+        // stco: 1 chunk @ offset 100.
+        let stco_body = {
+            let mut b = 1u32.to_be_bytes().to_vec();
+            b.extend_from_slice(&100u32.to_be_bytes());
+            b
+        };
+        let mut stbl = Vec::new();
+        stbl.extend_from_slice(&wrap(b"stts", &full_box(0, 0, &stts_body)));
+        stbl.extend_from_slice(&wrap(b"stsc", &full_box(0, 0, &stsc_body)));
+        stbl.extend_from_slice(&wrap(b"stsz", &full_box(0, 0, &stsz_body)));
+        stbl.extend_from_slice(&wrap(b"stco", &full_box(0, 0, &stco_body)));
+        let err = sample_table(&stbl).unwrap_err();
+        match err {
+            Error::InvalidData(s) => assert!(
+                s.contains("soft cap") || s.contains("samples"),
+                "expected DoS cap message, got: {s}"
+            ),
+            _ => panic!("expected InvalidData"),
+        }
     }
 
     #[test]

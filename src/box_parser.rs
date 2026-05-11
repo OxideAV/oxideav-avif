@@ -80,18 +80,27 @@ impl<'a> Iterator for BoxIter<'a> {
 
 /// Parse a single box header at `start`.
 pub fn parse_box_header(buf: &[u8], start: usize) -> Result<BoxHeader> {
-    if start + 8 > buf.len() {
+    // Defensive arithmetic: `start` is caller-supplied so overflow checks
+    // come first. Subsequent slice indexing relies on these bounds.
+    let header_end = start
+        .checked_add(8)
+        .ok_or_else(|| Error::invalid("avif: box header offset overflow"))?;
+    if header_end > buf.len() {
         return Err(Error::invalid("avif: truncated box header"));
     }
     let size = read_u32(buf, start)?;
     let mut box_type = [0u8; 4];
     box_type.copy_from_slice(&buf[start + 4..start + 8]);
+    let remaining = buf.len() - start;
     let (payload_start, total_len) = if size == 1 {
-        if start + 16 > buf.len() {
+        let largesize_end = start
+            .checked_add(16)
+            .ok_or_else(|| Error::invalid("avif: largesize header offset overflow"))?;
+        if largesize_end > buf.len() {
             return Err(Error::invalid("avif: truncated largesize box"));
         }
         let ls = read_u64(buf, start + 8)?;
-        if ls < 16 || (ls as usize) > buf.len() - start {
+        if ls < 16 || ls > remaining as u64 {
             return Err(Error::invalid(format!(
                 "avif: box '{}' largesize {ls} out of range",
                 type_str(&box_type)
@@ -100,10 +109,10 @@ pub fn parse_box_header(buf: &[u8], start: usize) -> Result<BoxHeader> {
         (start + 16, ls as usize)
     } else if size == 0 {
         // Box extends to end of file.
-        (start + 8, buf.len() - start)
+        (start + 8, remaining)
     } else {
         let s = size as usize;
-        if s < 8 || s > buf.len() - start {
+        if s < 8 || s > remaining {
             return Err(Error::invalid(format!(
                 "avif: box '{}' size {s} out of range",
                 type_str(&box_type)
@@ -153,14 +162,20 @@ pub fn find_box<'a>(buf: &'a [u8], target: &BoxType) -> Result<Option<(&'a [u8],
 }
 
 pub fn read_u16(buf: &[u8], at: usize) -> Result<u16> {
-    if at + 2 > buf.len() {
+    let end = at
+        .checked_add(2)
+        .ok_or_else(|| Error::invalid("avif: u16 offset overflow"))?;
+    if end > buf.len() {
         return Err(Error::invalid("avif: truncated u16 read"));
     }
     Ok(u16::from_be_bytes([buf[at], buf[at + 1]]))
 }
 
 pub fn read_u32(buf: &[u8], at: usize) -> Result<u32> {
-    if at + 4 > buf.len() {
+    let end = at
+        .checked_add(4)
+        .ok_or_else(|| Error::invalid("avif: u32 offset overflow"))?;
+    if end > buf.len() {
         return Err(Error::invalid("avif: truncated u32 read"));
     }
     Ok(u32::from_be_bytes([
@@ -172,7 +187,10 @@ pub fn read_u32(buf: &[u8], at: usize) -> Result<u32> {
 }
 
 pub fn read_u64(buf: &[u8], at: usize) -> Result<u64> {
-    if at + 8 > buf.len() {
+    let end = at
+        .checked_add(8)
+        .ok_or_else(|| Error::invalid("avif: u64 offset overflow"))?;
+    if end > buf.len() {
         return Err(Error::invalid("avif: truncated u64 read"));
     }
     let mut b = [0u8; 8];
@@ -234,5 +252,28 @@ mod tests {
         let buf = [0, 0, 0, 0x20, b'f', b't', b'y', b'p', 0, 0, 0]; // 20 advertised, only 11 present
         let err = parse_box_header(&buf, 0).unwrap_err();
         assert!(format!("{err}").contains("out of range"));
+    }
+
+    /// `parse_box_header` rejects an offset close to `usize::MAX` instead
+    /// of overflowing the `start + 8` computation — that path used to
+    /// debug-panic before the saturating arithmetic was added.
+    #[test]
+    fn rejects_offset_overflow() {
+        let buf = [0u8; 16];
+        let err = parse_box_header(&buf, usize::MAX - 3).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("overflow") || msg.contains("truncated"),
+            "expected overflow / truncated, got: {msg}"
+        );
+    }
+
+    /// `read_u32` at an out-of-range offset (close to `usize::MAX`) must
+    /// surface the `u32 offset overflow` error rather than wrap silently.
+    #[test]
+    fn read_u32_rejects_overflow_offset() {
+        let buf = [0u8; 4];
+        let err = read_u32(&buf, usize::MAX - 1).unwrap_err();
+        assert!(format!("{err}").contains("overflow"));
     }
 }

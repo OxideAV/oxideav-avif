@@ -124,10 +124,19 @@ fn infer_av1_pixmap(frame: &VideoFrame) -> Result<(PixelFormat, u32, u32)> {
         1 => PixelFormat::Gray8,
         3 => {
             let u = &frame.planes[1];
+            if u.stride == 0 {
+                return Err(Error::invalid("avif: AV1 frame U plane has zero stride"));
+            }
             // 4:2:0 — chroma stride is half luma; chroma data len is
             // chroma_stride * (height / 2 ceil).
-            let chroma_h = u.data.len().checked_div(u.stride).unwrap_or(0);
-            if u.stride * 2 == y.stride && chroma_h * 2 >= height as usize {
+            let chroma_h = u.data.len() / u.stride;
+            // Use checked / saturating arithmetic here so a corrupt AV1
+            // decoder output (e.g. a stride that overflows when doubled)
+            // can't trigger a debug-build panic before we surface the
+            // mismatch as an InvalidData error.
+            let u_stride_doubled = u.stride.saturating_mul(2);
+            let chroma_h_doubled = chroma_h.saturating_mul(2);
+            if u_stride_doubled == y.stride && chroma_h_doubled >= height as usize {
                 if chroma_h as u32 == height.div_ceil(2) {
                     PixelFormat::Yuv420P
                 } else {
@@ -316,7 +325,8 @@ impl AvifDecoder {
         })?;
         // Eagerly validate the codec config — same shape as the
         // still-image path uses for the av1C item property.
-        let _ = Av1CodecConfig::parse(&av1c)?;
+        let cfg = Av1CodecConfig::parse(&av1c)?;
+        validate_av1_config(&cfg)?;
 
         let timescale = if meta.timescale == 0 {
             1
@@ -335,6 +345,13 @@ impl AvifDecoder {
         let mut cumulative_pts: u64 = 0;
         for (i, s) in meta.samples.iter().enumerate() {
             let bytes = sample_bytes(file, s).map_err(core_err)?;
+            if bytes.len() > MAX_AV1_ITEM_BYTES {
+                return Err(Error::invalid(format!(
+                    "avis: sample {i} payload {} bytes exceeds soft cap {} bytes",
+                    bytes.len(),
+                    MAX_AV1_ITEM_BYTES
+                )));
+            }
             // Build a packet on stream 0 with the movie timescale so
             // the framework consumer recovers presentation order
             // without an extra remapping step.
@@ -391,6 +408,70 @@ fn core_err(e: crate::error::AvifError) -> Error {
     }
 }
 
+/// Defensive sanity check on a parsed `av1C` record before its bytes are
+/// handed to the AV1 decoder. AVIF §2.2.1 + AV1 §A.4 constrain the fields
+/// the record carries; corrupt values are a strong signal that the rest of
+/// the OBU stream is adversarial. Rejecting here keeps the host from
+/// feeding garbage into the AV1 entropy decoder, where prior fuzzing has
+/// surfaced arithmetic-overflow panics (see fuzz_regressions tests).
+///
+/// Checks (spec citations):
+///
+/// * AV1 §A.4 — `seq_profile` ∈ {0,1,2}.
+/// * AV1 §A.3 — `seq_level_idx_0` ∈ \[0..=23\] ∪ {31}; values 24..=30 are reserved.
+/// * AV1 §5.5.2 — at most one of `monochrome` / chroma-subsampling needs
+///   coherence: `monochrome == 1` requires both `chroma_subsampling_x` and
+///   `chroma_subsampling_y` set to 1 (4:0:0 carries no chroma planes).
+/// * AV1 §5.5.2 — 4:2:2 (sub_x=1, sub_y=0) is only valid for `seq_profile == 2`.
+/// * AV1 §5.5.2 — 4:4:4 (sub_x=0, sub_y=0) is only valid for `seq_profile ∈ {1, 2}`.
+fn validate_av1_config(cfg: &Av1CodecConfig) -> Result<()> {
+    if cfg.seq_profile > 2 {
+        return Err(Error::invalid(format!(
+            "av1C: seq_profile={} > 2 (AV1 §A.4)",
+            cfg.seq_profile
+        )));
+    }
+    // AV1 §A.3: reserved values are 24..=30. 31 is the "level not specified" sentinel.
+    if (24..=30).contains(&cfg.seq_level_idx_0) {
+        return Err(Error::invalid(format!(
+            "av1C: seq_level_idx_0={} is reserved (AV1 §A.3)",
+            cfg.seq_level_idx_0
+        )));
+    }
+    let sub_x = cfg.chroma_subsampling_x;
+    let sub_y = cfg.chroma_subsampling_y;
+    if cfg.monochrome && !(sub_x && sub_y) {
+        return Err(Error::invalid(format!(
+            "av1C: monochrome=1 requires chroma_subsampling_x=chroma_subsampling_y=1, \
+             got x={sub_x} y={sub_y} (AV1 §5.5.2)"
+        )));
+    }
+    // 4:2:2 = (1, 0) is only legal in profile 2.
+    if !cfg.monochrome && sub_x && !sub_y && cfg.seq_profile != 2 {
+        return Err(Error::invalid(format!(
+            "av1C: 4:2:2 subsampling requires seq_profile=2, got profile={} (AV1 §5.5.2)",
+            cfg.seq_profile
+        )));
+    }
+    // 4:4:4 = (0, 0) is only legal in profiles 1 or 2.
+    if !cfg.monochrome && !sub_x && !sub_y && cfg.seq_profile == 0 {
+        return Err(Error::invalid(
+            "av1C: 4:4:4 subsampling requires seq_profile in {1, 2}, got profile=0 (AV1 §5.5.2)",
+        ));
+    }
+    Ok(())
+}
+
+/// Soft upper bound on the AV1 OBU payload size we are willing to forward
+/// from an AVIF item. Files in the wild rarely exceed a few MB per item;
+/// rejecting absurdly large payloads here avoids handing the AV1 decoder
+/// a buffer that would dominate the fuzz wall-clock budget.
+///
+/// `32 MiB` is generous — even a 8K HDR still tops out around 5 MiB in
+/// practice — and keeps the limit well above all real-world fixtures
+/// shipped under `tests/fixtures/`.
+const MAX_AV1_ITEM_BYTES: usize = 32 * 1024 * 1024;
+
 /// Decode a single av01 item's OBU bitstream into a `VideoFrame` plus
 /// its inferred `(format, width, height)` triple. The slim
 /// [`VideoFrame`] no longer carries those fields, so we recover them
@@ -400,7 +481,15 @@ fn decode_av01_item(
     av1c: &[u8],
     ispe: Option<(u32, u32)>,
 ) -> Result<(VideoFrame, PixelFormat, u32, u32)> {
-    let _cfg = Av1CodecConfig::parse(av1c)?; // eagerly validate
+    if obu_bytes.len() > MAX_AV1_ITEM_BYTES {
+        return Err(Error::invalid(format!(
+            "avif: av01 item payload {} bytes exceeds soft cap {} bytes",
+            obu_bytes.len(),
+            MAX_AV1_ITEM_BYTES
+        )));
+    }
+    let cfg = Av1CodecConfig::parse(av1c)?; // eagerly validate
+    validate_av1_config(&cfg)?;
     let mut params = CodecParameters::video(CodecId::new("av1"));
     if let Some((w, h)) = ispe {
         params.width = Some(w);
@@ -602,6 +691,89 @@ mod tests {
     use super::*;
 
     const FIXTURE: &[u8] = include_bytes!("../tests/fixtures/monochrome.avif");
+
+    /// `validate_av1_config` rejects `seq_profile > 2` (AV1 §A.4 reserves
+    /// profiles 3..=7).
+    #[test]
+    fn validate_av1_config_rejects_high_profile() {
+        let mut cfg = Av1CodecConfig::parse(&[0x81, 0x00, 0x0c, 0x00]).unwrap();
+        cfg.seq_profile = 3;
+        let err = validate_av1_config(&cfg).unwrap_err();
+        match err {
+            Error::InvalidData(s) => assert!(s.contains("seq_profile"), "got: {s}"),
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    /// `validate_av1_config` rejects reserved `seq_level_idx_0` values
+    /// (24..=30 are reserved per AV1 §A.3).
+    #[test]
+    fn validate_av1_config_rejects_reserved_level() {
+        let mut cfg = Av1CodecConfig::parse(&[0x81, 0x00, 0x0c, 0x00]).unwrap();
+        cfg.seq_level_idx_0 = 27;
+        let err = validate_av1_config(&cfg).unwrap_err();
+        match err {
+            Error::InvalidData(s) => assert!(s.contains("seq_level_idx_0"), "got: {s}"),
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    /// `validate_av1_config` rejects a monochrome record that doesn't
+    /// also set chroma_subsampling_x=chroma_subsampling_y=1 — AV1 §5.5.2
+    /// requires both bits for 4:0:0.
+    #[test]
+    fn validate_av1_config_rejects_monochrome_without_subsampling() {
+        let mut cfg = Av1CodecConfig::parse(&[0x81, 0x00, 0x0c, 0x00]).unwrap();
+        cfg.monochrome = true;
+        cfg.chroma_subsampling_x = false;
+        cfg.chroma_subsampling_y = true;
+        let err = validate_av1_config(&cfg).unwrap_err();
+        match err {
+            Error::InvalidData(s) => assert!(s.contains("monochrome"), "got: {s}"),
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    /// `validate_av1_config` rejects 4:2:2 declared on `seq_profile=0` —
+    /// AV1 §5.5.2 only allows 4:2:2 chroma in profile 2.
+    #[test]
+    fn validate_av1_config_rejects_422_outside_profile_2() {
+        let mut cfg = Av1CodecConfig::parse(&[0x81, 0x00, 0x0c, 0x00]).unwrap();
+        cfg.seq_profile = 0;
+        cfg.chroma_subsampling_x = true;
+        cfg.chroma_subsampling_y = false;
+        let err = validate_av1_config(&cfg).unwrap_err();
+        match err {
+            Error::InvalidData(s) => assert!(s.contains("4:2:2"), "got: {s}"),
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    /// `validate_av1_config` rejects 4:4:4 on `seq_profile=0` — AV1
+    /// §5.5.2 confines 4:4:4 to profiles 1 and 2.
+    #[test]
+    fn validate_av1_config_rejects_444_in_profile_0() {
+        let mut cfg = Av1CodecConfig::parse(&[0x81, 0x00, 0x0c, 0x00]).unwrap();
+        cfg.seq_profile = 0;
+        cfg.chroma_subsampling_x = false;
+        cfg.chroma_subsampling_y = false;
+        let err = validate_av1_config(&cfg).unwrap_err();
+        match err {
+            Error::InvalidData(s) => assert!(s.contains("4:4:4"), "got: {s}"),
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    /// `validate_av1_config` accepts the canonical 4:2:0 / profile-0 /
+    /// level 1 layout used by every still-image AVIF fixture in this
+    /// crate's `tests/fixtures/`.
+    #[test]
+    fn validate_av1_config_accepts_canonical_420_profile0() {
+        // 0x81 = marker=1 version=1; 0x00 = seq_profile=0 level=0;
+        // 0x0c = chroma_subsampling_x=chroma_subsampling_y=1 (4:2:0).
+        let cfg = Av1CodecConfig::parse(&[0x81, 0x00, 0x0c, 0x00]).unwrap();
+        validate_av1_config(&cfg).expect("canonical 4:2:0 / profile 0 must validate");
+    }
 
     #[test]
     fn decoder_surfaces_av1_errors_unwrapped() {

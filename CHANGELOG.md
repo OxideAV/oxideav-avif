@@ -9,6 +9,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Fuzz-driven hardening pass at the AVIF→AV1 boundary (workspace task
+  #730). Adds defensive validation that refuses adversarial input
+  before it reaches the AV1 decoder's entropy / transform stages,
+  guarding against the arithmetic-overflow class of crashes the
+  daily fuzz workflow surfaced through round 46:
+  - New `validate_av1_config` rejects an `av1C` record whose
+    `seq_profile > 2` (AV1 §A.4 reserved), whose `seq_level_idx_0`
+    falls in the reserved 24..=30 range (AV1 §A.3), whose
+    `monochrome` flag is set without both chroma-subsampling bits
+    (AV1 §5.5.2 requires 4:0:0 to set both), whose 4:2:2 chroma
+    declaration appears outside `seq_profile = 2` (AV1 §5.5.2), or
+    whose 4:4:4 chroma declaration appears in `seq_profile = 0`
+    (AV1 §5.5.2). Six unit tests cover each rejection plus the
+    canonical 4:2:0 / profile-0 acceptance case.
+  - `decode_av01_item` + `decode_avis_file` enforce a 32 MiB soft
+    cap on the AV1 OBU payload they will hand to the AV1 decoder.
+    Real-world AVIF items stay well under this; the cap protects
+    against pathological inputs that would dominate the fuzz wall
+    clock without surfacing useful crashes.
+  - `infer_av1_pixmap` swaps the `u.stride * 2` debug-overflowable
+    multiplication for `saturating_mul`, and now refuses a zero
+    U-plane stride explicitly (AV1 §7.3.1 requires positive plane
+    strides on every decoded frame).
+- `oxideav-avif::avis::sample_table` enforces a soft cap of
+  16 Mi expanded samples to defend against `stsc` entries whose
+  `samples_per_chunk` field has been inflated to `0xFFFF_FFFF` —
+  without this guard the per-chunk expansion loop ran for hours
+  (ISO/IEC 14496-12 §8.7.4 doesn't bound the field, but real AVIS
+  streams stay 5 orders of magnitude below the cap). Unit test
+  `sample_table_rejects_oversized_stsc_expansion` pins the path.
+- Defensive arithmetic across the box walker:
+  `parse_box_header` / `read_u16` / `read_u32` / `read_u64` now
+  use `checked_add` for every offset computation and refuse
+  `usize::MAX`-adjacent positions instead of debug-panicking
+  (ISO/IEC 14496-12 §4.2 box-size invariants). Two new unit tests
+  in `box_parser`: `rejects_offset_overflow` and
+  `read_u32_rejects_overflow_offset`.
+- New regression-test crate
+  (`crates/oxideav-avif/tests/fuzz_regressions.rs`) anchored on
+  three real AVIF bitstreams captured from the daily fuzz workflow
+  (`y_plane_divergence_match.avif`, `y_plane_roundtrip_avif1.avif`,
+  `y_plane_roundtrip_avif2.avif`). The tests assert decode does
+  not panic; pixel correctness remains the cross-decode harness's
+  responsibility (the residual Y-plane divergence is tracked as
+  workspace task #786 in `oxideav-av1`). Fourth test pins the
+  malformed-av1C high-`seq_profile` rejection from the validator
+  pass above.
 - AVIS (AVIF Image Sequence) end-to-end decode pipeline
   (`AvifDecoder::decode_avis_file`). Walks the track's sample table
   via the existing [`avis::parse_avis`] surface, lifts the

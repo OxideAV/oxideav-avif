@@ -72,6 +72,47 @@ still loses significant signal.
 See `examples/diag_decode.rs` for a drop-in report of exactly which
 stage each input reaches.
 
+### Round 47 — fuzz-driven AVIF→AV1 boundary hardening
+
+Daily cargo-fuzz workflow surfaced an arithmetic-overflow class of
+crashes in `oxideav-av1`'s coefficient decoder when fed adversarial
+AV1 OBU streams wrapped in AVIF containers. The AV1 fix itself is a
+sibling-crate concern; this round adds the AVIF-side defensive
+layer so the host stops handing garbage to the AV1 entropy stage.
+
+* **`validate_av1_config`** at the AVIF→AV1 handoff refuses `av1C`
+  records whose fields violate AV1 spec invariants:
+  `seq_profile > 2` (§A.4), reserved `seq_level_idx_0` in 24..=30
+  (§A.3), `monochrome = 1` without both chroma-subsampling bits
+  (§5.5.2), 4:2:2 outside `seq_profile = 2` (§5.5.2), 4:4:4 in
+  `seq_profile = 0` (§5.5.2). Both the still-image path
+  (`decode_av01_item`) and the AVIS sequence path
+  (`decode_avis_file`) call into the validator before forwarding
+  any OBU bytes.
+* **32 MiB soft cap** on the AV1 OBU payload size at the AVIF→AV1
+  handoff. Real-world AVIF items stay well under this; the cap
+  protects against pathological inputs that dominate the fuzz wall
+  clock without surfacing useful crashes.
+* **AVIS `samples_per_chunk` DoS guard**: `sample_table` enforces
+  a 16 Mi total-samples soft cap. Without it, an `stsc` entry
+  with `samples_per_chunk = 0xFFFF_FFFF` spun the per-chunk
+  expansion loop for hours.
+* **Defensive box-walker arithmetic**: `parse_box_header` +
+  `read_u16/u32/u64` now use `checked_add` for every offset
+  computation and refuse `usize::MAX`-adjacent positions instead of
+  debug-panicking on the `start + 8 > buf.len()` shape.
+* **Regression suite** in `tests/fuzz_regressions.rs` anchored on
+  three real AVIF bitstreams captured from the daily fuzz workflow.
+  Asserts decode does not panic — pixel correctness remains the
+  cross-decode harness's responsibility (the residual Y-plane
+  divergence is tracked as a sibling follow-up in `oxideav-av1`).
+
+The remaining fuzz-discovered divergence (Y-plane pixels diverging
+between `oxideav-avif` and `libavif` on the same AV1 bitstream)
+is a sibling-crate issue: the AVIF container layer hands identical
+OBU bytes to both decoders, so any divergence is an `oxideav-av1`
+decode-path bug, not an AVIF wrap issue.
+
 ### Round 22 — HDR metadata + AV1 wrap pass-through + multi-extent items
 
 Three headroom items addressed for the 60% → 75% coverage push:
