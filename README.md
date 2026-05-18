@@ -27,6 +27,10 @@ still loses significant signal.
 | `ftyp` brand check                     | accepts `avif` / `avis` / `mif1` / `msf1` / `miaf`                                                                                                         |
 | `meta` sub-boxes                       | `hdlr`, `pitm` (v0/v1), `iinf` (v0/v1) + `infe` (v2/v3), `iloc` (v0/v1/v2), `iref`, `iprp` / `ipco` / `ipma` (v0/v1, small + large property indices)       |
 | Item properties                        | `av1C`, `ispe`, `colr` (nclx + ICC), `pixi`, `pasp`, `irot`, `imir`, `clap`, `auxC`, `mdcv`, `clli`, `cclv`; unknown boxes retained as `Property::Other` so indices stay valid |
+| Metadata items (`Exif`, XMP)           | `cdsc` iref walker resolves Exif (`item_type == 'Exif'` and `mime`-wrapped `application/octet-stream` / `image/tiff` / `image/x-exif`) + XMP (`mime` + `application/rdf+xml`) attached to the primary; surfaced as `AvifInfo::{exif_item_id, xmp_item_id, has_descriptive_metadata()}`. Raw bytes are extracted on demand via `item_payload_bytes` |
+| Thumbnails                             | `thmb` iref enumeration: `AvifInfo::thumbnail_item_ids` lists every thumbnail item attached to the primary; `has_thumbnails()` shorthand |
+| Premultiplied-alpha signalling         | HEIF `prem` iref (`from_id` = alpha auxiliary, `to_ids` includes the colour image) is detected and surfaced as `AvifInfo::premultiplied_alpha` |
+| `infe` v2/v3 tail fields               | `mime` items: `content_type` + optional `content_encoding` (empty string normalised to `None`); `uri ` items: `item_uri_type`. All exposed on `ItemInfo` so callers can route generic carriers without re-parsing the box |
 | CICP color signalling                  | `colr` nclx → `CicpTriple` (primaries / transfer / matrix / full_range) with H.273 defaults (`Unspecified` = `2/2/2/false`); ICC + Unknown fall back to Unspecified; alpha auxiliary CICP constant carries `full_range = true` per av1-avif §4.1 |
 | HDR metadata                           | `mdcv` (SMPTE ST 2086 mastering display primaries + luminance), `clli` (MaxCLL / MaxFALL cd/m²), `cclv` (draft av1-avif extension, same layout as `clli`); surfaced via `AvifInfo::{mdcv, clli, cclv, has_hdr_metadata(), max_cll(), max_fall()}` |
 | AV1 wrap pass-through                  | `av1C`-derived bit depth (8/10/12-bit), monochrome flag, and chroma subsampling `(x, y)` decoded and surfaced via `AvifInfo::{bit_depth, monochrome, chroma_subsampling}`; callers no longer need to re-parse `av1C` |
@@ -71,6 +75,51 @@ still loses significant signal.
 
 See `examples/diag_decode.rs` for a drop-in report of exactly which
 stage each input reaches.
+
+### Round 75 — HEIF item-properties + iref typed-relationships
+
+Container side reaches further into the descriptive surface that an AVIF
+file carries around its primary AV1 OBU stream. None of this requires
+the AV1 decoder.
+
+* **`infe` v2/v3 tail fields** (`ItemInfo.content_type` /
+  `content_encoding` / `item_uri_type`). ISO/IEC 14496-12 §8.11.6.2:
+  for `item_type == 'mime'` the entry ships `content_type` (MIME)
+  then an optional `content_encoding`; for `item_type == 'uri '` it
+  ships an absolute URI. Previously the parser stopped at
+  `item_name` and discarded the tail, leaving callers unable to tell
+  an XMP item from an Exif `octet-stream` item. The three new
+  optional fields are populated only when relevant; every other
+  item_type leaves them `None` so the common path stays compact.
+* **`thmb` / `cdsc` / `prem` iref enumeration** (`Meta`
+  `iref_sources_of` plus `is_alpha_premultiplied_for`). ISO/IEC
+  14496-12 §8.11.12 / HEIF §6.10.1.1. The existing
+  `iref_source_of` only returned the first match; `iref_sources_of`
+  walks every entry, which a primary item with multiple thumbnails
+  needs.
+* **`AvifInfo` carries descriptive-metadata pointers**:
+  `thumbnail_item_ids: Vec<u32>`, `exif_item_id: Option<u32>`,
+  `xmp_item_id: Option<u32>`, `premultiplied_alpha: bool`.
+  Helpers: `has_thumbnails()`, `has_descriptive_metadata()`. The
+  Exif detector accepts the native `'Exif'` item type AND the
+  libheif-style `mime` carrier with
+  `application/octet-stream` / `image/tiff` / `image/x-exif`
+  content_type. XMP is detected via
+  `mime` + `application/rdf+xml` (case-insensitive — encoders
+  disagree on capitalisation).
+* **`item_payload_bytes(file, item_id) -> Result<Vec<u8>>`**: a
+  thin public wrapper around the existing `item_bytes_owned`
+  resolver so callers with a populated `AvifInfo` can extract the
+  Exif TIFF or XMP RDF/XML payload in one call.
+* **Real-fixture validation**: the Microsoft `monochrome.avif`
+  conformance fixture ships a native Exif item (id 2) linked via
+  `cdsc`. The new `inspect_fixture_resolves_native_exif_metadata_item`
+  test pins the end-to-end resolution path on real bytes plus
+  verifies HEIF §A.2.1's 4-byte `exif_tiff_header_offset` prefix
+  → TIFF byte-order marker (`II` / `MM`).
+
+Test delta: +14 unit tests in `meta` / `inspect` (118 lib, was 104),
+integration suite unchanged (41 + 1 ignored).
 
 ### Round 47 — fuzz-driven AVIF→AV1 boundary hardening
 

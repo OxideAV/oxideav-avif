@@ -28,6 +28,21 @@ const IPCO: BoxType = b(b"ipco");
 const IPMA: BoxType = b(b"ipma");
 const IREF: BoxType = b(b"iref");
 
+/// HEIF / ISOBMFF item-type four-CC carrying a generic MIME-tagged blob
+/// in the `mdat` (Exif/XMP item carriers when the writer chose the
+/// `mime` flavour). ISO/IEC 14496-12 §8.11.6.2.
+pub const ITEM_TYPE_MIME: BoxType = b(b"mime");
+/// HEIF / ISOBMFF item-type four-CC for URI-tagged items. Rare in AVIF
+/// but legal per ISO/IEC 14496-12 §8.11.6.2.
+pub const ITEM_TYPE_URI: BoxType = b(b"uri ");
+/// HEIF item-type four-CC for an Exif metadata payload. The first 4
+/// bytes of the resolved item bytes are a big-endian offset to the
+/// Exif TIFF header (HEIF §A.2.1); the remaining bytes are a standard
+/// TIFF / Exif blob. Files in the wild also wrap Exif as a `mime`
+/// item with `content_type == "application/octet-stream"` — both
+/// forms are detected.
+pub const ITEM_TYPE_EXIF: BoxType = b(b"Exif");
+
 const AV1C: BoxType = b(b"av1C");
 const ISPE: BoxType = b(b"ispe");
 const COLR: BoxType = b(b"colr");
@@ -42,11 +57,35 @@ const CLLI: BoxType = b(b"clli");
 const CCLV: BoxType = b(b"cclv");
 
 /// One `infe` entry.
+///
+/// Spec: ISO/IEC 14496-12 §8.11.6 (ItemInfoEntry). Version 2 / 3 entries
+/// carry an `item_type` plus, depending on that type, additional fields:
+///
+/// * `item_type == 'mime'` (HEIF metadata items such as Exif / XMP
+///   wrapped as raw bytes): the entry also ships `content_type`
+///   (MIME type — `application/rdf+xml` for XMP, `application/octet-stream`
+///   for Exif TIFF blobs in some writers) and an optional `content_encoding`
+///   (HTTP content-encoding — empty string means raw).
+/// * `item_type == 'uri '` (URI metadata items, rare in AVIF): the entry
+///   ships an absolute URI in `item_uri_type` that identifies the
+///   payload format.
+///
+/// For every other `item_type` (`av01`, `grid`, `Exif`, `auxl` targets,
+/// …) these fields are `None` and the payload bytes (resolved through
+/// the matching [`ItemLocation`]) are interpreted by the consumer.
 #[derive(Clone, Debug)]
 pub struct ItemInfo {
     pub id: u32,
     pub item_type: BoxType,
     pub name: String,
+    /// MIME content-type (only populated when `item_type == 'mime'`).
+    pub content_type: Option<String>,
+    /// Optional content-encoding tag (only populated when
+    /// `item_type == 'mime'`; empty string is normalised to `None`).
+    pub content_encoding: Option<String>,
+    /// Absolute URI type indicator (only populated when
+    /// `item_type == 'uri '`).
+    pub item_uri_type: Option<String>,
 }
 
 /// One `iloc` extent (offset + length pair inside the referenced data
@@ -377,6 +416,31 @@ impl Meta {
         None
     }
 
+    /// Return every source of an iref of `reference_type` whose
+    /// `to_ids` contains `to_id`. Multiple iref entries can point at a
+    /// single item (e.g. several thumbnails of one master image), so a
+    /// list is returned. Returns `Vec::new()` when nothing matches.
+    pub fn iref_sources_of(&self, reference_type: &BoxType, to_id: u32) -> Vec<u32> {
+        let mut out = Vec::new();
+        for e in &self.irefs {
+            if &e.reference_type == reference_type && e.to_ids.contains(&to_id) {
+                out.push(e.from_id);
+            }
+        }
+        out
+    }
+
+    /// True when the alpha auxiliary attached to `to_id` is signalled as
+    /// premultiplied per HEIF iref type `prem`. The `prem` iref's
+    /// `from_id` is the alpha item and `to_ids` contains the colour
+    /// image. Spec: ISO/IEC 23008-12 (HEIF) §6.10.1.1 — `prem` is the
+    /// canonical signal that the colour values have been premultiplied
+    /// by the alpha.
+    pub fn is_alpha_premultiplied_for(&self, to_id: u32) -> bool {
+        const PREM: BoxType = b(b"prem");
+        self.iref_source_of(&PREM, to_id).is_some()
+    }
+
     pub fn item_by_id(&self, id: u32) -> Option<&ItemInfo> {
         self.items.iter().find(|i| i.id == id)
     }
@@ -488,13 +552,47 @@ fn parse_infe(payload: &[u8]) -> Result<ItemInfo> {
     };
     let (name, next) = read_cstr(body, cursor)?;
     cursor = next;
-    // Remaining fields (content_type, URI, …) depend on item_type; we
-    // don't need them for AVIF decoding.
+    // ISO/IEC 14496-12 §8.11.6.2 ItemInfoEntry syntax: for v2/v3 the
+    // tail of the box carries type-dependent fields. `mime` items ship
+    // `content_type` then optional `content_encoding`; `uri ` items
+    // ship `item_uri_type`. Every other type stops after `item_name`.
+    let (content_type, content_encoding, item_uri_type) = match &item_type {
+        x if x == &ITEM_TYPE_MIME => {
+            // content_type is mandatory for 'mime'; content_encoding is
+            // optional — when the box ends after content_type the field
+            // is treated as absent (§8.11.6.3: an explicit empty string
+            // means "no encoding", we collapse that to None for parity
+            // so callers don't have to special-case the empty case).
+            let (ct, after_ct) = read_cstr(body, cursor)?;
+            cursor = after_ct;
+            let ce = if cursor < body.len() {
+                let (raw, after_ce) = read_cstr(body, cursor)?;
+                cursor = after_ce;
+                if raw.is_empty() {
+                    None
+                } else {
+                    Some(raw)
+                }
+            } else {
+                None
+            };
+            (Some(ct), ce, None)
+        }
+        x if x == &ITEM_TYPE_URI => {
+            let (u, after_u) = read_cstr(body, cursor)?;
+            cursor = after_u;
+            (None, None, Some(u))
+        }
+        _ => (None, None, None),
+    };
     let _ = cursor;
     Ok(ItemInfo {
         id,
         item_type,
         name,
+        content_type,
+        content_encoding,
+        item_uri_type,
     })
 }
 
@@ -1146,5 +1244,155 @@ mod tests {
     fn cclv_rejects_truncated() {
         let buf = vec![0u8; 1];
         assert!(parse_cclv(&buf).is_err());
+    }
+
+    /// Build a synthetic v2 `infe` payload with the given item_type +
+    /// optional trailing fields. The wrapper FullBox header lives in the
+    /// `body` argument's prefix to mirror what the iinf parser hands to
+    /// `parse_infe`.
+    fn build_infe_v2(item_type: &[u8; 4], name: &str, tail: &[u8]) -> Vec<u8> {
+        // FullBox header: version=2, flags=0
+        let mut buf = vec![2u8, 0, 0, 0];
+        buf.extend_from_slice(&1u16.to_be_bytes()); // item_ID = 1
+        buf.extend_from_slice(&0u16.to_be_bytes()); // protection_index = 0
+        buf.extend_from_slice(item_type); // item_type
+        buf.extend_from_slice(name.as_bytes());
+        buf.push(0); // NUL for item_name
+        buf.extend_from_slice(tail);
+        buf
+    }
+
+    /// A 'mime' v2 infe carries both content_type and an optional
+    /// content_encoding after item_name. The XMP item shape that
+    /// libheif / libavif emit (`application/rdf+xml`) is the canonical
+    /// case the AVIF metadata path needs to recognise.
+    #[test]
+    fn infe_v2_mime_parses_content_type_and_encoding() {
+        let mut tail = Vec::new();
+        tail.extend_from_slice(b"application/rdf+xml\0");
+        tail.extend_from_slice(b"\0"); // explicit empty content_encoding
+        let payload = build_infe_v2(b"mime", "xmp", &tail);
+        let info = parse_infe(&payload).unwrap();
+        assert_eq!(info.id, 1);
+        assert_eq!(&info.item_type, b"mime");
+        assert_eq!(info.name, "xmp");
+        assert_eq!(info.content_type.as_deref(), Some("application/rdf+xml"));
+        // Spec §8.11.6.3 — empty string content_encoding means "no
+        // encoding"; we collapse it to None so callers don't need to
+        // special-case the empty string.
+        assert!(info.content_encoding.is_none());
+        assert!(info.item_uri_type.is_none());
+    }
+
+    /// 'mime' v3 infe shape (32-bit item_ID), Exif TIFF blob wrapped
+    /// with content_type=application/octet-stream — the libheif Exif
+    /// writer pattern.
+    #[test]
+    fn infe_v3_mime_octet_stream_for_exif() {
+        // FullBox header: version=3, flags=0
+        let mut buf = vec![3u8, 0, 0, 0];
+        buf.extend_from_slice(&42u32.to_be_bytes()); // item_ID = 42
+        buf.extend_from_slice(&0u16.to_be_bytes()); // protection
+        buf.extend_from_slice(b"mime"); // item_type
+        buf.extend_from_slice(b"\0"); // empty item_name
+        buf.extend_from_slice(b"application/octet-stream\0");
+        // content_encoding absent (box ends after content_type cstr)
+        let info = parse_infe(&buf).unwrap();
+        assert_eq!(info.id, 42);
+        assert_eq!(&info.item_type, b"mime");
+        assert_eq!(
+            info.content_type.as_deref(),
+            Some("application/octet-stream")
+        );
+        assert!(info.content_encoding.is_none());
+    }
+
+    /// 'uri ' item_type carries an item_uri_type cstr instead of
+    /// content_type/content_encoding.
+    #[test]
+    fn infe_v2_uri_parses_uri_type() {
+        let mut tail = Vec::new();
+        tail.extend_from_slice(b"https://example.invalid/spec\0");
+        let payload = build_infe_v2(b"uri ", "uri-meta", &tail);
+        let info = parse_infe(&payload).unwrap();
+        assert_eq!(&info.item_type, b"uri ");
+        assert!(info.content_type.is_none());
+        assert_eq!(
+            info.item_uri_type.as_deref(),
+            Some("https://example.invalid/spec")
+        );
+    }
+
+    /// Generic item types (`av01`, `Exif`, `grid`, …) stop after
+    /// `item_name`; no additional fields are parsed.
+    #[test]
+    fn infe_v2_generic_item_type_stops_at_name() {
+        let payload = build_infe_v2(b"av01", "color", &[]);
+        let info = parse_infe(&payload).unwrap();
+        assert_eq!(&info.item_type, b"av01");
+        assert!(info.content_type.is_none());
+        assert!(info.content_encoding.is_none());
+        assert!(info.item_uri_type.is_none());
+        let payload = build_infe_v2(b"Exif", "exif-blob", &[]);
+        let info = parse_infe(&payload).unwrap();
+        assert_eq!(&info.item_type, b"Exif");
+        assert!(info.content_type.is_none());
+    }
+
+    /// `iref_sources_of` returns every source whose `to_ids` contains
+    /// the target id. Two `thmb` irefs both pointing at the primary
+    /// (small + tiny thumbnails of one master) should both surface.
+    #[test]
+    fn iref_sources_of_returns_all_matches() {
+        let m = Meta {
+            irefs: vec![
+                IrefEntry {
+                    reference_type: *b"thmb",
+                    from_id: 10,
+                    to_ids: vec![1],
+                },
+                IrefEntry {
+                    reference_type: *b"thmb",
+                    from_id: 11,
+                    to_ids: vec![1],
+                },
+                // Irrelevant: different reference_type
+                IrefEntry {
+                    reference_type: *b"auxl",
+                    from_id: 12,
+                    to_ids: vec![1],
+                },
+                // Irrelevant: different target
+                IrefEntry {
+                    reference_type: *b"thmb",
+                    from_id: 13,
+                    to_ids: vec![2],
+                },
+            ],
+            ..Meta::default()
+        };
+        let mut got = m.iref_sources_of(b"thmb", 1);
+        got.sort_unstable();
+        assert_eq!(got, vec![10, 11]);
+        assert!(m.iref_sources_of(b"thmb", 99).is_empty());
+    }
+
+    /// `is_alpha_premultiplied_for` detects HEIF `prem` iref linking an
+    /// alpha auxiliary to a colour image.
+    #[test]
+    fn is_alpha_premultiplied_for_detects_prem_iref() {
+        let m = Meta {
+            irefs: vec![IrefEntry {
+                reference_type: *b"prem",
+                from_id: 2,
+                to_ids: vec![1],
+            }],
+            ..Meta::default()
+        };
+        assert!(m.is_alpha_premultiplied_for(1));
+        assert!(!m.is_alpha_premultiplied_for(2));
+        // Negative case: empty meta
+        let empty = Meta::default();
+        assert!(!empty.is_alpha_premultiplied_for(1));
     }
 }

@@ -11,7 +11,9 @@ use crate::box_parser::{b, BoxType};
 use crate::cicp::{effective_cicp, CicpTriple};
 use crate::error::{AvifError as Error, Result};
 use crate::grid::ImageGrid;
-use crate::meta::{Cclv, Clli, Colr, Ispe, Mdcv, Meta, Pasp, Pixi, Property};
+use crate::meta::{
+    Cclv, Clli, Colr, Ispe, Mdcv, Meta, Pasp, Pixi, Property, ITEM_TYPE_EXIF, ITEM_TYPE_MIME,
+};
 use crate::parser::{
     classify_brands, item_bytes, parse, parse_header, AvifHeader, AvifImage, BrandClass,
     ITEM_TYPE_GRID,
@@ -80,6 +82,36 @@ pub struct AvifInfo {
     /// `(false, false)` = 4:4:4. `None` when `av1c` is empty or
     /// monochrome (subsampling is undefined for 4:0:0).
     pub chroma_subsampling: Option<(bool, bool)>,
+    /// Item IDs of every thumbnail (`thmb` iref source) attached to the
+    /// primary item. HEIF / ISOBMFF §8.11.12: a `thmb` iref's `from_id`
+    /// is the thumbnail item; its `to_ids` lists the master image(s)
+    /// the thumbnail represents. Multiple thumbnails of varying sizes
+    /// can be attached, hence a `Vec`. Empty when the file ships no
+    /// thumbnails.
+    pub thumbnail_item_ids: Vec<u32>,
+    /// Item ID of the Exif metadata item linked to the primary, when
+    /// present. Detection rules:
+    ///
+    /// 1. Find every item linked by a `cdsc` (content-description) iref
+    ///    whose `to_ids` includes the primary item.
+    /// 2. Among those, pick the one whose `infe` declares
+    ///    `item_type == 'Exif'`, OR whose `item_type == 'mime'` with a
+    ///    `content_type` of `application/octet-stream` or `image/tiff`
+    ///    (both forms appear in the wild — see ISO/IEC 23008-12
+    ///    §A.2.1 + libheif writer patterns).
+    pub exif_item_id: Option<u32>,
+    /// Item ID of the XMP metadata item linked to the primary, when
+    /// present. Detection rule: a `cdsc` iref source whose `infe`
+    /// declares `item_type == 'mime'` with `content_type ==
+    /// "application/rdf+xml"` (the canonical XMP MIME type per
+    /// ISO/IEC 23008-12 §A.3.2).
+    pub xmp_item_id: Option<u32>,
+    /// True when the alpha auxiliary is signalled as premultiplied via
+    /// a HEIF `prem` iref (ISO/IEC 23008-12 §6.10.1.1). `false` when no
+    /// alpha is present, or when alpha is present but the encoder
+    /// didn't add the `prem` signal (the alpha is then straight /
+    /// unassociated).
+    pub premultiplied_alpha: bool,
 }
 
 impl AvifInfo {
@@ -136,6 +168,19 @@ impl AvifInfo {
             .or_else(|| self.cclv.map(|c| c.max_pic_average_light_level))
     }
 
+    /// True when at least one thumbnail item is linked to the primary
+    /// via a `thmb` iref. Shorthand for `!thumbnail_item_ids.is_empty()`.
+    pub fn has_thumbnails(&self) -> bool {
+        !self.thumbnail_item_ids.is_empty()
+    }
+
+    /// True when either Exif or XMP metadata is attached to the primary
+    /// via a `cdsc` iref. Shorthand gate for downstream consumers that
+    /// only need a "should I extract metadata" hint.
+    pub fn has_descriptive_metadata(&self) -> bool {
+        self.exif_item_id.is_some() || self.xmp_item_id.is_some()
+    }
+
     /// Resolve the effective CICP signalling quadruple for the primary
     /// item: parse the `colr` nclx triple if present, fold to the
     /// spec-mandated `Unspecified` quadruple `(2, 2, 2, false)`
@@ -182,6 +227,88 @@ pub fn inspect(file: &[u8]) -> Result<AvifInfo> {
             brands,
         )
     }
+}
+
+/// Walk every `cdsc` iref whose `to_ids` contains `target_id` and
+/// classify the source items as Exif / XMP based on the `infe` shape.
+///
+/// Returns `(exif_item_id, xmp_item_id)`. Either may be `None`. When
+/// multiple Exif or XMP items are linked to the same target (rare in
+/// practice — encoders ship one of each), the first encountered wins.
+///
+/// The Exif side accepts two encodings seen in the wild:
+///
+/// * `item_type == 'Exif'` (HEIF §A.2.1 native form).
+/// * `item_type == 'mime'` with `content_type` matching
+///   `application/octet-stream` or `image/tiff` (libheif / Apple writer
+///   pattern — wraps the Exif TIFF blob behind the generic mime carrier).
+///
+/// XMP follows the canonical form: `item_type == 'mime'` with
+/// `content_type == "application/rdf+xml"`.
+fn resolve_metadata_items(meta: &Meta, target_id: u32) -> (Option<u32>, Option<u32>) {
+    const CDSC: BoxType = b(b"cdsc");
+    let mut exif = None;
+    let mut xmp = None;
+    for src in meta.iref_sources_of(&CDSC, target_id) {
+        let Some(info) = meta.item_by_id(src) else {
+            continue;
+        };
+        if info.item_type == ITEM_TYPE_EXIF {
+            if exif.is_none() {
+                exif = Some(src);
+            }
+            continue;
+        }
+        if info.item_type == ITEM_TYPE_MIME {
+            let ct = info.content_type.as_deref().unwrap_or("");
+            // Case-insensitive match on the MIME root; encoders disagree
+            // on capitalisation ("Application/rdf+xml" has been seen).
+            let ct_lower = ct.to_ascii_lowercase();
+            let is_xmp =
+                ct_lower == "application/rdf+xml" || ct_lower.starts_with("application/rdf+xml");
+            let is_exif_mime = ct_lower == "application/octet-stream"
+                || ct_lower == "image/tiff"
+                || ct_lower == "image/x-exif";
+            if is_xmp && xmp.is_none() {
+                xmp = Some(src);
+            } else if is_exif_mime && exif.is_none() {
+                exif = Some(src);
+            }
+        }
+    }
+    (exif, xmp)
+}
+
+/// Extract the raw item bytes for a given item ID from an AVIF file.
+/// Useful for callers that have a populated [`AvifInfo`] and want to
+/// pull the Exif or XMP payload out for further processing. For
+/// multi-extent items this allocates and concatenates per HEIF §8.11.3.3;
+/// for single-extent items this is a zero-copy slice copied into a
+/// `Vec<u8>` (the API returns owned bytes for uniformity).
+///
+/// Errors when the item is missing from `iloc`, when its
+/// `construction_method` isn't file-offset (0), or when an extent runs
+/// off the end of `file`.
+///
+/// For Exif items (`item_type == 'Exif'`), HEIF §A.2.1 specifies that
+/// the first 4 bytes of the resolved payload are a big-endian
+/// `exif_tiff_header_offset` indicating where the TIFF header starts
+/// inside the payload. Callers that want just the TIFF blob should skip
+/// `4 + offset` bytes. We return the raw item bytes verbatim so callers
+/// see the prefix; stripping is a downstream concern.
+///
+/// For `mime` items the returned bytes are the raw blob — no prefix /
+/// no encoding-aware transform (the `content_encoding` field on the
+/// matching [`crate::meta::ItemInfo`] tells callers whether to gunzip
+/// the result; HEIF in the wild always ships `content_encoding` empty,
+/// so the raw blob is usually directly consumable).
+pub fn item_payload_bytes(file: &[u8], item_id: u32) -> Result<Vec<u8>> {
+    let hdr = parse_header(file)?;
+    let loc = hdr
+        .meta
+        .location_by_id(item_id)
+        .ok_or_else(|| Error::invalid(format!("avif: item {item_id} missing in iloc")))?;
+    crate::parser::item_bytes_owned(file, loc)
 }
 
 /// Decode `av1C` bytes into `(bit_depth, monochrome, chroma_subsampling)`.
@@ -235,6 +362,28 @@ pub(crate) fn build_info(
     let mdcv = img.mdcv;
     let clli = img.clli;
     let cclv = img.cclv;
+    let primary_id = img.primary_item_id;
+    let thumbnail_item_ids = img.meta.iref_sources_of(b"thmb", primary_id);
+    let (exif_item_id, xmp_item_id) = resolve_metadata_items(&img.meta, primary_id);
+    // Per HEIF §6.10.1.1, premultiplication is signalled by a `prem`
+    // iref whose `from_id` is the alpha auxiliary and whose `to_ids`
+    // contains the primary item. Find the alpha first, then check.
+    let premultiplied_alpha = if has_alpha {
+        match find_alpha_item_id(&img.meta, primary_id) {
+            // The alpha item is the `from_id` of the `prem` iref;
+            // `prem`'s `to_ids` lists the colour image(s) it premuls.
+            // Walk every `prem` iref and look for one whose from matches
+            // our alpha and whose to contains the primary.
+            Some(alpha_id) => img.meta.irefs.iter().any(|e| {
+                &e.reference_type == b"prem"
+                    && e.from_id == alpha_id
+                    && e.to_ids.contains(&primary_id)
+            }),
+            None => false,
+        }
+    } else {
+        false
+    };
     Ok(AvifInfo {
         width,
         height,
@@ -252,6 +401,10 @@ pub(crate) fn build_info(
         bit_depth,
         monochrome,
         chroma_subsampling,
+        thumbnail_item_ids,
+        exif_item_id,
+        xmp_item_id,
+        premultiplied_alpha,
     })
 }
 
@@ -343,6 +496,21 @@ pub(crate) fn build_info_grid(
         },
     };
     let (bit_depth, monochrome, chroma_subsampling) = decode_av1c_flags(&av1c);
+    let thumbnail_item_ids = hdr.meta.iref_sources_of(b"thmb", primary_id);
+    let (exif_item_id, xmp_item_id) = resolve_metadata_items(&hdr.meta, primary_id);
+    let has_alpha = find_alpha_item_id(&hdr.meta, primary_id).is_some();
+    let premultiplied_alpha = if has_alpha {
+        match find_alpha_item_id(&hdr.meta, primary_id) {
+            Some(alpha_id) => hdr.meta.irefs.iter().any(|e| {
+                &e.reference_type == b"prem"
+                    && e.from_id == alpha_id
+                    && e.to_ids.contains(&primary_id)
+            }),
+            None => false,
+        }
+    } else {
+        false
+    };
     Ok(AvifInfo {
         width: grid.output_width,
         height: grid.output_height,
@@ -351,7 +519,7 @@ pub(crate) fn build_info_grid(
         av1c,
         obu_bytes: Vec::new(),
         is_grid: true,
-        has_alpha: find_alpha_item_id(&hdr.meta, primary_id).is_some(),
+        has_alpha,
         brands,
         colour,
         mdcv,
@@ -360,6 +528,10 @@ pub(crate) fn build_info_grid(
         bit_depth,
         monochrome,
         chroma_subsampling,
+        thumbnail_item_ids,
+        exif_item_id,
+        xmp_item_id,
+        premultiplied_alpha,
     })
 }
 
@@ -483,5 +655,218 @@ mod tests {
         assert!(bd.is_none());
         assert!(!mono);
         assert!(sub.is_none());
+    }
+
+    /// The Microsoft `monochrome.avif` conformance fixture ships a
+    /// native Exif metadata item (`item_type == 'Exif'`, id 2) linked
+    /// to the primary via a `cdsc` iref — pinning the end-to-end
+    /// resolution path (iinf + iref + cdsc enumeration → `exif_item_id`)
+    /// on real bytes rather than only on synthetic Meta values. The
+    /// same fixture ships no XMP item, no thumbnails, and no `prem`
+    /// signal.
+    #[test]
+    fn inspect_fixture_resolves_native_exif_metadata_item() {
+        let info = inspect(FIXTURE).expect("inspect");
+        assert!(info.thumbnail_item_ids.is_empty());
+        assert_eq!(
+            info.exif_item_id,
+            Some(2),
+            "monochrome.avif fixture must surface its Exif metadata item via cdsc"
+        );
+        assert!(
+            info.xmp_item_id.is_none(),
+            "monochrome.avif ships no XMP item"
+        );
+        assert!(!info.premultiplied_alpha);
+        assert!(!info.has_thumbnails());
+        assert!(
+            info.has_descriptive_metadata(),
+            "Exif item presence implies has_descriptive_metadata() is true"
+        );
+        // And the resolved item bytes can be extracted directly via the
+        // crate's public helper. HEIF §A.2.1: the first 4 bytes are a
+        // big-endian exif_tiff_header_offset; the rest is a TIFF/Exif
+        // blob that opens with the `II` (little-endian) or `MM` (big-
+        // endian) TIFF byte-order marker.
+        let exif_bytes = item_payload_bytes(FIXTURE, info.exif_item_id.unwrap())
+            .expect("extract exif item bytes");
+        assert!(
+            exif_bytes.len() > 4,
+            "exif payload at least carries the 4-byte tiff_header_offset"
+        );
+        // Per §A.2.1 the offset addresses the TIFF header start inside
+        // the payload; the (4 + offset)-th byte onward must begin with
+        // the TIFF byte-order marker.
+        let off = u32::from_be_bytes(exif_bytes[0..4].try_into().unwrap()) as usize;
+        let tiff_start = 4 + off;
+        assert!(
+            tiff_start + 2 <= exif_bytes.len(),
+            "tiff offset {off} fits inside payload of {} bytes",
+            exif_bytes.len()
+        );
+        let bom = &exif_bytes[tiff_start..tiff_start + 2];
+        assert!(
+            bom == b"II" || bom == b"MM",
+            "TIFF header BOM must be II or MM, got {bom:?}"
+        );
+    }
+
+    use crate::meta::{IrefEntry, ItemInfo};
+
+    fn make_item(id: u32, item_type: &[u8; 4]) -> ItemInfo {
+        ItemInfo {
+            id,
+            item_type: *item_type,
+            name: String::new(),
+            content_type: None,
+            content_encoding: None,
+            item_uri_type: None,
+        }
+    }
+
+    fn make_mime_item(id: u32, content_type: &str) -> ItemInfo {
+        ItemInfo {
+            id,
+            item_type: *b"mime",
+            name: String::new(),
+            content_type: Some(content_type.to_string()),
+            content_encoding: None,
+            item_uri_type: None,
+        }
+    }
+
+    /// Native Exif item: `item_type == 'Exif'` linked via `cdsc` iref to
+    /// the primary. Resolves as Exif.
+    #[test]
+    fn resolve_metadata_picks_native_exif_item() {
+        let meta = Meta {
+            items: vec![make_item(2, b"Exif")],
+            irefs: vec![IrefEntry {
+                reference_type: *b"cdsc",
+                from_id: 2,
+                to_ids: vec![1],
+            }],
+            ..Meta::default()
+        };
+        let (exif, xmp) = resolve_metadata_items(&meta, 1);
+        assert_eq!(exif, Some(2));
+        assert!(xmp.is_none());
+    }
+
+    /// `mime`-wrapped Exif: `item_type == 'mime'` +
+    /// `content_type == "application/octet-stream"` (libheif Exif writer
+    /// pattern). Same outcome as native Exif: resolves as Exif.
+    #[test]
+    fn resolve_metadata_picks_mime_wrapped_exif() {
+        let meta = Meta {
+            items: vec![make_mime_item(3, "application/octet-stream")],
+            irefs: vec![IrefEntry {
+                reference_type: *b"cdsc",
+                from_id: 3,
+                to_ids: vec![1],
+            }],
+            ..Meta::default()
+        };
+        let (exif, xmp) = resolve_metadata_items(&meta, 1);
+        assert_eq!(exif, Some(3));
+        assert!(xmp.is_none());
+    }
+
+    /// XMP item: `mime` + `application/rdf+xml`. Resolves as XMP.
+    #[test]
+    fn resolve_metadata_picks_xmp_mime_item() {
+        let meta = Meta {
+            items: vec![make_mime_item(4, "application/rdf+xml")],
+            irefs: vec![IrefEntry {
+                reference_type: *b"cdsc",
+                from_id: 4,
+                to_ids: vec![1],
+            }],
+            ..Meta::default()
+        };
+        let (exif, xmp) = resolve_metadata_items(&meta, 1);
+        assert!(exif.is_none());
+        assert_eq!(xmp, Some(4));
+    }
+
+    /// A file shipping both Exif and XMP attached to the primary: both
+    /// fields populate.
+    #[test]
+    fn resolve_metadata_picks_both_exif_and_xmp() {
+        let meta = Meta {
+            items: vec![
+                make_item(2, b"Exif"),
+                make_mime_item(3, "application/rdf+xml"),
+            ],
+            irefs: vec![
+                IrefEntry {
+                    reference_type: *b"cdsc",
+                    from_id: 2,
+                    to_ids: vec![1],
+                },
+                IrefEntry {
+                    reference_type: *b"cdsc",
+                    from_id: 3,
+                    to_ids: vec![1],
+                },
+            ],
+            ..Meta::default()
+        };
+        let (exif, xmp) = resolve_metadata_items(&meta, 1);
+        assert_eq!(exif, Some(2));
+        assert_eq!(xmp, Some(3));
+    }
+
+    /// Case-insensitive content-type matching: "Application/RDF+XML"
+    /// still resolves as XMP. Encoders in the wild disagree on
+    /// capitalisation.
+    #[test]
+    fn resolve_metadata_xmp_match_is_case_insensitive() {
+        let meta = Meta {
+            items: vec![make_mime_item(4, "Application/RDF+XML")],
+            irefs: vec![IrefEntry {
+                reference_type: *b"cdsc",
+                from_id: 4,
+                to_ids: vec![1],
+            }],
+            ..Meta::default()
+        };
+        let (_, xmp) = resolve_metadata_items(&meta, 1);
+        assert_eq!(xmp, Some(4));
+    }
+
+    /// An item not linked by `cdsc` does NOT resolve — `iinf` alone is
+    /// insufficient, the iref is the binding signal.
+    #[test]
+    fn resolve_metadata_ignores_items_not_linked_via_cdsc() {
+        let meta = Meta {
+            items: vec![make_item(2, b"Exif")],
+            // No iref — Exif item exists in iinf but isn't linked.
+            irefs: vec![],
+            ..Meta::default()
+        };
+        let (exif, xmp) = resolve_metadata_items(&meta, 1);
+        assert!(exif.is_none());
+        assert!(xmp.is_none());
+    }
+
+    /// A `cdsc` iref pointing at a different target does NOT bind to the
+    /// primary. The walker is target-scoped.
+    #[test]
+    fn resolve_metadata_only_targets_the_requested_item() {
+        let meta = Meta {
+            items: vec![make_item(2, b"Exif")],
+            irefs: vec![IrefEntry {
+                reference_type: *b"cdsc",
+                from_id: 2,
+                to_ids: vec![5], // not primary (1)
+            }],
+            ..Meta::default()
+        };
+        let (exif, _) = resolve_metadata_items(&meta, 1);
+        assert!(exif.is_none());
+        // Same iref does bind item 5, however.
+        let (exif5, _) = resolve_metadata_items(&meta, 5);
+        assert_eq!(exif5, Some(2));
     }
 }

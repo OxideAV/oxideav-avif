@@ -89,14 +89,15 @@ pub use cicp::{
 pub use error::{AvifError, Result};
 pub use grid::{composite_grid, ImageGrid};
 pub use image::{AvifFrame, AvifPixelFormat, AvifPlane};
-pub use inspect::{inspect, transforms_for, AvifInfo};
+pub use inspect::{inspect, item_payload_bytes, transforms_for, AvifInfo};
 pub use meta::{
     AuxC, Cclv, Clap, Clli, Colr, Imir, IrefEntry, Irot, Ispe, ItemInfo, ItemLocation, Mdcv, Meta,
-    Pasp, Pixi, Property,
+    Pasp, Pixi, Property, ITEM_TYPE_EXIF, ITEM_TYPE_MIME, ITEM_TYPE_URI,
 };
 pub use parser::{
     classify_brands, item_bytes_owned, parse, parse_header, AvifHeader, AvifImage, BrandClass,
     BRAND_AVIF, BRAND_AVIO, BRAND_AVIS, BRAND_MA1A, BRAND_MA1B, BRAND_MIAF, BRAND_MIF1, BRAND_MSF1,
+    ITEM_TYPE_AV01, ITEM_TYPE_GRID,
 };
 pub use transform::{apply_clap, apply_imir, apply_irot, crop_top_left};
 

@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 75 — HEIF item properties + iref typed-relationship enumeration.
+  Container side pushes further into the descriptive surface around the
+  primary AV1 OBU stream:
+  - `ItemInfo` carries optional `content_type`, `content_encoding`,
+    and `item_uri_type` populated from the tail of an `infe` v2/v3
+    box for `item_type == 'mime'` and `item_type == 'uri '` per
+    ISO/IEC 14496-12 §8.11.6.2. Generic item types stop after
+    `item_name` so the common path stays compact.
+  - `Meta::iref_sources_of(&BoxType, u32) -> Vec<u32>` walks every
+    iref of a given reference_type whose `to_ids` contains the
+    target — needed because a primary may have multiple thumbnails
+    or be linked from multiple metadata items.
+  - `Meta::is_alpha_premultiplied_for(u32) -> bool` checks for a
+    HEIF `prem` iref linking an alpha auxiliary to the colour image
+    per ISO/IEC 23008-12 §6.10.1.1.
+  - `AvifInfo` gains `thumbnail_item_ids: Vec<u32>`,
+    `exif_item_id: Option<u32>`, `xmp_item_id: Option<u32>`, and
+    `premultiplied_alpha: bool`. Helpers: `has_thumbnails()`,
+    `has_descriptive_metadata()`. Exif detection accepts native
+    `item_type == 'Exif'` AND the libheif-style `mime` carrier with
+    `application/octet-stream` / `image/tiff` / `image/x-exif`
+    content_type. XMP is detected via `mime` +
+    `application/rdf+xml` (case-insensitive).
+  - `item_payload_bytes(file, item_id) -> Result<Vec<u8>>`:
+    public extractor that wraps `item_bytes_owned` so a caller with
+    a populated `AvifInfo` can pull the Exif TIFF / XMP RDF/XML
+    blob out in one call.
+  - Public constants exposed: `ITEM_TYPE_AV01`, `ITEM_TYPE_GRID`
+    (re-exported from `parser`), `ITEM_TYPE_EXIF`, `ITEM_TYPE_MIME`,
+    `ITEM_TYPE_URI` (in `meta`).
+  - New tests: `infe_v2_mime_parses_content_type_and_encoding`,
+    `infe_v3_mime_octet_stream_for_exif`,
+    `infe_v2_uri_parses_uri_type`,
+    `infe_v2_generic_item_type_stops_at_name`,
+    `iref_sources_of_returns_all_matches`,
+    `is_alpha_premultiplied_for_detects_prem_iref` (meta.rs);
+    `inspect_fixture_resolves_native_exif_metadata_item` plus six
+    `resolve_metadata_*` cases (inspect.rs). Lib test count
+    104 → 118.
+
 - Fuzz-driven hardening pass at the AVIF→AV1 boundary (workspace task
   #730). Adds defensive validation that refuses adversarial input
   before it reaches the AV1 decoder's entropy / transform stages,
