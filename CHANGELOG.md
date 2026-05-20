@@ -39,32 +39,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     fixture (fully compliant) plus a synth ftyp-only no-meta input.
   - `Meta` exposes raw `grpl` + `idat` slices for downstream routing
     of entity groups and item-data-bearing derived items.
-- Internal `decoder::av1_shim` parses `AV1CodecConfigurationRecord` per
-  AV1-ISOBMFF §2.3.3 and exposes a stub `Av1Decoder` returning
-  `Error::Unsupported` at `send_packet`. Keeps the registry feature
-  building + every spec-citation validator unit test alive while the
-  upstream `oxideav-av1` clean-room rebuild matures.
 
-### Fixed
+### Notes
 
-- `register_with_av1` no longer references the removed
-  `oxideav_av1::register_codecs`; the post-rebuild av1 crate's
-  `register(&mut RuntimeContext)` is a no-op, so we just register the
-  AVIF entry directly and leave the function signature intact.
-- `examples/diag_decode.rs` updated to use the new `oxideav_av1::ObuIter::new`
-  + `ObuType::from_raw` / `as_raw` API and read AV1-config summary
-  fields from the existing `AvifInfo` projections instead of the
-  removed `Av1CodecConfig::parse`.
-- `tests/fuzz_regressions.rs` no longer imports the removed
-  `oxideav_av1::Av1CodecConfig`; the regression check now goes
-  through the public `AvifDecoder::send_packet` path against the
-  monochrome fixture (the `validate_av1_config_*` unit tests inside
-  `decoder.rs` continue to exercise every spec-citation rule against
-  synth configs).
-- `tests/integration.rs` graceful-skip predicate now treats the AV1
-  stub's "AV1 decoder unavailable" `Unsupported` as a skip signal
-  alongside the prior coded_lossless / §7.7.4 limitation. Decode
-  tests skip cleanly, container tests run unchanged.
+- Workspace-local builds (when the umbrella `[patch.crates-io]` table
+  resolves `oxideav-av1` to the orphan-rebuilt master) currently fail
+  the registry-gated build because the rebuilt av1 crate is a
+  `NotImplemented` scaffold with no `Av1CodecConfig` / `Av1Decoder`.
+  CI for this repo checks out the avif crate alone and pulls
+  `oxideav-av1` from crates.io (currently 0.1.8, pre-rebuild), so the
+  registry path keeps building + testing through CI. Resolution
+  arrives when the av1 clean-room ships its decoder; until then the
+  consumer-must-wait-for-publisher pattern in the workspace memory
+  applies.
+- `tests/integration.rs` graceful-skip predicate accepts the future
+  `oxideav-av1` "decoder unavailable" / `NotImplemented` shape
+  alongside the existing coded_lossless / §7.7.4 limitation so that
+  when av1 0.2.x publishes and the registry path starts returning
+  the new error string, end-to-end decode tests still graceful-skip
+  rather than failing.
 
 - Round 75 — HEIF item properties + iref typed-relationship enumeration.
   Container side pushes further into the descriptive surface around the

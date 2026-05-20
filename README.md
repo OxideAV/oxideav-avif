@@ -131,23 +131,22 @@ new validators below all work end-to-end.
 * **`Meta` exposes raw `grpl` + `idat` slices** so callers can route
   entity-grouping and item-data-bearing derived items without
   rewalking the meta box.
-* **`AV1` decoder shim** — the orphan-rebuilt `oxideav-av1` no longer
-  ships `Av1CodecConfig` / `Av1Decoder` / `register_codecs`. We added
-  a tiny `decoder::av1_shim` that parses `AV1CodecConfigurationRecord`
-  per AV1-ISOBMFF §2.3.3 (the same 4-byte BE layout `decode_av1c_flags`
-  already pulls out) and a stub decoder that returns the documented
-  `Unsupported` at `send_packet`. This keeps the crate's registry
-  feature building + the validator unit tests exercising the same
-  spec citations they always did. The example was updated to use
-  the new `ObuIter::new` / `ObuType::from_raw` API in the rebuilt
-  av1 crate.
+Test delta: +13 lib unit tests on the standalone (no-default)
+surface (131 lib, was 118; +10 more under the default `registry`
+feature for the existing `validate_av1_config_*` tests, totalling
+141 against `oxideav-av1` 0.1.8 from crates.io). Integration suite
+unchanged (41 + 1 ignored).
 
-Test delta: +23 unit tests (141 lib, was 118). Integration suite
-unchanged (41 + 1 ignored). The integration drive helper now treats
-the AV1-stub `Unsupported` as a graceful skip alongside the prior
-coded_lossless / §7.7.4 limitation — every `inspect` / `audit_mif1` /
-parse / transforms test still runs and passes; pixel-decode tests
-graceful-skip until the av1 clean-room ships a decoder.
+Workspace caveat: the AV1 calls in this commit target the published
+`oxideav-av1` 0.1.8 API (the one this crate's CI pulls from
+crates.io). The umbrella workspace's `[patch.crates-io]` table
+currently redirects to the orphan-rebuilt `oxideav-av1` master,
+which is a `NotImplemented` scaffold without `Av1CodecConfig` /
+`Av1Decoder` — so workspace-level builds will fail the registry
+feature until the av1 clean-room ships its decoder. The integration
+drive helper already graceful-skips both the old `coded_lossless` /
+`§7.7.4` shape and any future "decoder unavailable" string so a
+real decoder publishing in either direction doesn't tip tests red.
 
 ### Round 75 — HEIF item-properties + iref typed-relationships
 
