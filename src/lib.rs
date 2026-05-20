@@ -188,18 +188,13 @@ mod registry_glue {
         ))
     }
 
-    /// Convenience: register AVIF + (when available) its underlying
-    /// AV1 decoder in one call. After the 2026-05-20 oxideav-av1
-    /// clean-room rebuild this only registers the AVIF entry; the
-    /// rebuilt av1 crate's `register` is a no-op scaffold. The function
-    /// is retained for source-compatibility with downstreams that
-    /// expect the historical two-codec wire-up call.
+    /// Convenience: register AVIF + its underlying AV1 decoder in one
+    /// call. Useful when the registry is being built from scratch and
+    /// the caller only wants AVIF — they don't have to remember that
+    /// AVIF delegates to the AV1 codec.
     pub fn register_with_av1(reg: &mut CodecRegistry) {
         register_codecs(reg);
-        // oxideav-av1's `register` is a no-op stub against a
-        // RuntimeContext; the previous direct-into-CodecRegistry shape
-        // is gone. Until the av1 rebuild ships a real decoder, AVIF is
-        // the only codec wired up here.
+        oxideav_av1::register_codecs(reg);
     }
 
     /// Register the `.avif` / `.avifs` extensions against the codec id
