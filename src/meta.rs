@@ -27,6 +27,8 @@ const IPRP: BoxType = b(b"iprp");
 const IPCO: BoxType = b(b"ipco");
 const IPMA: BoxType = b(b"ipma");
 const IREF: BoxType = b(b"iref");
+const GRPL: BoxType = b(b"grpl");
+const IDAT: BoxType = b(b"idat");
 
 /// HEIF / ISOBMFF item-type four-CC carrying a generic MIME-tagged blob
 /// in the `mdat` (Exif/XMP item carriers when the writer chose the
@@ -55,6 +57,50 @@ const AUXC: BoxType = b(b"auxC");
 const MDCV: BoxType = b(b"mdcv");
 const CLLI: BoxType = b(b"clli");
 const CCLV: BoxType = b(b"cclv");
+/// HEIF §6.5.7 — Relative Location property.
+const RLOC: BoxType = b(b"rloc");
+/// HEIF §6.5.11 — Layer Selector property.
+const LSEL: BoxType = b(b"lsel");
+
+/// HEIF §6.6.2.2 — image overlay derived-image type.
+pub const ITEM_TYPE_IOVL: BoxType = b(b"iovl");
+/// HEIF §6.6.2.1 — identity-transform derived-image type.
+pub const ITEM_TYPE_IDEN: BoxType = b(b"iden");
+
+/// Auxiliary-image type URN classification (HEIF §6.5.8, av1-avif §4).
+///
+/// The `auxC.aux_type` field is a URN identifying what the auxiliary
+/// image represents. The well-known values are:
+///
+/// * `Alpha` — `urn:mpeg:mpegB:cicp:systems:auxiliary:alpha` (also
+///   `urn:mpeg:hevc:2015:auxid:1` from HEVC HEIF). The alpha plane
+///   for the colour image referenced by `auxl`.
+/// * `DepthMap` — `urn:mpeg:mpegB:cicp:systems:auxiliary:depth` (also
+///   `urn:mpeg:hevc:2015:auxid:2`). Per-pixel depth in a monochrome
+///   auxiliary item.
+/// * `HdrGainMap` — `urn:com:apple:photo:2020:aux:hdrgainmap`. An
+///   Apple HDR gain-map auxiliary (proprietary but widely used by
+///   iPhone-emitted HEIC files).
+/// * `Other` — recognised auxC carrier but the URN is one we don't
+///   classify. The raw URN is still available on `AuxC.aux_type`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuxKind {
+    Alpha,
+    DepthMap,
+    HdrGainMap,
+    Other,
+}
+
+/// Well-known auxC URN: alpha plane (HEIF §6.5.8 / av1-avif §4.1).
+pub const AUX_URN_ALPHA_MPEG: &str = "urn:mpeg:mpegB:cicp:systems:auxiliary:alpha";
+/// Well-known auxC URN: alpha plane (HEVC HEIF flavour).
+pub const AUX_URN_ALPHA_HEVC: &str = "urn:mpeg:hevc:2015:auxid:1";
+/// Well-known auxC URN: depth map (HEIF §6.5.8).
+pub const AUX_URN_DEPTH_MPEG: &str = "urn:mpeg:mpegB:cicp:systems:auxiliary:depth";
+/// Well-known auxC URN: depth map (HEVC HEIF flavour).
+pub const AUX_URN_DEPTH_HEVC: &str = "urn:mpeg:hevc:2015:auxid:2";
+/// Apple HDR gain-map auxC URN (proprietary; emitted by iPhone HEIC).
+pub const AUX_URN_HDR_GAINMAP: &str = "urn:com:apple:photo:2020:aux:hdrgainmap";
 
 /// One `infe` entry.
 ///
@@ -246,6 +292,67 @@ pub struct AuxC {
     pub aux_subtype: Vec<u8>,
 }
 
+impl AuxC {
+    /// Classify the `aux_type` URN into one of the well-known auxiliary
+    /// kinds. Returns [`AuxKind::Other`] when the URN doesn't match any
+    /// of the alpha / depth / HDR-gain-map entries we recognise; the raw
+    /// URN remains available on `aux_type`.
+    ///
+    /// Matching is exact (no prefix-only matches) so a writer that
+    /// extends `urn:mpeg:mpegB:cicp:systems:auxiliary:alpha` with a
+    /// trailing tag won't be misclassified as plain alpha.
+    pub fn kind(&self) -> AuxKind {
+        match self.aux_type.as_str() {
+            AUX_URN_ALPHA_MPEG | AUX_URN_ALPHA_HEVC => AuxKind::Alpha,
+            AUX_URN_DEPTH_MPEG | AUX_URN_DEPTH_HEVC => AuxKind::DepthMap,
+            AUX_URN_HDR_GAINMAP => AuxKind::HdrGainMap,
+            _ => AuxKind::Other,
+        }
+    }
+
+    /// True when this auxC describes an alpha plane (either the MPEG
+    /// or HEVC URN spelling).
+    pub fn is_alpha(&self) -> bool {
+        matches!(self.kind(), AuxKind::Alpha)
+    }
+
+    /// True when this auxC describes a depth map.
+    pub fn is_depth_map(&self) -> bool {
+        matches!(self.kind(), AuxKind::DepthMap)
+    }
+
+    /// True when this auxC declares Apple's HDR gain-map URN.
+    pub fn is_hdr_gain_map(&self) -> bool {
+        matches!(self.kind(), AuxKind::HdrGainMap)
+    }
+}
+
+/// Relative-location item property (`rloc`) — HEIF §6.5.7.
+/// Specifies horizontal + vertical offsets in pixels of the associated
+/// image item's reconstructed pixels inside a related image item's
+/// pixel grid. The "related" item is conventionally the one that has
+/// this item as a `dimg` derived input (e.g. a tile inside its grid).
+///
+/// Spec: ISO/IEC 23008-12 §6.5.7.2 — `unsigned int(32) horizontal_offset;`
+/// + `unsigned int(32) vertical_offset;` inside a FullBox header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rloc {
+    pub horizontal_offset: u32,
+    pub vertical_offset: u32,
+}
+
+/// Layer-selector item property (`lsel`) — HEIF §6.5.11.
+/// Picks one reconstructed image among several produced by a multi-layer
+/// image item. `essential` shall be 1 for an `lsel` property; if the
+/// reader cannot interpret it, the item is considered unrecognised.
+///
+/// Spec: ISO/IEC 23008-12 §6.5.11.2 — `unsigned int(16) layer_id;`
+/// inside an ItemProperty (no FullBox header).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Lsel {
+    pub layer_id: u16,
+}
+
 /// Mastering display colour volume (`mdcv`) — SMPTE ST 2086 / CTA-861-G
 /// HDR metadata. Spec: ISO/IEC 14496-12 §12.1.5.3 (MasteringDisplayColourVolumeBox).
 ///
@@ -311,6 +418,10 @@ pub enum Property {
     Clli(Clli),
     /// Colour volume luminance — draft AVIF supplement equivalent to `clli`.
     Cclv(Cclv),
+    /// Relative-location property (HEIF §6.5.7).
+    Rloc(Rloc),
+    /// Layer-selector property (HEIF §6.5.11).
+    Lsel(Lsel),
     Other(BoxType, Vec<u8>),
 }
 
@@ -329,6 +440,8 @@ impl Property {
             Property::Mdcv(_) => MDCV,
             Property::Clli(_) => CLLI,
             Property::Cclv(_) => CCLV,
+            Property::Rloc(_) => RLOC,
+            Property::Lsel(_) => LSEL,
             Property::Other(t, _) => *t,
         }
     }
@@ -354,6 +467,16 @@ pub struct Meta {
     pub properties: Vec<Property>,
     pub associations: Vec<ItemPropertyAssociation>,
     pub irefs: Vec<IrefEntry>,
+    /// Raw `grpl` (GroupsListBox) payload bytes when present, ready for
+    /// [`crate::derived::parse_grpl`] consumption. We don't eagerly parse
+    /// because most AVIF files don't ship a `grpl` and the parsed
+    /// representation belongs in a callers-need-it module. Spec:
+    /// ISO/IEC 23008-12 §9.4.2.
+    pub grpl: Option<Vec<u8>>,
+    /// Raw `idat` (ItemDataBox) payload bytes when present. Used by
+    /// derived items (overlay, grid) whose descriptor lives in `idat`
+    /// rather than `mdat`. Spec: ISO/IEC 14496-12 §8.11.11.
+    pub idat: Option<Vec<u8>>,
 }
 
 impl Meta {
@@ -385,6 +508,12 @@ impl Meta {
                 }
                 x if x == &IREF => {
                     me.irefs = parse_iref(payload)?;
+                }
+                x if x == &GRPL => {
+                    me.grpl = Some(payload.to_vec());
+                }
+                x if x == &IDAT => {
+                    me.idat = Some(payload.to_vec());
                 }
                 _ => {}
             }
@@ -463,6 +592,38 @@ impl Meta {
             }
         }
         None
+    }
+
+    /// Parse the raw `grpl` slice into typed entity groups. Returns
+    /// `Ok(Vec::new())` when the file has no `grpl` (the common case);
+    /// surfaces parse errors only when the box is malformed.
+    ///
+    /// Spec: ISO/IEC 23008-12 §9.4.
+    pub fn groups(&self) -> Result<Vec<crate::derived::EntityGroup>> {
+        match &self.grpl {
+            None => Ok(Vec::new()),
+            Some(bytes) => crate::derived::parse_grpl(bytes),
+        }
+    }
+
+    /// Enumerate every auxiliary item attached to `to_id` via an `auxl`
+    /// iref, paired with its classified [`AuxKind`]. Items that lack
+    /// an `auxC` property (malformed) are skipped silently — they
+    /// can't be routed without the URN.
+    ///
+    /// Spec: HEIF §6.5.8 + ISO/IEC 14496-12 §8.11.12. The `auxl`
+    /// iref's `from_id` is the auxiliary item; its `to_ids` lists the
+    /// image(s) the auxiliary describes.
+    pub fn aux_items_for(&self, to_id: u32) -> Vec<(u32, AuxKind)> {
+        const AUXL: BoxType = b(b"auxl");
+        const AUXC_KIND: BoxType = b(b"auxC");
+        let mut out = Vec::new();
+        for src in self.iref_sources_of(&AUXL, to_id) {
+            if let Some(Property::AuxC(aux)) = self.property_for(src, &AUXC_KIND) {
+                out.push((src, aux.kind()));
+            }
+        }
+        out
     }
 }
 
@@ -714,6 +875,8 @@ fn parse_ipco(payload: &[u8]) -> Result<Vec<Property>> {
             x if x == &MDCV => Property::Mdcv(parse_mdcv(body)?),
             x if x == &CLLI => Property::Clli(parse_clli(body)?),
             x if x == &CCLV => Property::Cclv(parse_cclv(body)?),
+            x if x == &RLOC => Property::Rloc(parse_rloc(body)?),
+            x if x == &LSEL => Property::Lsel(parse_lsel(body)?),
             other => Property::Other(*other, body.to_vec()),
         };
         out.push(prop);
@@ -884,6 +1047,40 @@ fn parse_cclv(body: &[u8]) -> Result<Cclv> {
     Ok(Cclv {
         max_content_light_level: read_u16(body, 0)?,
         max_pic_average_light_level: read_u16(body, 2)?,
+    })
+}
+
+/// Parse `rloc` (RelativeLocationProperty — HEIF §6.5.7). FullBox(v=0,
+/// f=0) followed by two big-endian `unsigned int(32)` offsets in pixels.
+fn parse_rloc(body: &[u8]) -> Result<Rloc> {
+    let (version, _flags, rest) = parse_full_box(body)?;
+    if version != 0 {
+        return Err(Error::invalid(format!("avif: rloc version {version} != 0")));
+    }
+    if rest.len() < 8 {
+        return Err(Error::invalid(format!(
+            "avif: rloc too short ({} < 8)",
+            rest.len()
+        )));
+    }
+    Ok(Rloc {
+        horizontal_offset: read_u32(rest, 0)?,
+        vertical_offset: read_u32(rest, 4)?,
+    })
+}
+
+/// Parse `lsel` (LayerSelectorProperty — HEIF §6.5.11). ItemProperty
+/// (NO FullBox header) containing a single big-endian `unsigned int(16)`
+/// `layer_id`.
+fn parse_lsel(body: &[u8]) -> Result<Lsel> {
+    if body.len() < 2 {
+        return Err(Error::invalid(format!(
+            "avif: lsel too short ({} < 2)",
+            body.len()
+        )));
+    }
+    Ok(Lsel {
+        layer_id: read_u16(body, 0)?,
     })
 }
 
@@ -1394,5 +1591,160 @@ mod tests {
         // Negative case: empty meta
         let empty = Meta::default();
         assert!(!empty.is_alpha_premultiplied_for(1));
+    }
+
+    /// `AuxC::kind` recognises the canonical alpha URNs (both MPEG and
+    /// HEVC HEIF spellings map to `AuxKind::Alpha`).
+    #[test]
+    fn auxc_kind_classifies_alpha() {
+        let mpeg = AuxC {
+            aux_type: AUX_URN_ALPHA_MPEG.to_string(),
+            aux_subtype: Vec::new(),
+        };
+        assert_eq!(mpeg.kind(), AuxKind::Alpha);
+        assert!(mpeg.is_alpha());
+        assert!(!mpeg.is_depth_map());
+
+        let hevc = AuxC {
+            aux_type: AUX_URN_ALPHA_HEVC.to_string(),
+            aux_subtype: Vec::new(),
+        };
+        assert_eq!(hevc.kind(), AuxKind::Alpha);
+        assert!(hevc.is_alpha());
+    }
+
+    /// `AuxC::kind` recognises both depth-map URN spellings.
+    #[test]
+    fn auxc_kind_classifies_depth_map() {
+        let mpeg = AuxC {
+            aux_type: AUX_URN_DEPTH_MPEG.to_string(),
+            aux_subtype: Vec::new(),
+        };
+        assert_eq!(mpeg.kind(), AuxKind::DepthMap);
+        assert!(mpeg.is_depth_map());
+        assert!(!mpeg.is_alpha());
+
+        let hevc = AuxC {
+            aux_type: AUX_URN_DEPTH_HEVC.to_string(),
+            aux_subtype: Vec::new(),
+        };
+        assert_eq!(hevc.kind(), AuxKind::DepthMap);
+    }
+
+    /// `AuxC::kind` recognises Apple's HDR gain-map URN.
+    #[test]
+    fn auxc_kind_classifies_hdr_gain_map() {
+        let g = AuxC {
+            aux_type: AUX_URN_HDR_GAINMAP.to_string(),
+            aux_subtype: Vec::new(),
+        };
+        assert_eq!(g.kind(), AuxKind::HdrGainMap);
+        assert!(g.is_hdr_gain_map());
+        assert!(!g.is_alpha());
+    }
+
+    /// Unknown auxC URNs report `AuxKind::Other` rather than
+    /// misclassifying. A prefix-only match doesn't slip through —
+    /// classification is exact.
+    #[test]
+    fn auxc_kind_other_for_unknown_urn() {
+        let custom = AuxC {
+            aux_type: "urn:example:foo:bar".to_string(),
+            aux_subtype: Vec::new(),
+        };
+        assert_eq!(custom.kind(), AuxKind::Other);
+        assert!(!custom.is_alpha());
+
+        // Prefix-only match must not be classified as Alpha. A writer
+        // that decorates the canonical URN with a trailing identifier
+        // (e.g. for sub-typing) gets `Other` and the raw URN is still
+        // visible on aux_type.
+        let prefix = AuxC {
+            aux_type: format!("{AUX_URN_ALPHA_MPEG}:extended"),
+            aux_subtype: Vec::new(),
+        };
+        assert_eq!(prefix.kind(), AuxKind::Other);
+    }
+
+    /// `rloc` round-trip: FullBox v=0 + two big-endian u32 offsets.
+    #[test]
+    fn rloc_round_trip() {
+        let mut buf = vec![0u8; 4]; // FullBox v=0 f=0
+        buf.extend_from_slice(&96u32.to_be_bytes()); // horizontal_offset
+        buf.extend_from_slice(&128u32.to_be_bytes()); // vertical_offset
+        let r = parse_rloc(&buf).unwrap();
+        assert_eq!(r.horizontal_offset, 96);
+        assert_eq!(r.vertical_offset, 128);
+    }
+
+    /// `rloc` rejects unrecognised versions.
+    #[test]
+    fn rloc_rejects_nonzero_version() {
+        let mut buf = vec![1u8, 0, 0, 0]; // FullBox v=1
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        assert!(parse_rloc(&buf).is_err());
+    }
+
+    /// `rloc` rejects truncated payload.
+    #[test]
+    fn rloc_rejects_truncated() {
+        let buf = vec![0u8; 4 + 4]; // missing vertical_offset
+        assert!(parse_rloc(&buf).is_err());
+    }
+
+    /// `lsel` round-trip: ItemProperty (NO FullBox) carrying a single
+    /// u16 layer_id.
+    #[test]
+    fn lsel_round_trip() {
+        let buf = 3u16.to_be_bytes();
+        let l = parse_lsel(&buf).unwrap();
+        assert_eq!(l.layer_id, 3);
+    }
+
+    /// `lsel` rejects truncated payload.
+    #[test]
+    fn lsel_rejects_truncated() {
+        let buf = vec![0u8; 1];
+        assert!(parse_lsel(&buf).is_err());
+    }
+
+    /// `rloc` plus `lsel` parse through the property-store dispatch so
+    /// associations land on items end-to-end. Build a minimal ipco
+    /// containing both boxes.
+    #[test]
+    fn ipco_dispatches_rloc_and_lsel() {
+        // rloc body: FullBox(v=0,f=0) + horiz=10 + vert=20
+        let rloc_body = {
+            let mut b = vec![0u8; 4];
+            b.extend_from_slice(&10u32.to_be_bytes());
+            b.extend_from_slice(&20u32.to_be_bytes());
+            b
+        };
+        // lsel body: ItemProperty + layer_id=5
+        let lsel_body = 5u16.to_be_bytes().to_vec();
+        // Build an ipco containing both child boxes.
+        let mut ipco = Vec::new();
+        let rloc_size = 8 + rloc_body.len() as u32;
+        ipco.extend_from_slice(&rloc_size.to_be_bytes());
+        ipco.extend_from_slice(b"rloc");
+        ipco.extend_from_slice(&rloc_body);
+        let lsel_size = 8 + lsel_body.len() as u32;
+        ipco.extend_from_slice(&lsel_size.to_be_bytes());
+        ipco.extend_from_slice(b"lsel");
+        ipco.extend_from_slice(&lsel_body);
+        let props = parse_ipco(&ipco).unwrap();
+        assert_eq!(props.len(), 2);
+        match &props[0] {
+            Property::Rloc(r) => {
+                assert_eq!(r.horizontal_offset, 10);
+                assert_eq!(r.vertical_offset, 20);
+            }
+            other => panic!("expected Rloc, got {other:?}"),
+        }
+        match &props[1] {
+            Property::Lsel(l) => assert_eq!(l.layer_id, 5),
+            other => panic!("expected Lsel, got {other:?}"),
+        }
     }
 }

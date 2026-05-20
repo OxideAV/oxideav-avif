@@ -9,12 +9,30 @@
 
 use std::path::PathBuf;
 
-use oxideav_av1::{iter_obus, Av1CodecConfig, ObuType};
+use oxideav_av1::{ObuIter, ObuType};
 use oxideav_avif::meta::Property;
 use oxideav_avif::parser::item_bytes;
 use oxideav_avif::{find_alpha_item_id, inspect, parse, parse_header, AvifDecoder};
 use oxideav_core::Decoder;
 use oxideav_core::{CodecId, Frame, Packet, TimeBase};
+
+/// Friendly name for an OBU type — the post-2026-05-20 oxideav-av1
+/// rebuild dropped `ObuType::name()`, so we provide an inline mapping
+/// for diagnostic output.
+fn obu_name(t: ObuType) -> String {
+    match t {
+        ObuType::Reserved(v) => format!("Reserved({v})"),
+        ObuType::SequenceHeader => "SequenceHeader".to_string(),
+        ObuType::TemporalDelimiter => "TemporalDelimiter".to_string(),
+        ObuType::FrameHeader => "FrameHeader".to_string(),
+        ObuType::TileGroup => "TileGroup".to_string(),
+        ObuType::Metadata => "Metadata".to_string(),
+        ObuType::Frame => "Frame".to_string(),
+        ObuType::RedundantFrameHeader => "RedundantFrameHeader".to_string(),
+        ObuType::TileList => "TileList".to_string(),
+        ObuType::Padding => "Padding".to_string(),
+    }
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -58,28 +76,19 @@ fn probe(path: &PathBuf) {
     );
 
     // 2. Decode the av1C record — print seq header summary.
-    match Av1CodecConfig::parse(&info.av1c) {
-        Ok(cfg) => {
-            let depth = if cfg.twelve_bit {
-                12
-            } else if cfg.high_bitdepth {
-                10
-            } else {
-                8
-            };
-            println!(
-                "  av1C: profile={} level={} tier={} depth={} mono={} chroma_sub=({},{}) has_seq_header={}",
-                cfg.seq_profile,
-                cfg.seq_level_idx_0,
-                cfg.seq_tier_0,
-                depth,
-                cfg.monochrome,
-                cfg.chroma_subsampling_x as u8,
-                cfg.chroma_subsampling_y as u8,
-                cfg.seq_header.is_some(),
-            );
-        }
-        Err(e) => println!("  av1C parse FAILED: {e}"),
+    // After the 2026-05-20 oxideav-av1 orphan rebuild, the public
+    // `Av1CodecConfig::parse` no longer exists; the AvifInfo struct
+    // exposes the AV1C-derived fields directly so we read those.
+    if !info.av1c.is_empty() {
+        println!(
+            "  av1C: depth={:?} mono={} chroma_sub={:?} av1c_bytes={}",
+            info.bit_depth,
+            info.monochrome,
+            info.chroma_subsampling,
+            info.av1c.len(),
+        );
+    } else {
+        println!("  av1C: missing on primary item");
     }
 
     // 3. Walk the OBUs in the primary item.
@@ -87,11 +96,11 @@ fn probe(path: &PathBuf) {
         let mut count = 0usize;
         let mut by_type = std::collections::BTreeMap::<u8, usize>::new();
         let mut walk_err: Option<String> = None;
-        for o in iter_obus(&info.obu_bytes) {
+        for o in ObuIter::new(&info.obu_bytes) {
             match o {
                 Ok(obu) => {
                     count += 1;
-                    *by_type.entry(obu.header.obu_type as u8).or_insert(0) += 1;
+                    *by_type.entry(obu.obu_type.as_raw()).or_insert(0) += 1;
                 }
                 Err(e) => {
                     walk_err = Some(format!("{e}"));
@@ -101,7 +110,7 @@ fn probe(path: &PathBuf) {
         }
         let mut breakdown = Vec::new();
         for (t, n) in &by_type {
-            let name = ObuType::from_u8(*t).name();
+            let name = obu_name(ObuType::from_raw(*t));
             breakdown.push(format!("{}={}", name, n));
         }
         match walk_err {
@@ -136,19 +145,18 @@ fn probe(path: &PathBuf) {
                             );
                             let mut a_count = 0usize;
                             let mut a_by_type = std::collections::BTreeMap::<u8, usize>::new();
-                            for o in iter_obus(abytes) {
+                            for o in ObuIter::new(abytes) {
                                 match o {
                                     Ok(obu) => {
                                         a_count += 1;
-                                        *a_by_type.entry(obu.header.obu_type as u8).or_insert(0) +=
-                                            1;
+                                        *a_by_type.entry(obu.obu_type.as_raw()).or_insert(0) += 1;
                                     }
                                     Err(_) => break,
                                 }
                             }
                             let mut bd = Vec::new();
                             for (t, n) in &a_by_type {
-                                bd.push(format!("{}={}", ObuType::from_u8(*t).name(), n));
+                                bd.push(format!("{}={}", obu_name(ObuType::from_raw(*t)), n));
                             }
                             println!("  alpha obus: total={} {}", a_count, bd.join(" "));
                         }

@@ -26,7 +26,11 @@ still loses significant signal.
 |----------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `ftyp` brand check                     | accepts `avif` / `avis` / `mif1` / `msf1` / `miaf`                                                                                                         |
 | `meta` sub-boxes                       | `hdlr`, `pitm` (v0/v1), `iinf` (v0/v1) + `infe` (v2/v3), `iloc` (v0/v1/v2), `iref`, `iprp` / `ipco` / `ipma` (v0/v1, small + large property indices)       |
-| Item properties                        | `av1C`, `ispe`, `colr` (nclx + ICC), `pixi`, `pasp`, `irot`, `imir`, `clap`, `auxC`, `mdcv`, `clli`, `cclv`; unknown boxes retained as `Property::Other` so indices stay valid |
+| Item properties                        | `av1C`, `ispe`, `colr` (nclx + ICC), `pixi`, `pasp`, `irot`, `imir`, `clap`, `auxC`, `mdcv`, `clli`, `cclv`, `rloc`, `lsel`; unknown boxes retained as `Property::Other` so indices stay valid |
+| Auxiliary classification (`AuxKind`)   | `auxC` URN routed to `Alpha` / `DepthMap` / `HdrGainMap` / `Other` covering MPEG, HEVC-HEIF, and Apple gain-map spellings; `AvifInfo` exposes `aux_items` + per-kind item-id helpers |
+| Derived images (`iovl`, `iden`)        | `iovl` ImageOverlay descriptor parsed (16-bit + 32-bit field widths, signed offsets); `iden` item-type constant exported. Composition pending an AV1 decoder for the sources |
+| Entity grouping (`grpl`)               | `GroupsListBox` walk emits typed `EntityGroup` per `EntityToGroupBox`; `altr` / `ster` / `eqiv` recognised via `is_alternates()` / `is_stereo_pair()` / `is_equivalence()` (HEIF §9.4) |
+| Brand compliance audit                 | `audit_mif1` (HEIF §10.2.1.1): reports per-box presence + the `mif1` brand claim, returning a `Mif1Compliance { is_compliant(), missing() }`. Pinned against the Microsoft monochrome fixture |
 | Metadata items (`Exif`, XMP)           | `cdsc` iref walker resolves Exif (`item_type == 'Exif'` and `mime`-wrapped `application/octet-stream` / `image/tiff` / `image/x-exif`) + XMP (`mime` + `application/rdf+xml`) attached to the primary; surfaced as `AvifInfo::{exif_item_id, xmp_item_id, has_descriptive_metadata()}`. Raw bytes are extracted on demand via `item_payload_bytes` |
 | Thumbnails                             | `thmb` iref enumeration: `AvifInfo::thumbnail_item_ids` lists every thumbnail item attached to the primary; `has_thumbnails()` shorthand |
 | Premultiplied-alpha signalling         | HEIF `prem` iref (`from_id` = alpha auxiliary, `to_ids` includes the colour image) is detected and surfaced as `AvifInfo::premultiplied_alpha` |
@@ -75,6 +79,75 @@ still loses significant signal.
 
 See `examples/diag_decode.rs` for a drop-in report of exactly which
 stage each input reaches.
+
+### Round 81 — derived-image + entity-grouping + MIAF compliance
+
+Container side gains a coordinated batch of HEIF surface that doesn't
+need the AV1 decoder (which after the 2026-05-20 `oxideav-av1`
+clean-room rebuild is a `NotImplemented` scaffold). The decoder path
+in this crate keeps its public API and now reports a clean
+`Unsupported` at the AV1 hand-off, the same shape callers would have
+seen from `oxideav-av1::NotImplemented`. Parse, `inspect`, and the
+new validators below all work end-to-end.
+
+* **`auxC` URN classification** — HEIF §6.5.8. `AuxKind` enum maps
+  the URN string to `Alpha` / `DepthMap` / `HdrGainMap` / `Other`,
+  covering both the MPEG spelling (`urn:mpeg:mpegB:cicp:systems:auxiliary:*`)
+  and the HEVC-HEIF spelling (`urn:mpeg:hevc:2015:auxid:1` / `:2`)
+  plus Apple's HDR gain-map URN
+  (`urn:com:apple:photo:2020:aux:hdrgainmap`). `Meta::aux_items_for`
+  enumerates every auxiliary linked to a primary via `auxl`, paired
+  with its kind; `AvifInfo` surfaces `aux_items`, `alpha_aux_kind`,
+  `depth_map_item_id`, `hdr_gain_map_item_id` for one-call routing.
+* **`rloc` relative-location property** (HEIF §6.5.7) —
+  `Rloc { horizontal_offset, vertical_offset }` parsed alongside the
+  other descriptive item properties and surfaced through the
+  existing `property_for` dispatch.
+* **`lsel` layer-selector property** (HEIF §6.5.11) —
+  `Lsel { layer_id }` for multi-layer image items. ItemProperty
+  (no FullBox), one u16.
+* **`iovl` image-overlay descriptor** (HEIF §6.6.2.2) — the new
+  `derived::ImageOverlay::parse(payload, reference_count)` decodes
+  the per-derivation header plus `(horizontal_offset, vertical_offset)`
+  per source image. Handles both the 16-bit and 32-bit
+  (`flags & 1 == 1`) field-length variants and signed offsets per
+  spec. `dimg` iref enumeration on the caller side supplies the
+  source IDs in layering order (bottom-most first). This is HEIF
+  surface that an AVIF reader may encounter on `mif1`/MIAF inputs.
+* **Entity groups (`grpl`)** (HEIF §9.4) — `derived::parse_grpl` walks
+  a GroupsListBox payload into typed `EntityGroup { grouping_type,
+  group_id, entity_ids }`. Helpers `is_alternates()` /
+  `is_stereo_pair()` / `is_equivalence()` cover the common `altr` /
+  `ster` / `eqiv` groupings. `Meta` captures the raw `grpl` slice
+  during the meta walk and `Meta::groups()` lazy-parses on demand.
+* **`mif1` compliance audit** (HEIF §10.2.1.1) —
+  `parser::audit_mif1` walks `ftyp` + `meta` once and reports per-box
+  presence (`hdlr` / `pitm` / `iinf` + at least one `infe` / `iloc` /
+  `iprp`) plus the `mif1` brand claim, returning a
+  `Mif1Compliance { is_compliant(), missing() }`. Pinned against the
+  Microsoft `monochrome.avif` fixture (fully compliant) plus a
+  ftyp-only synthetic that exercises the missing-box path.
+  `AvifInfo` carries the audit result alongside `is_strict_mif1()`.
+* **`Meta` exposes raw `grpl` + `idat` slices** so callers can route
+  entity-grouping and item-data-bearing derived items without
+  rewalking the meta box.
+* **`AV1` decoder shim** — the orphan-rebuilt `oxideav-av1` no longer
+  ships `Av1CodecConfig` / `Av1Decoder` / `register_codecs`. We added
+  a tiny `decoder::av1_shim` that parses `AV1CodecConfigurationRecord`
+  per AV1-ISOBMFF §2.3.3 (the same 4-byte BE layout `decode_av1c_flags`
+  already pulls out) and a stub decoder that returns the documented
+  `Unsupported` at `send_packet`. This keeps the crate's registry
+  feature building + the validator unit tests exercising the same
+  spec citations they always did. The example was updated to use
+  the new `ObuIter::new` / `ObuType::from_raw` API in the rebuilt
+  av1 crate.
+
+Test delta: +23 unit tests (141 lib, was 118). Integration suite
+unchanged (41 + 1 ignored). The integration drive helper now treats
+the AV1-stub `Unsupported` as a graceful skip alongside the prior
+coded_lossless / §7.7.4 limitation — every `inspect` / `audit_mif1` /
+parse / transforms test still runs and passes; pixel-decode tests
+graceful-skip until the av1 clean-room ships a decoder.
 
 ### Round 75 — HEIF item-properties + iref typed-relationships
 

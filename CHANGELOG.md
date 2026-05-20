@@ -9,6 +9,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 81 — derived-image + entity-grouping + MIAF compliance. Container
+  side gains a coordinated batch of HEIF surface that doesn't need the
+  AV1 decoder (oxideav-av1 is a `NotImplemented` scaffold post the
+  2026-05-20 orphan rebuild):
+  - `auxC` URN classification (`AuxKind { Alpha, DepthMap, HdrGainMap,
+    Other }`) covering MPEG and HEVC-HEIF URN spellings plus Apple's
+    HDR gain-map URN. `Meta::aux_items_for` enumerates every aux item
+    attached to a given target; `AvifInfo` adds `aux_items`,
+    `alpha_aux_kind`, `depth_map_item_id`, `hdr_gain_map_item_id`,
+    `has_depth_map()`, `has_hdr_gain_map()`.
+  - `rloc` relative-location property parser (HEIF §6.5.7) — FullBox
+    with two big-endian u32 offsets.
+  - `lsel` layer-selector property parser (HEIF §6.5.11) — ItemProperty
+    (no FullBox) with one u16 layer_id.
+  - `iovl` image-overlay descriptor parser (HEIF §6.6.2.2) in the new
+    `derived` module. Handles both 16-bit and 32-bit field-width
+    variants (`flags & 1`) and signed offsets per spec; emits
+    `ImageOverlay { canvas_fill_value, output_*, entries: Vec<OverlayEntry> }`.
+  - Entity-grouping (`grpl`) parser (HEIF §9.4) — `parse_grpl` walks
+    a `GroupsListBox` payload into typed `EntityGroup` per
+    `EntityToGroupBox`, with `is_alternates()` / `is_stereo_pair()` /
+    `is_equivalence()` helpers. `Meta` captures the raw `grpl` slice
+    during walk; `Meta::groups()` lazy-parses on demand.
+  - `audit_mif1` brand-compliance audit (HEIF §10.2.1.1) returning a
+    `Mif1Compliance { is_compliant(), missing(), claims_mif1, ... }`.
+    `AvifInfo.mif1_compliance` carries the audit alongside
+    `is_strict_mif1()`. Pinned against the Microsoft monochrome
+    fixture (fully compliant) plus a synth ftyp-only no-meta input.
+  - `Meta` exposes raw `grpl` + `idat` slices for downstream routing
+    of entity groups and item-data-bearing derived items.
+- Internal `decoder::av1_shim` parses `AV1CodecConfigurationRecord` per
+  AV1-ISOBMFF §2.3.3 and exposes a stub `Av1Decoder` returning
+  `Error::Unsupported` at `send_packet`. Keeps the registry feature
+  building + every spec-citation validator unit test alive while the
+  upstream `oxideav-av1` clean-room rebuild matures.
+
+### Fixed
+
+- `register_with_av1` no longer references the removed
+  `oxideav_av1::register_codecs`; the post-rebuild av1 crate's
+  `register(&mut RuntimeContext)` is a no-op, so we just register the
+  AVIF entry directly and leave the function signature intact.
+- `examples/diag_decode.rs` updated to use the new `oxideav_av1::ObuIter::new`
+  + `ObuType::from_raw` / `as_raw` API and read AV1-config summary
+  fields from the existing `AvifInfo` projections instead of the
+  removed `Av1CodecConfig::parse`.
+- `tests/fuzz_regressions.rs` no longer imports the removed
+  `oxideav_av1::Av1CodecConfig`; the regression check now goes
+  through the public `AvifDecoder::send_packet` path against the
+  monochrome fixture (the `validate_av1_config_*` unit tests inside
+  `decoder.rs` continue to exercise every spec-citation rule against
+  synth configs).
+- `tests/integration.rs` graceful-skip predicate now treats the AV1
+  stub's "AV1 decoder unavailable" `Unsupported` as a skip signal
+  alongside the prior coded_lossless / §7.7.4 limitation. Decode
+  tests skip cleanly, container tests run unchanged.
+
 - Round 75 — HEIF item properties + iref typed-relationship enumeration.
   Container side pushes further into the descriptive surface around the
   primary AV1 OBU stream:

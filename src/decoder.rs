@@ -20,7 +20,133 @@ use oxideav_core::frame::{VideoFrame, VideoPlane};
 use oxideav_core::Decoder;
 use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Result, TimeBase};
 
-use oxideav_av1::{Av1CodecConfig, Av1Decoder};
+// AV1 decoder shim. The upstream `oxideav-av1` crate was orphan-rebuilt
+// to a scaffold on 2026-05-20 and no longer exposes a working decoder.
+// The AVIF crate keeps its container-side machinery intact and now
+// reports `Unsupported` at the hand-off boundary — same surface the
+// caller would see when oxideav-av1 returns `NotImplemented` — so the
+// HEIF / metadata pipeline (inspect, parse, audit_mif1, grid + alpha
+// composition over a caller-supplied AV1 decoder) continues to build
+// and test end-to-end.
+//
+// `Av1CodecConfigStub` is a parser for the documented
+// `AV1CodecConfigurationRecord` byte layout (av1-isobmff §2.3.3) — a
+// four-byte big-endian record with no entropy coding, the same fields
+// `decode_av1c_flags` already pulls out. Validation continues to use
+// it so `validate_av1_config` keeps its spec-citation tests.
+//
+// `Av1DecoderStub::send_packet` always returns `Error::Unsupported`,
+// matching what the real decoder used to return for an unimplemented
+// path.
+use av1_shim::{Av1CodecConfig, Av1Decoder};
+
+mod av1_shim {
+    use oxideav_core::{CodecParameters, Error, Frame, Packet, Result};
+
+    /// Minimal `AV1CodecConfigurationRecord` parser per AV1-ISOBMFF
+    /// §2.3.3. The first four bytes of the av1C box carry the sequence
+    /// header summary fields the AVIF validator inspects; everything
+    /// after byte 3 is the embedded config OBUs (unused here).
+    #[allow(dead_code)]
+    #[derive(Clone, Debug, Default)]
+    pub struct Av1CodecConfig {
+        pub marker: u8,
+        pub version: u8,
+        pub seq_profile: u8,
+        pub seq_level_idx_0: u8,
+        pub seq_tier_0: bool,
+        pub high_bitdepth: bool,
+        pub twelve_bit: bool,
+        pub monochrome: bool,
+        pub chroma_subsampling_x: bool,
+        pub chroma_subsampling_y: bool,
+        pub chroma_sample_position: u8,
+    }
+
+    impl Av1CodecConfig {
+        /// Parse the first four bytes of an `av1C` record. AV1-ISOBMFF
+        /// §2.3.3 layout (big-endian, MSB first):
+        ///
+        /// | byte | bits             | field                       |
+        /// |------|------------------|-----------------------------|
+        /// | 0    | 1 / 7            | marker / version            |
+        /// | 1    | 3 / 5            | seq_profile / seq_level_idx_0 |
+        /// | 2    | 1 / 1 / 1 / 1 / 1 / 1 / 2 | seq_tier_0 / high_bitdepth / twelve_bit / monochrome / chroma_x / chroma_y / chroma_sample_position |
+        /// | 3    | 3 / 1 / 4        | reserved / initial_presentation_delay_present / initial_presentation_delay_minus_one |
+        ///
+        /// Returns `Error::InvalidData` if the marker/version pair is
+        /// wrong or the record is shorter than 4 bytes.
+        pub fn parse(av1c: &[u8]) -> Result<Self> {
+            if av1c.len() < 4 {
+                return Err(Error::invalid("av1C: record shorter than 4 bytes"));
+            }
+            let b0 = av1c[0];
+            let marker = (b0 >> 7) & 1;
+            let version = b0 & 0x7f;
+            if marker != 1 || version != 1 {
+                return Err(Error::invalid(format!(
+                    "av1C: bad marker/version byte 0x{b0:02x} (marker={marker} version={version})"
+                )));
+            }
+            let b1 = av1c[1];
+            let seq_profile = (b1 >> 5) & 0x07;
+            let seq_level_idx_0 = b1 & 0x1f;
+            let b2 = av1c[2];
+            let seq_tier_0 = ((b2 >> 7) & 1) != 0;
+            let high_bitdepth = ((b2 >> 6) & 1) != 0;
+            let twelve_bit = ((b2 >> 5) & 1) != 0;
+            let monochrome = ((b2 >> 4) & 1) != 0;
+            let chroma_subsampling_x = ((b2 >> 3) & 1) != 0;
+            let chroma_subsampling_y = ((b2 >> 2) & 1) != 0;
+            let chroma_sample_position = b2 & 0x03;
+            Ok(Av1CodecConfig {
+                marker,
+                version,
+                seq_profile,
+                seq_level_idx_0,
+                seq_tier_0,
+                high_bitdepth,
+                twelve_bit,
+                monochrome,
+                chroma_subsampling_x,
+                chroma_subsampling_y,
+                chroma_sample_position,
+            })
+        }
+    }
+
+    /// Stub AV1 decoder. The orphan-rebuilt `oxideav-av1` does not yet
+    /// ship a working decoder; this shim surfaces the same
+    /// `Unsupported` error the AVIF crate's call sites would have
+    /// gotten from a `NotImplemented` upstream return.
+    pub struct Av1Decoder {
+        _params: CodecParameters,
+    }
+
+    impl Av1Decoder {
+        pub fn new(_params: CodecParameters) -> Self {
+            Av1Decoder { _params }
+        }
+
+        pub fn send_packet(&mut self, _packet: &Packet) -> Result<()> {
+            Err(Error::unsupported(
+                "avif: AV1 decoder unavailable — oxideav-av1 is a scaffold post 2026-05-20 \
+                 clean-room rebuild. Container-side parse, inspect, and audit_mif1 still work; \
+                 pair this crate with an external AV1 decoder to recover pixel output.",
+            ))
+        }
+
+        pub fn receive_frame(&mut self) -> Result<Frame> {
+            Err(Error::unsupported("avif: AV1 decoder unavailable"))
+        }
+
+        /// Mirrors the `Decoder::flush` trait method; an
+        /// unavailable-decoder flush is a no-op.
+        pub fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+}
 
 use crate::alpha::{composite_alpha, find_alpha_item_id};
 use crate::avis::{parse_avis, sample_bytes};
@@ -203,29 +329,31 @@ impl AvifDecoder {
         // Decode the primary frame, either via the grid path or the
         // single-item path.
         let brands = classify_brands(&hdr.major_brand, &hdr.compatible_brands).map_err(core_err)?;
-        let (color_frame, color_format, mut width, mut height, info) =
-            if primary_info.item_type == ITEM_TYPE_GRID {
-                let (f, fmt, w, h) = decode_grid_primary(&hdr, primary_id)?;
-                let info = build_info_grid(&hdr, primary_id, brands).map_err(core_err)?;
-                (f, fmt, w, h, info)
-            } else if primary_info.item_type == ITEM_TYPE_AV01 {
-                let img = parse(file).map_err(core_err)?;
-                let (f, fmt, w, h) = decode_av01_item(
-                    img.primary_item_data,
-                    img.av1c
-                        .as_deref()
-                        .ok_or_else(|| Error::invalid("avif: primary item missing av1C"))?,
-                    img.ispe.map(|e| (e.width, e.height)),
-                )?;
-                let has_alpha = find_alpha_item_id(&hdr.meta, primary_id).is_some();
-                let info = build_info(&img, has_alpha, brands).map_err(core_err)?;
-                (f, fmt, w, h, info)
-            } else {
-                return Err(Error::unsupported(format!(
-                    "avif: primary item type '{}' not supported",
-                    String::from_utf8_lossy(&primary_info.item_type)
-                )));
-            };
+        let mif1 = crate::parser::audit_mif1(file).map_err(core_err)?;
+        let (color_frame, color_format, mut width, mut height, info) = if primary_info.item_type
+            == ITEM_TYPE_GRID
+        {
+            let (f, fmt, w, h) = decode_grid_primary(&hdr, primary_id)?;
+            let info = build_info_grid(&hdr, primary_id, brands, mif1.clone()).map_err(core_err)?;
+            (f, fmt, w, h, info)
+        } else if primary_info.item_type == ITEM_TYPE_AV01 {
+            let img = parse(file).map_err(core_err)?;
+            let (f, fmt, w, h) = decode_av01_item(
+                img.primary_item_data,
+                img.av1c
+                    .as_deref()
+                    .ok_or_else(|| Error::invalid("avif: primary item missing av1C"))?,
+                img.ispe.map(|e| (e.width, e.height)),
+            )?;
+            let has_alpha = find_alpha_item_id(&hdr.meta, primary_id).is_some();
+            let info = build_info(&img, has_alpha, brands, mif1.clone()).map_err(core_err)?;
+            (f, fmt, w, h, info)
+        } else {
+            return Err(Error::unsupported(format!(
+                "avif: primary item type '{}' not supported",
+                String::from_utf8_lossy(&primary_info.item_type)
+            )));
+        };
 
         // Move into crate-local AvifFrame for the composition layer.
         let mut frame = core_to_avif_frame(color_frame);

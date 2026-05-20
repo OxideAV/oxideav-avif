@@ -69,6 +69,7 @@ pub mod alpha;
 pub mod avis;
 pub mod box_parser;
 pub mod cicp;
+pub mod derived;
 pub mod error;
 pub mod grid;
 pub mod image;
@@ -86,18 +87,21 @@ pub use cicp::{
     effective_cicp, is_matrix_reserved, is_primaries_reserved, is_transfer_reserved, matrix_name,
     primaries_name, transfer_name, CicpTriple,
 };
+pub use derived::{parse_grpl, EntityGroup, ImageOverlay, Mif1Compliance, OverlayEntry};
 pub use error::{AvifError, Result};
 pub use grid::{composite_grid, ImageGrid};
 pub use image::{AvifFrame, AvifPixelFormat, AvifPlane};
 pub use inspect::{inspect, item_payload_bytes, transforms_for, AvifInfo};
 pub use meta::{
-    AuxC, Cclv, Clap, Clli, Colr, Imir, IrefEntry, Irot, Ispe, ItemInfo, ItemLocation, Mdcv, Meta,
-    Pasp, Pixi, Property, ITEM_TYPE_EXIF, ITEM_TYPE_MIME, ITEM_TYPE_URI,
+    AuxC, AuxKind, Cclv, Clap, Clli, Colr, Imir, IrefEntry, Irot, Ispe, ItemInfo, ItemLocation,
+    Lsel, Mdcv, Meta, Pasp, Pixi, Property, Rloc, AUX_URN_ALPHA_HEVC, AUX_URN_ALPHA_MPEG,
+    AUX_URN_DEPTH_HEVC, AUX_URN_DEPTH_MPEG, AUX_URN_HDR_GAINMAP, ITEM_TYPE_EXIF, ITEM_TYPE_IDEN,
+    ITEM_TYPE_IOVL, ITEM_TYPE_MIME, ITEM_TYPE_URI,
 };
 pub use parser::{
-    classify_brands, item_bytes_owned, parse, parse_header, AvifHeader, AvifImage, BrandClass,
-    BRAND_AVIF, BRAND_AVIO, BRAND_AVIS, BRAND_MA1A, BRAND_MA1B, BRAND_MIAF, BRAND_MIF1, BRAND_MSF1,
-    ITEM_TYPE_AV01, ITEM_TYPE_GRID,
+    audit_mif1, classify_brands, item_bytes_owned, parse, parse_header, AvifHeader, AvifImage,
+    BrandClass, BRAND_AVIF, BRAND_AVIO, BRAND_AVIS, BRAND_MA1A, BRAND_MA1B, BRAND_MIAF, BRAND_MIF1,
+    BRAND_MSF1, ITEM_TYPE_AV01, ITEM_TYPE_GRID,
 };
 pub use transform::{apply_clap, apply_imir, apply_irot, crop_top_left};
 
@@ -184,13 +188,18 @@ mod registry_glue {
         ))
     }
 
-    /// Convenience: register AVIF + its underlying AV1 decoder in one
-    /// call. Useful when the registry is being built from scratch and
-    /// the caller only wants AVIF — they don't have to remember that
-    /// AVIF delegates to the AV1 codec.
+    /// Convenience: register AVIF + (when available) its underlying
+    /// AV1 decoder in one call. After the 2026-05-20 oxideav-av1
+    /// clean-room rebuild this only registers the AVIF entry; the
+    /// rebuilt av1 crate's `register` is a no-op scaffold. The function
+    /// is retained for source-compatibility with downstreams that
+    /// expect the historical two-codec wire-up call.
     pub fn register_with_av1(reg: &mut CodecRegistry) {
         register_codecs(reg);
-        oxideav_av1::register_codecs(reg);
+        // oxideav-av1's `register` is a no-op stub against a
+        // RuntimeContext; the previous direct-into-CodecRegistry shape
+        // is gone. Until the av1 rebuild ships a real decoder, AVIF is
+        // the only codec wired up here.
     }
 
     /// Register the `.avif` / `.avifs` extensions against the codec id

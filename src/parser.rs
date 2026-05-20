@@ -2,9 +2,10 @@
 //! resolve the primary item's payload inside `mdat` → return the AV1
 //! OBU byte slice + the properties the downstream decoder needs.
 
+use crate::derived::Mif1Compliance;
 use crate::error::{AvifError as Error, Result};
 
-use crate::box_parser::{b, iter_boxes, read_u32, type_str, BoxType};
+use crate::box_parser::{b, iter_boxes, parse_full_box, read_u32, type_str, BoxType};
 use crate::meta::{
     Cclv, Clli, Colr, Ispe, ItemInfo, ItemLocation, Mdcv, Meta, Pasp, Pixi, Property,
 };
@@ -12,6 +13,12 @@ use crate::meta::{
 const FTYP: BoxType = b(b"ftyp");
 const META: BoxType = b(b"meta");
 const MDAT: BoxType = b(b"mdat");
+const HDLR: BoxType = b(b"hdlr");
+const PITM: BoxType = b(b"pitm");
+const IINF: BoxType = b(b"iinf");
+const INFE: BoxType = b(b"infe");
+const ILOC: BoxType = b(b"iloc");
+const IPRP: BoxType = b(b"iprp");
 
 /// `avif` — AV1 image / image collection brand (av1-avif §6.2).
 pub const BRAND_AVIF: BoxType = b(b"avif");
@@ -104,6 +111,103 @@ pub fn parse_header(file: &[u8]) -> Result<AvifHeader<'_>> {
 /// grid / alpha paths can independently fetch tile + alpha items.
 pub fn item_bytes<'a>(file: &'a [u8], loc: &ItemLocation) -> Result<&'a [u8]> {
     resolve_item_bytes(file, loc)
+}
+
+/// Audit a file against the HEIF §10.2.1.1 `mif1` structural-brand
+/// requirements. The returned [`Mif1Compliance`] is informational —
+/// every flag is reported even when some are missing, so a caller that
+/// wants a strict pass / fail can decide per-flag.
+///
+/// We accept files that fail strict mif1 (lots of in-the-wild AVIFs
+/// omit one or another mif1 mandatory box) — this is a deliberate
+/// helper for callers who want stricter validation than the default
+/// reader path.
+///
+/// `claims_mif1` is set when `mif1` appears in either major_brand or
+/// the compatible_brands array. Files that don't claim mif1 can still
+/// be audited — the flag distinguishes "this file says it's mif1 and
+/// fails" from "this file makes no mif1 claim and so missing boxes
+/// are fine."
+pub fn audit_mif1(file: &[u8]) -> Result<Mif1Compliance> {
+    // Walk top-level boxes for ftyp + meta location.
+    let mut ftyp_payload: Option<&[u8]> = None;
+    let mut meta_payload: Option<&[u8]> = None;
+    for hdr in iter_boxes(file) {
+        let hdr = hdr?;
+        let payload = &file[hdr.payload_start..hdr.end()];
+        match &hdr.box_type {
+            x if x == &FTYP => ftyp_payload = Some(payload),
+            x if x == &META => meta_payload = Some(payload),
+            _ => {}
+        }
+    }
+    let mut out = Mif1Compliance::default();
+    let Some(ftyp) = ftyp_payload else {
+        return Err(Error::invalid("avif: audit_mif1 missing ftyp"));
+    };
+    let (major, _minor, compat) = parse_ftyp(ftyp)?;
+    out.claims_mif1 = major == BRAND_MIF1 || compat.contains(&BRAND_MIF1);
+    let Some(meta_p) = meta_payload else {
+        return Ok(out);
+    };
+    let (_v, _f, meta_body) = parse_full_box(meta_p)?;
+    // mif1 requires hdlr, pitm, iinf (with at least one infe), iloc,
+    // iprp directly under the meta box. Walk the body once.
+    for hdr in iter_boxes(meta_body) {
+        let hdr = hdr?;
+        let payload = &meta_body[hdr.payload_start..hdr.end()];
+        match &hdr.box_type {
+            x if x == &HDLR => out.has_hdlr = true,
+            x if x == &PITM => out.has_pitm = true,
+            x if x == &IINF => {
+                out.has_iinf = true;
+                out.infe_count = count_infe(payload)?;
+            }
+            x if x == &ILOC => out.has_iloc = true,
+            x if x == &IPRP => out.has_iprp = true,
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+/// Count `infe` children inside an `iinf` payload without fully
+/// parsing each one. Used by [`audit_mif1`].
+fn count_infe(payload: &[u8]) -> Result<usize> {
+    let (version, _flags, body) = parse_full_box(payload)?;
+    // header carries entry_count (u16 for v0, u32 for v1) then the
+    // declared number of infe children. Use the declared count when it
+    // matches reality; otherwise walk for safety.
+    let _declared = match version {
+        0 => {
+            if body.len() < 2 {
+                0
+            } else {
+                u16::from_be_bytes([body[0], body[1]]) as usize
+            }
+        }
+        _ => {
+            if body.len() < 4 {
+                0
+            } else {
+                u32::from_be_bytes([body[0], body[1], body[2], body[3]]) as usize
+            }
+        }
+    };
+    // Walk for the actual count — robust against malformed entry_count.
+    let start = if version == 0 { 2 } else { 4 };
+    if body.len() < start {
+        return Ok(0);
+    }
+    let tail = &body[start..];
+    let mut n = 0;
+    for hdr in iter_boxes(tail) {
+        let hdr = hdr?;
+        if hdr.box_type == INFE {
+            n += 1;
+        }
+    }
+    Ok(n)
 }
 
 /// Parse an AVIF file, returning the bits needed to decode the primary
@@ -562,5 +666,46 @@ mod tests {
         };
         let err = item_bytes_owned(b"data", &loc).unwrap_err();
         assert!(matches!(err, crate::error::AvifError::Unsupported(_)));
+    }
+
+    /// `audit_mif1` against the Microsoft monochrome AVIF fixture
+    /// reports full mif1 compliance plus the mif1 brand claim.
+    /// The fixture's `ftyp` is `avif` major with `mif1` in
+    /// compatible_brands and its `meta` ships every mif1-mandatory
+    /// child box (hdlr / pitm / iinf with one infe / iloc / iprp).
+    #[test]
+    fn audit_mif1_monochrome_fixture_is_compliant() {
+        let m = audit_mif1(FIXTURE).expect("audit");
+        assert!(m.claims_mif1, "fixture has mif1 in compatible_brands");
+        assert!(m.has_hdlr);
+        assert!(m.has_pitm);
+        assert!(m.has_iinf);
+        assert!(m.has_iloc);
+        assert!(m.has_iprp);
+        assert!(m.infe_count >= 1);
+        assert!(m.is_compliant());
+        assert!(m.missing().is_empty());
+    }
+
+    /// `audit_mif1` on bytes with no meta box reports `claims_mif1`
+    /// from the ftyp and every other flag false. Useful gate for
+    /// "is this even a plausible mif1 carrier".
+    #[test]
+    fn audit_mif1_ftyp_only_reports_brand_no_boxes() {
+        // Synth ftyp: major='mif1' minor=0 compat=[mif1]
+        let mut buf = Vec::new();
+        let payload_len: u32 = 4 + 4 + 4; // major + minor + one compat
+        let size: u32 = 8 + payload_len;
+        buf.extend_from_slice(&size.to_be_bytes());
+        buf.extend_from_slice(b"ftyp");
+        buf.extend_from_slice(b"mif1");
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(b"mif1");
+        let m = audit_mif1(&buf).expect("audit");
+        assert!(m.claims_mif1);
+        assert!(!m.is_compliant());
+        let missing = m.missing();
+        assert!(missing.contains(&"hdlr"));
+        assert!(missing.contains(&"pitm"));
     }
 }

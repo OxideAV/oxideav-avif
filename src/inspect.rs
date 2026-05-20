@@ -112,6 +112,34 @@ pub struct AvifInfo {
     /// didn't add the `prem` signal (the alpha is then straight /
     /// unassociated).
     pub premultiplied_alpha: bool,
+    /// Every auxiliary item attached to the primary via an `auxl`
+    /// iref, paired with its classified [`crate::meta::AuxKind`].
+    /// Alpha typically lives in the first / only entry; depth maps
+    /// and HDR gain maps appear here as separate entries with the
+    /// matching kind.
+    ///
+    /// Empty when no auxC-bearing auxiliary is attached. Spec:
+    /// HEIF §6.5.8 + av1-avif §4.1 / §4.4 (depth) / Apple HDR gain-map.
+    pub aux_items: Vec<(u32, crate::meta::AuxKind)>,
+    /// Convenience: the URN of the first alpha auxiliary item (when
+    /// `has_alpha` is true). Distinguishes the MPEG and HEVC URN
+    /// spellings without a re-walk of the meta.
+    pub alpha_aux_kind: Option<crate::meta::AuxKind>,
+    /// Item id of an attached depth-map auxiliary, when the primary
+    /// item has one (HEIF §6.5.8 — `urn:mpeg:mpegB:cicp:systems:auxiliary:depth`
+    /// or the HEVC spelling `urn:mpeg:hevc:2015:auxid:2`).
+    pub depth_map_item_id: Option<u32>,
+    /// Item id of an attached Apple HDR gain-map auxiliary
+    /// (`urn:com:apple:photo:2020:aux:hdrgainmap`).
+    pub hdr_gain_map_item_id: Option<u32>,
+    /// Number of [`crate::derived::EntityGroup`] entries the file
+    /// carries in a top-level `grpl`. Zero for the typical AVIF file
+    /// that ships no groups list. Spec: HEIF §9.4.
+    pub entity_group_count: usize,
+    /// `mif1` brand compliance audit for the file. Surfaced through
+    /// inspect for callers that want strict-mif1 mode without a
+    /// separate audit pass. Spec: HEIF §10.2.1.1.
+    pub mif1_compliance: crate::derived::Mif1Compliance,
 }
 
 impl AvifInfo {
@@ -181,6 +209,28 @@ impl AvifInfo {
         self.exif_item_id.is_some() || self.xmp_item_id.is_some()
     }
 
+    /// True when an attached auxiliary item declares the depth-map URN
+    /// (HEIF §6.5.8).
+    pub fn has_depth_map(&self) -> bool {
+        self.depth_map_item_id.is_some()
+    }
+
+    /// True when an attached auxiliary item declares Apple's HDR
+    /// gain-map URN.
+    pub fn has_hdr_gain_map(&self) -> bool {
+        self.hdr_gain_map_item_id.is_some()
+    }
+
+    /// True when the file's `ftyp` claims the `mif1` brand and every
+    /// HEIF §10.2.1.1 mandatory child box is present in `meta`. False
+    /// when the file claims `mif1` but is missing required boxes, OR
+    /// when the file makes no `mif1` claim — call sites that want
+    /// "is this strict-mif1" should check `mif1_compliance.claims_mif1`
+    /// directly.
+    pub fn is_strict_mif1(&self) -> bool {
+        self.mif1_compliance.claims_mif1 && self.mif1_compliance.is_compliant()
+    }
+
     /// Resolve the effective CICP signalling quadruple for the primary
     /// item: parse the `colr` nclx triple if present, fold to the
     /// spec-mandated `Unspecified` quadruple `(2, 2, 2, false)`
@@ -217,14 +267,16 @@ pub fn inspect(file: &[u8]) -> Result<AvifInfo> {
         .item_by_id(primary_id)
         .ok_or_else(|| Error::invalid("avif: pitm references unknown item"))?;
     let brands = classify_brands(&hdr.major_brand, &hdr.compatible_brands)?;
+    let mif1_compliance = crate::parser::audit_mif1(file)?;
     if primary_info.item_type == ITEM_TYPE_GRID {
-        build_info_grid(&hdr, primary_id, brands)
+        build_info_grid(&hdr, primary_id, brands, mif1_compliance)
     } else {
         let img = parse(file)?;
         build_info(
             &img,
             find_alpha_item_id(&hdr.meta, primary_id).is_some(),
             brands,
+            mif1_compliance,
         )
     }
 }
@@ -344,6 +396,7 @@ pub(crate) fn build_info(
     img: &AvifImage<'_>,
     has_alpha: bool,
     brands: BrandClass,
+    mif1_compliance: crate::derived::Mif1Compliance,
 ) -> Result<AvifInfo> {
     let av1c = img
         .av1c
@@ -384,6 +437,20 @@ pub(crate) fn build_info(
     } else {
         false
     };
+    let aux_items = img.meta.aux_items_for(primary_id);
+    let alpha_aux_kind = aux_items
+        .iter()
+        .find(|(_, k)| matches!(k, crate::meta::AuxKind::Alpha))
+        .map(|(_, k)| *k);
+    let depth_map_item_id = aux_items
+        .iter()
+        .find(|(_, k)| matches!(k, crate::meta::AuxKind::DepthMap))
+        .map(|(id, _)| *id);
+    let hdr_gain_map_item_id = aux_items
+        .iter()
+        .find(|(_, k)| matches!(k, crate::meta::AuxKind::HdrGainMap))
+        .map(|(id, _)| *id);
+    let entity_group_count = img.meta.groups().map(|g| g.len()).unwrap_or(0);
     Ok(AvifInfo {
         width,
         height,
@@ -405,6 +472,12 @@ pub(crate) fn build_info(
         exif_item_id,
         xmp_item_id,
         premultiplied_alpha,
+        aux_items,
+        alpha_aux_kind,
+        depth_map_item_id,
+        hdr_gain_map_item_id,
+        entity_group_count,
+        mif1_compliance,
     })
 }
 
@@ -412,6 +485,7 @@ pub(crate) fn build_info_grid(
     hdr: &AvifHeader<'_>,
     primary_id: u32,
     brands: BrandClass,
+    mif1_compliance: crate::derived::Mif1Compliance,
 ) -> Result<AvifInfo> {
     // Pull grid item bytes, parse the descriptor.
     let loc = hdr
@@ -511,6 +585,20 @@ pub(crate) fn build_info_grid(
     } else {
         false
     };
+    let aux_items = hdr.meta.aux_items_for(primary_id);
+    let alpha_aux_kind = aux_items
+        .iter()
+        .find(|(_, k)| matches!(k, crate::meta::AuxKind::Alpha))
+        .map(|(_, k)| *k);
+    let depth_map_item_id = aux_items
+        .iter()
+        .find(|(_, k)| matches!(k, crate::meta::AuxKind::DepthMap))
+        .map(|(id, _)| *id);
+    let hdr_gain_map_item_id = aux_items
+        .iter()
+        .find(|(_, k)| matches!(k, crate::meta::AuxKind::HdrGainMap))
+        .map(|(id, _)| *id);
+    let entity_group_count = hdr.meta.groups().map(|g| g.len()).unwrap_or(0);
     Ok(AvifInfo {
         width: grid.output_width,
         height: grid.output_height,
@@ -532,6 +620,12 @@ pub(crate) fn build_info_grid(
         exif_item_id,
         xmp_item_id,
         premultiplied_alpha,
+        aux_items,
+        alpha_aux_kind,
+        depth_map_item_id,
+        hdr_gain_map_item_id,
+        entity_group_count,
+        mif1_compliance,
     })
 }
 
