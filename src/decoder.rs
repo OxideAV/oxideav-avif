@@ -20,7 +20,7 @@ use oxideav_core::frame::{VideoFrame, VideoPlane};
 use oxideav_core::Decoder;
 use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Result, TimeBase};
 
-use oxideav_av1::{Av1CodecConfig, Av1Decoder};
+use crate::av1_stub::{Av1CodecConfig, Av1Decoder};
 
 use crate::alpha::{composite_alpha, find_alpha_item_id};
 use crate::avis::{parse_avis, sample_bytes};

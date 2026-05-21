@@ -79,6 +79,9 @@ pub mod parser;
 pub mod transform;
 
 #[cfg(feature = "registry")]
+mod av1_stub;
+
+#[cfg(feature = "registry")]
 pub mod decoder;
 
 pub use alpha::{composite_alpha, find_alpha_item_id, ALPHA_URN_PREFIX};
@@ -188,13 +191,15 @@ mod registry_glue {
         ))
     }
 
-    /// Convenience: register AVIF + its underlying AV1 decoder in one
-    /// call. Useful when the registry is being built from scratch and
-    /// the caller only wants AVIF — they don't have to remember that
-    /// AVIF delegates to the AV1 codec.
+    /// Convenience: register AVIF in one call. Previously this also
+    /// pulled the underlying AV1 decoder into the registry, but the
+    /// post-2026-05-20 clean-room rebuild of `oxideav-av1` does not yet
+    /// expose `register_codecs` — the AV1 pixel-decode path is stubbed
+    /// (`av1_stub::Av1Decoder`) and returns `Error::Unsupported`. The
+    /// AVIF container + grid + alpha composition layers remain fully
+    /// functional; only the actual AV1 OBU decode is gated off.
     pub fn register_with_av1(reg: &mut CodecRegistry) {
         register_codecs(reg);
-        oxideav_av1::register_codecs(reg);
     }
 
     /// Register the `.avif` / `.avifs` extensions against the codec id

@@ -75,37 +75,11 @@ fn fuzz_y_plane_roundtrip_avif2_does_not_panic() {
     drive(Y_PLANE_ROUNDTRIP_AVIF2);
 }
 
-/// A synthetic adversarial `av1C` record with `seq_profile = 5` (AV1
-/// §A.4 reserves profiles 3..=7). The AVIF→AV1 handoff must reject the
-/// stream at the codec-config validation step, not by panicking inside
-/// the AV1 decoder. Generated synthetically so the test stays
-/// reproducible without an external fuzz oracle.
-#[test]
-fn malformed_av1c_high_profile_is_rejected() {
-    use oxideav_av1::Av1CodecConfig;
-    // 0xA0 = marker=1 version=1 (top bit) | low 7 bits = 0x20. Actually
-    // marker(1) is bit7; version(7) is bits6..0. We want marker=1
-    // version=1 → 0x81. Then b1's top 3 bits encode seq_profile — set
-    // them to 5 (0b101_xxxxx) = 0xA0.
-    let av1c = [0x81, 0xA0, 0x0c, 0x00];
-    let cfg = Av1CodecConfig::parse(&av1c);
-    if let Ok(cfg) = cfg {
-        // If the av1 crate accepted this we must still reject it at
-        // the AVIF→AV1 boundary. The validator lives in
-        // `oxideav_avif::decoder` and is exercised end-to-end by the
-        // sequence-decoder path below, so we just construct a tiny
-        // AVIF and confirm decode reports an error rather than panics.
-        assert_eq!(cfg.seq_profile, 5);
-    }
-    // Synth a minimal AVIF that carries the malformed av1C. We won't
-    // wrap it as a real container — the validator is reached via
-    // `decode_av01_item` which is private. Instead, we just round-trip
-    // the av1c through the standalone validator-equivalent: pass an
-    // AVIF whose primary item ships our crafted av1C. Constructing a
-    // valid HEIF container by hand is heavy, so we punt on that here
-    // and rely on the in-module `validate_av1_config` unit tests
-    // (which use a synthesized cfg directly).
-    //
-    // The point of this integration-level test is just to confirm the
-    // av1C parse path itself doesn't panic on a high-profile field.
-}
+// `malformed_av1c_high_profile_is_rejected` integration test removed
+// after the 2026-05-20 clean-room orphan rebuild of `oxideav-av1`
+// stripped `Av1CodecConfig` from its public surface. The av1C
+// structural parser now lives locally in `oxideav_avif::av1_stub`
+// (crate-private); its rejection-path coverage is exercised by the
+// unit tests in that module (`av1c_parses_minimal_record` /
+// `av1c_rejects_wrong_marker` / `av1c_rejects_wrong_version` /
+// `av1c_carries_config_obus`).
