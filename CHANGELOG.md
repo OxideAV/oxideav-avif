@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-avif/compare/v0.0.7...v0.0.8) - 2026-05-21
+
+### Other
+
+- local av1C parser + Av1Decoder stub after av1 clean-room rebuild
+- r81 docs: reflect revert + the av1 workspace caveat
+- keep AV1 calls on published 0.1.8 API for CI
+- derived-image + entity-grouping + MIAF compliance audit
+- HEIF item-properties + iref typed-relationship enumeration
+- harden AVIF→AV1 boundary against fuzz-discovered crashes
+- AVIS sequence decode + integration tests tolerate av1 coded_lossless
+
 ### Added
 
 - Round 81 — derived-image + entity-grouping + MIAF compliance. Container
