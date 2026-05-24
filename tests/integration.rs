@@ -2005,6 +2005,201 @@ fn build_synthetic_av01_with_colr(
     file
 }
 
+/// Build a synthetic single-item AVIF whose primary item carries the
+/// AV1-specific layered-image properties: `a1op` (operating-point
+/// selector — av1-avif §2.3.2.1) and `a1lx` (layered-image indexing —
+/// av1-avif §2.3.2.3). `a1op` is associated as essential per the spec;
+/// `a1lx` as non-essential. The OBU payload itself stays opaque — these
+/// are container-level descriptive item properties.
+fn build_synthetic_av01_with_layered_props(op_index: u8, layer_sizes: [u16; 3]) -> Vec<u8> {
+    fn u32be(v: u32) -> [u8; 4] {
+        v.to_be_bytes()
+    }
+    fn u16be(v: u16) -> [u8; 2] {
+        v.to_be_bytes()
+    }
+    fn box_bytes(btype: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let size = (8 + body.len()) as u32;
+        let mut out = size.to_be_bytes().to_vec();
+        out.extend_from_slice(btype);
+        out.extend_from_slice(body);
+        out
+    }
+    fn full_box(btype: &[u8; 4], version: u8, flags: u32, body: &[u8]) -> Vec<u8> {
+        let mut payload = vec![
+            version,
+            (flags >> 16) as u8,
+            (flags >> 8) as u8,
+            flags as u8,
+        ];
+        payload.extend_from_slice(body);
+        box_bytes(btype, &payload)
+    }
+    fn infe_v2(id: u16, item_type: &[u8; 4]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&id.to_be_bytes());
+        body.extend_from_slice(&[0u8, 0]);
+        body.extend_from_slice(item_type);
+        body.push(0);
+        full_box(b"infe", 2, 0, &body)
+    }
+
+    let mut ftyp_body = Vec::new();
+    ftyp_body.extend_from_slice(b"avif");
+    ftyp_body.extend_from_slice(&u32be(0));
+    ftyp_body.extend_from_slice(b"mif1");
+    ftyp_body.extend_from_slice(b"miaf");
+    let ftyp = box_bytes(b"ftyp", &ftyp_body);
+
+    let mut hdlr_body = Vec::new();
+    hdlr_body.extend_from_slice(&[0u8; 4]);
+    hdlr_body.extend_from_slice(b"pict");
+    hdlr_body.extend_from_slice(&[0u8; 12]);
+    hdlr_body.extend_from_slice(b"\0");
+    let hdlr = full_box(b"hdlr", 0, 0, &hdlr_body);
+
+    let pitm = full_box(b"pitm", 0, 0, &u16be(1));
+
+    let infe1 = infe_v2(1, b"av01");
+    let mut iinf_body = Vec::new();
+    iinf_body.extend_from_slice(&u16be(1));
+    iinf_body.extend_from_slice(&infe1);
+    let iinf = full_box(b"iinf", 0, 0, &iinf_body);
+
+    let obu_data = vec![0xAAu8; 8];
+
+    let mut ispe_body = Vec::new();
+    ispe_body.extend_from_slice(&u32be(8));
+    ispe_body.extend_from_slice(&u32be(8));
+    let ispe = full_box(b"ispe", 0, 0, &ispe_body);
+
+    let av1c = box_bytes(b"av1C", &[0x81u8, 0, 0, 0]);
+
+    let mut pixi_body = vec![0u8; 4];
+    pixi_body.push(1);
+    pixi_body.push(8);
+    let pixi = box_bytes(b"pixi", &pixi_body);
+
+    // a1op: bare ItemProperty with a single u8 op_index.
+    let a1op = box_bytes(b"a1op", &[op_index]);
+
+    // a1lx: large_size = 0 → three 16-bit layer sizes.
+    let mut a1lx_body = vec![0x00u8]; // reserved(7)=0, large_size(1)=0
+    a1lx_body.extend_from_slice(&u16be(layer_sizes[0]));
+    a1lx_body.extend_from_slice(&u16be(layer_sizes[1]));
+    a1lx_body.extend_from_slice(&u16be(layer_sizes[2]));
+    let a1lx = box_bytes(b"a1lx", &a1lx_body);
+
+    // ipco: ispe(1) + av1C(2) + pixi(3) + a1op(4) + a1lx(5)
+    let mut ipco_body = Vec::new();
+    ipco_body.extend_from_slice(&ispe);
+    ipco_body.extend_from_slice(&av1c);
+    ipco_body.extend_from_slice(&pixi);
+    ipco_body.extend_from_slice(&a1op);
+    ipco_body.extend_from_slice(&a1lx);
+    let ipco = box_bytes(b"ipco", &ipco_body);
+
+    // ipma: item 1 -> [1, 2, 3, 4(essential), 5]. The essential bit is
+    // the high bit (0x80) of the 1-byte association index.
+    let mut ipma_body = Vec::new();
+    ipma_body.extend_from_slice(&u32be(1));
+    ipma_body.extend_from_slice(&1u16.to_be_bytes());
+    ipma_body.push(5); // assoc_count
+    ipma_body.push(1 & 0x7f);
+    ipma_body.push(2 & 0x7f);
+    ipma_body.push(3 & 0x7f);
+    ipma_body.push(0x80 | (4 & 0x7f)); // a1op essential
+    ipma_body.push(5 & 0x7f); // a1lx non-essential
+    let ipma = full_box(b"ipma", 0, 0, &ipma_body);
+
+    let mut iprp_body = Vec::new();
+    iprp_body.extend_from_slice(&ipco);
+    iprp_body.extend_from_slice(&ipma);
+    let iprp = box_bytes(b"iprp", &iprp_body);
+
+    let iloc_size = 8 + 4 + 1 + 1 + 2 + 14;
+    let ftyp_size = ftyp.len();
+    let meta_payload_size = 4 + hdlr.len() + pitm.len() + iinf.len() + iprp.len() + iloc_size;
+    let meta_size = 8 + meta_payload_size;
+    let mdat_payload_start = ftyp_size + meta_size + 8;
+    let item_off = mdat_payload_start;
+
+    let mut iloc_inner = Vec::new();
+    iloc_inner.push(0x44);
+    iloc_inner.push(0x00);
+    iloc_inner.extend_from_slice(&u16be(1));
+    iloc_inner.extend_from_slice(&u16be(1));
+    iloc_inner.extend_from_slice(&u16be(0));
+    iloc_inner.extend_from_slice(&u16be(1));
+    iloc_inner.extend_from_slice(&u32be(item_off as u32));
+    iloc_inner.extend_from_slice(&u32be(obu_data.len() as u32));
+    let iloc = full_box(b"iloc", 0, 0, &iloc_inner);
+
+    let mut meta_body = Vec::new();
+    meta_body.extend_from_slice(&[0u8; 4]);
+    meta_body.extend_from_slice(&hdlr);
+    meta_body.extend_from_slice(&pitm);
+    meta_body.extend_from_slice(&iinf);
+    meta_body.extend_from_slice(&iprp);
+    meta_body.extend_from_slice(&iloc);
+    let meta = box_bytes(b"meta", &meta_body);
+    assert_eq!(meta.len(), meta_size, "meta size recalc");
+
+    let mdat = box_bytes(b"mdat", &obu_data);
+
+    let mut file = Vec::new();
+    file.extend_from_slice(&ftyp);
+    file.extend_from_slice(&meta);
+    file.extend_from_slice(&mdat);
+    file
+}
+
+/// `inspect` surfaces the `a1op` operating-point selector and `a1lx`
+/// layered-image index when the primary item carries them
+/// (av1-avif §2.3.2.1 + §2.3.2.3).
+#[test]
+fn inspect_surfaces_a1op_and_a1lx() {
+    let bytes = build_synthetic_av01_with_layered_props(2, [128, 256, 0]);
+    let info = inspect(&bytes).expect("inspect layered av01");
+    let op = info.operating_point.expect("a1op should be surfaced");
+    assert_eq!(op.op_index, 2);
+    let lx = info.layered_index.expect("a1lx should be surfaced");
+    assert!(!lx.large_size);
+    assert_eq!(lx.layer_size, [128, 256, 0]);
+    // Two leading non-zero sizes → three layers in the image.
+    assert_eq!(lx.documented_layers(), 2);
+}
+
+/// The monochrome real fixture has no AV1 layered properties — both
+/// fields stay `None`.
+#[test]
+fn inspect_no_layered_props_when_absent() {
+    let info = inspect(MONO).expect("inspect monochrome");
+    assert!(info.operating_point.is_none());
+    assert!(info.layered_index.is_none());
+}
+
+/// The parser recognises an essential `a1op` (it is typed, not
+/// `Property::Other`), so the primary item is NOT flagged as carrying an
+/// unsupported essential property. Conversely an unknown essential
+/// property would block. Exercises `Meta::has_unsupported_essential_property`
+/// end-to-end on a synthetic file (av1-avif §2.3.2.1.2 + MIAF §7.3.5).
+#[test]
+fn essential_a1op_is_recognised_and_does_not_block() {
+    let bytes = build_synthetic_av01_with_layered_props(1, [64, 0, 0]);
+    let hdr = parse_header(&bytes).expect("parse header");
+    let primary = hdr.meta.primary_item_id.expect("pitm");
+    // a1op is essential in the fixture but recognised, so no block.
+    assert!(
+        !hdr.meta.has_unsupported_essential_property(primary),
+        "recognised essential a1op must not block the item"
+    );
+    assert!(hdr
+        .meta
+        .unsupported_essential_properties(primary)
+        .is_empty());
+}
+
 // ---------------------------------------------------------------------
 // Round 21 — grid hardening: tile-edge sample handling, grid stride
 // math (per-tile vs grid-derived `colr` / `pixi` / `pasp`), and CICP

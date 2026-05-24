@@ -140,6 +140,18 @@ pub struct AvifInfo {
     /// inspect for callers that want strict-mif1 mode without a
     /// separate audit pass. Spec: HEIF §10.2.1.1.
     pub mif1_compliance: crate::derived::Mif1Compliance,
+    /// Operating-point selector (`a1op`) attached to the primary item,
+    /// when present (av1-avif §2.3.2.1). Carries the `op_index` the
+    /// reader should process for a scalable AV1 Image Item. The property
+    /// is mandated essential, so a reader that cannot honour the index
+    /// must reject the item. `None` for the common single-operating-point
+    /// case.
+    pub operating_point: Option<crate::meta::A1op>,
+    /// AV1 layered-image indexing (`a1lx`) attached to the primary item,
+    /// when present (av1-avif §2.3.2.3). Documents per-layer byte sizes
+    /// so a caller can extract individual layers of an operating point.
+    /// Non-essential; `None` for non-layered items.
+    pub layered_index: Option<crate::meta::A1lx>,
 }
 
 impl AvifInfo {
@@ -451,6 +463,14 @@ pub(crate) fn build_info(
         .find(|(_, k)| matches!(k, crate::meta::AuxKind::HdrGainMap))
         .map(|(id, _)| *id);
     let entity_group_count = img.meta.groups().map(|g| g.len()).unwrap_or(0);
+    let operating_point = match img.meta.property_for(primary_id, b"a1op") {
+        Some(Property::A1op(a)) => Some(*a),
+        _ => None,
+    };
+    let layered_index = match img.meta.property_for(primary_id, b"a1lx") {
+        Some(Property::A1lx(a)) => Some(*a),
+        _ => None,
+    };
     Ok(AvifInfo {
         width,
         height,
@@ -478,6 +498,8 @@ pub(crate) fn build_info(
         hdr_gain_map_item_id,
         entity_group_count,
         mif1_compliance,
+        operating_point,
+        layered_index,
     })
 }
 
@@ -599,6 +621,14 @@ pub(crate) fn build_info_grid(
         .find(|(_, k)| matches!(k, crate::meta::AuxKind::HdrGainMap))
         .map(|(id, _)| *id);
     let entity_group_count = hdr.meta.groups().map(|g| g.len()).unwrap_or(0);
+    let operating_point = match hdr.meta.property_for(primary_id, b"a1op") {
+        Some(Property::A1op(a)) => Some(*a),
+        _ => None,
+    };
+    let layered_index = match hdr.meta.property_for(primary_id, b"a1lx") {
+        Some(Property::A1lx(a)) => Some(*a),
+        _ => None,
+    };
     Ok(AvifInfo {
         width: grid.output_width,
         height: grid.output_height,
@@ -626,6 +656,8 @@ pub(crate) fn build_info_grid(
         hdr_gain_map_item_id,
         entity_group_count,
         mif1_compliance,
+        operating_point,
+        layered_index,
     })
 }
 

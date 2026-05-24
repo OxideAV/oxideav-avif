@@ -61,6 +61,10 @@ const CCLV: BoxType = b(b"cclv");
 const RLOC: BoxType = b(b"rloc");
 /// HEIF §6.5.11 — Layer Selector property.
 const LSEL: BoxType = b(b"lsel");
+/// av1-avif §2.3.2.1 — Operating Point Selector property.
+const A1OP: BoxType = b(b"a1op");
+/// av1-avif §2.3.2.3 — AV1 Layered Image Indexing property.
+const A1LX: BoxType = b(b"a1lx");
 
 /// HEIF §6.6.2.2 — image overlay derived-image type.
 pub const ITEM_TYPE_IOVL: BoxType = b(b"iovl");
@@ -353,6 +357,67 @@ pub struct Lsel {
     pub layer_id: u16,
 }
 
+/// Operating Point Selector item property (`a1op`) — av1-avif §2.3.2.1.
+///
+/// Selects which AV1 operating point the reader should process for a
+/// scalable / multi-layer AV1 Image Item. The spec mandates that when
+/// this property is associated it **shall be marked as essential**, so a
+/// reader that cannot honour the selected operating point must not
+/// process the item (av1-avif §2.3.2.1.2 + MIAF §7.3.5 essential-property
+/// semantics).
+///
+/// Syntax: `ItemProperty('a1op')` (NO FullBox header) carrying a single
+/// `unsigned int(8) op_index`. `op_index` shall be in
+/// `0..=operating_points_cnt_minus_1` of the AV1 sequence header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct A1op {
+    /// Index of the operating point to be processed for this item.
+    pub op_index: u8,
+}
+
+/// AV1 Layered Image Indexing item property (`a1lx`) — av1-avif §2.3.2.3.
+///
+/// Documents the size in bytes of each layer (except the last) inside
+/// the AV1 Image Item Data, so a reader can determine the byte ranges
+/// needed to process one or more layers of an operating point without
+/// parsing the OBU stream. The spec mandates this property **shall not
+/// be marked as essential** — a reader that ignores it can still decode
+/// the full item.
+///
+/// Syntax: `ItemProperty('a1lx')` (NO FullBox header):
+///
+/// ```text
+/// unsigned int(7) reserved = 0;
+/// unsigned int(1) large_size;
+/// FieldLength = (large_size + 1) * 16;
+/// unsigned int(FieldLength) layer_size[3];
+/// ```
+///
+/// `layer_size` values are in increasing order of `spatial_id`. A value
+/// of zero terminates the list — all following values shall also be 0
+/// (av1-avif §2.3.2.3.4). The size of the final layer is implicit (item
+/// payload length minus the documented prefix), so it is never stored
+/// here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct A1lx {
+    /// `false` → 16-bit `layer_size` fields; `true` → 32-bit fields.
+    pub large_size: bool,
+    /// Byte size of layers 0..2 (in increasing `spatial_id` order). A
+    /// zero entry, and every entry after it, is unused (the layer is
+    /// either absent or the final, implicitly-sized layer).
+    pub layer_size: [u32; 3],
+}
+
+impl A1lx {
+    /// Number of documented (non-zero, leading) layer sizes. Per
+    /// av1-avif §2.3.2.3.4 a zero entry terminates the list, so this
+    /// counts the leading run of non-zero values. Equals
+    /// `(number of layers in the image) - 1`.
+    pub fn documented_layers(&self) -> usize {
+        self.layer_size.iter().take_while(|&&s| s != 0).count()
+    }
+}
+
 /// Mastering display colour volume (`mdcv`) — SMPTE ST 2086 / CTA-861-G
 /// HDR metadata. Spec: ISO/IEC 14496-12 §12.1.5.3 (MasteringDisplayColourVolumeBox).
 ///
@@ -422,6 +487,10 @@ pub enum Property {
     Rloc(Rloc),
     /// Layer-selector property (HEIF §6.5.11).
     Lsel(Lsel),
+    /// Operating-point selector property (av1-avif §2.3.2.1).
+    A1op(A1op),
+    /// AV1 layered-image indexing property (av1-avif §2.3.2.3).
+    A1lx(A1lx),
     Other(BoxType, Vec<u8>),
 }
 
@@ -442,6 +511,8 @@ impl Property {
             Property::Cclv(_) => CCLV,
             Property::Rloc(_) => RLOC,
             Property::Lsel(_) => LSEL,
+            Property::A1op(_) => A1OP,
+            Property::A1lx(_) => A1LX,
             Property::Other(t, _) => *t,
         }
     }
@@ -592,6 +663,54 @@ impl Meta {
             }
         }
         None
+    }
+
+    /// Enumerate the box types of every property associated with `item_id`
+    /// that is **marked essential** but lands in [`Property::Other`] —
+    /// i.e. an essential property this crate does not interpret.
+    ///
+    /// Per av1-avif §2.3.2.1.2 and MIAF (ISO/IEC 23000-22) §7.3.5, a
+    /// reader that encounters an item with an essential item property it
+    /// does not support shall not process that item. This helper lets the
+    /// decode path consult that rule without re-walking associations:
+    /// every returned `BoxType` is a 4CC the caller's pipeline could not
+    /// honour. An empty vector means the item is safe to process (every
+    /// essential property is recognised, or all unknown properties are
+    /// non-essential and may be ignored).
+    ///
+    /// `a1lx` is treated as recognised even when its bytes are not acted
+    /// upon, because the spec forbids marking it essential; a `clap`,
+    /// `irot`, `imir`, `lsel`, `a1op`, etc. that we parse counts as
+    /// recognised regardless of the essential bit.
+    pub fn unsupported_essential_properties(&self, item_id: u32) -> Vec<BoxType> {
+        let Some(assoc) = self.assoc_by_id(item_id) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for pa in &assoc.entries {
+            if !pa.essential {
+                continue;
+            }
+            match self.properties.get(pa.index as usize) {
+                // An unknown property carried as `Other` and flagged
+                // essential is exactly the case the spec guards against.
+                Some(Property::Other(t, _)) => out.push(*t),
+                // A property index that points past the container is
+                // malformed; treat the missing essential property as
+                // unsupported (its 4CC is unknowable, use zeros).
+                None => out.push([0, 0, 0, 0]),
+                // Any typed property is one we recognise and can honour
+                // (or safely ignore if non-transformative).
+                Some(_) => {}
+            }
+        }
+        out
+    }
+
+    /// True when `item_id` carries an essential item property this crate
+    /// cannot interpret (see [`Meta::unsupported_essential_properties`]).
+    pub fn has_unsupported_essential_property(&self, item_id: u32) -> bool {
+        !self.unsupported_essential_properties(item_id).is_empty()
     }
 
     /// Parse the raw `grpl` slice into typed entity groups. Returns
@@ -877,6 +996,8 @@ fn parse_ipco(payload: &[u8]) -> Result<Vec<Property>> {
             x if x == &CCLV => Property::Cclv(parse_cclv(body)?),
             x if x == &RLOC => Property::Rloc(parse_rloc(body)?),
             x if x == &LSEL => Property::Lsel(parse_lsel(body)?),
+            x if x == &A1OP => Property::A1op(parse_a1op(body)?),
+            x if x == &A1LX => Property::A1lx(parse_a1lx(body)?),
             other => Property::Other(*other, body.to_vec()),
         };
         out.push(prop);
@@ -1081,6 +1202,57 @@ fn parse_lsel(body: &[u8]) -> Result<Lsel> {
     }
     Ok(Lsel {
         layer_id: read_u16(body, 0)?,
+    })
+}
+
+/// Parse `a1op` (OperatingPointSelectorProperty — av1-avif §2.3.2.1).
+/// ItemProperty (NO FullBox header) carrying a single
+/// `unsigned int(8) op_index`.
+fn parse_a1op(body: &[u8]) -> Result<A1op> {
+    if body.is_empty() {
+        return Err(Error::invalid("avif: a1op too short (0 < 1)"));
+    }
+    Ok(A1op { op_index: body[0] })
+}
+
+/// Parse `a1lx` (AV1LayeredImageIndexingProperty — av1-avif §2.3.2.3).
+/// ItemProperty (NO FullBox header):
+///
+/// ```text
+/// unsigned int(7) reserved = 0;
+/// unsigned int(1) large_size;
+/// FieldLength = (large_size + 1) * 16;
+/// unsigned int(FieldLength) layer_size[3];
+/// ```
+///
+/// `large_size == 0` → three 16-bit sizes (7 bytes total);
+/// `large_size == 1` → three 32-bit sizes (13 bytes total). The reserved
+/// 7 bits of the first byte are ignored on read.
+fn parse_a1lx(body: &[u8]) -> Result<A1lx> {
+    if body.is_empty() {
+        return Err(Error::invalid("avif: a1lx too short (0 < 1)"));
+    }
+    let large_size = (body[0] & 0x01) != 0;
+    let field_bytes = if large_size { 4 } else { 2 };
+    let need = 1 + field_bytes * 3;
+    if body.len() < need {
+        return Err(Error::invalid(format!(
+            "avif: a1lx too short ({} < {need})",
+            body.len()
+        )));
+    }
+    let mut layer_size = [0u32; 3];
+    for (i, slot) in layer_size.iter_mut().enumerate() {
+        let at = 1 + i * field_bytes;
+        *slot = if large_size {
+            read_u32(body, at)?
+        } else {
+            u32::from(read_u16(body, at)?)
+        };
+    }
+    Ok(A1lx {
+        large_size,
+        layer_size,
     })
 }
 
@@ -1746,5 +1918,158 @@ mod tests {
             Property::Lsel(l) => assert_eq!(l.layer_id, 5),
             other => panic!("expected Lsel, got {other:?}"),
         }
+    }
+
+    /// `a1op` is a single u8 op_index in a bare ItemProperty.
+    #[test]
+    fn a1op_reads_op_index() {
+        let a = parse_a1op(&[7]).unwrap();
+        assert_eq!(a.op_index, 7);
+        // Empty body is malformed.
+        assert!(parse_a1op(&[]).is_err());
+    }
+
+    /// `a1lx` with large_size = 0 → three 16-bit layer sizes.
+    #[test]
+    fn a1lx_16bit_field_width() {
+        // byte0: reserved(7)=0, large_size(1)=0
+        let mut buf = vec![0x00u8];
+        buf.extend_from_slice(&100u16.to_be_bytes());
+        buf.extend_from_slice(&200u16.to_be_bytes());
+        buf.extend_from_slice(&0u16.to_be_bytes());
+        let a = parse_a1lx(&buf).unwrap();
+        assert!(!a.large_size);
+        assert_eq!(a.layer_size, [100, 200, 0]);
+        // Two leading non-zero sizes → image has three layers.
+        assert_eq!(a.documented_layers(), 2);
+    }
+
+    /// `a1lx` with large_size = 1 → three 32-bit layer sizes. The
+    /// reserved upper 7 bits of byte 0 must be ignored on read.
+    #[test]
+    fn a1lx_32bit_field_width_ignores_reserved() {
+        // byte0: reserved bits all 1, large_size(1)=1 → 0xFF
+        let mut buf = vec![0xFFu8];
+        buf.extend_from_slice(&70_000u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        let a = parse_a1lx(&buf).unwrap();
+        assert!(a.large_size);
+        assert_eq!(a.layer_size, [70_000, 0, 0]);
+        assert_eq!(a.documented_layers(), 1);
+        // Truncated 32-bit body is rejected.
+        let short = vec![0x01u8, 0, 0, 0, 0];
+        assert!(parse_a1lx(&short).is_err());
+    }
+
+    /// `ipco` dispatch routes the two AV1-specific properties to their
+    /// typed variants rather than `Property::Other`.
+    #[test]
+    fn ipco_dispatches_a1op_and_a1lx() {
+        let a1op_body = vec![3u8]; // op_index = 3
+        let a1lx_body = {
+            let mut b = vec![0x00u8]; // large_size = 0
+            b.extend_from_slice(&5u16.to_be_bytes());
+            b.extend_from_slice(&0u16.to_be_bytes());
+            b.extend_from_slice(&0u16.to_be_bytes());
+            b
+        };
+        let mut ipco = Vec::new();
+        let s = 8 + a1op_body.len() as u32;
+        ipco.extend_from_slice(&s.to_be_bytes());
+        ipco.extend_from_slice(b"a1op");
+        ipco.extend_from_slice(&a1op_body);
+        let s = 8 + a1lx_body.len() as u32;
+        ipco.extend_from_slice(&s.to_be_bytes());
+        ipco.extend_from_slice(b"a1lx");
+        ipco.extend_from_slice(&a1lx_body);
+        let props = parse_ipco(&ipco).unwrap();
+        assert_eq!(props.len(), 2);
+        match &props[0] {
+            Property::A1op(a) => assert_eq!(a.op_index, 3),
+            other => panic!("expected A1op, got {other:?}"),
+        }
+        match &props[1] {
+            Property::A1lx(a) => {
+                assert!(!a.large_size);
+                assert_eq!(a.layer_size, [5, 0, 0]);
+            }
+            other => panic!("expected A1lx, got {other:?}"),
+        }
+    }
+
+    /// Essential-property enforcement (av1-avif §2.3.2.1.2 + MIAF §7.3.5):
+    /// an item flagged with an essential property the crate cannot parse
+    /// (lands in `Property::Other`) is reported as unprocessable; a
+    /// recognised property — even one we only ignore — is not.
+    #[test]
+    fn unsupported_essential_property_detected() {
+        let m = Meta {
+            properties: vec![
+                // index 0: a known property (irot) — recognised.
+                Property::Irot(Irot { angle: 1 }),
+                // index 1: an unknown property carried as Other.
+                Property::Other(*b"zzzz", vec![0, 1, 2]),
+            ],
+            associations: vec![ItemPropertyAssociation {
+                item_id: 1,
+                entries: vec![
+                    // irot marked essential — recognised, so OK.
+                    PropertyAssociation {
+                        index: 0,
+                        essential: true,
+                    },
+                    // unknown 'zzzz' marked essential — must block.
+                    PropertyAssociation {
+                        index: 1,
+                        essential: true,
+                    },
+                ],
+            }],
+            ..Meta::default()
+        };
+        assert!(m.has_unsupported_essential_property(1));
+        assert_eq!(m.unsupported_essential_properties(1), vec![*b"zzzz"]);
+        // An item with no associations is trivially processable.
+        assert!(!m.has_unsupported_essential_property(99));
+    }
+
+    /// An unknown property that is *not* marked essential may be safely
+    /// ignored — the item stays processable (ISO/IEC 14496-12 §8.11.14:
+    /// non-essential unrecognised properties are skipped).
+    #[test]
+    fn non_essential_unknown_property_does_not_block() {
+        let m = Meta {
+            properties: vec![Property::Other(*b"zzzz", vec![0])],
+            associations: vec![ItemPropertyAssociation {
+                item_id: 1,
+                entries: vec![PropertyAssociation {
+                    index: 0,
+                    essential: false,
+                }],
+            }],
+            ..Meta::default()
+        };
+        assert!(!m.has_unsupported_essential_property(1));
+        assert!(m.unsupported_essential_properties(1).is_empty());
+    }
+
+    /// A property association whose index points past the container is
+    /// malformed; if it is flagged essential the item must be rejected
+    /// (we cannot prove the essential property is supported).
+    #[test]
+    fn essential_property_with_dangling_index_blocks() {
+        let m = Meta {
+            properties: vec![],
+            associations: vec![ItemPropertyAssociation {
+                item_id: 1,
+                entries: vec![PropertyAssociation {
+                    index: 5,
+                    essential: true,
+                }],
+            }],
+            ..Meta::default()
+        };
+        assert!(m.has_unsupported_essential_property(1));
     }
 }

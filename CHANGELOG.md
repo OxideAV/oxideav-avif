@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 123 — AV1 layered-image item properties + essential-property
+  enforcement (av1-avif §2.3.2 + MIAF §7.3.5). Container-level box work,
+  no AV1 decode dependency:
+  - `a1op` OperatingPointSelectorProperty parser (av1-avif §2.3.2.1) —
+    bare `ItemProperty` carrying a single `unsigned int(8) op_index`.
+    New `meta::A1op { op_index }` type. The spec mandates this property
+    be marked essential.
+  - `a1lx` AV1LayeredImageIndexingProperty parser (av1-avif §2.3.2.3) —
+    `unsigned int(7) reserved + unsigned int(1) large_size` byte then
+    three `(large_size+1)*16`-bit `layer_size` values. New
+    `meta::A1lx { large_size, layer_size: [u32; 3] }` with a
+    `documented_layers()` helper that counts the leading non-zero run
+    (= number of layers minus one).
+  - Both routed through `Property::A1op` / `Property::A1lx` (previously
+    fell into `Property::Other`) and surfaced on `AvifInfo` as
+    `operating_point: Option<A1op>` / `layered_index: Option<A1lx>`,
+    resolved on the primary item for both single-item and grid paths.
+  - Essential-property enforcement: `Meta::unsupported_essential_properties`
+    + `Meta::has_unsupported_essential_property` report any property that
+    is marked essential (the `ipma` association high bit) yet lands in
+    `Property::Other` — i.e. an essential property this crate cannot
+    interpret. Per av1-avif §2.3.2.1.2 + MIAF §7.3.5 a reader must not
+    process such an item. A recognised property (typed, even if only
+    ignored downstream) and any non-essential unknown property do not
+    block; a dangling association index that is essential does.
+  - Tests: +8 unit (`a1op`/`a1lx` field-width round-trips, `ipco`
+    dispatch, three essential-enforcement cases) + 3 integration
+    (synthetic single-item AVIF carrying `a1op`/`a1lx` surfaced through
+    `inspect`, the negative no-props path on the mono fixture, and an
+    essential-but-recognised `a1op` not blocking the item).
+
 - Round 81 — derived-image + entity-grouping + MIAF compliance. Container
   side gains a coordinated batch of HEIF surface that doesn't need the
   AV1 decoder (oxideav-av1 is a `NotImplemented` scaffold post the

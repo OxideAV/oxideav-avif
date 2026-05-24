@@ -26,7 +26,9 @@ still loses significant signal.
 |----------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `ftyp` brand check                     | accepts `avif` / `avis` / `mif1` / `msf1` / `miaf`                                                                                                         |
 | `meta` sub-boxes                       | `hdlr`, `pitm` (v0/v1), `iinf` (v0/v1) + `infe` (v2/v3), `iloc` (v0/v1/v2), `iref`, `iprp` / `ipco` / `ipma` (v0/v1, small + large property indices)       |
-| Item properties                        | `av1C`, `ispe`, `colr` (nclx + ICC), `pixi`, `pasp`, `irot`, `imir`, `clap`, `auxC`, `mdcv`, `clli`, `cclv`, `rloc`, `lsel`; unknown boxes retained as `Property::Other` so indices stay valid |
+| Item properties                        | `av1C`, `ispe`, `colr` (nclx + ICC), `pixi`, `pasp`, `irot`, `imir`, `clap`, `auxC`, `mdcv`, `clli`, `cclv`, `rloc`, `lsel`, `a1op`, `a1lx`; unknown boxes retained as `Property::Other` so indices stay valid |
+| AV1 layered properties (`a1op`/`a1lx`) | `a1op` operating-point selector (u8 `op_index`) + `a1lx` layered-image index (`layer_size[3]`, 16/32-bit fields, `documented_layers()`) parsed per av1-avif §2.3.2; surfaced via `AvifInfo::{operating_point, layered_index}` |
+| Essential-property enforcement         | `Meta::{unsupported_essential_properties, has_unsupported_essential_property}` flag any `ipma`-essential property that lands in `Property::Other`; a reader must not process such an item (av1-avif §2.3.2.1.2 + MIAF §7.3.5) |
 | Auxiliary classification (`AuxKind`)   | `auxC` URN routed to `Alpha` / `DepthMap` / `HdrGainMap` / `Other` covering MPEG, HEVC-HEIF, and Apple gain-map spellings; `AvifInfo` exposes `aux_items` + per-kind item-id helpers |
 | Derived images (`iovl`, `iden`)        | `iovl` ImageOverlay descriptor parsed (16-bit + 32-bit field widths, signed offsets); `iden` item-type constant exported. Composition pending an AV1 decoder for the sources |
 | Entity grouping (`grpl`)               | `GroupsListBox` walk emits typed `EntityGroup` per `EntityToGroupBox`; `altr` / `ster` / `eqiv` recognised via `is_alternates()` / `is_stereo_pair()` / `is_equivalence()` (HEIF §9.4) |
@@ -79,6 +81,44 @@ still loses significant signal.
 
 See `examples/diag_decode.rs` for a drop-in report of exactly which
 stage each input reaches.
+
+### Round 123 — AV1 layered-image properties + essential-property enforcement
+
+Two AV1-specific descriptive item properties that previously fell into
+`Property::Other` are now parsed and typed (av1-avif §2.3.2). Pure
+container box work — no AV1 decode dependency.
+
+* **`a1op` — OperatingPointSelectorProperty** (av1-avif §2.3.2.1). A bare
+  `ItemProperty` carrying a single `unsigned int(8) op_index` that
+  selects which AV1 operating point a scalable item should decode. New
+  `meta::A1op { op_index }`; the spec mandates the property be marked
+  essential.
+* **`a1lx` — AV1LayeredImageIndexingProperty** (av1-avif §2.3.2.3). A
+  `reserved(7) + large_size(1)` byte then three
+  `(large_size+1)*16`-bit `layer_size` values documenting the byte size
+  of every layer except the last. New
+  `meta::A1lx { large_size, layer_size: [u32; 3] }` with
+  `documented_layers()` (leading non-zero run = layer count − 1). Both
+  16-bit and 32-bit field widths handled; the spec forbids marking this
+  property essential.
+* Both surfaced on `AvifInfo` as `operating_point: Option<A1op>` and
+  `layered_index: Option<A1lx>`, resolved on the primary item for the
+  single-item and grid paths alike.
+* **Essential-property enforcement** (av1-avif §2.3.2.1.2 + MIAF §7.3.5).
+  The `ipma` essential bit was parsed but inert. `Meta::{
+  unsupported_essential_properties, has_unsupported_essential_property}`
+  now report any property flagged essential that this crate cannot
+  interpret (lands in `Property::Other`, or whose association index
+  dangles). A reader must not process such an item. Recognised
+  properties (typed, even if only ignored) and non-essential unknown
+  properties do not block.
+
+Test delta: +8 unit (`a1op`/`a1lx` round-trips at both field widths,
+`ipco` dispatch, three essential-enforcement cases) + 3 integration
+(synthetic `a1op`/`a1lx`-bearing AVIF through `inspect`, the negative
+no-props path, and an essential-but-recognised `a1op` not blocking).
+Standalone lib 138 (was 131); default lib 153; integration 44 + 1
+ignored (was 41 + 1).
 
 ### Round 81 — derived-image + entity-grouping + MIAF compliance
 
