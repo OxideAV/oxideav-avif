@@ -141,6 +141,26 @@ pub struct ItemInfo {
     /// Absolute URI type indicator (only populated when
     /// `item_type == 'uri '`).
     pub item_uri_type: Option<String>,
+    /// The 24-bit `flags` field from the enclosing `infe` `FullBox`
+    /// header. Spec: ISO/IEC 14496-12 §8.11.6.1 — bit 0 (`(flags & 1)
+    /// == 1`) signals that the item is a [hidden image item][HEIF
+    /// §6.4.2]: it shall not be displayed (e.g. as part of a derived
+    /// image only). Higher-numbered flag bits are reserved. We retain
+    /// the whole 24-bit value so callers can branch on future
+    /// extensions without re-parsing.
+    pub flags: u32,
+}
+
+impl ItemInfo {
+    /// True when bit 0 of the `infe` `flags` is set — the HEIF
+    /// hidden-image-item signal (ISO/IEC 23008-12 §6.4.2 + ISO/IEC
+    /// 14496-12 §8.11.6.1). Hidden items shall not be presented
+    /// directly by a reader (typical use: a base image item that only
+    /// exists as an input to a `tmap` / `iden` / `iovl` / `sato`
+    /// derivation, or an `auxl` auxiliary like the alpha plane).
+    pub fn is_hidden(&self) -> bool {
+        (self.flags & 0x01) == 0x01
+    }
 }
 
 /// One `iloc` extent (offset + length pair inside the referenced data
@@ -817,7 +837,7 @@ fn parse_iinf(payload: &[u8]) -> Result<Vec<ItemInfo>> {
 }
 
 fn parse_infe(payload: &[u8]) -> Result<ItemInfo> {
-    let (version, _flags, body) = parse_full_box(payload)?;
+    let (version, flags, body) = parse_full_box(payload)?;
     // Versions 2 and 3 are the ones used by AVIF / HEIF. Version 0/1
     // predate item_type and aren't legal for image items.
     let (id, _protection_index, item_type, mut cursor) = match version {
@@ -890,6 +910,7 @@ fn parse_infe(payload: &[u8]) -> Result<ItemInfo> {
         content_type,
         content_encoding,
         item_uri_type,
+        flags,
     })
 }
 

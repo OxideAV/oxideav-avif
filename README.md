@@ -28,7 +28,7 @@ still loses significant signal.
 | `meta` sub-boxes                       | `hdlr`, `pitm` (v0/v1), `iinf` (v0/v1) + `infe` (v2/v3), `iloc` (v0/v1/v2), `iref`, `iprp` / `ipco` / `ipma` (v0/v1, small + large property indices)       |
 | Item properties                        | `av1C`, `ispe`, `colr` (nclx + ICC), `pixi`, `pasp`, `irot`, `imir`, `clap`, `auxC`, `mdcv`, `clli`, `cclv`, `rloc`, `lsel`, `a1op`, `a1lx`; unknown boxes retained as `Property::Other` so indices stay valid |
 | Sample Transform (`sato`)              | descriptor parser + per-sample evaluator for av1-avif §4.2.3 — full operator table (negation/abs/not/bsr unary + sum/difference/product/quotient/and/or/xor/pow/min/max binary), all 4 bit-depth widths (8/16/32/64-bit intermediate), every spec assertion enforced (`token_count >= 1`, sample index ≤ `reference_count`, postfix order, stack discipline, single-element terminal stack, reserved-token rejection); composition into a reconstructed image deferred until oxideav-av1 ships a decoder |
-| Tone Map (`tmap`)                      | item-type four-CC detection + `AvifInfo::tmap_item_ids` enumeration; descriptor body parse (HEIF-defined) deferred |
+| Tone Map (`tmap`)                      | item-type four-CC detection + `AvifInfo::tmap_item_ids` enumeration + av1-avif §4.2.2 `should`-level compliance audit (`audit_tone_map` / `ToneMapCompliance`): `altr` group pairs the tmap with its base item; gain-map inputs (`dimg to_ids[1..]`) flagged hidden via `infe` flags low bit; aggregate via `AvifInfo::tone_map_compliance` / `tone_map_strict_compliant()`. HEIF-defined descriptor body parse still deferred pending an HEIF edition in `docs/image/heif/` |
 | AV1 layered properties (`a1op`/`a1lx`) | `a1op` operating-point selector (u8 `op_index`) + `a1lx` layered-image index (`layer_size[3]`, 16/32-bit fields, `documented_layers()`) parsed per av1-avif §2.3.2; surfaced via `AvifInfo::{operating_point, layered_index}` |
 | Essential-property enforcement         | `Meta::{unsupported_essential_properties, has_unsupported_essential_property}` flag any `ipma`-essential property that lands in `Property::Other`; a reader must not process such an item (av1-avif §2.3.2.1.2 + MIAF §7.3.5) |
 | Auxiliary classification (`AuxKind`)   | `auxC` URN routed to `Alpha` / `DepthMap` / `HdrGainMap` / `Other` covering MPEG, HEVC-HEIF, and Apple gain-map spellings; `AvifInfo` exposes `aux_items` + per-kind item-id helpers |
@@ -83,6 +83,52 @@ still loses significant signal.
 
 See `examples/diag_decode.rs` for a drop-in report of exactly which
 stage each input reaches.
+
+### Round 130 — Tone Map (`tmap`) av1-avif §4.2.2 compliance audit
+
+The HEIF-defined `'tmap'` descriptor body parse stays deferred (the
+only HEIF edition currently shipped in `docs/image/heif/` is the 2017
+first edition, which predates `tmap`). What av1-avif §4.2.2 *does*
+normatively require independently of the descriptor body is two
+file-shape `should` constraints, and this round audits both:
+
+1. The `tmap` item and its base image item (input `0` of the tmap's
+   `'dimg'` iref) should be grouped together by an `'altr'` entity
+   group, so legacy readers that don't understand `tmap` still pick a
+   valid alternate.
+2. Each gain-map input image item (`to_ids[1..]` of the same iref) of
+   the tmap should be a HEIF [hidden image item][HEIF §6.4.2]: the
+   `infe` FullBox `flags` low bit (`(flags & 0x01) == 1`) is set so a
+   legacy reader never surfaces the gain map as a primary picture.
+
+The new `oxideav_avif::derived::audit_tone_map(&Meta)` walker returns
+one `ToneMapCompliance { tmap_item_id, base_item_id,
+gain_map_item_ids, paired_in_altr, gain_maps_hidden,
+is_compliant(), missing() }` record per `'tmap'` item in `iinf`
+order. `AvifInfo::tone_map_compliance: Vec<ToneMapCompliance>` is
+populated by both the single-item and grid `build_info` paths;
+`AvifInfo::tone_map_strict_compliant()` returns the AND of every
+audit record (trivially `true` for files without any tmap items, so
+combine with `has_tone_map()` for a presence + compliance gate).
+
+`ItemInfo` now retains the 24-bit `infe` FullBox `flags` field
+(previously dropped on the floor) so the hidden-image-item check
+above can run without re-walking the box. `ItemInfo::is_hidden()`
+exposes the low-bit semantics (`(flags & 0x01) == 0x01`) and ignores
+the upper reserved bits.
+
+Test delta: +8 unit (`derived::tests::audit_tone_map_*` covering the
+two-`should` happy path with and without a gain map, both-fail surface
+with no `grpl` plus a visible gain map, `altr` group missing the tmap
+id, tmap with no `dimg` iref, empty audit list when no tmap items
+present, multiple tmap items returned in `iinf` order, plus an
+`ItemInfo::is_hidden` low-bit-semantics sweep across the 24-bit flag
+space). Default lib 182 (was 174); standalone lib 167 (was 159);
+integration 46 + 1 ignored unchanged.
+
+Followup: an HEIF edition (2022 / 3rd edition or later) shipped in
+`docs/image/heif/` would unblock the `tmap` descriptor body parse +
+the full tone-map composition path.
 
 ### Round 127 — Sample Transform Derived Image Item (`sato`) parser + evaluator
 

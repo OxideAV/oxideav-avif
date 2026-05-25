@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 130 — Tone Map Derived Image Item (`tmap`) compliance audit
+  (av1-avif v1.2.0 §4.2.2). The HEIF-defined `tmap` descriptor body
+  parse is intentionally out of scope (the only HEIF edition currently
+  shipped in `docs/image/heif/` is the 2017 first edition which
+  predates `tmap`); what av1-avif §4.2.2 *does* normatively require
+  independently of the body is two file-shape `should` constraints
+  this round audits:
+  1. The `tmap` item and its base image item (input `0` of the tmap's
+     `'dimg'` iref) should be grouped together by an `'altr'` entity
+     group so legacy readers still see a valid alternate.
+  2. Each gain-map input image item (`to_ids[1..]` of the same iref)
+     should be a HEIF [hidden image item][HEIF §6.4.2] (`infe` flags
+     low bit set) so it's never surfaced directly.
+  New surface: `derived::ToneMapCompliance` struct (per-item record),
+  `derived::audit_tone_map(&Meta)` walker, plus
+  `AvifInfo::tone_map_compliance: Vec<ToneMapCompliance>` populated in
+  both the single-item and grid `build_info` paths, with a summary
+  `AvifInfo::tone_map_strict_compliant()` predicate.
+- `ItemInfo` now retains the 24-bit `infe` FullBox `flags` field
+  (previously discarded). New `ItemInfo::is_hidden()` helper exposes
+  the HEIF §6.4.2 hidden-image bit (`(flags & 0x01) == 0x01`).
+- 8 new unit tests in `derived::tests` covering: full happy-path
+  pairing (one tmap + base + `altr`); compliance with a hidden gain
+  map; both-failures path (no `grpl` + visible gain map) surfacing
+  both `missing()` strings; `altr` group missing the tmap id;
+  tmap with no `dimg` iref at all; empty audit list when no tmap
+  items present; multiple tmap items returned in `iinf` declaration
+  order; `ItemInfo::is_hidden` low-bit semantics across the 24-bit
+  flag space.
+
 - Round 127 — Sample Transform Derived Image Item (`sato`) descriptor
   parser + evaluator (av1-avif v1.2.0 §4.2.3). Container-level only,
   no AV1 decode dependency. The descriptor is decoded with

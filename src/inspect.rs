@@ -169,6 +169,15 @@ pub struct AvifInfo {
     /// surfaced via [`Self::entity_group_count`] + a full `Meta::groups`
     /// walk.
     pub tmap_item_ids: Vec<u32>,
+    /// av1-avif §4.2.2 compliance audit results, one entry per `'tmap'`
+    /// item in [`Self::tmap_item_ids`] (same order). Each entry reports
+    /// whether the file pairs the tmap with its base image item in an
+    /// `'altr'` entity group and whether the gain-map input image
+    /// item(s) are flagged hidden. Empty when no tmap items are
+    /// present. Both checks are `should`s, not `shall`s — see
+    /// [`crate::derived::ToneMapCompliance`] for the strict-mode
+    /// interpretation.
+    pub tone_map_compliance: Vec<crate::derived::ToneMapCompliance>,
 }
 
 impl AvifInfo {
@@ -262,6 +271,17 @@ impl AvifInfo {
     /// Item (av1-avif §4.2.2 — `tmap`).
     pub fn has_tone_map(&self) -> bool {
         !self.tmap_item_ids.is_empty()
+    }
+
+    /// True when every `'tmap'` item in the file passes the av1-avif
+    /// §4.2.2 `should`-level audit (paired with its base item via an
+    /// `'altr'` group and every gain-map input marked hidden).
+    ///
+    /// Trivially `true` when the file ships no tmap items
+    /// ([`Self::has_tone_map`] is `false`) — callers that want a
+    /// presence + compliance signal should combine the two.
+    pub fn tone_map_strict_compliant(&self) -> bool {
+        self.tone_map_compliance.iter().all(|c| c.is_compliant())
     }
 
     /// True when the file's `ftyp` claims the `mif1` brand and every
@@ -504,6 +524,7 @@ pub(crate) fn build_info(
     };
     let sato_item_ids = img.meta.item_ids_of_type(&crate::meta::ITEM_TYPE_SATO);
     let tmap_item_ids = img.meta.item_ids_of_type(&crate::meta::ITEM_TYPE_TMAP);
+    let tone_map_compliance = crate::derived::audit_tone_map(&img.meta);
     Ok(AvifInfo {
         width,
         height,
@@ -535,6 +556,7 @@ pub(crate) fn build_info(
         layered_index,
         sato_item_ids,
         tmap_item_ids,
+        tone_map_compliance,
     })
 }
 
@@ -666,6 +688,7 @@ pub(crate) fn build_info_grid(
     };
     let sato_item_ids = hdr.meta.item_ids_of_type(&crate::meta::ITEM_TYPE_SATO);
     let tmap_item_ids = hdr.meta.item_ids_of_type(&crate::meta::ITEM_TYPE_TMAP);
+    let tone_map_compliance = crate::derived::audit_tone_map(&hdr.meta);
     Ok(AvifInfo {
         width: grid.output_width,
         height: grid.output_height,
@@ -697,6 +720,7 @@ pub(crate) fn build_info_grid(
         layered_index,
         sato_item_ids,
         tmap_item_ids,
+        tone_map_compliance,
     })
 }
 
@@ -886,6 +910,7 @@ mod tests {
             content_type: None,
             content_encoding: None,
             item_uri_type: None,
+            flags: 0,
         }
     }
 
@@ -897,6 +922,7 @@ mod tests {
             content_type: Some(content_type.to_string()),
             content_encoding: None,
             item_uri_type: None,
+            flags: 0,
         }
     }
 

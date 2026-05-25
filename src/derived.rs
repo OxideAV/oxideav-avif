@@ -29,7 +29,7 @@
 //! enumerate AVIF/HEIF alternates without rebuilding the container
 //! traversal.
 
-use crate::box_parser::{iter_boxes, parse_full_box, read_u16, read_u32, type_str, BoxType};
+use crate::box_parser::{b, iter_boxes, parse_full_box, read_u16, read_u32, type_str, BoxType};
 use crate::error::{AvifError as Error, Result};
 
 /// One placed image inside an `iovl` overlay descriptor (HEIF §6.6.2.2).
@@ -792,6 +792,139 @@ fn pow_truncated(base: i64, exp: i64) -> i64 {
     result
 }
 
+// ---------------------------------------------------------------------------
+// AV1-AVIF v1.2.0 §4.2.2 — Tone Map Derived Image Item (`tmap`) compliance
+// ---------------------------------------------------------------------------
+
+/// Result of an av1-avif §4.2.2 audit on a single `'tmap'` Tone Map
+/// Derived Image Item carried by the file.
+///
+/// The `tmap` descriptor body itself is defined by ISO/IEC 23008-12
+/// (HEIF) — its parse is **not** in scope here because the only HEIF
+/// edition shipped in `docs/image/heif/` is the 2017 first edition
+/// which predates `tmap`. What av1-avif §4.2.2 *does* normatively
+/// require, independently of the descriptor body, is two file-shape
+/// `should` constraints that this audit checks:
+///
+/// 1. **`altr` grouping.** The base image item (i.e. the input the
+///    tmap item references via `'dimg'`) and the `tmap` item should be
+///    grouped together by an `'altr'` entity group, so legacy readers
+///    that don't understand `tmap` still pick a valid alternate.
+/// 2. **Hidden gain map.** When the tmap derivation references a "gain
+///    map" input image item (the additional image input layered onto
+///    the base via tone mapping), that input should be a HEIF
+///    [hidden image item](crate::meta::ItemInfo::is_hidden) so a
+///    legacy reader never surfaces it as a primary picture.
+///
+/// Both are `should`, not `shall`, so a fail does not invalidate the
+/// file — it is purely informational for callers that want strict
+/// av1-avif §4.2.2 mode. [`Self::is_compliant`] reports the AND of
+/// both signals; [`Self::missing`] lists which checks failed.
+///
+/// `tmap` items carry their inputs in `'dimg'` iref entries whose
+/// `from_item_ID` is the `tmap` item id (per av1-avif §4.2.3.1
+/// SingleItemTypeReferenceBox conventions, the same shape `'sato'`
+/// uses). Convention in HEIF gain-map layouts is `to_ids[0]` =
+/// base image item, `to_ids[1..]` = gain map(s); we treat
+/// `to_ids[0]` as the base and every subsequent entry as a gain map.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct ToneMapCompliance {
+    /// The `'tmap'` item id this audit describes.
+    pub tmap_item_id: u32,
+    /// The base image item id (input `0` of the tmap's `dimg`), or
+    /// `None` when the tmap has no `dimg` iref / no inputs at all.
+    pub base_item_id: Option<u32>,
+    /// Every additional input image item id (`to_ids[1..]`) — these
+    /// are the gain map inputs the spec wants hidden. Empty when the
+    /// tmap has exactly one input (base only).
+    pub gain_map_item_ids: Vec<u32>,
+    /// True when *some* `'altr'` entity group pairs `tmap_item_id`
+    /// with `base_item_id` (av1-avif §4.2.2 first `should`).
+    /// False when no `grpl` is present, when no `altr` group lists
+    /// both ids, or when `base_item_id` is `None`.
+    pub paired_in_altr: bool,
+    /// True when every id in `gain_map_item_ids` is marked hidden
+    /// (`infe` flags low bit set; HEIF §6.4.2). Trivially true when
+    /// `gain_map_item_ids` is empty.
+    pub gain_maps_hidden: bool,
+}
+
+impl ToneMapCompliance {
+    /// True when both `should`s pass — there exists an `altr` group
+    /// pairing the tmap with its base item, and every gain-map input
+    /// is hidden.
+    pub fn is_compliant(&self) -> bool {
+        self.paired_in_altr && self.gain_maps_hidden
+    }
+
+    /// Human-readable list of failed checks. Returns an empty vector
+    /// when [`Self::is_compliant`].
+    pub fn missing(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if !self.paired_in_altr {
+            out.push("altr-pairs-base-and-tmap");
+        }
+        if !self.gain_maps_hidden {
+            out.push("gain-map-hidden");
+        }
+        out
+    }
+}
+
+/// Audit every `'tmap'` item carried in `meta` against the two av1-avif
+/// §4.2.2 `should` constraints. Returns one [`ToneMapCompliance`]
+/// record per tmap item, in `iinf` declaration order. The returned
+/// vector is empty when the file ships no tmap items.
+///
+/// Spec: av1-avif v1.2.0 §4.2.2 (Tone Map Derived Image Item) — the
+/// av1-avif clauses only; the HEIF-defined `tmap` descriptor body
+/// parse is intentionally out of scope here pending an HEIF edition
+/// with `tmap` semantics in `docs/image/heif/`.
+pub fn audit_tone_map(meta: &crate::meta::Meta) -> Vec<ToneMapCompliance> {
+    let tmap_type = crate::meta::ITEM_TYPE_TMAP;
+    let dimg = b(b"dimg");
+    let groups = meta.groups().unwrap_or_default();
+    meta.item_ids_of_type(&tmap_type)
+        .into_iter()
+        .map(|tmap_id| audit_one_tone_map(meta, &groups, &dimg, tmap_id))
+        .collect()
+}
+
+fn audit_one_tone_map(
+    meta: &crate::meta::Meta,
+    groups: &[EntityGroup],
+    dimg: &BoxType,
+    tmap_id: u32,
+) -> ToneMapCompliance {
+    let inputs = meta.iref_targets(dimg, tmap_id);
+    let base_item_id = inputs.first().copied();
+    let gain_map_item_ids: Vec<u32> = inputs.iter().skip(1).copied().collect();
+
+    // §4.2.2 first `should`: an `altr` group contains both the tmap and
+    // its base image item.
+    let paired_in_altr = match base_item_id {
+        Some(base) => groups.iter().any(|g| {
+            g.is_alternates() && g.entity_ids.contains(&tmap_id) && g.entity_ids.contains(&base)
+        }),
+        None => false,
+    };
+
+    // §4.2.2 second `should`: every gain-map input image item is
+    // hidden. Items missing from `iinf` (malformed iref) count as
+    // not-hidden — they fail the audit rather than silently passing.
+    let gain_maps_hidden = gain_map_item_ids
+        .iter()
+        .all(|id| meta.item_by_id(*id).is_some_and(|info| info.is_hidden()));
+
+    ToneMapCompliance {
+        tmap_item_id: tmap_id,
+        base_item_id,
+        gain_map_item_ids,
+        paired_in_altr,
+        gain_maps_hidden,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1338,5 +1471,216 @@ mod tests {
         let st = SampleTransform::parse(&payload, 3).unwrap();
         let err = st.evaluate(&[1, 2]).unwrap_err();
         assert!(format!("{err:?}").contains("out of range"));
+    }
+
+    // -------------------------------------------------------------------
+    // Tone Map compliance audit (av1-avif v1.2.0 §4.2.2)
+    // -------------------------------------------------------------------
+
+    use crate::meta::{IrefEntry, ItemInfo, Meta};
+
+    fn make_infe(id: u32, item_type: &[u8; 4], flags: u32) -> ItemInfo {
+        ItemInfo {
+            id,
+            item_type: *item_type,
+            name: String::new(),
+            content_type: None,
+            content_encoding: None,
+            item_uri_type: None,
+            flags,
+        }
+    }
+
+    /// Build a `grpl` payload containing one `altr` EntityToGroupBox
+    /// over the given ids.
+    fn build_altr_grpl(group_id: u32, ids: &[u32]) -> Vec<u8> {
+        let mut child = vec![0u8; 4]; // FullBox(version=0, flags=0)
+        child.extend_from_slice(&group_id.to_be_bytes());
+        child.extend_from_slice(&(ids.len() as u32).to_be_bytes());
+        for id in ids {
+            child.extend_from_slice(&id.to_be_bytes());
+        }
+        let size = (8 + child.len()) as u32;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&size.to_be_bytes());
+        buf.extend_from_slice(b"altr");
+        buf.extend_from_slice(&child);
+        buf
+    }
+
+    /// Happy path: one tmap item with one base (no gain map), grouped
+    /// with the base by an `altr` entity group. Compliant.
+    #[test]
+    fn audit_tone_map_altr_pairing_compliant() {
+        let meta = Meta {
+            items: vec![
+                make_infe(1, b"av01", 0), // base, visible
+                make_infe(2, b"tmap", 0), // tmap derived item
+            ],
+            irefs: vec![IrefEntry {
+                reference_type: *b"dimg",
+                from_id: 2,
+                to_ids: vec![1],
+            }],
+            grpl: Some(build_altr_grpl(7, &[1, 2])),
+            ..Meta::default()
+        };
+        let results = audit_tone_map(&meta);
+        assert_eq!(results.len(), 1);
+        let r = &results[0];
+        assert_eq!(r.tmap_item_id, 2);
+        assert_eq!(r.base_item_id, Some(1));
+        assert!(r.gain_map_item_ids.is_empty());
+        assert!(r.paired_in_altr);
+        assert!(r.gain_maps_hidden);
+        assert!(r.is_compliant());
+        assert!(r.missing().is_empty());
+    }
+
+    /// tmap + base + gain map, where the gain map is hidden as the
+    /// spec recommends. Should pass when there's also an `altr` group.
+    #[test]
+    fn audit_tone_map_hidden_gain_map_compliant() {
+        let meta = Meta {
+            items: vec![
+                make_infe(1, b"av01", 0),    // base, visible
+                make_infe(2, b"av01", 0x01), // gain map, hidden
+                make_infe(3, b"tmap", 0),    // tmap derived item
+            ],
+            irefs: vec![IrefEntry {
+                reference_type: *b"dimg",
+                from_id: 3,
+                to_ids: vec![1, 2],
+            }],
+            grpl: Some(build_altr_grpl(9, &[1, 3])),
+            ..Meta::default()
+        };
+        let r = &audit_tone_map(&meta)[0];
+        assert_eq!(r.base_item_id, Some(1));
+        assert_eq!(r.gain_map_item_ids, vec![2]);
+        assert!(r.paired_in_altr);
+        assert!(r.gain_maps_hidden);
+        assert!(r.is_compliant());
+    }
+
+    /// No `grpl` at all → `altr` pairing fails; visible gain map →
+    /// gain-map hidden check fails. Both `missing` entries surface.
+    #[test]
+    fn audit_tone_map_flags_both_failures() {
+        let meta = Meta {
+            items: vec![
+                make_infe(1, b"av01", 0), // base, visible
+                make_infe(2, b"av01", 0), // gain map NOT hidden
+                make_infe(3, b"tmap", 0),
+            ],
+            irefs: vec![IrefEntry {
+                reference_type: *b"dimg",
+                from_id: 3,
+                to_ids: vec![1, 2],
+            }],
+            grpl: None,
+            ..Meta::default()
+        };
+        let r = &audit_tone_map(&meta)[0];
+        assert!(!r.paired_in_altr);
+        assert!(!r.gain_maps_hidden);
+        assert!(!r.is_compliant());
+        let m = r.missing();
+        assert!(m.contains(&"altr-pairs-base-and-tmap"));
+        assert!(m.contains(&"gain-map-hidden"));
+    }
+
+    /// `grpl` present but the `altr` group lists only the base — the
+    /// pairing check should still fail when the tmap id is absent.
+    #[test]
+    fn audit_tone_map_altr_without_tmap_id_fails_pairing() {
+        let meta = Meta {
+            items: vec![make_infe(1, b"av01", 0), make_infe(2, b"tmap", 0)],
+            irefs: vec![IrefEntry {
+                reference_type: *b"dimg",
+                from_id: 2,
+                to_ids: vec![1],
+            }],
+            grpl: Some(build_altr_grpl(11, &[1, 99])), // tmap not in altr
+            ..Meta::default()
+        };
+        let r = &audit_tone_map(&meta)[0];
+        assert!(!r.paired_in_altr);
+        // No gain map → hidden check trivially true.
+        assert!(r.gain_maps_hidden);
+        assert!(!r.is_compliant());
+    }
+
+    /// A tmap with no `dimg` iref at all surfaces `base_item_id =
+    /// None` and fails the altr-pairing check (nothing to pair with).
+    #[test]
+    fn audit_tone_map_no_dimg_iref() {
+        let meta = Meta {
+            items: vec![make_infe(2, b"tmap", 0)],
+            irefs: vec![],
+            grpl: None,
+            ..Meta::default()
+        };
+        let r = &audit_tone_map(&meta)[0];
+        assert_eq!(r.base_item_id, None);
+        assert!(r.gain_map_item_ids.is_empty());
+        assert!(!r.paired_in_altr);
+        // No gain map → hidden check trivially true.
+        assert!(r.gain_maps_hidden);
+    }
+
+    /// File with no `tmap` items returns an empty audit list.
+    #[test]
+    fn audit_tone_map_empty_when_no_tmap_items() {
+        let meta = Meta {
+            items: vec![make_infe(1, b"av01", 0)],
+            ..Meta::default()
+        };
+        assert!(audit_tone_map(&meta).is_empty());
+    }
+
+    /// Multiple `tmap` items audited in `iinf` declaration order.
+    #[test]
+    fn audit_tone_map_reports_each_tmap_item() {
+        let meta = Meta {
+            items: vec![
+                make_infe(1, b"av01", 0),
+                make_infe(2, b"tmap", 0),
+                make_infe(3, b"av01", 0x01), // hidden
+                make_infe(4, b"tmap", 0),
+            ],
+            irefs: vec![
+                IrefEntry {
+                    reference_type: *b"dimg",
+                    from_id: 2,
+                    to_ids: vec![1],
+                },
+                IrefEntry {
+                    reference_type: *b"dimg",
+                    from_id: 4,
+                    to_ids: vec![1, 3],
+                },
+            ],
+            grpl: Some(build_altr_grpl(1, &[1, 2, 4])),
+            ..Meta::default()
+        };
+        let r = audit_tone_map(&meta);
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].tmap_item_id, 2);
+        assert_eq!(r[1].tmap_item_id, 4);
+        assert!(r[0].is_compliant());
+        assert!(r[1].is_compliant());
+    }
+
+    /// `ItemInfo::is_hidden` honours `flags & 0x01` and ignores higher
+    /// bits.
+    #[test]
+    fn item_info_is_hidden_reads_low_bit_only() {
+        assert!(!make_infe(1, b"av01", 0).is_hidden());
+        assert!(make_infe(1, b"av01", 0x01).is_hidden());
+        // High bits set but bit 0 clear → not hidden.
+        assert!(!make_infe(1, b"av01", 0xfffe).is_hidden());
+        // Mixed: bit 0 set + other bits set → hidden.
+        assert!(make_infe(1, b"av01", 0xff03).is_hidden());
     }
 }

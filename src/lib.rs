@@ -10,7 +10,11 @@
 //!   `irot`, `imir`, `clap`, `auxC`, `mdcv`, `clli`, `cclv`,
 //!   `a1op`, `a1lx`. Derived-image carriers: `iovl` / `iden` /
 //!   `grid` / `sato` (Sample Transform — av1-avif v1.2.0 §4.2.3) /
-//!   `tmap` item-type detection.
+//!   `tmap` item-type detection plus an av1-avif §4.2.2 `should`-
+//!   level compliance audit ([`audit_tone_map`] /
+//!   [`ToneMapCompliance`]) covering the `altr` pairing + hidden
+//!   gain-map signals (the HEIF-defined descriptor body parse is
+//!   pending an HEIF edition in `docs/image/heif/`).
 //! * Primary item resolution via `pitm`, file-offset extent reads via
 //!   `iloc`, brand check accepting `avif` / `avis` / `mif1` / `msf1` /
 //!   `miaf`.
@@ -94,7 +98,8 @@ pub use cicp::{
     primaries_name, transfer_name, CicpTriple,
 };
 pub use derived::{
-    parse_grpl, EntityGroup, ImageOverlay, Mif1Compliance, OverlayEntry, SampleTransform, Token,
+    audit_tone_map, parse_grpl, EntityGroup, ImageOverlay, Mif1Compliance, OverlayEntry,
+    SampleTransform, Token, ToneMapCompliance,
 };
 pub use error::{AvifError, Result};
 pub use grid::{composite_grid, ImageGrid};
