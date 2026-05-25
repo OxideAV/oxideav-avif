@@ -162,12 +162,13 @@ pub struct AvifInfo {
     pub sato_item_ids: Vec<u32>,
     /// Item IDs of every Tone Map Derived Image Item carried in the
     /// file (av1-avif v1.2.0 §4.2.2 — `'tmap'`). Detection: `infe.item_type
-    /// == 'tmap'`. Descriptor parsing is HEIF-defined and not implemented
-    /// here yet; the field exists so callers can detect the carrier and
-    /// gracefully degrade. Empty for files without any tone-map
-    /// derivation. The `altr` group pairing this with the base item is
-    /// surfaced via [`Self::entity_group_count`] + a full `Meta::groups`
-    /// walk.
+    /// == 'tmap'`. The HEIF-defined descriptor body parse is not
+    /// implemented here yet (pending an HEIF edition in
+    /// `docs/image/heif/`); the field exists so callers can detect the
+    /// carrier and gracefully degrade. Empty for files without any
+    /// tone-map derivation. The av1-avif §4.2.2 file-shape `should`
+    /// constraints (altr pairing + hidden gain-map) are surfaced
+    /// separately via [`Self::tone_map_compliance`].
     pub tmap_item_ids: Vec<u32>,
     /// av1-avif §4.2.2 compliance audit results, one entry per `'tmap'`
     /// item in [`Self::tmap_item_ids`] (same order). Each entry reports
