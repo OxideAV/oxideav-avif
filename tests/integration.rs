@@ -2673,3 +2673,228 @@ fn grid_tile_edge_geometry_round_trips() {
     assert!((2u32 * grid.columns as u32) >= grid.output_width);
     assert!((2u32 * grid.rows as u32) >= grid.output_height);
 }
+
+// ---------------------------------------------------------------------
+// Round 127 — sato (Sample Transform) item-type detection (av1-avif
+// v1.2.0 §4.2.3).
+// ---------------------------------------------------------------------
+
+/// Build a minimal synthetic AVIF that ships:
+///
+/// * Item 1 — `av01` primary (8×8 monochrome, OBU bytes are placeholder
+///   `0xAA`).
+/// * Item 2 — `sato` Sample Transform derived item whose descriptor body
+///   is a 1-token `Sample(1)` expression (the identity transform — copy
+///   sample from input image 1 to the output).
+/// * `dimg` iref from item 2 → item 1 (the input image for the
+///   sample-transform expression).
+///
+/// The synthesised file omits item-property associations for the `sato`
+/// item entirely (HEIF lets a derived item inherit pixi/ispe from its
+/// inputs, av1-avif §4.2.3.1). The point of the fixture is to drive the
+/// item-type enumeration + descriptor parse path; pixel-level
+/// composition is out of scope until oxideav-av1 is rebuilt.
+fn build_synthetic_avif_with_sato() -> Vec<u8> {
+    fn u32be(v: u32) -> [u8; 4] {
+        v.to_be_bytes()
+    }
+    fn u16be(v: u16) -> [u8; 2] {
+        v.to_be_bytes()
+    }
+    fn box_bytes(btype: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let size = (8 + body.len()) as u32;
+        let mut out = size.to_be_bytes().to_vec();
+        out.extend_from_slice(btype);
+        out.extend_from_slice(body);
+        out
+    }
+    fn full_box(btype: &[u8; 4], version: u8, flags: u32, body: &[u8]) -> Vec<u8> {
+        let mut payload = vec![
+            version,
+            (flags >> 16) as u8,
+            (flags >> 8) as u8,
+            flags as u8,
+        ];
+        payload.extend_from_slice(body);
+        box_bytes(btype, &payload)
+    }
+    fn infe_v2(id: u16, item_type: &[u8; 4]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&id.to_be_bytes());
+        body.extend_from_slice(&[0u8, 0]);
+        body.extend_from_slice(item_type);
+        body.push(0);
+        full_box(b"infe", 2, 0, &body)
+    }
+
+    // ---- ftyp ----
+    let mut ftyp_body = Vec::new();
+    ftyp_body.extend_from_slice(b"avif");
+    ftyp_body.extend_from_slice(&u32be(0));
+    ftyp_body.extend_from_slice(b"mif1");
+    ftyp_body.extend_from_slice(b"miaf");
+    let ftyp = box_bytes(b"ftyp", &ftyp_body);
+
+    // ---- hdlr ----
+    let mut hdlr_body = Vec::new();
+    hdlr_body.extend_from_slice(&[0u8; 4]);
+    hdlr_body.extend_from_slice(b"pict");
+    hdlr_body.extend_from_slice(&[0u8; 12]);
+    hdlr_body.extend_from_slice(b"\0");
+    let hdlr = full_box(b"hdlr", 0, 0, &hdlr_body);
+
+    // ---- pitm → item 1 (av01) ----
+    let pitm = full_box(b"pitm", 0, 0, &u16be(1));
+
+    // ---- iinf with item 1 = av01 and item 2 = sato ----
+    let infe1 = infe_v2(1, b"av01");
+    let infe2 = infe_v2(2, b"sato");
+    let mut iinf_body = Vec::new();
+    iinf_body.extend_from_slice(&u16be(2));
+    iinf_body.extend_from_slice(&infe1);
+    iinf_body.extend_from_slice(&infe2);
+    let iinf = full_box(b"iinf", 0, 0, &iinf_body);
+
+    // ---- iref dimg: from item 2 → [item 1] ----
+    let mut dimg_body = Vec::new();
+    dimg_body.extend_from_slice(&u16be(2));
+    dimg_body.extend_from_slice(&u16be(1));
+    dimg_body.extend_from_slice(&u16be(1));
+    let dimg_box = box_bytes(b"dimg", &dimg_body);
+    let iref = full_box(b"iref", 0, 0, &dimg_box);
+
+    // ---- properties: ispe + av1C + pixi, all attached to item 1 ----
+    let mut ipco_body = Vec::new();
+    let mut ispe_body = Vec::new();
+    ispe_body.extend_from_slice(&u32be(8));
+    ispe_body.extend_from_slice(&u32be(8));
+    let ispe = full_box(b"ispe", 0, 0, &ispe_body);
+    ipco_body.extend_from_slice(&ispe);
+    let av1c = box_bytes(b"av1C", &[0x81u8, 0, 0, 0]);
+    ipco_body.extend_from_slice(&av1c);
+    let mut pixi_body = vec![0u8; 4];
+    pixi_body.push(1);
+    pixi_body.push(8);
+    let pixi = box_bytes(b"pixi", &pixi_body);
+    ipco_body.extend_from_slice(&pixi);
+    let ipco = box_bytes(b"ipco", &ipco_body);
+
+    // ipma: item 1 -> [1, 2, 3]
+    let mut ipma_body = Vec::new();
+    ipma_body.extend_from_slice(&u32be(1));
+    ipma_body.extend_from_slice(&1u16.to_be_bytes());
+    ipma_body.push(3);
+    ipma_body.push(1);
+    ipma_body.push(2);
+    ipma_body.push(3);
+    let ipma = full_box(b"ipma", 0, 0, &ipma_body);
+
+    let mut iprp_body = Vec::new();
+    iprp_body.extend_from_slice(&ipco);
+    iprp_body.extend_from_slice(&ipma);
+    let iprp = box_bytes(b"iprp", &iprp_body);
+
+    // ---- item bodies ----
+    // Item 1: 8 bytes of OBU placeholder. Item 2: a 3-byte sato body
+    // (header byte 0, token_count = 1, token = Sample(1)).
+    let obu_data = vec![0xAAu8; 8];
+    let sato_body = vec![0u8, 1, 1];
+
+    // ---- iloc: two items with 1 extent each ----
+    // version=0 → offset_size=4, length_size=4, base_offset_size=0,
+    // index_size=0 (high nibble of byte 1 + low nibble of byte 0:
+    // here we emit 0x44 / 0x00 — same as the layered fixture).
+    let ftyp_size = ftyp.len();
+    let iloc_size = 8 + 4 + 1 + 1 + 2 + 14 * 2; // header + 4 (version/flags) + item_count + offset_size + (per-item 14)
+    let meta_payload_size =
+        4 + hdlr.len() + pitm.len() + iinf.len() + iref.len() + iprp.len() + iloc_size;
+    let meta_size = 8 + meta_payload_size;
+    let mdat_start = ftyp_size + meta_size + 8;
+    let item1_off = mdat_start;
+    let item2_off = mdat_start + obu_data.len();
+
+    let mut iloc_inner = Vec::new();
+    iloc_inner.push(0x44); // offset_size=4, length_size=4
+    iloc_inner.push(0x00); // base_offset_size=0, index_size=0
+    iloc_inner.extend_from_slice(&u16be(2)); // item_count
+
+    // item 1
+    iloc_inner.extend_from_slice(&u16be(1)); // item_id
+    iloc_inner.extend_from_slice(&u16be(0)); // data_reference_index
+    iloc_inner.extend_from_slice(&u16be(1)); // extent_count
+    iloc_inner.extend_from_slice(&u32be(item1_off as u32));
+    iloc_inner.extend_from_slice(&u32be(obu_data.len() as u32));
+    // item 2
+    iloc_inner.extend_from_slice(&u16be(2));
+    iloc_inner.extend_from_slice(&u16be(0));
+    iloc_inner.extend_from_slice(&u16be(1));
+    iloc_inner.extend_from_slice(&u32be(item2_off as u32));
+    iloc_inner.extend_from_slice(&u32be(sato_body.len() as u32));
+    let iloc = full_box(b"iloc", 0, 0, &iloc_inner);
+
+    let mut meta_body = Vec::new();
+    meta_body.extend_from_slice(&[0u8; 4]); // FullBox header for meta
+    meta_body.extend_from_slice(&hdlr);
+    meta_body.extend_from_slice(&pitm);
+    meta_body.extend_from_slice(&iinf);
+    meta_body.extend_from_slice(&iref);
+    meta_body.extend_from_slice(&iprp);
+    meta_body.extend_from_slice(&iloc);
+    let meta = box_bytes(b"meta", &meta_body);
+    assert_eq!(meta.len(), meta_size, "meta size recalc");
+
+    // ---- mdat: item 1 bytes followed by item 2 bytes ----
+    let mut mdat_payload = Vec::new();
+    mdat_payload.extend_from_slice(&obu_data);
+    mdat_payload.extend_from_slice(&sato_body);
+    let mdat = box_bytes(b"mdat", &mdat_payload);
+
+    let mut file = Vec::new();
+    file.extend_from_slice(&ftyp);
+    file.extend_from_slice(&meta);
+    file.extend_from_slice(&mdat);
+    file
+}
+
+/// `AvifInfo::sato_item_ids` enumerates Sample Transform Derived Image
+/// Items detected via `infe.item_type == 'sato'`. The descriptor body
+/// resolved through [`item_payload_bytes`] then round-trips through
+/// [`SampleTransform::parse`] with the parallel `dimg` iref's
+/// reference_count.
+#[test]
+fn inspect_surfaces_sato_item_ids_and_descriptor_parses() {
+    use oxideav_avif::derived::SampleTransform;
+    use oxideav_avif::{inspect, item_payload_bytes, Token};
+
+    let bytes = build_synthetic_avif_with_sato();
+    let info = inspect(&bytes).expect("inspect");
+    // Primary is still item 1 (the av01 source).
+    assert_eq!(info.width, 8);
+    assert_eq!(info.height, 8);
+    assert_eq!(info.sato_item_ids, vec![2]);
+    assert!(info.has_sample_transform());
+    assert!(!info.has_tone_map());
+    assert!(info.tmap_item_ids.is_empty());
+
+    let payload = item_payload_bytes(&bytes, 2).expect("resolve sato item");
+    // The fixture's dimg iref maps from item 2 → [item 1], so
+    // reference_count = 1.
+    let st = SampleTransform::parse(&payload, 1).expect("parse sato descriptor");
+    assert_eq!(st.version, 0);
+    assert_eq!(st.bit_depth, 0);
+    assert_eq!(st.tokens, vec![Token::Sample(1)]);
+    // Identity expression: evaluating with input sample = 42 should
+    // yield 42.
+    assert_eq!(st.evaluate(&[42]).unwrap(), 42);
+}
+
+/// Files without any `sato` carriers have an empty `sato_item_ids`
+/// list and report `has_sample_transform() == false`.
+#[test]
+fn inspect_reports_no_sato_for_typical_files() {
+    let info = inspect(MONO).expect("inspect monochrome");
+    assert!(info.sato_item_ids.is_empty());
+    assert!(!info.has_sample_transform());
+    assert!(info.tmap_item_ids.is_empty());
+    assert!(!info.has_tone_map());
+}

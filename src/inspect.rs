@@ -152,6 +152,23 @@ pub struct AvifInfo {
     /// so a caller can extract individual layers of an operating point.
     /// Non-essential; `None` for non-layered items.
     pub layered_index: Option<crate::meta::A1lx>,
+    /// Item IDs of every Sample Transform Derived Image Item carried in
+    /// the file (av1-avif v1.2.0 §4.2.3). Detection: `infe.item_type ==
+    /// 'sato'`. The descriptor bytes live in `mdat` (resolve via
+    /// [`item_payload_bytes`]) and parse with
+    /// [`crate::derived::SampleTransform::parse`] given the parallel
+    /// `dimg` iref's reference_count. Empty for files without any
+    /// sample-transform derivation.
+    pub sato_item_ids: Vec<u32>,
+    /// Item IDs of every Tone Map Derived Image Item carried in the
+    /// file (av1-avif v1.2.0 §4.2.2 — `'tmap'`). Detection: `infe.item_type
+    /// == 'tmap'`. Descriptor parsing is HEIF-defined and not implemented
+    /// here yet; the field exists so callers can detect the carrier and
+    /// gracefully degrade. Empty for files without any tone-map
+    /// derivation. The `altr` group pairing this with the base item is
+    /// surfaced via [`Self::entity_group_count`] + a full `Meta::groups`
+    /// walk.
+    pub tmap_item_ids: Vec<u32>,
 }
 
 impl AvifInfo {
@@ -231,6 +248,20 @@ impl AvifInfo {
     /// gain-map URN.
     pub fn has_hdr_gain_map(&self) -> bool {
         self.hdr_gain_map_item_id.is_some()
+    }
+
+    /// True when the file ships at least one Sample Transform Derived
+    /// Image Item (av1-avif §4.2.3 — `sato`). The descriptor for each
+    /// item ID in [`Self::sato_item_ids`] can be parsed with
+    /// [`crate::derived::SampleTransform::parse`].
+    pub fn has_sample_transform(&self) -> bool {
+        !self.sato_item_ids.is_empty()
+    }
+
+    /// True when the file ships at least one Tone Map Derived Image
+    /// Item (av1-avif §4.2.2 — `tmap`).
+    pub fn has_tone_map(&self) -> bool {
+        !self.tmap_item_ids.is_empty()
     }
 
     /// True when the file's `ftyp` claims the `mif1` brand and every
@@ -471,6 +502,8 @@ pub(crate) fn build_info(
         Some(Property::A1lx(a)) => Some(*a),
         _ => None,
     };
+    let sato_item_ids = img.meta.item_ids_of_type(&crate::meta::ITEM_TYPE_SATO);
+    let tmap_item_ids = img.meta.item_ids_of_type(&crate::meta::ITEM_TYPE_TMAP);
     Ok(AvifInfo {
         width,
         height,
@@ -500,6 +533,8 @@ pub(crate) fn build_info(
         mif1_compliance,
         operating_point,
         layered_index,
+        sato_item_ids,
+        tmap_item_ids,
     })
 }
 
@@ -629,6 +664,8 @@ pub(crate) fn build_info_grid(
         Some(Property::A1lx(a)) => Some(*a),
         _ => None,
     };
+    let sato_item_ids = hdr.meta.item_ids_of_type(&crate::meta::ITEM_TYPE_SATO);
+    let tmap_item_ids = hdr.meta.item_ids_of_type(&crate::meta::ITEM_TYPE_TMAP);
     Ok(AvifInfo {
         width: grid.output_width,
         height: grid.output_height,
@@ -658,6 +695,8 @@ pub(crate) fn build_info_grid(
         mif1_compliance,
         operating_point,
         layered_index,
+        sato_item_ids,
+        tmap_item_ids,
     })
 }
 

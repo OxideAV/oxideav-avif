@@ -9,6 +9,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 127 — Sample Transform Derived Image Item (`sato`) descriptor
+  parser + evaluator (av1-avif v1.2.0 §4.2.3). Container-level only,
+  no AV1 decode dependency. The descriptor is decoded with
+  `oxideav_avif::derived::SampleTransform::parse(payload,
+  reference_count)`; the strict parser enforces every spec assertion
+  (`66976029` non-zero `token_count`, `1f569fa5` sample-index ≤
+  `reference_count`, `989adc85` postfix order, `98b07e13` unary stack
+  pre-condition, `75c5cbbc` binary stack pre-condition, `bac41e3a`
+  single-element terminal stack, reserved-token rejection per
+  §4.2.3.3). A relaxed counterpart (`parse_relaxed`) surfaces reserved
+  tokens as `Token::Reserved(u8)` for diagnostic dumps. The full
+  operator table is implemented: unary `negation` / `abs` / `not` /
+  `bsr` (Table 2 rows 64..=67), binary `sum` / `difference` /
+  `product` / `quotient` / `and` / `or` / `xor` / `pow` / `min` /
+  `max` (rows 128..=137), `Constant` (row 0) with bit-depth-keyed
+  field width (1 / 2 / 4 / 8 bytes for `bit_depth` 0..=3 per Table
+  1), and `Sample(n)` (1-based input index). `SampleTransform::
+  evaluate(&inputs)` walks the postfix expression to produce one
+  output sample value; intermediate arithmetic saturates at i64 then
+  clamps to the `num_bits` precision per §4.2.3.3 underflow / overflow
+  rule. Composition into a reconstructed image is deferred until
+  `oxideav-av1` exposes a decoder again.
+- New `meta::ITEM_TYPE_SATO` + `meta::ITEM_TYPE_TMAP` four-CC
+  constants and a generic `Meta::item_ids_of_type(&four_cc)` walker
+  for enumerating derived-image carriers by type.
+- `AvifInfo` surfaces `sato_item_ids: Vec<u32>` + `tmap_item_ids:
+  Vec<u32>` populated by both the single-item and grid `build_info`
+  paths, with `has_sample_transform()` / `has_tone_map()` predicates
+  for callers that only need a presence gate. The Tone Map carrier
+  side parses the item-type four-CC only; the HEIF-defined `tmap`
+  descriptor body parse is a follow-up.
+- 21 new unit tests in `derived::tests` covering: round-trip parse +
+  evaluation at every `bit_depth` (0..=3 → 8/16/32/64-bit
+  intermediate); two-sample postfix sum and difference (right-pop-
+  first ordering verified); the av1-avif Appendix A
+  MSB/residual recombination example
+  (`Sample(1) Const(2) Const(8) pow product Sample(2) sum` =
+  `(msb << 8) | residual`); unary negation; unary `bsr` (0 for
+  `L <= 0`, `truncate(log2(L))` for `L > 0`); quotient with `R == 0`
+  returning `L`; pow with `L == 0` returning `0`; min / max; rejection
+  of `token_count = 0`, non-zero `version`, sample index >
+  `reference_count`, every reserved-byte range (33..=63, 68..=127,
+  138..=255), binary op with insufficient operands, expression with
+  leftover stack, truncated token stream, truncated constant payload;
+  Token classification helpers; min/max value per bit-depth; and the
+  graceful error path when `evaluate` receives fewer inputs than the
+  expression dereferences. 2 new integration tests build a synthetic
+  AVIF with an `av01` primary + `sato` derived item linked by `dimg`
+  and exercise the full pipeline: `inspect` returns the right
+  `sato_item_ids`, `item_payload_bytes` resolves the descriptor body
+  through `iloc`, and `SampleTransform::parse` round-trips the
+  identity (`Sample(1)`) expression. The companion "no sato in
+  typical files" test pins the Microsoft monochrome fixture's
+  baseline.
+
 - Round 123 — AV1 layered-image item properties + essential-property
   enforcement (av1-avif §2.3.2 + MIAF §7.3.5). Container-level box work,
   no AV1 decode dependency:

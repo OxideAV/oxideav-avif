@@ -70,6 +70,11 @@ const A1LX: BoxType = b(b"a1lx");
 pub const ITEM_TYPE_IOVL: BoxType = b(b"iovl");
 /// HEIF §6.6.2.1 — identity-transform derived-image type.
 pub const ITEM_TYPE_IDEN: BoxType = b(b"iden");
+/// av1-avif v1.2.0 §4.2.3.1 — Sample Transform derived-image type.
+pub const ITEM_TYPE_SATO: BoxType = b(b"sato");
+/// av1-avif v1.2.0 §4.2.2 — Tone Map derived-image type. The
+/// descriptor body itself is defined in HEIF; AVIF reuses it.
+pub const ITEM_TYPE_TMAP: BoxType = b(b"tmap");
 
 /// Auxiliary-image type URN classification (HEIF §6.5.8, av1-avif §4).
 ///
@@ -743,6 +748,18 @@ impl Meta {
             }
         }
         out
+    }
+
+    /// Item IDs whose `infe` declares `item_type` matching `target`.
+    /// Useful for enumerating derived-image carriers (e.g. `sato`,
+    /// `iovl`, `iden`, `grid`, `tmap`) without rewalking the meta
+    /// item list manually.
+    pub fn item_ids_of_type(&self, target: &BoxType) -> Vec<u32> {
+        self.items
+            .iter()
+            .filter(|it| it.item_type == *target)
+            .map(|it| it.id)
+            .collect()
     }
 }
 

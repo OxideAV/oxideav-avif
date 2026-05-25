@@ -27,6 +27,8 @@ still loses significant signal.
 | `ftyp` brand check                     | accepts `avif` / `avis` / `mif1` / `msf1` / `miaf`                                                                                                         |
 | `meta` sub-boxes                       | `hdlr`, `pitm` (v0/v1), `iinf` (v0/v1) + `infe` (v2/v3), `iloc` (v0/v1/v2), `iref`, `iprp` / `ipco` / `ipma` (v0/v1, small + large property indices)       |
 | Item properties                        | `av1C`, `ispe`, `colr` (nclx + ICC), `pixi`, `pasp`, `irot`, `imir`, `clap`, `auxC`, `mdcv`, `clli`, `cclv`, `rloc`, `lsel`, `a1op`, `a1lx`; unknown boxes retained as `Property::Other` so indices stay valid |
+| Sample Transform (`sato`)              | descriptor parser + per-sample evaluator for av1-avif §4.2.3 — full operator table (negation/abs/not/bsr unary + sum/difference/product/quotient/and/or/xor/pow/min/max binary), all 4 bit-depth widths (8/16/32/64-bit intermediate), every spec assertion enforced (`token_count >= 1`, sample index ≤ `reference_count`, postfix order, stack discipline, single-element terminal stack, reserved-token rejection); composition into a reconstructed image deferred until oxideav-av1 ships a decoder |
+| Tone Map (`tmap`)                      | item-type four-CC detection + `AvifInfo::tmap_item_ids` enumeration; descriptor body parse (HEIF-defined) deferred |
 | AV1 layered properties (`a1op`/`a1lx`) | `a1op` operating-point selector (u8 `op_index`) + `a1lx` layered-image index (`layer_size[3]`, 16/32-bit fields, `documented_layers()`) parsed per av1-avif §2.3.2; surfaced via `AvifInfo::{operating_point, layered_index}` |
 | Essential-property enforcement         | `Meta::{unsupported_essential_properties, has_unsupported_essential_property}` flag any `ipma`-essential property that lands in `Property::Other`; a reader must not process such an item (av1-avif §2.3.2.1.2 + MIAF §7.3.5) |
 | Auxiliary classification (`AuxKind`)   | `auxC` URN routed to `Alpha` / `DepthMap` / `HdrGainMap` / `Other` covering MPEG, HEVC-HEIF, and Apple gain-map spellings; `AvifInfo` exposes `aux_items` + per-kind item-id helpers |
@@ -81,6 +83,65 @@ still loses significant signal.
 
 See `examples/diag_decode.rs` for a drop-in report of exactly which
 stage each input reaches.
+
+### Round 127 — Sample Transform Derived Image Item (`sato`) parser + evaluator
+
+The av1-avif v1.2.0 §4.2.3 Sample Transform derived-image carrier is
+now fully decoded at the container layer. `oxideav_avif::derived::
+SampleTransform::parse(payload, reference_count)` decodes a `sato`
+descriptor's postfix-notation expression into a typed
+`Vec<Token>` (Token = `Constant(i64) | Sample(u8) | Unary(u8) |
+Binary(u8) | Reserved(u8)`), checking every spec assertion before
+returning:
+
+* Header layout: `version:2 | reserved:4 | bit_depth:2` then a
+  `token_count: u8` then `token_count` tokens. `version` must be 0;
+  `token_count` must be ≥ 1; `bit_depth` selects an 8/16/32/64-bit
+  intermediate precision per Table 1 and, for `Constant` tokens, the
+  byte width of the inline literal.
+* Operator table: unary `negation` / `abs` / `not` / `bsr` (Table 2
+  rows 64..=67); binary `sum` / `difference` / `product` / `quotient` /
+  `and` / `or` / `xor` / `pow` / `min` / `max` (rows 128..=137).
+  `Sample(n)` tokens (`1..=32`) are 1-based input-image indices into
+  the parallel `dimg` iref's `to_ids`; the parser rejects any value
+  exceeding the `reference_count` argument per §4.2.3.4.
+* Reserved-token rejection: values in `33..=63`, `68..=127`, and
+  `138..=255` cause `parse` to error. A `parse_relaxed` counterpart
+  surfaces them as `Token::Reserved(raw)` for diagnostic dumps.
+* Stack discipline: parse-time validation enforces every constraint
+  from §4.2.3.4 — unary tokens require ≥ 1 element on the stack,
+  binary tokens require ≥ 2, the final expression must leave exactly
+  one element on the stack. Underflowing expressions are rejected
+  before the descriptor is handed back.
+
+`SampleTransform::evaluate(&inputs)` walks the parsed expression to
+produce one output sample value. Intermediate arithmetic saturates at
+`i64` then clamps to the `num_bits` precision per the §4.2.3.3
+underflow / overflow rule (replaced by `-2^(num_bits-1)` /
+`2^(num_bits-1)-1`); the caller is responsible for the final clamp
+into the reconstructed item's `PixelInformationProperty` bit depth.
+Composition of an actual `sato` reconstructed image is deferred
+until `oxideav-av1` ships a decoder again — for now the descriptor
+parse path is enough to validate files and reason about their layout.
+
+Item-type enumeration: `meta::ITEM_TYPE_SATO` + `meta::ITEM_TYPE_TMAP`
+constants land alongside `IOVL` / `IDEN`, and the new
+`Meta::item_ids_of_type(&four_cc)` walker enumerates derived-image
+carriers by type. `AvifInfo::sato_item_ids` / `tmap_item_ids` are
+populated by both the single-item and grid `build_info` paths;
+`AvifInfo::has_sample_transform()` / `has_tone_map()` predicates give
+callers a one-call presence gate. The Tone Map carrier currently
+parses only the item-type four-CC; the HEIF-defined `tmap` descriptor
+body is a follow-up.
+
+Test delta: +21 unit (`derived::tests::sato_*` — bit-depth coverage,
+operator semantics, evaluation of the Appendix A MSB/residual
+recombination example, reserved-token rejection per range, stack
+discipline, truncated payloads, classification helpers) and +2
+integration (synthetic AVIF with `av01` primary + `sato` derived
+item linked by `dimg`, plus a negative on the Microsoft monochrome
+fixture). Standalone lib 159 (was 138); default lib 174 (was 153);
+integration 46 + 1 ignored (was 44 + 1).
 
 ### Round 123 — AV1 layered-image properties + essential-property enforcement
 
