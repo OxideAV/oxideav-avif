@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 172 — av1-avif v1.2.0 §7 General-constraints
+  transformative-property audit for grid derivation chains. The §7
+  `shall` "Transformative properties shall not be associated with items
+  in a derivation chain that serves as an input to a grid derived image
+  item" is now validated at the container layer via
+  `oxideav_avif::derived::audit_grid_derivations(&Meta)`, returning one
+  `GridDerivationAudit { grid_item_id, tile_item_ids, offenders,
+  is_compliant(), offending_tile_ids() }` record per `'grid'` item in
+  `iinf` declaration order. Each record lists the offending
+  `(tile_item_id, property_kind)` pairs (transformative properties
+  recognised: `'clap'`, `'irot'`, `'imir'`) attached to any tile in the
+  grid's `'dimg'` derivation chain. Transformative properties on the
+  grid item itself are explicitly permitted by §7 and don't surface.
+- `AvifInfo::grid_derivation_compliance:
+  Vec<crate::derived::GridDerivationAudit>` populated by both the
+  single-item and grid `build_info` paths, plus
+  `AvifInfo::grid_derivations_strict_compliant()` predicate folding
+  every record into a single boolean (trivially `true` when no grid
+  items present, so combine with `is_grid` for a presence + compliance
+  gate).
+- 7 new unit tests in `derived::tests` covering: clean derivation chain
+  with grid-level `irot` (permitted by §7 — the audit must not flag the
+  grid item itself); single tile carrying `irot` flagged as an
+  offender; one tile carrying all three transformative kinds emits
+  three offender entries in stable `(clap, irot, imir)` order; two
+  tiles offending in different ways with the unique-tile-id list
+  collapsing duplicates; empty audit list when no grid items present;
+  multi-grid file producing one record per grid in `iinf` order; grid
+  without a `dimg` iref is vacuously compliant. 2 new integration tests
+  pin the audit end-to-end: `synthetic_4x1_strip_passes_grid_
+  derivation_audit` confirms the 4-tile-clean shape through `inspect`,
+  and `monochrome_fixture_has_no_grid_derivation_audit_records` pins
+  the no-grid-item shape on the Microsoft monochrome conformance
+  fixture.
+
 - Round 130 — Tone Map Derived Image Item (`tmap`) compliance audit
   (av1-avif v1.2.0 §4.2.2). The HEIF-defined `tmap` descriptor body
   parse is intentionally out of scope (the only HEIF edition currently

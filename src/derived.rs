@@ -925,6 +925,106 @@ fn audit_one_tone_map(
     }
 }
 
+/// Per-grid `shall`-level compliance against av1-avif §7's
+/// transformative-property constraint:
+///
+/// > Transformative properties shall not be associated with items in a
+/// > derivation chain (as defined in [MIAF]) that serves as an input to
+/// > a grid derived image item. For example, if a file contains a grid
+/// > item and its referenced coded image items, cropping, mirroring or
+/// > rotation transformations are only permitted on the grid item itself.
+///
+/// This is a *file-shape* constraint: the spec lets the grid item itself
+/// carry any of `clap` / `irot` / `imir`, but forbids any of its `dimg`
+/// input tiles from doing so. A reader that processes a non-compliant
+/// file would either silently get the wrong pixels (if it ignored the
+/// per-tile transform) or render a torn canvas (if it honoured the
+/// per-tile transform before compositing).
+///
+/// One [`GridDerivationAudit`] record is emitted per `'grid'` item in
+/// `iinf` declaration order via [`audit_grid_derivations`]. Each record
+/// lists the offending `(tile_item_id, transformative_kind)` pairs found
+/// on any `dimg` input. An empty `offenders` vector is the compliant
+/// case; [`Self::is_compliant`] is a one-call gate.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct GridDerivationAudit {
+    /// The `'grid'` item id this audit describes.
+    pub grid_item_id: u32,
+    /// Tile items referenced by the grid's `dimg` iref, in declaration
+    /// order. Empty when the grid has no `dimg` iref (already a malformed
+    /// grid; the audit still emits the record).
+    pub tile_item_ids: Vec<u32>,
+    /// `(tile_item_id, property_kind)` pairs where a tile carries a
+    /// transformative property (`'clap'` / `'irot'` / `'imir'`). One
+    /// entry per (tile, kind) — a tile that carries all three lands as
+    /// three entries. Empty when the grid is compliant.
+    pub offenders: Vec<(u32, BoxType)>,
+}
+
+impl GridDerivationAudit {
+    /// True when no tile in the derivation chain carries any
+    /// transformative property — the spec-compliant shape.
+    pub fn is_compliant(&self) -> bool {
+        self.offenders.is_empty()
+    }
+
+    /// Convenience: list the unique offending tile item ids (a tile that
+    /// carries multiple transformative properties only appears once).
+    pub fn offending_tile_ids(&self) -> Vec<u32> {
+        let mut out: Vec<u32> = self.offenders.iter().map(|(id, _)| *id).collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+}
+
+/// Audit every `'grid'` item carried in `meta` against the av1-avif §7
+/// transformative-property `shall`. Returns one [`GridDerivationAudit`]
+/// record per grid item, in `iinf` declaration order. The returned
+/// vector is empty when the file ships no grid items.
+///
+/// Spec: av1-avif v1.2.0 §7 General constraints — "Transformative
+/// properties shall not be associated with items in a derivation chain
+/// that serves as an input to a grid derived image item." The
+/// transformative properties this crate recognises are `'clap'`
+/// (cropping), `'irot'` (rotation), and `'imir'` (mirroring) per HEIF
+/// §6.5.10 / §6.5.13. Other transformative properties defined in HEIF
+/// (e.g. `'iscl'`, `'rref'`) are not yet parsed here and so are not
+/// flagged; an explicit `Property::Other` association on a tile is
+/// surfaced by the existing
+/// [`crate::meta::Meta::unsupported_essential_properties`] path.
+pub fn audit_grid_derivations(meta: &crate::meta::Meta) -> Vec<GridDerivationAudit> {
+    let grid_type = crate::parser::ITEM_TYPE_GRID;
+    let dimg = b(b"dimg");
+    let irot = b(b"irot");
+    let imir = b(b"imir");
+    let clap = b(b"clap");
+    meta.item_ids_of_type(&grid_type)
+        .into_iter()
+        .map(|grid_id| {
+            let tile_item_ids = meta.iref_targets(&dimg, grid_id);
+            let mut offenders = Vec::new();
+            for tile_id in &tile_item_ids {
+                // For each tile we check the three transformative property
+                // kinds explicitly so the output preserves a stable
+                // (clap, irot, imir) ordering per offending tile — easier
+                // for callers (and tests) to diff than association order,
+                // which depends on `ipma` writer choice.
+                for kind in [clap, irot, imir] {
+                    if meta.property_for(*tile_id, &kind).is_some() {
+                        offenders.push((*tile_id, kind));
+                    }
+                }
+            }
+            GridDerivationAudit {
+                grid_item_id: grid_id,
+                tile_item_ids,
+                offenders,
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1682,5 +1782,228 @@ mod tests {
         assert!(!make_infe(1, b"av01", 0xfffe).is_hidden());
         // Mixed: bit 0 set + other bits set → hidden.
         assert!(make_infe(1, b"av01", 0xff03).is_hidden());
+    }
+
+    // -------------------------------------------------------------------
+    // Grid derivation chain — transformative-property audit (av1-avif §7)
+    // -------------------------------------------------------------------
+
+    use crate::meta::{Clap, Imir, Irot, ItemPropertyAssociation, Property, PropertyAssociation};
+
+    /// Sample Clap value — arbitrary, the audit only cares about presence.
+    fn sample_clap() -> Clap {
+        Clap {
+            clean_aperture_width_n: 1,
+            clean_aperture_width_d: 1,
+            clean_aperture_height_n: 1,
+            clean_aperture_height_d: 1,
+            horiz_off_n: 0,
+            horiz_off_d: 1,
+            vert_off_n: 0,
+            vert_off_d: 1,
+        }
+    }
+
+    fn assoc(item_id: u32, indices: &[u16]) -> ItemPropertyAssociation {
+        ItemPropertyAssociation {
+            item_id,
+            entries: indices
+                .iter()
+                .map(|i| PropertyAssociation {
+                    index: *i,
+                    essential: false,
+                })
+                .collect(),
+        }
+    }
+
+    /// Compliant grid: no tile carries a transformative property — the
+    /// grid item may itself carry `irot` / `imir` / `clap` (we put `irot`
+    /// on the grid here to prove the audit ignores grid-level transforms).
+    #[test]
+    fn audit_grid_derivations_clean_chain_compliant() {
+        let meta = Meta {
+            items: vec![
+                make_infe(1, b"grid", 0),
+                make_infe(2, b"av01", 0),
+                make_infe(3, b"av01", 0),
+            ],
+            irefs: vec![IrefEntry {
+                reference_type: *b"dimg",
+                from_id: 1,
+                to_ids: vec![2, 3],
+            }],
+            // Index 0: irot on the grid item (permitted by §7).
+            properties: vec![Property::Irot(Irot { angle: 1 })],
+            associations: vec![assoc(1, &[0])],
+            ..Meta::default()
+        };
+        let r = audit_grid_derivations(&meta);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].grid_item_id, 1);
+        assert_eq!(r[0].tile_item_ids, vec![2, 3]);
+        assert!(
+            r[0].offenders.is_empty(),
+            "grid-level transforms must not flag the chain"
+        );
+        assert!(r[0].is_compliant());
+        assert!(r[0].offending_tile_ids().is_empty());
+    }
+
+    /// Non-compliant grid: a tile carries `irot`. The audit reports the
+    /// offending tile + `irot` kind, and `is_compliant` flips to false.
+    #[test]
+    fn audit_grid_derivations_tile_irot_flagged() {
+        let meta = Meta {
+            items: vec![
+                make_infe(1, b"grid", 0),
+                make_infe(2, b"av01", 0),
+                make_infe(3, b"av01", 0),
+            ],
+            irefs: vec![IrefEntry {
+                reference_type: *b"dimg",
+                from_id: 1,
+                to_ids: vec![2, 3],
+            }],
+            properties: vec![Property::Irot(Irot { angle: 2 })],
+            // Tile 3 carries the property — chain violation.
+            associations: vec![assoc(3, &[0])],
+            ..Meta::default()
+        };
+        let r = &audit_grid_derivations(&meta)[0];
+        assert!(!r.is_compliant());
+        assert_eq!(r.offenders, vec![(3, *b"irot")]);
+        assert_eq!(r.offending_tile_ids(), vec![3]);
+    }
+
+    /// A single tile carrying all three transformative kinds surfaces
+    /// three offender entries in the stable `(clap, irot, imir)` order
+    /// the audit produces.
+    #[test]
+    fn audit_grid_derivations_tile_with_all_three_kinds() {
+        let meta = Meta {
+            items: vec![make_infe(1, b"grid", 0), make_infe(2, b"av01", 0)],
+            irefs: vec![IrefEntry {
+                reference_type: *b"dimg",
+                from_id: 1,
+                to_ids: vec![2],
+            }],
+            properties: vec![
+                Property::Clap(sample_clap()),
+                Property::Irot(Irot { angle: 1 }),
+                Property::Imir(Imir { axis: 0 }),
+            ],
+            associations: vec![assoc(2, &[0, 1, 2])],
+            ..Meta::default()
+        };
+        let r = &audit_grid_derivations(&meta)[0];
+        assert_eq!(
+            r.offenders,
+            vec![(2, *b"clap"), (2, *b"irot"), (2, *b"imir")]
+        );
+        // Tile id is unique even though it offends three times.
+        assert_eq!(r.offending_tile_ids(), vec![2]);
+    }
+
+    /// Two tiles offending in different ways. Both surface; the unique
+    /// tile-id list collapses duplicates.
+    #[test]
+    fn audit_grid_derivations_multiple_offending_tiles() {
+        let meta = Meta {
+            items: vec![
+                make_infe(1, b"grid", 0),
+                make_infe(2, b"av01", 0),
+                make_infe(3, b"av01", 0),
+                make_infe(4, b"av01", 0),
+            ],
+            irefs: vec![IrefEntry {
+                reference_type: *b"dimg",
+                from_id: 1,
+                to_ids: vec![2, 3, 4],
+            }],
+            properties: vec![
+                Property::Imir(Imir { axis: 1 }),
+                Property::Clap(sample_clap()),
+            ],
+            associations: vec![
+                // Tile 3 carries imir; tile 4 carries clap; tile 2 clean.
+                assoc(3, &[0]),
+                assoc(4, &[1]),
+            ],
+            ..Meta::default()
+        };
+        let r = &audit_grid_derivations(&meta)[0];
+        assert!(!r.is_compliant());
+        // clap-on-4 sorts before imir-on-3 in the per-tile loop:
+        // we walk tiles in dimg order (2, 3, 4) and emit (clap, irot, imir)
+        // per tile, so the result is [(3, imir), (4, clap)].
+        assert_eq!(r.offenders, vec![(3, *b"imir"), (4, *b"clap")]);
+        assert_eq!(r.offending_tile_ids(), vec![3, 4]);
+    }
+
+    /// File with no `grid` items returns an empty audit list — the
+    /// constraint is vacuous and the strict-compliant predicate folds
+    /// to true.
+    #[test]
+    fn audit_grid_derivations_empty_when_no_grid_items() {
+        let meta = Meta {
+            items: vec![make_infe(1, b"av01", 0)],
+            ..Meta::default()
+        };
+        assert!(audit_grid_derivations(&meta).is_empty());
+    }
+
+    /// Multiple grid items each get their own audit record, in `iinf`
+    /// declaration order.
+    #[test]
+    fn audit_grid_derivations_reports_each_grid_item() {
+        let meta = Meta {
+            items: vec![
+                make_infe(1, b"grid", 0), // first grid
+                make_infe(2, b"av01", 0),
+                make_infe(3, b"av01", 0),
+                make_infe(4, b"grid", 0), // second grid
+                make_infe(5, b"av01", 0),
+            ],
+            irefs: vec![
+                IrefEntry {
+                    reference_type: *b"dimg",
+                    from_id: 1,
+                    to_ids: vec![2, 3],
+                },
+                IrefEntry {
+                    reference_type: *b"dimg",
+                    from_id: 4,
+                    to_ids: vec![5],
+                },
+            ],
+            properties: vec![Property::Irot(Irot { angle: 3 })],
+            // Tile 5 (second grid's tile) carries an irot.
+            associations: vec![assoc(5, &[0])],
+            ..Meta::default()
+        };
+        let r = audit_grid_derivations(&meta);
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].grid_item_id, 1);
+        assert!(r[0].is_compliant());
+        assert_eq!(r[1].grid_item_id, 4);
+        assert!(!r[1].is_compliant());
+        assert_eq!(r[1].offenders, vec![(5, *b"irot")]);
+    }
+
+    /// A grid item with no `dimg` iref still emits an audit record with
+    /// empty tile + offender vectors. The constraint is trivially
+    /// satisfied (no chain → no offending tiles); a malformed grid is
+    /// caught elsewhere.
+    #[test]
+    fn audit_grid_derivations_grid_without_dimg_is_compliant() {
+        let meta = Meta {
+            items: vec![make_infe(1, b"grid", 0)],
+            ..Meta::default()
+        };
+        let r = &audit_grid_derivations(&meta)[0];
+        assert_eq!(r.grid_item_id, 1);
+        assert!(r.tile_item_ids.is_empty());
+        assert!(r.is_compliant());
     }
 }

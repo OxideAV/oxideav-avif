@@ -1520,6 +1520,52 @@ fn synthetic_4x1_strip_resolves_all_tile_ids() {
     assert_eq!(tiles, vec![2, 3, 4, 5], "all four tile ids in dimg order");
 }
 
+/// av1-avif §7 grid-derivation-chain audit on the 4×1 strip synthesizer:
+/// the synthetic doesn't attach any `clap` / `irot` / `imir` to its
+/// tiles, so the audit must report a single record for the grid item
+/// with an empty `offenders` vector and `is_compliant()` true. The
+/// `AvifInfo::grid_derivations_strict_compliant()` predicate folds the
+/// whole-file audit to a single boolean.
+#[test]
+fn synthetic_4x1_strip_passes_grid_derivation_audit() {
+    let bytes = build_synthetic_strip_avif(4);
+    let info = inspect(&bytes).expect("inspect 4x1 strip");
+    assert!(info.is_grid);
+    assert_eq!(
+        info.grid_derivation_compliance.len(),
+        1,
+        "exactly one grid item → exactly one audit record"
+    );
+    let r = &info.grid_derivation_compliance[0];
+    assert_eq!(r.grid_item_id, 1, "primary grid item id = 1");
+    assert_eq!(r.tile_item_ids, vec![2, 3, 4, 5]);
+    assert!(
+        r.is_compliant(),
+        "no tile carries a transformative property"
+    );
+    assert!(r.offenders.is_empty());
+    assert!(info.grid_derivations_strict_compliant());
+}
+
+/// The Microsoft monochrome conformance fixture is a single-item AVIF
+/// (no `grid`) so the §7 audit returns an empty vector and the
+/// strict-compliant gate folds to `true` vacuously. Pins the
+/// no-grid-item shape of the audit on a real fixture.
+#[test]
+fn monochrome_fixture_has_no_grid_derivation_audit_records() {
+    const MONOCHROME: &[u8] = include_bytes!("fixtures/monochrome.avif");
+    let info = inspect(MONOCHROME).expect("inspect monochrome");
+    assert!(!info.is_grid);
+    assert!(
+        info.grid_derivation_compliance.is_empty(),
+        "no grid item → empty audit vector"
+    );
+    assert!(
+        info.grid_derivations_strict_compliant(),
+        "vacuous compliance for files without grid items"
+    );
+}
+
 /// Validate that a `grid` whose declared output exceeds what its
 /// tiles can cover is rejected at container parse time. The synthetic
 /// fixture asks for a 100x100 output but only declares 1x1 tiles of

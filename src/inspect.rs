@@ -179,6 +179,20 @@ pub struct AvifInfo {
     /// [`crate::derived::ToneMapCompliance`] for the strict-mode
     /// interpretation.
     pub tone_map_compliance: Vec<crate::derived::ToneMapCompliance>,
+    /// av1-avif §7 transformative-property `shall`-level audit results,
+    /// one entry per `'grid'` item in the file (in `iinf` declaration
+    /// order). Each entry lists offending `(tile_item_id,
+    /// property_kind)` pairs for transformative properties (`'clap'` /
+    /// `'irot'` / `'imir'`) attached to any tile in the grid's
+    /// derivation chain. The compliant case is an empty `offenders`
+    /// vector; combine with [`Self::grid_derivations_strict_compliant`]
+    /// for a one-call gate.
+    ///
+    /// Spec: av1-avif v1.2.0 §7 — "Transformative properties shall not
+    /// be associated with items in a derivation chain that serves as an
+    /// input to a grid derived image item." Per-tile transformative
+    /// properties are only permitted on the grid item itself.
+    pub grid_derivation_compliance: Vec<crate::derived::GridDerivationAudit>,
 }
 
 impl AvifInfo {
@@ -283,6 +297,20 @@ impl AvifInfo {
     /// presence + compliance signal should combine the two.
     pub fn tone_map_strict_compliant(&self) -> bool {
         self.tone_map_compliance.iter().all(|c| c.is_compliant())
+    }
+
+    /// True when every `'grid'` item in the file passes the av1-avif §7
+    /// transformative-property `shall` audit (no tile in any grid's
+    /// `dimg` derivation chain carries `'clap'` / `'irot'` / `'imir'`).
+    ///
+    /// Trivially `true` when the file ships no grid items (the
+    /// constraint applies to grid derivation chains; a file with no
+    /// grids has no such chains). Callers that want a presence +
+    /// compliance signal should combine with [`Self::is_grid`].
+    pub fn grid_derivations_strict_compliant(&self) -> bool {
+        self.grid_derivation_compliance
+            .iter()
+            .all(|g| g.is_compliant())
     }
 
     /// True when the file's `ftyp` claims the `mif1` brand and every
@@ -526,6 +554,7 @@ pub(crate) fn build_info(
     let sato_item_ids = img.meta.item_ids_of_type(&crate::meta::ITEM_TYPE_SATO);
     let tmap_item_ids = img.meta.item_ids_of_type(&crate::meta::ITEM_TYPE_TMAP);
     let tone_map_compliance = crate::derived::audit_tone_map(&img.meta);
+    let grid_derivation_compliance = crate::derived::audit_grid_derivations(&img.meta);
     Ok(AvifInfo {
         width,
         height,
@@ -558,6 +587,7 @@ pub(crate) fn build_info(
         sato_item_ids,
         tmap_item_ids,
         tone_map_compliance,
+        grid_derivation_compliance,
     })
 }
 
@@ -690,6 +720,7 @@ pub(crate) fn build_info_grid(
     let sato_item_ids = hdr.meta.item_ids_of_type(&crate::meta::ITEM_TYPE_SATO);
     let tmap_item_ids = hdr.meta.item_ids_of_type(&crate::meta::ITEM_TYPE_TMAP);
     let tone_map_compliance = crate::derived::audit_tone_map(&hdr.meta);
+    let grid_derivation_compliance = crate::derived::audit_grid_derivations(&hdr.meta);
     Ok(AvifInfo {
         width: grid.output_width,
         height: grid.output_height,
@@ -722,6 +753,7 @@ pub(crate) fn build_info_grid(
         sato_item_ids,
         tmap_item_ids,
         tone_map_compliance,
+        grid_derivation_compliance,
     })
 }
 

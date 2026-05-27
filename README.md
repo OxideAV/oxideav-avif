@@ -43,7 +43,7 @@ still loses significant signal.
 | HDR metadata                           | `mdcv` (SMPTE ST 2086 mastering display primaries + luminance), `clli` (MaxCLL / MaxFALL cd/m²), `cclv` (draft av1-avif extension, same layout as `clli`); surfaced via `AvifInfo::{mdcv, clli, cclv, has_hdr_metadata(), max_cll(), max_fall()}` |
 | AV1 wrap pass-through                  | `av1C`-derived bit depth (8/10/12-bit), monochrome flag, and chroma subsampling `(x, y)` decoded and surfaced via `AvifInfo::{bit_depth, monochrome, chroma_subsampling}`; callers no longer need to re-parse `av1C` |
 | Primary item data                      | resolved via `iloc` construction_method 0 (file offset); single-extent items return a zero-copy slice; multi-extent items are concatenated via `item_bytes_owned()` (HEIF §8.11.3.3) |
-| Grid primary items (HEIF §6.6.2)       | grid descriptor parse + per-tile decode via `dimg` iref + composite into the declared output rectangle                                                     |
+| Grid primary items (HEIF §6.6.2)       | grid descriptor parse + per-tile decode via `dimg` iref + composite into the declared output rectangle; plus av1-avif §7 derivation-chain audit (`audit_grid_derivations` / `GridDerivationAudit`) flagging any `clap` / `irot` / `imir` attached to a tile in violation of the "transformative properties only on the grid item itself" `shall`. Surfaced via `AvifInfo::grid_derivation_compliance` / `grid_derivations_strict_compliant()` |
 | Alpha auxiliary                        | `auxl` + `auxC` URN detection, AV1-coded monochrome item decoded, composited onto the color frame (`Gray8 → YA8`, `Yuv → YuvA`)                            |
 | Post-transforms                        | `clap` (centre crop) → `irot` (90/180/270°) → `imir` (horizontal/vertical), applied in that order per §6.5.10                                              |
 | AV1 hand-off                           | `av1C` plumbed through `CodecParameters::extradata`; primary-item OBU payload fed to `oxideav_av1::Av1Decoder`; frame returned through `AvifDecoder`       |
@@ -83,6 +83,50 @@ still loses significant signal.
 
 See `examples/diag_decode.rs` for a drop-in report of exactly which
 stage each input reaches.
+
+### Round 172 — av1-avif §7 grid-derivation transformative-property audit
+
+The §7 General-constraints `shall` "Transformative properties shall not be
+associated with items in a derivation chain that serves as an input to a
+grid derived image item" is now audited at the container layer. The new
+`oxideav_avif::derived::audit_grid_derivations(&Meta)` walker returns one
+`GridDerivationAudit { grid_item_id, tile_item_ids, offenders,
+is_compliant(), offending_tile_ids() }` record per `'grid'` item in
+`iinf` declaration order. Each record lists the offending
+`(tile_item_id, property_kind)` pairs found by walking the grid's
+`'dimg'` iref and inspecting every tile for an associated `'clap'` /
+`'irot'` / `'imir'` property. Transformative properties on the grid
+item *itself* are explicitly permitted by §7 and don't surface as
+offenders.
+
+`AvifInfo::grid_derivation_compliance: Vec<GridDerivationAudit>` is
+populated by both the single-item and grid `build_info` paths (the
+audit fires on every file — single-item files trivially return an empty
+vector since they have no grid items). `AvifInfo::
+grid_derivations_strict_compliant()` returns the AND of every record
+(trivially `true` when no grid items exist; combine with `is_grid` for
+a presence + compliance gate).
+
+Test delta: +7 unit (`derived::tests::audit_grid_derivations_*`
+covering: clean chain with grid-level `irot` permitted; single-tile
+`irot` flagged; tile with all three kinds emits three offender entries
+in stable `(clap, irot, imir)` order; multiple offending tiles across a
+chain; empty-when-no-grid-items vacuum; multi-grid file produces one
+record per grid; grid without a `dimg` iref returns a vacuously
+compliant record). +2 integration (`synthetic_4x1_strip_passes_grid_
+derivation_audit` pins the 4-tile-clean shape end-to-end through
+`inspect`; `monochrome_fixture_has_no_grid_derivation_audit_records`
+pins the no-grid-item shape on the real Microsoft fixture). Default
+lib 189 (was 182); standalone lib 174 (was 167); integration 48 + 1
+ignored (was 46 + 1).
+
+Followup: HEIF defines additional transformative properties (`'iscl'`
+image scaling, `'rref'` required reference) the audit doesn't yet
+flag — these would land in `Property::Other` today and a tile carrying
+one essential would already trip
+`Meta::unsupported_essential_properties`, but a focused §7 audit
+extension would surface them by kind once those property types are
+parsed here.
 
 ### Round 130 — Tone Map (`tmap`) av1-avif §4.2.2 compliance audit
 
