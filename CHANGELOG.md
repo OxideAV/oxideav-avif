@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 188 — ISO 21496-1:2025 Annex C.2 gain map metadata descriptor
+  body parser, the binary payload carried by the AVIF / HEIF `'tmap'`
+  (tone map) derived image item (av1-avif §4.2.2 registers the item;
+  ISO 21496-1 specifies its body). New API
+  `oxideav_avif::GainMapMetadata::parse(payload)` reads the big-endian
+  `GainMapVersion` (`minimum_version` / `writer_version`), the
+  `is_multichannel` (1 → 3 R/G/B channels, 0 → 1 channel) and
+  `use_base_colour_space` MSB-first flag bits, the base/alternate HDR
+  headroom rationals, and a `GainMapChannel` per channel (each carrying
+  the gain-map min/max, gamma, and base/alternate offset rationals).
+  Companion types `GainMapChannel` and `GainMapRational { numerator,
+  denominator, as_f64() }`. Every Annex C.2.3 `shall` is enforced:
+  rationals reject a `0` denominator, `gamma_numerator` must be
+  non-zero, and `writer_version` must be `>= minimum_version`; an
+  unrecognised `minimum_version` returns `Unsupported` (Annex C.2.3
+  directs the reader to display the base image rather than fail);
+  trailing padding or future-optional metadata after the recognised
+  fields is ignored per Annex C.2.1. This replaces the prior "HEIF
+  descriptor body parse deferred" caveat on the Tone Map row.
 - Round 182 — av1-avif v1.2.0 §2.1 "The AV1 Image Item Data shall have
   exactly one Sequence Header OBU" container-layer compliance audit.
   New API `oxideav_avif::derived::audit_sequence_header_obu(meta, file)`

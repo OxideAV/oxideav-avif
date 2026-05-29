@@ -104,8 +104,9 @@ pub use cicp::{
 };
 pub use derived::{
     audit_alpha_bit_depth, audit_iden_derivations, audit_sequence_header_obu, audit_tone_map,
-    parse_grpl, AlphaBitDepthAudit, EntityGroup, IdenCompliance, ImageOverlay, Mif1Compliance,
-    OverlayEntry, SampleTransform, SequenceHeaderObuAudit, Token, ToneMapCompliance,
+    parse_grpl, AlphaBitDepthAudit, EntityGroup, GainMapChannel, GainMapMetadata, GainMapRational,
+    IdenCompliance, ImageOverlay, Mif1Compliance, OverlayEntry, SampleTransform,
+    SequenceHeaderObuAudit, Token, ToneMapCompliance,
 };
 pub use error::{AvifError, Result};
 pub use grid::{composite_grid, ImageGrid};

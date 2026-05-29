@@ -799,12 +799,12 @@ fn pow_truncated(base: i64, exp: i64) -> i64 {
 /// Result of an av1-avif §4.2.2 audit on a single `'tmap'` Tone Map
 /// Derived Image Item carried by the file.
 ///
-/// The `tmap` descriptor body itself is defined by ISO/IEC 23008-12
-/// (HEIF) — its parse is **not** in scope here because the only HEIF
-/// edition shipped in `docs/image/heif/` is the 2017 first edition
-/// which predates `tmap`. What av1-avif §4.2.2 *does* normatively
-/// require, independently of the descriptor body, is two file-shape
-/// `should` constraints that this audit checks:
+/// The `tmap` item type itself is registered by the HEIF / MIAF family;
+/// the descriptor *body* the item points at via its `iloc` is the ISO
+/// 21496-1 gain map metadata payload, parsed by
+/// [`GainMapMetadata::parse`]. This audit covers the two file-shape
+/// `should` constraints av1-avif §4.2.2 imposes *independently* of that
+/// body:
 ///
 /// 1. **`altr` grouping.** The base image item (i.e. the input the
 ///    tmap item references via `'dimg'`) and the `tmap` item should be
@@ -877,9 +877,9 @@ impl ToneMapCompliance {
 /// vector is empty when the file ships no tmap items.
 ///
 /// Spec: av1-avif v1.2.0 §4.2.2 (Tone Map Derived Image Item) — the
-/// av1-avif clauses only; the HEIF-defined `tmap` descriptor body
-/// parse is intentionally out of scope here pending an HEIF edition
-/// with `tmap` semantics in `docs/image/heif/`.
+/// av1-avif file-shape clauses only. The `tmap` descriptor body itself
+/// (the ISO 21496-1 gain map metadata payload pointed at by the item's
+/// `iloc`) is parsed separately by [`GainMapMetadata::parse`].
 pub fn audit_tone_map(meta: &crate::meta::Meta) -> Vec<ToneMapCompliance> {
     let tmap_type = crate::meta::ITEM_TYPE_TMAP;
     let dimg = b(b"dimg");
@@ -923,6 +923,223 @@ fn audit_one_tone_map(
         paired_in_altr,
         gain_maps_hidden,
     }
+}
+
+// ---------------------------------------------------------------------------
+// ISO 21496-1:2025 Annex C.2 — Gain map metadata binary payload
+// ---------------------------------------------------------------------------
+
+/// A signed rational (`numerator / denominator`) read from the gain map
+/// metadata payload. The numerator is stored as a signed 32-bit integer
+/// and the denominator as an unsigned 32-bit integer per ISO 21496-1
+/// Annex C.2.2; the denominator of every rational field "shall not be 0".
+///
+/// Stored as raw integer components rather than a pre-divided float so
+/// the parse stays lossless — callers that want the value compute
+/// `numerator as f64 / denominator as f64` themselves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct GainMapRational {
+    /// Signed numerator (the `int(32)` component).
+    pub numerator: i32,
+    /// Unsigned denominator (the `unsigned int(32)` component). The spec
+    /// forbids `0`; [`GainMapMetadata::parse`] rejects any payload that
+    /// carries a zero denominator.
+    pub denominator: u32,
+}
+
+impl GainMapRational {
+    /// The rational evaluated as an `f64`. The denominator is guaranteed
+    /// non-zero by [`GainMapMetadata::parse`], so this never divides by
+    /// zero on a value obtained through the parser.
+    pub fn as_f64(&self) -> f64 {
+        self.numerator as f64 / self.denominator as f64
+    }
+}
+
+/// One per-channel gain map metadata record (ISO 21496-1 `GainMapChannel`,
+/// Annex C.2.2). Each field is a signed/unsigned rational pair; the
+/// per-component values are computed as `numerator / denominator`.
+///
+/// `gamma_numerator` and every `*_denominator` "shall not be 0" per Annex
+/// C.2.3; [`GainMapMetadata::parse`] enforces those constraints.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct GainMapChannel {
+    /// Per-component gain map min value (signed rational; 5.2.5.2).
+    pub gain_map_min: GainMapRational,
+    /// Per-component gain map max value (signed rational; 5.2.5.3).
+    pub gain_map_max: GainMapRational,
+    /// Per-component gamma value (unsigned rational; 5.2.5.6). The
+    /// numerator is constrained non-zero in addition to the denominator.
+    pub gamma: GainMapRational,
+    /// Per-component baseline offset constant (signed rational; 5.2.5.4).
+    pub base_offset: GainMapRational,
+    /// Per-component alternate offset constant (signed rational; 5.2.5.5).
+    pub alternate_offset: GainMapRational,
+}
+
+/// Parsed ISO 21496-1:2025 gain map metadata payload (Annex C.2) — the
+/// binary descriptor body carried by the AVIF / HEIF `'tmap'` (tone map)
+/// derived image item.
+///
+/// av1-avif §4.2.2 (and HEIF) register the `'tmap'` item type and the
+/// `altr`/hidden file-shape constraints audited by [`audit_tone_map`];
+/// the *body* the item points at via its `iloc` is this structure,
+/// specified by ISO 21496-1. Resolve the item bytes with
+/// [`crate::inspect::item_payload_bytes`] (or
+/// [`crate::parser::item_bytes_owned`]) and hand them to
+/// [`GainMapMetadata::parse`].
+///
+/// The byte order is big-endian regardless of the container, and the
+/// 1-bit `is_multichannel` / `use_base_colour_space` flags are read from
+/// the most-significant bits of a single byte (Annex C.2.1). Per Annex
+/// C.2.1 the structure may carry trailing padding or future optional
+/// metadata after the recognised fields; the parser stops after the last
+/// recognised field and ignores the remainder, so a longer payload is
+/// not an error.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct GainMapMetadata {
+    /// `minimum_version` — the minimum version a parser must understand to
+    /// apply the gain map. Annex C.2.3: this "shall be 0 in this version
+    /// of the specification". A reader encountering an unrecognised value
+    /// must ignore the payload and display the base image.
+    pub minimum_version: u16,
+    /// `writer_version` — the version the writer used; "shall be greater
+    /// than or equal to `minimum_version`".
+    pub writer_version: u16,
+    /// `is_multichannel` — when true the per-channel record count is 3
+    /// (channels in R, G, B order); when false it is 1.
+    pub is_multichannel: bool,
+    /// `use_base_colour_space` — true selects the baseline image colour
+    /// primaries for the gain map application space; false selects the
+    /// alternate image primaries (5.3.4).
+    pub use_base_colour_space: bool,
+    /// Baseline HDR headroom (unsigned rational; 5.2.6). Stored with its
+    /// `int(32)` numerator widened to `i32` for a uniform rational type —
+    /// the value is logically unsigned and the denominator is non-zero.
+    pub base_hdr_headroom: GainMapRational,
+    /// Alternate HDR headroom (unsigned rational; 5.2.7).
+    pub alternate_hdr_headroom: GainMapRational,
+    /// Per-channel metadata. Length is 3 when [`Self::is_multichannel`],
+    /// else 1.
+    pub channels: Vec<GainMapChannel>,
+}
+
+impl GainMapMetadata {
+    /// Parse an ISO 21496-1 Annex C.2.2 `GainMapMetadata` payload from
+    /// the raw `'tmap'` item bytes.
+    ///
+    /// Behaviour:
+    ///
+    /// * Returns [`AvifError::Unsupported`](crate::error::AvifError::Unsupported)
+    ///   when `minimum_version != 0` — Annex C.2.3 requires such a reader
+    ///   to ignore the payload, so the caller should fall back to the
+    ///   base image rather than treat the bytes as malformed.
+    /// * Returns [`AvifError::InvalidData`](crate::error::AvifError::InvalidData)
+    ///   when the payload is truncated, when `writer_version <
+    ///   minimum_version`, or when any rational denominator (or the gamma
+    ///   numerator) is `0` — all `shall`-level constraints in C.2.3.
+    /// * Trailing bytes after the last recognised field are ignored
+    ///   (Annex C.2.1 padding / future-optional-metadata rule).
+    pub fn parse(payload: &[u8]) -> Result<Self> {
+        // GainMapVersion: minimum_version(16) + writer_version(16).
+        let minimum_version = read_u16(payload, 0)?;
+        let writer_version = read_u16(payload, 2)?;
+
+        if minimum_version != 0 {
+            return Err(Error::unsupported(format!(
+                "avif: gain map metadata minimum_version {minimum_version} not understood \
+                 (ISO 21496-1 C.2.3 requires 0); caller should display the base image"
+            )));
+        }
+        // C.2.3: writer_version shall be >= minimum_version.
+        if writer_version < minimum_version {
+            return Err(Error::invalid(format!(
+                "avif: gain map metadata writer_version {writer_version} < minimum_version \
+                 {minimum_version} (ISO 21496-1 C.2.3)"
+            )));
+        }
+
+        // One flags byte: is_multichannel(1) | use_base_colour_space(1) |
+        // reserved(6), MSB-first (C.2.1).
+        let flags = *payload
+            .get(4)
+            .ok_or_else(|| Error::invalid("avif: gain map metadata truncated at flags byte"))?;
+        let is_multichannel = flags & 0x80 != 0;
+        let use_base_colour_space = flags & 0x40 != 0;
+        let channel_count = if is_multichannel { 3 } else { 1 };
+
+        // base/alternate HDR headroom: 4 × u32 starting at offset 5.
+        let base_hdr_headroom = read_unsigned_rational(payload, 5)?;
+        let alternate_hdr_headroom = read_unsigned_rational(payload, 13)?;
+
+        // GainMapChannel[channel_count] follow, each 10 × 32-bit fields
+        // (40 bytes): min, max, gamma, base_offset, alternate_offset.
+        let mut channels = Vec::with_capacity(channel_count);
+        let mut at = 21usize;
+        for _ in 0..channel_count {
+            let gain_map_min = read_signed_rational(payload, at)?;
+            let gain_map_max = read_signed_rational(payload, at + 8)?;
+            let gamma = read_unsigned_rational(payload, at + 16)?;
+            // C.2.3: gamma_numerator shall not be 0.
+            if gamma.numerator == 0 {
+                return Err(Error::invalid(
+                    "avif: gain map metadata gamma_numerator is 0 (ISO 21496-1 C.2.3)",
+                ));
+            }
+            let base_offset = read_signed_rational(payload, at + 24)?;
+            let alternate_offset = read_signed_rational(payload, at + 32)?;
+            channels.push(GainMapChannel {
+                gain_map_min,
+                gain_map_max,
+                gamma,
+                base_offset,
+                alternate_offset,
+            });
+            at += 40;
+        }
+
+        Ok(GainMapMetadata {
+            minimum_version,
+            writer_version,
+            is_multichannel,
+            use_base_colour_space,
+            base_hdr_headroom,
+            alternate_hdr_headroom,
+            channels,
+        })
+    }
+
+    /// The per-channel record count implied by [`Self::is_multichannel`]
+    /// (3 when multichannel, else 1). Always equal to `channels.len()`
+    /// for a value obtained from [`Self::parse`].
+    pub fn channel_count(&self) -> usize {
+        self.channels.len()
+    }
+}
+
+/// Read a `numerator(int32) / denominator(uint32)` rational and reject a
+/// zero denominator (every denominator field "shall not be 0", C.2.3).
+fn read_signed_rational(buf: &[u8], at: usize) -> Result<GainMapRational> {
+    let numerator = read_u32(buf, at)? as i32;
+    let denominator = read_u32(buf, at + 4)?;
+    if denominator == 0 {
+        return Err(Error::invalid(
+            "avif: gain map metadata rational denominator is 0 (ISO 21496-1 C.2.3)",
+        ));
+    }
+    Ok(GainMapRational {
+        numerator,
+        denominator,
+    })
+}
+
+/// Read a `numerator(uint32) / denominator(uint32)` rational. The HDR
+/// headroom numerators are logically unsigned but stored in the same
+/// `GainMapRational` (`i32` numerator) for a uniform type; values up to
+/// `i32::MAX` round-trip exactly and the denominator is still rejected
+/// when zero.
+fn read_unsigned_rational(buf: &[u8], at: usize) -> Result<GainMapRational> {
+    read_signed_rational(buf, at)
 }
 
 /// Per-grid `shall`-level compliance against av1-avif §7's
@@ -3539,5 +3756,160 @@ mod tests {
         assert_eq!(r[1].item_id, 2);
         assert!(!r[1].is_compliant());
         assert_eq!(r[1].sequence_header_count, 0);
+    }
+
+    // -- ISO 21496-1 Annex C.2 gain map metadata --------------------------
+
+    /// Push a `numerator(int32) / denominator(uint32)` rational pair onto
+    /// a big-endian payload buffer.
+    fn push_rational(buf: &mut Vec<u8>, num: i32, den: u32) {
+        buf.extend_from_slice(&(num as u32).to_be_bytes());
+        buf.extend_from_slice(&den.to_be_bytes());
+    }
+
+    /// Build a single-channel (`is_multichannel == 0`) gain map metadata
+    /// payload with deterministic, distinguishable rational values.
+    fn build_singlechannel_gain_map() -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0u16.to_be_bytes()); // minimum_version
+        buf.extend_from_slice(&0u16.to_be_bytes()); // writer_version
+        buf.push(0x40); // is_multichannel=0, use_base_colour_space=1
+        push_rational(&mut buf, 5, 2); // base_hdr_headroom
+        push_rational(&mut buf, 8, 1); // alternate_hdr_headroom
+                                       // one GainMapChannel
+        push_rational(&mut buf, -1, 4); // gain_map_min
+        push_rational(&mut buf, 3, 4); // gain_map_max
+        push_rational(&mut buf, 1, 1); // gamma
+        push_rational(&mut buf, -2, 16); // base_offset
+        push_rational(&mut buf, 7, 16); // alternate_offset
+        buf
+    }
+
+    /// Single-channel payload parses with the right flags, headroom, and
+    /// one channel record; the rationals round-trip exactly.
+    #[test]
+    fn gain_map_metadata_parses_single_channel() {
+        let buf = build_singlechannel_gain_map();
+        let m = GainMapMetadata::parse(&buf).unwrap();
+        assert_eq!(m.minimum_version, 0);
+        assert_eq!(m.writer_version, 0);
+        assert!(!m.is_multichannel);
+        assert!(m.use_base_colour_space);
+        assert_eq!(m.channel_count(), 1);
+        assert_eq!(
+            m.base_hdr_headroom,
+            GainMapRational {
+                numerator: 5,
+                denominator: 2
+            }
+        );
+        assert_eq!(
+            m.alternate_hdr_headroom,
+            GainMapRational {
+                numerator: 8,
+                denominator: 1
+            }
+        );
+        let c = m.channels[0];
+        assert_eq!(
+            c.gain_map_min,
+            GainMapRational {
+                numerator: -1,
+                denominator: 4
+            }
+        );
+        assert_eq!(c.gain_map_max.as_f64(), 0.75);
+        assert_eq!(
+            c.gamma,
+            GainMapRational {
+                numerator: 1,
+                denominator: 1
+            }
+        );
+        assert_eq!(c.base_offset.as_f64(), -0.125);
+        assert_eq!(c.alternate_offset.numerator, 7);
+    }
+
+    /// `is_multichannel == 1` yields three channel records (R, G, B
+    /// order) read from 3 × 40 trailing bytes.
+    #[test]
+    fn gain_map_metadata_parses_three_channels_when_multichannel() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0u16.to_be_bytes()); // minimum_version
+        buf.extend_from_slice(&1u16.to_be_bytes()); // writer_version
+        buf.push(0x80); // is_multichannel=1, use_base_colour_space=0
+        push_rational(&mut buf, 1, 1); // base_hdr_headroom
+        push_rational(&mut buf, 1, 1); // alternate_hdr_headroom
+        for ch in 0..3i32 {
+            push_rational(&mut buf, ch, 1); // gain_map_min (R=0,G=1,B=2)
+            push_rational(&mut buf, 10, 1); // gain_map_max
+            push_rational(&mut buf, 2, 1); // gamma
+            push_rational(&mut buf, 0, 1); // base_offset
+            push_rational(&mut buf, 0, 1); // alternate_offset
+        }
+        let m = GainMapMetadata::parse(&buf).unwrap();
+        assert!(m.is_multichannel);
+        assert!(!m.use_base_colour_space);
+        assert_eq!(m.channel_count(), 3);
+        assert_eq!(m.channels[0].gain_map_min.numerator, 0);
+        assert_eq!(m.channels[1].gain_map_min.numerator, 1);
+        assert_eq!(m.channels[2].gain_map_min.numerator, 2);
+    }
+
+    /// Annex C.2.1: trailing padding / future-optional metadata after the
+    /// recognised fields is ignored, not an error.
+    #[test]
+    fn gain_map_metadata_ignores_trailing_bytes() {
+        let mut buf = build_singlechannel_gain_map();
+        buf.extend_from_slice(&[0xAA; 32]); // padding + hypothetical v2 fields
+        let m = GainMapMetadata::parse(&buf).unwrap();
+        assert_eq!(m.channel_count(), 1);
+    }
+
+    /// Annex C.2.3: a `minimum_version` the reader doesn't understand is
+    /// an `Unsupported` (display the base image), not malformed data.
+    #[test]
+    fn gain_map_metadata_unknown_min_version_is_unsupported() {
+        let mut buf = build_singlechannel_gain_map();
+        buf[0] = 0;
+        buf[1] = 1; // minimum_version = 1
+        let err = GainMapMetadata::parse(&buf).unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)));
+    }
+
+    /// A zero rational denominator is rejected (C.2.3 "shall not be 0").
+    #[test]
+    fn gain_map_metadata_rejects_zero_denominator() {
+        let mut buf = build_singlechannel_gain_map();
+        // base_hdr_headroom denominator sits at offset 5+4 = 9.
+        buf[9] = 0;
+        buf[10] = 0;
+        buf[11] = 0;
+        buf[12] = 0;
+        let err = GainMapMetadata::parse(&buf).unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)));
+    }
+
+    /// `gamma_numerator == 0` is rejected (C.2.3 "gamma_numerator shall
+    /// not be 0"), distinct from the denominator constraint.
+    #[test]
+    fn gain_map_metadata_rejects_zero_gamma_numerator() {
+        let mut buf = build_singlechannel_gain_map();
+        // Channel record starts at offset 21; gamma is field 3 →
+        // 21 + 16 = 37, the gamma numerator (4 bytes).
+        for b in buf.iter_mut().skip(37).take(4) {
+            *b = 0;
+        }
+        let err = GainMapMetadata::parse(&buf).unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)));
+    }
+
+    /// A payload truncated before all channel bytes arrive is rejected.
+    #[test]
+    fn gain_map_metadata_rejects_truncated_channel() {
+        let mut buf = build_singlechannel_gain_map();
+        buf.truncate(buf.len() - 1); // drop last byte of the channel
+        let err = GainMapMetadata::parse(&buf).unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)));
     }
 }
