@@ -193,6 +193,22 @@ pub struct AvifInfo {
     /// input to a grid derived image item." Per-tile transformative
     /// properties are only permitted on the grid item itself.
     pub grid_derivation_compliance: Vec<crate::derived::GridDerivationAudit>,
+    /// Item IDs of every Identity Derived Image Item carried in the file
+    /// (HEIF §6.6.2.1 — `'iden'`). Detection: `infe.item_type == 'iden'`.
+    /// `iden` items have no body — the output is the source image with
+    /// the iden's own transformative properties applied. Empty for files
+    /// without any identity derivation.
+    pub iden_item_ids: Vec<u32>,
+    /// HEIF §6.6.2.1 + §6.6.1 `shall`-level audit results, one entry per
+    /// `'iden'` item in [`Self::iden_item_ids`] (same order). Each entry
+    /// reports whether the iden's `'dimg'` reference_count is exactly 1,
+    /// whether at most one `'dimg'` iref entry shares its `from_item_ID`,
+    /// and whether the item has no body. Empty when no iden items are
+    /// present. All three checks are `shall`s — see
+    /// [`crate::derived::IdenCompliance`] for the strict-mode
+    /// interpretation. Combine with [`Self::iden_strict_compliant`] for
+    /// a one-call gate.
+    pub iden_compliance: Vec<crate::derived::IdenCompliance>,
 }
 
 impl AvifInfo {
@@ -311,6 +327,24 @@ impl AvifInfo {
         self.grid_derivation_compliance
             .iter()
             .all(|g| g.is_compliant())
+    }
+
+    /// True when the file ships at least one Identity Derived Image
+    /// Item (HEIF §6.6.2.1 — `'iden'`).
+    pub fn has_iden(&self) -> bool {
+        !self.iden_item_ids.is_empty()
+    }
+
+    /// True when every `'iden'` item in the file passes the HEIF
+    /// §6.6.2.1 + §6.6.1 `shall`-level audit (exactly one `'dimg'`
+    /// input, exactly one `'dimg'` iref entry with that
+    /// `from_item_ID`, and no item body).
+    ///
+    /// Trivially `true` when the file ships no iden items
+    /// ([`Self::has_iden`] is `false`) — callers that want a presence
+    /// + compliance signal should combine the two.
+    pub fn iden_strict_compliant(&self) -> bool {
+        self.iden_compliance.iter().all(|i| i.is_compliant())
     }
 
     /// True when the file's `ftyp` claims the `mif1` brand and every
@@ -555,6 +589,8 @@ pub(crate) fn build_info(
     let tmap_item_ids = img.meta.item_ids_of_type(&crate::meta::ITEM_TYPE_TMAP);
     let tone_map_compliance = crate::derived::audit_tone_map(&img.meta);
     let grid_derivation_compliance = crate::derived::audit_grid_derivations(&img.meta);
+    let iden_item_ids = img.meta.item_ids_of_type(&crate::meta::ITEM_TYPE_IDEN);
+    let iden_compliance = crate::derived::audit_iden_derivations(&img.meta);
     Ok(AvifInfo {
         width,
         height,
@@ -588,6 +624,8 @@ pub(crate) fn build_info(
         tmap_item_ids,
         tone_map_compliance,
         grid_derivation_compliance,
+        iden_item_ids,
+        iden_compliance,
     })
 }
 
@@ -721,6 +759,8 @@ pub(crate) fn build_info_grid(
     let tmap_item_ids = hdr.meta.item_ids_of_type(&crate::meta::ITEM_TYPE_TMAP);
     let tone_map_compliance = crate::derived::audit_tone_map(&hdr.meta);
     let grid_derivation_compliance = crate::derived::audit_grid_derivations(&hdr.meta);
+    let iden_item_ids = hdr.meta.item_ids_of_type(&crate::meta::ITEM_TYPE_IDEN);
+    let iden_compliance = crate::derived::audit_iden_derivations(&hdr.meta);
     Ok(AvifInfo {
         width: grid.output_width,
         height: grid.output_height,
@@ -754,6 +794,8 @@ pub(crate) fn build_info_grid(
         tmap_item_ids,
         tone_map_compliance,
         grid_derivation_compliance,
+        iden_item_ids,
+        iden_compliance,
     })
 }
 

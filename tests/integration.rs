@@ -2944,3 +2944,198 @@ fn inspect_reports_no_sato_for_typical_files() {
     assert!(info.tmap_item_ids.is_empty());
     assert!(!info.has_tone_map());
 }
+
+// ===========================================================================
+// Round 176 — HEIF §6.6.2.1 Identity Derived Image Item (`iden`) audit
+// ===========================================================================
+
+/// Build a synthetic AVIF whose primary item is an `av01` (item 1) and
+/// which additionally carries an `iden` derived image item (item 2)
+/// pointing at item 1 via a single `dimg` iref. The `iden` item has no
+/// `iloc` entry (HEIF §6.6.2.1 — `iden` items shall carry no body), so
+/// the audit reports a fully compliant `IdenCompliance` record.
+fn build_synthetic_avif_with_iden() -> Vec<u8> {
+    fn u32be(v: u32) -> [u8; 4] {
+        v.to_be_bytes()
+    }
+    fn u16be(v: u16) -> [u8; 2] {
+        v.to_be_bytes()
+    }
+    fn box_bytes(btype: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let size = (8 + body.len()) as u32;
+        let mut out = size.to_be_bytes().to_vec();
+        out.extend_from_slice(btype);
+        out.extend_from_slice(body);
+        out
+    }
+    fn full_box(btype: &[u8; 4], version: u8, flags: u32, body: &[u8]) -> Vec<u8> {
+        let mut payload = vec![
+            version,
+            (flags >> 16) as u8,
+            (flags >> 8) as u8,
+            flags as u8,
+        ];
+        payload.extend_from_slice(body);
+        box_bytes(btype, &payload)
+    }
+    fn infe_v2(id: u16, item_type: &[u8; 4]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&id.to_be_bytes());
+        body.extend_from_slice(&[0u8, 0]);
+        body.extend_from_slice(item_type);
+        body.push(0);
+        full_box(b"infe", 2, 0, &body)
+    }
+
+    // ftyp
+    let mut ftyp_body = Vec::new();
+    ftyp_body.extend_from_slice(b"avif");
+    ftyp_body.extend_from_slice(&u32be(0));
+    ftyp_body.extend_from_slice(b"mif1");
+    ftyp_body.extend_from_slice(b"miaf");
+    let ftyp = box_bytes(b"ftyp", &ftyp_body);
+
+    // hdlr
+    let mut hdlr_body = Vec::new();
+    hdlr_body.extend_from_slice(&[0u8; 4]);
+    hdlr_body.extend_from_slice(b"pict");
+    hdlr_body.extend_from_slice(&[0u8; 12]);
+    hdlr_body.extend_from_slice(b"\0");
+    let hdlr = full_box(b"hdlr", 0, 0, &hdlr_body);
+
+    // pitm → item 1 (av01 source — keeps the primary path simple)
+    let pitm = full_box(b"pitm", 0, 0, &u16be(1));
+
+    // iinf with item 1 = av01 and item 2 = iden
+    let infe1 = infe_v2(1, b"av01");
+    let infe2 = infe_v2(2, b"iden");
+    let mut iinf_body = Vec::new();
+    iinf_body.extend_from_slice(&u16be(2));
+    iinf_body.extend_from_slice(&infe1);
+    iinf_body.extend_from_slice(&infe2);
+    let iinf = full_box(b"iinf", 0, 0, &iinf_body);
+
+    // iref dimg: from item 2 → [item 1] (reference_count = 1)
+    let mut dimg_body = Vec::new();
+    dimg_body.extend_from_slice(&u16be(2));
+    dimg_body.extend_from_slice(&u16be(1));
+    dimg_body.extend_from_slice(&u16be(1));
+    let dimg_box = box_bytes(b"dimg", &dimg_body);
+    let iref = full_box(b"iref", 0, 0, &dimg_box);
+
+    // Properties: ispe + av1C + pixi attached to item 1.
+    let mut ipco_body = Vec::new();
+    let mut ispe_body = Vec::new();
+    ispe_body.extend_from_slice(&u32be(8));
+    ispe_body.extend_from_slice(&u32be(8));
+    let ispe = full_box(b"ispe", 0, 0, &ispe_body);
+    ipco_body.extend_from_slice(&ispe);
+    let av1c = box_bytes(b"av1C", &[0x81u8, 0, 0, 0]);
+    ipco_body.extend_from_slice(&av1c);
+    let mut pixi_body = vec![0u8; 4];
+    pixi_body.push(1);
+    pixi_body.push(8);
+    let pixi = box_bytes(b"pixi", &pixi_body);
+    ipco_body.extend_from_slice(&pixi);
+    let ipco = box_bytes(b"ipco", &ipco_body);
+
+    // ipma: item 1 → [1, 2, 3]
+    let mut ipma_body = Vec::new();
+    ipma_body.extend_from_slice(&u32be(1));
+    ipma_body.extend_from_slice(&1u16.to_be_bytes());
+    ipma_body.push(3);
+    ipma_body.push(1);
+    ipma_body.push(2);
+    ipma_body.push(3);
+    let ipma = full_box(b"ipma", 0, 0, &ipma_body);
+
+    let mut iprp_body = Vec::new();
+    iprp_body.extend_from_slice(&ipco);
+    iprp_body.extend_from_slice(&ipma);
+    let iprp = box_bytes(b"iprp", &iprp_body);
+
+    // iloc — only item 1 has an extent; item 2 (iden) carries no entry
+    // at all, which trivially satisfies HEIF §6.6.2.1's "no item body".
+    let obu_data = vec![0xAAu8; 8];
+    let ftyp_size = ftyp.len();
+    // iloc header (8) + 4 (version/flags) + 1 (offset/length sizes) + 1
+    // (base_offset/index sizes) + 2 (item_count) + 1 entry × 14.
+    let iloc_size = 8 + 4 + 1 + 1 + 2 + 14;
+    let meta_payload_size =
+        4 + hdlr.len() + pitm.len() + iinf.len() + iref.len() + iprp.len() + iloc_size;
+    let meta_size = 8 + meta_payload_size;
+    let mdat_start = ftyp_size + meta_size + 8;
+    let item1_off = mdat_start;
+
+    let mut iloc_inner = Vec::new();
+    iloc_inner.push(0x44); // offset_size=4, length_size=4
+    iloc_inner.push(0x00); // base_offset_size=0, index_size=0
+    iloc_inner.extend_from_slice(&u16be(1)); // item_count = 1 (only item 1)
+    iloc_inner.extend_from_slice(&u16be(1)); // item_id
+    iloc_inner.extend_from_slice(&u16be(0)); // data_reference_index
+    iloc_inner.extend_from_slice(&u16be(1)); // extent_count
+    iloc_inner.extend_from_slice(&u32be(item1_off as u32));
+    iloc_inner.extend_from_slice(&u32be(obu_data.len() as u32));
+    let iloc = full_box(b"iloc", 0, 0, &iloc_inner);
+
+    let mut meta_body = Vec::new();
+    meta_body.extend_from_slice(&[0u8; 4]); // FullBox header for meta
+    meta_body.extend_from_slice(&hdlr);
+    meta_body.extend_from_slice(&pitm);
+    meta_body.extend_from_slice(&iinf);
+    meta_body.extend_from_slice(&iref);
+    meta_body.extend_from_slice(&iprp);
+    meta_body.extend_from_slice(&iloc);
+    let meta = box_bytes(b"meta", &meta_body);
+    assert_eq!(meta.len(), meta_size, "meta size recalc");
+
+    let mdat = box_bytes(b"mdat", &obu_data);
+
+    let mut file = Vec::new();
+    file.extend_from_slice(&ftyp);
+    file.extend_from_slice(&meta);
+    file.extend_from_slice(&mdat);
+    file
+}
+
+/// End-to-end audit of a synthetic AVIF whose `iden` derivation obeys
+/// every HEIF §6.6.2.1 + §6.6.1 `shall`. `inspect` surfaces the iden
+/// item id, its compliance record, and the strict-compliant gate folds
+/// to `true`.
+#[test]
+fn inspect_surfaces_iden_item_ids_and_compliance_audit() {
+    let bytes = build_synthetic_avif_with_iden();
+    let info = inspect(&bytes).expect("inspect");
+    assert_eq!(info.iden_item_ids, vec![2]);
+    assert!(info.has_iden());
+    assert_eq!(info.iden_compliance.len(), 1);
+    let r = &info.iden_compliance[0];
+    assert_eq!(r.iden_item_id, 2);
+    assert_eq!(r.dimg_reference_count, 1);
+    assert_eq!(r.dimg_iref_count, 1);
+    assert!(!r.has_item_body);
+    assert_eq!(r.source_item_id, Some(1));
+    assert!(r.is_compliant());
+    assert!(r.missing().is_empty());
+    assert!(info.iden_strict_compliant());
+}
+
+/// The Microsoft monochrome conformance fixture ships no `iden` items
+/// so the audit returns an empty vector and the strict-compliant gate
+/// folds to `true` vacuously. Pins the no-iden-item shape of the audit
+/// on a real fixture.
+#[test]
+fn monochrome_fixture_has_no_iden_audit_records() {
+    const MONOCHROME: &[u8] = include_bytes!("fixtures/monochrome.avif");
+    let info = inspect(MONOCHROME).expect("inspect monochrome");
+    assert!(info.iden_item_ids.is_empty());
+    assert!(!info.has_iden());
+    assert!(
+        info.iden_compliance.is_empty(),
+        "no iden item → empty audit vector"
+    );
+    assert!(
+        info.iden_strict_compliant(),
+        "vacuous compliance for files without iden items"
+    );
+}

@@ -98,8 +98,8 @@ pub use cicp::{
     primaries_name, transfer_name, CicpTriple,
 };
 pub use derived::{
-    audit_tone_map, parse_grpl, EntityGroup, ImageOverlay, Mif1Compliance, OverlayEntry,
-    SampleTransform, Token, ToneMapCompliance,
+    audit_iden_derivations, audit_tone_map, parse_grpl, EntityGroup, IdenCompliance, ImageOverlay,
+    Mif1Compliance, OverlayEntry, SampleTransform, Token, ToneMapCompliance,
 };
 pub use error::{AvifError, Result};
 pub use grid::{composite_grid, ImageGrid};

@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 176 — HEIF v1.2.0 §6.6.2.1 Identity Derived Image Item
+  (`iden`) `shall`-level compliance audit. The HEIF §6.6.2.1
+  constraints ("derived image item shall have no item body" and
+  "`reference_count` for the `dimg` item reference of a `iden` derived
+  image item shall be equal to 1") together with the crosscutting
+  §6.6.1 `shall` ("number of `SingleItemTypeReferenceBoxes` with the
+  box type `dimg` and with the same value of `from_item_ID` shall not
+  be greater than 1") are now audited at the container layer via
+  `oxideav_avif::derived::audit_iden_derivations(&Meta)`. Returns one
+  `IdenCompliance { iden_item_id, dimg_reference_count,
+  dimg_iref_count, has_item_body, source_item_id, is_compliant(),
+  missing() }` record per `'iden'` item in `iinf` declaration order.
+- `AvifInfo::iden_item_ids` enumerates every `'iden'` carrier; the
+  paired `AvifInfo::iden_compliance: Vec<IdenCompliance>` reports the
+  per-item audit result, and `AvifInfo::iden_strict_compliant()`
+  folds the AND of every record (vacuously `true` when no iden items
+  exist).
+- Public re-exports of `audit_iden_derivations` and `IdenCompliance`
+  from the crate root, mirroring the existing `audit_tone_map` /
+  `audit_grid_derivations` access pattern.
+- Test delta: +9 unit tests in `derived::tests::audit_iden_*`
+  covering the happy path (no `iloc` entry); compliant zero-length
+  extent; non-empty body flagged; zero `dimg` inputs; two inputs in
+  one iref; multiple iref entries sharing the same `from_item_ID`;
+  empty audit list when no iden items; multi-iden iinf-ordering;
+  non-`dimg` irefs ignored. +1 integration
+  (`monochrome_fixture_has_no_iden_audit_records`) pins the
+  no-iden-item vacuum on the Microsoft monochrome conformance fixture.
+
 - Round 172 — av1-avif v1.2.0 §7 General-constraints
   transformative-property audit for grid derivation chains. The §7
   `shall` "Transformative properties shall not be associated with items

@@ -1025,6 +1025,170 @@ pub fn audit_grid_derivations(meta: &crate::meta::Meta) -> Vec<GridDerivationAud
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// HEIF §6.6.2.1 — Identity Derived Image Item (`iden`) `shall`-level compliance
+// ---------------------------------------------------------------------------
+
+/// Per-iden `shall`-level compliance against ISO/IEC 23008-12 (HEIF) §6.6.2.1
+/// (Identity derivation):
+///
+/// > A derived image item of the `item_type` value `'iden'` (identity
+/// > transformation) may be used when it is desired to use transformative
+/// > properties to derive an image item. The derived image item **shall**
+/// > have no item body (i.e. no extents), and `reference_count` for the
+/// > `'dimg'` item reference of a `'iden'` derived image item **shall** be
+/// > equal to 1.
+///
+/// In addition to those two clause-local `shall`s, HEIF §6.6.1 imposes a
+/// crosscutting `shall` that applies to every derived image item (`iden`
+/// included):
+///
+/// > The number of `SingleItemTypeReferenceBoxes` with the box type `'dimg'`
+/// > and with the same value of `from_item_ID` **shall** not be greater
+/// > than 1.
+///
+/// Together, the constraints check whether a file's `'iden'` items obey
+/// the standalone identity-derivation `shall`s without depending on any
+/// pixel-side decode (the AV1 OBU pipeline is irrelevant here — `iden`
+/// items have no body to decode in the first place).
+///
+/// One [`IdenCompliance`] record is emitted per `'iden'` item in `iinf`
+/// declaration order via [`audit_iden_derivations`]. Each record reports:
+///
+/// * `dimg_reference_count` — number of `'dimg'` `to_ids` listed for the
+///   iden's `from_item_ID`. Compliant value is exactly `1`.
+/// * `dimg_iref_count` — how many separate `'dimg'` iref entries share the
+///   iden's `from_item_ID`. Compliant value is at most `1` (HEIF §6.6.1).
+/// * `has_item_body` — whether the iden's `'iloc'` entry lists any
+///   non-empty extent. Compliant value is `false` (no body).
+/// * `source_item_id` — the single contributing source item id, when
+///   `dimg_reference_count == 1`. Useful for callers that want to resolve
+///   which coded image item the iden derives from without re-walking the
+///   iref.
+///
+/// All three checks are `shall`-level, so a fail means the file is
+/// non-conformant per HEIF §6.6.2.1 / §6.6.1. [`Self::is_compliant`]
+/// reports the AND of every signal; [`Self::missing`] enumerates the
+/// failing checks for diagnostics.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct IdenCompliance {
+    /// The `'iden'` item id this audit describes.
+    pub iden_item_id: u32,
+    /// Number of `'dimg'` `to_ids` listed for the iden's `from_item_ID`,
+    /// across the single matching iref entry (HEIF §6.6.1 forbids more
+    /// than one such entry; when multiple are present this counts the
+    /// first only, and `dimg_iref_count` flags the violation separately).
+    /// Compliant value: exactly `1`.
+    pub dimg_reference_count: usize,
+    /// Number of distinct `'dimg'` `SingleItemTypeReferenceBox` entries
+    /// whose `from_item_ID` equals the iden item id. Compliant value: at
+    /// most `1` (HEIF §6.6.1).
+    pub dimg_iref_count: usize,
+    /// `true` when the iden item's `'iloc'` entry carries any extent —
+    /// HEIF §6.6.2.1 mandates the iden item have no body. Compliant
+    /// value: `false`. An iden with no `'iloc'` entry at all is also
+    /// compliant (empty extent list).
+    pub has_item_body: bool,
+    /// The single source image item id contributing to the iden, when
+    /// `dimg_reference_count == 1`. `None` when the iden has zero
+    /// inputs or when the input count is non-conformant (in which case
+    /// the audit doesn't pick "the" source — the file is malformed and
+    /// the caller should inspect `dimg_reference_count` to disambiguate).
+    pub source_item_id: Option<u32>,
+}
+
+impl IdenCompliance {
+    /// True when every HEIF §6.6.2.1 + §6.6.1 `shall` passes for this
+    /// iden item:
+    ///
+    /// * exactly one `'dimg'` input (`dimg_reference_count == 1`),
+    /// * exactly one `'dimg'` iref entry for the iden's `from_item_ID`
+    ///   (`dimg_iref_count <= 1`; zero is a degenerate but still
+    ///   non-conformant case),
+    /// * no item body (`!has_item_body`).
+    pub fn is_compliant(&self) -> bool {
+        self.dimg_reference_count == 1 && self.dimg_iref_count == 1 && !self.has_item_body
+    }
+
+    /// Human-readable list of failed `shall`s. Returns an empty vector
+    /// when [`Self::is_compliant`].
+    pub fn missing(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.dimg_reference_count != 1 {
+            out.push("dimg-reference-count-eq-1");
+        }
+        if self.dimg_iref_count != 1 {
+            out.push("dimg-iref-count-eq-1");
+        }
+        if self.has_item_body {
+            out.push("no-item-body");
+        }
+        out
+    }
+}
+
+/// Audit every `'iden'` item carried in `meta` against the HEIF §6.6.2.1
+/// (Identity derivation) and §6.6.1 (derived-image cross-clause)
+/// `shall`-level constraints. Returns one [`IdenCompliance`] record per
+/// iden item, in `iinf` declaration order. The returned vector is empty
+/// when the file ships no iden items.
+///
+/// Spec: ISO/IEC 23008-12 (HEIF) §6.6.2.1 — "The derived image item shall
+/// have no item body (i.e. no extents), and `reference_count` for the
+/// `'dimg'` item reference of a `'iden'` derived image item shall be equal
+/// to 1." + §6.6.1 — "The number of `SingleItemTypeReferenceBoxes` with
+/// the box type `'dimg'` and with the same value of `from_item_ID` shall
+/// not be greater than 1."
+pub fn audit_iden_derivations(meta: &crate::meta::Meta) -> Vec<IdenCompliance> {
+    let iden_type = crate::meta::ITEM_TYPE_IDEN;
+    let dimg = b(b"dimg");
+    meta.item_ids_of_type(&iden_type)
+        .into_iter()
+        .map(|iden_id| audit_one_iden(meta, &dimg, iden_id))
+        .collect()
+}
+
+fn audit_one_iden(meta: &crate::meta::Meta, dimg: &BoxType, iden_id: u32) -> IdenCompliance {
+    // Count how many distinct `'dimg'` iref entries share this iden as
+    // their `from_item_ID` (HEIF §6.6.1: shall not be greater than 1).
+    let dimg_iref_count = meta
+        .irefs
+        .iter()
+        .filter(|e| &e.reference_type == dimg && e.from_id == iden_id)
+        .count();
+
+    // `iref_targets` returns the to_ids of the first matching entry, so
+    // when `dimg_iref_count > 1` the reference count reported here is from
+    // entry 0 only — that's fine: the `dimg_iref_count` field is what
+    // flags the §6.6.1 violation, while `dimg_reference_count` checks the
+    // §6.6.2.1 single-input shall against the (possibly first-of-many)
+    // observed input list.
+    let inputs = meta.iref_targets(dimg, iden_id);
+    let dimg_reference_count = inputs.len();
+    let source_item_id = if dimg_reference_count == 1 {
+        Some(inputs[0])
+    } else {
+        None
+    };
+
+    // HEIF §6.6.2.1 mandates the iden item carry no item body. An item
+    // with no `'iloc'` entry at all trivially has no body; an entry with
+    // an empty extent list (or every extent length zero) is equivalent.
+    // Any non-zero-length extent flags a violation.
+    let has_item_body = meta
+        .location_by_id(iden_id)
+        .map(|loc| loc.extents.iter().any(|x| x.length > 0))
+        .unwrap_or(false);
+
+    IdenCompliance {
+        iden_item_id: iden_id,
+        dimg_reference_count,
+        dimg_iref_count,
+        has_item_body,
+        source_item_id,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2004,6 +2168,283 @@ mod tests {
         let r = &audit_grid_derivations(&meta)[0];
         assert_eq!(r.grid_item_id, 1);
         assert!(r.tile_item_ids.is_empty());
+        assert!(r.is_compliant());
+    }
+
+    // -------------------------------------------------------------------
+    // Identity (`iden`) compliance audit (HEIF §6.6.2.1 + §6.6.1)
+    // -------------------------------------------------------------------
+
+    use crate::meta::{IlocExtent, ItemLocation};
+
+    /// Build a placeholder [`ItemLocation`] with a single non-empty
+    /// extent — useful for the `has_item_body == true` (non-conformant)
+    /// shape.
+    fn make_iloc_with_body(id: u32) -> ItemLocation {
+        ItemLocation {
+            id,
+            construction_method: 0,
+            data_reference_index: 0,
+            base_offset: 0,
+            extents: vec![IlocExtent {
+                offset: 1000,
+                length: 16,
+            }],
+        }
+    }
+
+    /// `ItemLocation` with one extent whose `length == 0`. HEIF §6.6.2.1
+    /// requires the iden to have no body; a zero-length extent is
+    /// equivalent (no actual bytes) and the audit treats it as compliant.
+    fn make_iloc_zero_length(id: u32) -> ItemLocation {
+        ItemLocation {
+            id,
+            construction_method: 0,
+            data_reference_index: 0,
+            base_offset: 0,
+            extents: vec![IlocExtent {
+                offset: 0,
+                length: 0,
+            }],
+        }
+    }
+
+    /// Happy path: one `'iden'` item with exactly one `'dimg'` input,
+    /// exactly one `'dimg'` iref entry for the iden's `from_item_ID`,
+    /// and no `'iloc'` entry at all (so trivially no body).
+    #[test]
+    fn audit_iden_compliant_no_iloc_entry() {
+        let meta = Meta {
+            items: vec![
+                make_infe(1, b"av01", 0), // source
+                make_infe(2, b"iden", 0), // identity derivation
+            ],
+            irefs: vec![IrefEntry {
+                reference_type: *b"dimg",
+                from_id: 2,
+                to_ids: vec![1],
+            }],
+            ..Meta::default()
+        };
+        let r = audit_iden_derivations(&meta);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].iden_item_id, 2);
+        assert_eq!(r[0].dimg_reference_count, 1);
+        assert_eq!(r[0].dimg_iref_count, 1);
+        assert!(!r[0].has_item_body);
+        assert_eq!(r[0].source_item_id, Some(1));
+        assert!(r[0].is_compliant());
+        assert!(r[0].missing().is_empty());
+    }
+
+    /// An `'iden'` with an `'iloc'` entry that carries a zero-length
+    /// extent passes the "no item body" check — the spec defines "body"
+    /// in terms of actual byte content, not the presence of an iloc
+    /// entry. Compliant.
+    #[test]
+    fn audit_iden_compliant_iloc_with_zero_length_extent() {
+        let meta = Meta {
+            items: vec![make_infe(1, b"av01", 0), make_infe(2, b"iden", 0)],
+            locations: vec![make_iloc_zero_length(2)],
+            irefs: vec![IrefEntry {
+                reference_type: *b"dimg",
+                from_id: 2,
+                to_ids: vec![1],
+            }],
+            ..Meta::default()
+        };
+        let r = &audit_iden_derivations(&meta)[0];
+        assert!(!r.has_item_body);
+        assert!(r.is_compliant());
+    }
+
+    /// HEIF §6.6.2.1: an `'iden'` item with a non-empty extent has a
+    /// body, which is forbidden. The audit flags it.
+    #[test]
+    fn audit_iden_flags_non_empty_item_body() {
+        let meta = Meta {
+            items: vec![make_infe(1, b"av01", 0), make_infe(2, b"iden", 0)],
+            locations: vec![make_iloc_with_body(2)],
+            irefs: vec![IrefEntry {
+                reference_type: *b"dimg",
+                from_id: 2,
+                to_ids: vec![1],
+            }],
+            ..Meta::default()
+        };
+        let r = &audit_iden_derivations(&meta)[0];
+        assert!(r.has_item_body);
+        assert!(!r.is_compliant());
+        assert!(r.missing().contains(&"no-item-body"));
+    }
+
+    /// HEIF §6.6.2.1: `reference_count` of an `'iden'`'s `'dimg'` iref
+    /// shall be exactly 1. A zero-input iden fails.
+    #[test]
+    fn audit_iden_flags_zero_dimg_inputs() {
+        let meta = Meta {
+            items: vec![make_infe(2, b"iden", 0)],
+            irefs: vec![],
+            ..Meta::default()
+        };
+        let r = &audit_iden_derivations(&meta)[0];
+        assert_eq!(r.dimg_reference_count, 0);
+        assert_eq!(r.dimg_iref_count, 0);
+        assert_eq!(r.source_item_id, None);
+        assert!(!r.is_compliant());
+        let m = r.missing();
+        assert!(m.contains(&"dimg-reference-count-eq-1"));
+        assert!(m.contains(&"dimg-iref-count-eq-1"));
+    }
+
+    /// HEIF §6.6.2.1: `reference_count` of an `'iden'`'s `'dimg'` iref
+    /// shall be exactly 1. Two inputs fail. (HEIF §6.6.1 separately
+    /// forbids multiple iref entries with the same `from_item_ID`; this
+    /// case is one entry with reference_count = 2, so §6.6.1 is OK but
+    /// §6.6.2.1 is not.)
+    #[test]
+    fn audit_iden_flags_two_dimg_inputs_in_single_iref() {
+        let meta = Meta {
+            items: vec![
+                make_infe(1, b"av01", 0),
+                make_infe(2, b"av01", 0),
+                make_infe(3, b"iden", 0),
+            ],
+            irefs: vec![IrefEntry {
+                reference_type: *b"dimg",
+                from_id: 3,
+                to_ids: vec![1, 2],
+            }],
+            ..Meta::default()
+        };
+        let r = &audit_iden_derivations(&meta)[0];
+        assert_eq!(r.dimg_reference_count, 2);
+        // Single iref entry → §6.6.1 still satisfied even though it
+        // carries two to_ids.
+        assert_eq!(r.dimg_iref_count, 1);
+        assert_eq!(r.source_item_id, None);
+        assert!(!r.is_compliant());
+        assert!(r.missing().contains(&"dimg-reference-count-eq-1"));
+        assert!(!r.missing().contains(&"dimg-iref-count-eq-1"));
+    }
+
+    /// HEIF §6.6.1: number of `'dimg'` SingleItemTypeReferenceBoxes with
+    /// the same `from_item_ID` shall be at most 1. Two separate iref
+    /// entries fail.
+    #[test]
+    fn audit_iden_flags_multiple_dimg_iref_entries() {
+        let meta = Meta {
+            items: vec![
+                make_infe(1, b"av01", 0),
+                make_infe(2, b"av01", 0),
+                make_infe(3, b"iden", 0),
+            ],
+            irefs: vec![
+                IrefEntry {
+                    reference_type: *b"dimg",
+                    from_id: 3,
+                    to_ids: vec![1],
+                },
+                IrefEntry {
+                    reference_type: *b"dimg",
+                    from_id: 3,
+                    to_ids: vec![2],
+                },
+            ],
+            ..Meta::default()
+        };
+        let r = &audit_iden_derivations(&meta)[0];
+        assert_eq!(r.dimg_iref_count, 2);
+        // `iref_targets` returns the first matching entry only, so the
+        // observed reference_count is 1 (from entry 0). §6.6.1 violation
+        // is reported via `dimg_iref_count`.
+        assert_eq!(r.dimg_reference_count, 1);
+        assert!(!r.is_compliant());
+        assert!(r.missing().contains(&"dimg-iref-count-eq-1"));
+    }
+
+    /// File with no `'iden'` items returns an empty audit list. Other
+    /// derived items (`grid`, `tmap`, `sato`, `iovl`) are not picked up.
+    #[test]
+    fn audit_iden_empty_when_no_iden_items() {
+        let meta = Meta {
+            items: vec![
+                make_infe(1, b"av01", 0),
+                make_infe(2, b"grid", 0),
+                make_infe(3, b"tmap", 0),
+                make_infe(4, b"sato", 0),
+                make_infe(5, b"iovl", 0),
+            ],
+            ..Meta::default()
+        };
+        assert!(audit_iden_derivations(&meta).is_empty());
+    }
+
+    /// Multiple `'iden'` items are audited in `iinf` declaration order.
+    /// One compliant + one with a forbidden item body — the two records
+    /// surface independently with the right ids.
+    #[test]
+    fn audit_iden_reports_each_iden_item_in_iinf_order() {
+        let meta = Meta {
+            items: vec![
+                make_infe(1, b"av01", 0),
+                make_infe(2, b"iden", 0), // compliant
+                make_infe(3, b"av01", 0),
+                make_infe(4, b"iden", 0), // has body → non-compliant
+            ],
+            locations: vec![make_iloc_with_body(4)],
+            irefs: vec![
+                IrefEntry {
+                    reference_type: *b"dimg",
+                    from_id: 2,
+                    to_ids: vec![1],
+                },
+                IrefEntry {
+                    reference_type: *b"dimg",
+                    from_id: 4,
+                    to_ids: vec![3],
+                },
+            ],
+            ..Meta::default()
+        };
+        let r = audit_iden_derivations(&meta);
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].iden_item_id, 2);
+        assert!(r[0].is_compliant());
+        assert_eq!(r[1].iden_item_id, 4);
+        assert!(!r[1].is_compliant());
+        assert!(r[1].has_item_body);
+    }
+
+    /// A non-`'dimg'` iref of the same shape (e.g. `'cdsc'`) must not
+    /// be counted by the audit — only `'dimg'` references contribute to
+    /// HEIF §6.6.2.1 / §6.6.1 input enumeration.
+    #[test]
+    fn audit_iden_ignores_non_dimg_irefs() {
+        let meta = Meta {
+            items: vec![
+                make_infe(1, b"av01", 0),
+                make_infe(2, b"iden", 0),
+                make_infe(9, b"Exif", 0),
+            ],
+            irefs: vec![
+                IrefEntry {
+                    reference_type: *b"dimg",
+                    from_id: 2,
+                    to_ids: vec![1],
+                },
+                // `cdsc` from a metadata item — irrelevant to iden input.
+                IrefEntry {
+                    reference_type: *b"cdsc",
+                    from_id: 9,
+                    to_ids: vec![2],
+                },
+            ],
+            ..Meta::default()
+        };
+        let r = &audit_iden_derivations(&meta)[0];
+        assert_eq!(r.dimg_iref_count, 1);
+        assert_eq!(r.dimg_reference_count, 1);
         assert!(r.is_compliant());
     }
 }
