@@ -3139,3 +3139,57 @@ fn monochrome_fixture_has_no_iden_audit_records() {
         "vacuous compliance for files without iden items"
     );
 }
+
+/// The Microsoft monochrome conformance fixture ships no alpha
+/// auxiliary, so the av1-avif §4.1 audit returns an empty vector and
+/// the strict-compliant gate folds to `true` vacuously. Pins the
+/// no-alpha-auxiliary shape on a real fixture.
+#[test]
+fn monochrome_fixture_has_no_alpha_bit_depth_audit_records() {
+    const MONOCHROME: &[u8] = include_bytes!("fixtures/monochrome.avif");
+    let info = inspect(MONOCHROME).expect("inspect monochrome");
+    assert!(!info.has_alpha);
+    assert!(
+        info.alpha_bit_depth_compliance.is_empty(),
+        "no alpha auxiliary → empty bit-depth audit vector"
+    );
+    assert!(
+        info.alpha_bit_depth_strict_compliant(),
+        "vacuous compliance for files without alpha auxiliaries"
+    );
+}
+
+/// The Microsoft `bbb_alpha_inverted.avif` carries an alpha auxiliary;
+/// the av1-avif §4.1 audit must produce at least one record and (since
+/// the fixture is a real conformance file) flag the pairing compliant.
+/// Both alpha and master are 8-bit per `av1C`.
+#[test]
+fn bbb_alpha_fixture_alpha_master_bit_depth_match() {
+    let info = inspect(BBB_ALPHA).expect("inspect bbb_alpha");
+    assert!(info.has_alpha, "bbb_alpha_inverted must carry alpha");
+    assert!(
+        !info.alpha_bit_depth_compliance.is_empty(),
+        "alpha-bearing fixture must emit at least one (alpha, master) audit record"
+    );
+    for r in &info.alpha_bit_depth_compliance {
+        assert!(
+            !r.alpha_missing_av1c,
+            "alpha item must carry an av1C per §2.1 — fixture violates that"
+        );
+        assert!(
+            !r.master_missing_av1c,
+            "master item must carry an av1C per §2.1 — fixture violates that"
+        );
+        assert_eq!(
+            r.alpha_bit_depth, r.master_bit_depth,
+            "§4.1 shall: alpha {:?} vs master {:?} on pairing ({}, {})",
+            r.alpha_bit_depth, r.master_bit_depth, r.alpha_item_id, r.master_item_id
+        );
+        assert!(r.is_compliant(), "bbb_alpha must be §4.1 compliant");
+        assert!(r.missing().is_empty());
+    }
+    assert!(
+        info.alpha_bit_depth_strict_compliant(),
+        "every (alpha, master) pairing in bbb_alpha must agree on bit depth"
+    );
+}

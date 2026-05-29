@@ -1189,6 +1189,189 @@ fn audit_one_iden(meta: &crate::meta::Meta, dimg: &BoxType, iden_id: u32) -> Ide
     }
 }
 
+// ---------------------------------------------------------------------------
+// AV1 Alpha Image Item bit-depth match audit (av1-avif v1.2.0 §4.1)
+// ---------------------------------------------------------------------------
+
+/// Decode bit-depth from the first three bytes of an `av1C` (AV1
+/// CodecConfigurationRecord) payload. Returns `None` when the slice is
+/// too short to carry the `high_bitdepth` / `twelve_bit` flag byte.
+///
+/// Layout per av1-avif §2.2.1 (which references AV1 Bitstream &
+/// Decoding Process §6.4): `av1C[2]` packs
+/// `high_bitdepth (1) | twelve_bit (1) | monochrome (1) |
+///  chroma_subsampling_x (1) | chroma_subsampling_y (1) |
+///  chroma_sample_position (2) | reserved (1)`. Bit depth is `8`
+/// (neither flag), `10` (high only), or `12` (both).
+fn decode_av1c_bit_depth(av1c: &[u8]) -> Option<u8> {
+    if av1c.len() < 3 {
+        return None;
+    }
+    let b2 = av1c[2];
+    let high_bitdepth = ((b2 >> 6) & 1) != 0;
+    let twelve_bit = ((b2 >> 5) & 1) != 0;
+    Some(if twelve_bit {
+        12
+    } else if high_bitdepth {
+        10
+    } else {
+        8
+    })
+}
+
+/// Per-(alpha, master) `shall`-level compliance against av1-avif v1.2.0
+/// §4.1 (Auxiliary Image Items and Sequences):
+///
+/// > An AV1 Alpha Image Item (respectively an AV1 Alpha Image Sequence)
+/// > shall be encoded with the same bit depth as the associated master
+/// > AV1 Image Item (respectively AV1 Image Sequence).
+///
+/// One [`AlphaBitDepthAudit`] record is emitted per `(alpha_item_id,
+/// master_item_id)` pair an `auxl` iref's `to_ids` declares, in iref
+/// declaration order. The audit is independent of any AV1 OBU decode —
+/// the check operates entirely on the `av1C` configuration record
+/// surfaced by the box walker.
+///
+/// Fields:
+///
+/// * `alpha_bit_depth` / `master_bit_depth` — bit depths extracted from
+///   each item's `av1C` property (`8`, `10`, or `12`). `None` when the
+///   corresponding item carries no `av1C` (malformed) or when the
+///   `av1C` payload is too short to carry the flag byte.
+/// * `master_missing_av1c` — `true` when the master item id appearing
+///   in the `auxl` iref does not resolve to an item with an `av1C`
+///   property. This is also a §2.1 violation (every AV1 Image Item
+///   shall carry `av1C`) and surfaces alongside the bit-depth check
+///   here for a single point of inspection.
+/// * `alpha_missing_av1c` — same for the alpha item.
+///
+/// The check passes ([`AlphaBitDepthAudit::is_compliant`]) when both
+/// items carry an `av1C` and both decoded bit depths agree. Either
+/// item missing `av1C`, or any mismatch, fails the audit.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct AlphaBitDepthAudit {
+    /// The AV1 Alpha Image Item id (the `auxl` iref's `from_id`).
+    pub alpha_item_id: u32,
+    /// The associated master AV1 Image Item id (one of the `auxl`
+    /// iref's `to_ids`).
+    pub master_item_id: u32,
+    /// Bit depth decoded from the alpha item's `av1C` (`8`, `10`, or
+    /// `12`), or `None` when `av1C` is absent or truncated.
+    pub alpha_bit_depth: Option<u8>,
+    /// Bit depth decoded from the master item's `av1C`, or `None` when
+    /// `av1C` is absent or truncated.
+    pub master_bit_depth: Option<u8>,
+    /// `true` when the alpha item carries no `av1C` association at all.
+    /// Distinct from a present-but-truncated `av1C` (which surfaces as
+    /// `alpha_bit_depth = None` without setting this flag).
+    pub alpha_missing_av1c: bool,
+    /// `true` when the master item carries no `av1C` association at
+    /// all.
+    pub master_missing_av1c: bool,
+}
+
+impl AlphaBitDepthAudit {
+    /// True when both items carry an `av1C` whose decoded bit depth
+    /// agrees — the spec-compliant shape per av1-avif §4.1.
+    pub fn is_compliant(&self) -> bool {
+        match (self.alpha_bit_depth, self.master_bit_depth) {
+            (Some(a), Some(m)) => a == m,
+            _ => false,
+        }
+    }
+
+    /// Human-readable list of failed `shall`s. Returns an empty vector
+    /// when [`Self::is_compliant`].
+    pub fn missing(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.alpha_missing_av1c {
+            out.push("alpha-item-missing-av1C");
+        } else if self.alpha_bit_depth.is_none() {
+            out.push("alpha-item-av1C-truncated");
+        }
+        if self.master_missing_av1c {
+            out.push("master-item-missing-av1C");
+        } else if self.master_bit_depth.is_none() {
+            out.push("master-item-av1C-truncated");
+        }
+        if let (Some(a), Some(m)) = (self.alpha_bit_depth, self.master_bit_depth) {
+            if a != m {
+                out.push("alpha-master-bit-depth-mismatch");
+            }
+        }
+        out
+    }
+}
+
+/// Audit every `(AV1 Alpha Image Item, associated master AV1 Image
+/// Item)` pairing carried in `meta` against the av1-avif §4.1 `shall`
+/// that they share bit depth. Returns one [`AlphaBitDepthAudit`] record
+/// per `(alpha, master)` pair declared by an `auxl` iref. The returned
+/// vector is empty when the file ships no AV1 Alpha Image Items.
+///
+/// An item qualifies as an "AV1 Alpha Image Item" when:
+///
+/// 1. It is the `from_id` of an `auxl` iref entry, and
+/// 2. It carries an `auxC` property whose URN starts with the alpha
+///    prefix (`urn:mpeg:mpegB:cicp:systems:auxiliary:alpha`), matching
+///    [`crate::alpha::ALPHA_URN_PREFIX`].
+///
+/// Each `to_id` in the same iref entry is audited as a master. A single
+/// alpha item declared against multiple masters (a `to_ids` list of
+/// length > 1) emits one record per master, in `to_ids` order — the
+/// `shall` applies per pairing. Iref entries are processed in the order
+/// they appear inside the source `iref` box.
+///
+/// Spec: av1-avif v1.2.0 §4.1 — "An AV1 Alpha Image Item (respectively
+/// an AV1 Alpha Image Sequence) shall be encoded with the same bit
+/// depth as the associated master AV1 Image Item (respectively AV1
+/// Image Sequence)."
+pub fn audit_alpha_bit_depth(meta: &crate::meta::Meta) -> Vec<AlphaBitDepthAudit> {
+    let auxl = b(b"auxl");
+    let auxc = b(b"auxC");
+    let av1c = b(b"av1C");
+    let mut out = Vec::new();
+    for entry in &meta.irefs {
+        if entry.reference_type != auxl {
+            continue;
+        }
+        let alpha_id = entry.from_id;
+        // Classify the candidate as an alpha auxiliary by URN prefix
+        // match against the `auxC` property. Non-alpha auxiliaries
+        // (depth maps, HDR gain maps) are bound by separate `shall`s
+        // beyond §4.1's bit-depth constraint and don't surface here.
+        let is_alpha = match meta.property_for(alpha_id, &auxc) {
+            Some(crate::meta::Property::AuxC(aux)) => {
+                aux.aux_type.starts_with(crate::alpha::ALPHA_URN_PREFIX)
+            }
+            _ => false,
+        };
+        if !is_alpha {
+            continue;
+        }
+        let (alpha_bit_depth, alpha_missing_av1c) = match meta.property_for(alpha_id, &av1c) {
+            Some(crate::meta::Property::Av1C(bytes)) => (decode_av1c_bit_depth(bytes), false),
+            _ => (None, true),
+        };
+        for &master_id in &entry.to_ids {
+            let (master_bit_depth, master_missing_av1c) = match meta.property_for(master_id, &av1c)
+            {
+                Some(crate::meta::Property::Av1C(bytes)) => (decode_av1c_bit_depth(bytes), false),
+                _ => (None, true),
+            };
+            out.push(AlphaBitDepthAudit {
+                alpha_item_id: alpha_id,
+                master_item_id: master_id,
+                alpha_bit_depth,
+                master_bit_depth,
+                alpha_missing_av1c,
+                master_missing_av1c,
+            });
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2446,5 +2629,349 @@ mod tests {
         assert_eq!(r.dimg_iref_count, 1);
         assert_eq!(r.dimg_reference_count, 1);
         assert!(r.is_compliant());
+    }
+
+    // -------------------------------------------------------------------
+    // AV1 Alpha bit-depth match audit (av1-avif v1.2.0 §4.1)
+    // -------------------------------------------------------------------
+
+    use crate::meta::{AuxC, ItemPropertyAssociation as Ipa, PropertyAssociation as Pa};
+
+    /// Build an `av1C` payload whose first three bytes carry the
+    /// `(high_bitdepth, twelve_bit)` flag pair for the given bit depth.
+    /// Bit 7 is the `marker` (always 1), bits 6..0 of byte 0 are
+    /// `version` (always 1) — but the audit only consults byte 2, so
+    /// we just zero the first two bytes here.
+    fn av1c_with_bit_depth(bit_depth: u8) -> Vec<u8> {
+        let (high, twelve) = match bit_depth {
+            8 => (0u8, 0u8),
+            10 => (1, 0),
+            12 => (1, 1),
+            _ => panic!("test helper supports 8/10/12 only"),
+        };
+        // byte 0: marker(1) + version(7) — recreated nominally as 0x81.
+        // byte 1: profile/seq_level — irrelevant to bit depth.
+        // byte 2: high_bitdepth(1)<<6 | twelve_bit(1)<<5 | rest.
+        let b2 = (high << 6) | (twelve << 5);
+        vec![0x81, 0x00, b2]
+    }
+
+    fn ipa(item_id: u32, indices: &[u16]) -> Ipa {
+        Ipa {
+            item_id,
+            entries: indices
+                .iter()
+                .map(|i| Pa {
+                    index: *i,
+                    essential: false,
+                })
+                .collect(),
+        }
+    }
+
+    fn make_alpha_auxc() -> AuxC {
+        AuxC {
+            aux_type: crate::alpha::ALPHA_URN_PREFIX.to_string(),
+            aux_subtype: Vec::new(),
+        }
+    }
+
+    fn make_depth_auxc() -> AuxC {
+        AuxC {
+            aux_type: crate::meta::AUX_URN_DEPTH_MPEG.to_string(),
+            aux_subtype: Vec::new(),
+        }
+    }
+
+    /// `decode_av1c_bit_depth` covers the three legal AV1 depths.
+    #[test]
+    fn decode_av1c_bit_depth_recognises_8_10_12() {
+        assert_eq!(decode_av1c_bit_depth(&av1c_with_bit_depth(8)), Some(8));
+        assert_eq!(decode_av1c_bit_depth(&av1c_with_bit_depth(10)), Some(10));
+        assert_eq!(decode_av1c_bit_depth(&av1c_with_bit_depth(12)), Some(12));
+    }
+
+    /// Truncated `av1C` (< 3 bytes) is rejected without panicking.
+    #[test]
+    fn decode_av1c_bit_depth_handles_truncation() {
+        assert_eq!(decode_av1c_bit_depth(&[]), None);
+        assert_eq!(decode_av1c_bit_depth(&[0x81]), None);
+        assert_eq!(decode_av1c_bit_depth(&[0x81, 0x00]), None);
+    }
+
+    /// Happy path: 8-bit master + 8-bit alpha → compliant.
+    #[test]
+    fn audit_alpha_bit_depth_match_compliant() {
+        let meta = Meta {
+            items: vec![
+                make_infe(1, b"av01", 0), // master
+                make_infe(2, b"av01", 0), // alpha
+            ],
+            irefs: vec![IrefEntry {
+                reference_type: *b"auxl",
+                from_id: 2,
+                to_ids: vec![1],
+            }],
+            properties: vec![
+                Property::Av1C(av1c_with_bit_depth(8)), // index 0 — master av1C
+                Property::Av1C(av1c_with_bit_depth(8)), // index 1 — alpha av1C
+                Property::AuxC(make_alpha_auxc()),      // index 2
+            ],
+            associations: vec![ipa(1, &[0]), ipa(2, &[1, 2])],
+            ..Meta::default()
+        };
+        let r = audit_alpha_bit_depth(&meta);
+        assert_eq!(r.len(), 1);
+        let rec = &r[0];
+        assert_eq!(rec.alpha_item_id, 2);
+        assert_eq!(rec.master_item_id, 1);
+        assert_eq!(rec.alpha_bit_depth, Some(8));
+        assert_eq!(rec.master_bit_depth, Some(8));
+        assert!(!rec.alpha_missing_av1c);
+        assert!(!rec.master_missing_av1c);
+        assert!(rec.is_compliant());
+        assert!(rec.missing().is_empty());
+    }
+
+    /// 10-bit master + 8-bit alpha → §4.1 mismatch flagged.
+    #[test]
+    fn audit_alpha_bit_depth_mismatch_flagged() {
+        let meta = Meta {
+            items: vec![make_infe(1, b"av01", 0), make_infe(2, b"av01", 0)],
+            irefs: vec![IrefEntry {
+                reference_type: *b"auxl",
+                from_id: 2,
+                to_ids: vec![1],
+            }],
+            properties: vec![
+                Property::Av1C(av1c_with_bit_depth(10)), // master 10-bit
+                Property::Av1C(av1c_with_bit_depth(8)),  // alpha 8-bit
+                Property::AuxC(make_alpha_auxc()),
+            ],
+            associations: vec![ipa(1, &[0]), ipa(2, &[1, 2])],
+            ..Meta::default()
+        };
+        let rec = &audit_alpha_bit_depth(&meta)[0];
+        assert_eq!(rec.alpha_bit_depth, Some(8));
+        assert_eq!(rec.master_bit_depth, Some(10));
+        assert!(!rec.is_compliant());
+        assert_eq!(rec.missing(), vec!["alpha-master-bit-depth-mismatch"]);
+    }
+
+    /// 12-bit on both sides also matches.
+    #[test]
+    fn audit_alpha_bit_depth_12_bit_compliant() {
+        let meta = Meta {
+            items: vec![make_infe(1, b"av01", 0), make_infe(2, b"av01", 0)],
+            irefs: vec![IrefEntry {
+                reference_type: *b"auxl",
+                from_id: 2,
+                to_ids: vec![1],
+            }],
+            properties: vec![
+                Property::Av1C(av1c_with_bit_depth(12)),
+                Property::Av1C(av1c_with_bit_depth(12)),
+                Property::AuxC(make_alpha_auxc()),
+            ],
+            associations: vec![ipa(1, &[0]), ipa(2, &[1, 2])],
+            ..Meta::default()
+        };
+        let rec = &audit_alpha_bit_depth(&meta)[0];
+        assert!(rec.is_compliant());
+    }
+
+    /// Alpha item missing `av1C` surfaces both the missing-av1c flag
+    /// and the corresponding `missing()` entry. The §2.1 violation
+    /// (every AV1 Image Item shall carry `av1C`) is reported alongside
+    /// the §4.1 check.
+    #[test]
+    fn audit_alpha_bit_depth_alpha_missing_av1c() {
+        let meta = Meta {
+            items: vec![make_infe(1, b"av01", 0), make_infe(2, b"av01", 0)],
+            irefs: vec![IrefEntry {
+                reference_type: *b"auxl",
+                from_id: 2,
+                to_ids: vec![1],
+            }],
+            properties: vec![
+                Property::Av1C(av1c_with_bit_depth(10)),
+                Property::AuxC(make_alpha_auxc()),
+            ],
+            // Alpha item 2 has only the auxC, no av1C.
+            associations: vec![ipa(1, &[0]), ipa(2, &[1])],
+            ..Meta::default()
+        };
+        let rec = &audit_alpha_bit_depth(&meta)[0];
+        assert!(rec.alpha_missing_av1c);
+        assert_eq!(rec.alpha_bit_depth, None);
+        assert!(!rec.is_compliant());
+        assert_eq!(rec.missing(), vec!["alpha-item-missing-av1C"]);
+    }
+
+    /// Master item missing `av1C` surfaces the corresponding flag +
+    /// `missing()` entry.
+    #[test]
+    fn audit_alpha_bit_depth_master_missing_av1c() {
+        let meta = Meta {
+            items: vec![make_infe(1, b"av01", 0), make_infe(2, b"av01", 0)],
+            irefs: vec![IrefEntry {
+                reference_type: *b"auxl",
+                from_id: 2,
+                to_ids: vec![1],
+            }],
+            properties: vec![
+                Property::Av1C(av1c_with_bit_depth(10)),
+                Property::AuxC(make_alpha_auxc()),
+            ],
+            // Master item 1 has no av1C; alpha carries both.
+            associations: vec![ipa(2, &[0, 1])],
+            ..Meta::default()
+        };
+        let rec = &audit_alpha_bit_depth(&meta)[0];
+        assert!(rec.master_missing_av1c);
+        assert_eq!(rec.master_bit_depth, None);
+        assert!(!rec.is_compliant());
+        assert_eq!(rec.missing(), vec!["master-item-missing-av1C"]);
+    }
+
+    /// Truncated `av1C` payload on the alpha side surfaces as
+    /// `alpha-item-av1C-truncated` (distinct from the missing case).
+    #[test]
+    fn audit_alpha_bit_depth_truncated_av1c() {
+        let meta = Meta {
+            items: vec![make_infe(1, b"av01", 0), make_infe(2, b"av01", 0)],
+            irefs: vec![IrefEntry {
+                reference_type: *b"auxl",
+                from_id: 2,
+                to_ids: vec![1],
+            }],
+            properties: vec![
+                Property::Av1C(av1c_with_bit_depth(10)),
+                // Alpha av1C is truncated to 2 bytes — present-but-unusable.
+                Property::Av1C(vec![0x81, 0x00]),
+                Property::AuxC(make_alpha_auxc()),
+            ],
+            associations: vec![ipa(1, &[0]), ipa(2, &[1, 2])],
+            ..Meta::default()
+        };
+        let rec = &audit_alpha_bit_depth(&meta)[0];
+        assert!(!rec.alpha_missing_av1c);
+        assert_eq!(rec.alpha_bit_depth, None);
+        assert!(!rec.is_compliant());
+        assert_eq!(rec.missing(), vec!["alpha-item-av1C-truncated"]);
+    }
+
+    /// Non-alpha auxiliaries (depth maps, gain maps) are out of §4.1's
+    /// scope and must not surface in the audit. A depth-map auxC is the
+    /// canonical confound — the same `auxl` iref + a non-alpha URN
+    /// means the audit walks past.
+    #[test]
+    fn audit_alpha_bit_depth_skips_depth_map_auxiliary() {
+        let meta = Meta {
+            items: vec![make_infe(1, b"av01", 0), make_infe(2, b"av01", 0)],
+            irefs: vec![IrefEntry {
+                reference_type: *b"auxl",
+                from_id: 2,
+                to_ids: vec![1],
+            }],
+            properties: vec![
+                Property::Av1C(av1c_with_bit_depth(10)),
+                Property::Av1C(av1c_with_bit_depth(8)),
+                Property::AuxC(make_depth_auxc()), // depth, not alpha
+            ],
+            associations: vec![ipa(1, &[0]), ipa(2, &[1, 2])],
+            ..Meta::default()
+        };
+        assert!(audit_alpha_bit_depth(&meta).is_empty());
+    }
+
+    /// A single alpha item declared against multiple masters in one
+    /// `auxl` `to_ids` list emits one record per master pairing, in
+    /// `to_ids` order. The §4.1 `shall` applies per pairing.
+    #[test]
+    fn audit_alpha_bit_depth_one_record_per_master() {
+        let meta = Meta {
+            items: vec![
+                make_infe(1, b"av01", 0), // master A, 8-bit
+                make_infe(2, b"av01", 0), // master B, 10-bit
+                make_infe(3, b"av01", 0), // alpha, 10-bit
+            ],
+            irefs: vec![IrefEntry {
+                reference_type: *b"auxl",
+                from_id: 3,
+                to_ids: vec![1, 2],
+            }],
+            properties: vec![
+                Property::Av1C(av1c_with_bit_depth(8)),  // master A
+                Property::Av1C(av1c_with_bit_depth(10)), // master B
+                Property::Av1C(av1c_with_bit_depth(10)), // alpha
+                Property::AuxC(make_alpha_auxc()),
+            ],
+            associations: vec![ipa(1, &[0]), ipa(2, &[1]), ipa(3, &[2, 3])],
+            ..Meta::default()
+        };
+        let r = audit_alpha_bit_depth(&meta);
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].master_item_id, 1);
+        assert!(!r[0].is_compliant()); // 10 vs 8 → mismatch
+        assert_eq!(r[1].master_item_id, 2);
+        assert!(r[1].is_compliant()); // 10 vs 10 → ok
+    }
+
+    /// Files with no alpha auxiliaries emit no records.
+    #[test]
+    fn audit_alpha_bit_depth_empty_when_no_alpha() {
+        let meta = Meta {
+            items: vec![make_infe(1, b"av01", 0)],
+            irefs: Vec::new(),
+            properties: vec![Property::Av1C(av1c_with_bit_depth(10))],
+            associations: vec![ipa(1, &[0])],
+            ..Meta::default()
+        };
+        assert!(audit_alpha_bit_depth(&meta).is_empty());
+    }
+
+    /// Multiple alpha auxiliaries (one per master in a multi-image
+    /// collection) emit one record per `(alpha, master)` pair in iref
+    /// declaration order.
+    #[test]
+    fn audit_alpha_bit_depth_multiple_alpha_items() {
+        let meta = Meta {
+            items: vec![
+                make_infe(1, b"av01", 0),
+                make_infe(2, b"av01", 0),
+                make_infe(3, b"av01", 0),
+                make_infe(4, b"av01", 0),
+            ],
+            irefs: vec![
+                IrefEntry {
+                    reference_type: *b"auxl",
+                    from_id: 3,
+                    to_ids: vec![1],
+                },
+                IrefEntry {
+                    reference_type: *b"auxl",
+                    from_id: 4,
+                    to_ids: vec![2],
+                },
+            ],
+            properties: vec![
+                Property::Av1C(av1c_with_bit_depth(8)),
+                Property::Av1C(av1c_with_bit_depth(10)),
+                Property::Av1C(av1c_with_bit_depth(8)),
+                Property::Av1C(av1c_with_bit_depth(10)),
+                Property::AuxC(make_alpha_auxc()),
+            ],
+            associations: vec![ipa(1, &[0]), ipa(2, &[1]), ipa(3, &[2, 4]), ipa(4, &[3, 4])],
+            ..Meta::default()
+        };
+        let r = audit_alpha_bit_depth(&meta);
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].alpha_item_id, 3);
+        assert_eq!(r[0].master_item_id, 1);
+        assert!(r[0].is_compliant());
+        assert_eq!(r[1].alpha_item_id, 4);
+        assert_eq!(r[1].master_item_id, 2);
+        assert!(r[1].is_compliant());
     }
 }

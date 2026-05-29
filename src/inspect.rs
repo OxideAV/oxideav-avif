@@ -209,6 +209,19 @@ pub struct AvifInfo {
     /// interpretation. Combine with [`Self::iden_strict_compliant`] for
     /// a one-call gate.
     pub iden_compliance: Vec<crate::derived::IdenCompliance>,
+    /// av1-avif v1.2.0 §4.1 `shall`-level audit results, one entry per
+    /// `(alpha, master)` pairing declared by an `'auxl'` iref whose
+    /// source is classified as an AV1 Alpha Image Item (alpha URN
+    /// prefix on its `auxC`). Each entry reports the bit depth decoded
+    /// from each item's `av1C` and whether they agree. Empty when no
+    /// AV1 Alpha Image Items are present.
+    ///
+    /// Spec: av1-avif v1.2.0 §4.1 — "An AV1 Alpha Image Item
+    /// (respectively an AV1 Alpha Image Sequence) shall be encoded
+    /// with the same bit depth as the associated master AV1 Image
+    /// Item (respectively AV1 Image Sequence)." Combine with
+    /// [`Self::alpha_bit_depth_strict_compliant`] for a one-call gate.
+    pub alpha_bit_depth_compliance: Vec<crate::derived::AlphaBitDepthAudit>,
 }
 
 impl AvifInfo {
@@ -345,6 +358,20 @@ impl AvifInfo {
     /// + compliance signal should combine the two.
     pub fn iden_strict_compliant(&self) -> bool {
         self.iden_compliance.iter().all(|i| i.is_compliant())
+    }
+
+    /// True when every AV1 Alpha Image Item's pairing with its master
+    /// AV1 Image Item passes the av1-avif §4.1 bit-depth-match `shall`
+    /// (and both items carry an `av1C` whose flag byte is reachable).
+    ///
+    /// Trivially `true` when the file ships no alpha auxiliaries — the
+    /// constraint applies per `(alpha, master)` pairing; a file with
+    /// none has no such pairings. Callers that want a presence +
+    /// compliance signal should combine with [`Self::has_alpha`].
+    pub fn alpha_bit_depth_strict_compliant(&self) -> bool {
+        self.alpha_bit_depth_compliance
+            .iter()
+            .all(|a| a.is_compliant())
     }
 
     /// True when the file's `ftyp` claims the `mif1` brand and every
@@ -591,6 +618,7 @@ pub(crate) fn build_info(
     let grid_derivation_compliance = crate::derived::audit_grid_derivations(&img.meta);
     let iden_item_ids = img.meta.item_ids_of_type(&crate::meta::ITEM_TYPE_IDEN);
     let iden_compliance = crate::derived::audit_iden_derivations(&img.meta);
+    let alpha_bit_depth_compliance = crate::derived::audit_alpha_bit_depth(&img.meta);
     Ok(AvifInfo {
         width,
         height,
@@ -626,6 +654,7 @@ pub(crate) fn build_info(
         grid_derivation_compliance,
         iden_item_ids,
         iden_compliance,
+        alpha_bit_depth_compliance,
     })
 }
 
@@ -761,6 +790,7 @@ pub(crate) fn build_info_grid(
     let grid_derivation_compliance = crate::derived::audit_grid_derivations(&hdr.meta);
     let iden_item_ids = hdr.meta.item_ids_of_type(&crate::meta::ITEM_TYPE_IDEN);
     let iden_compliance = crate::derived::audit_iden_derivations(&hdr.meta);
+    let alpha_bit_depth_compliance = crate::derived::audit_alpha_bit_depth(&hdr.meta);
     Ok(AvifInfo {
         width: grid.output_width,
         height: grid.output_height,
@@ -796,6 +826,7 @@ pub(crate) fn build_info_grid(
         grid_derivation_compliance,
         iden_item_ids,
         iden_compliance,
+        alpha_bit_depth_compliance,
     })
 }
 

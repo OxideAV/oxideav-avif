@@ -9,6 +9,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 176 — av1-avif v1.2.0 §4.1 Auxiliary-Image bit-depth match
+  audit. The §4.1 `shall` "An AV1 Alpha Image Item (respectively an
+  AV1 Alpha Image Sequence) shall be encoded with the same bit depth
+  as the associated master AV1 Image Item (respectively AV1 Image
+  Sequence)" is now validated at the container layer via
+  `oxideav_avif::derived::audit_alpha_bit_depth(&Meta)`, returning one
+  `AlphaBitDepthAudit { alpha_item_id, master_item_id,
+  alpha_bit_depth, master_bit_depth, alpha_missing_av1c,
+  master_missing_av1c, is_compliant(), missing() }` record per
+  `(alpha, master)` pairing declared by an `'auxl'` iref whose source
+  carries an `'auxC'` URN starting with the alpha prefix
+  (`urn:mpeg:mpegB:cicp:systems:auxiliary:alpha`). A single alpha
+  attached to multiple masters emits one record per master in
+  `to_ids` order; iref entries are processed in declaration order.
+- Bit depth is decoded directly from each item's `av1C` flag byte
+  (`8`, `10`, or `12`) via a new private `decode_av1c_bit_depth`
+  helper. The audit also surfaces two §2.1 violations that would
+  defeat the §4.1 check: missing `av1C` association
+  (`{alpha,master}_missing_av1c`) and truncated `av1C` payload
+  (decoded depth is `None` with the missing flag still false).
+- `AvifInfo::alpha_bit_depth_compliance:
+  Vec<crate::derived::AlphaBitDepthAudit>` populated by both the
+  single-item and grid `build_info` paths, plus
+  `AvifInfo::alpha_bit_depth_strict_compliant()` predicate folding
+  every record into a single boolean (trivially `true` when no alpha
+  auxiliaries present, so combine with `has_alpha` for a presence +
+  compliance gate).
+- 10 new unit tests in `derived::tests` covering: matching 8-bit
+  pairing compliant; 10-bit master vs 8-bit alpha flagged with
+  `alpha-master-bit-depth-mismatch`; 12-bit pairing compliant; alpha
+  item missing `av1C`; master item missing `av1C`; truncated `av1C`
+  surfaces as `alpha-item-av1C-truncated` distinct from missing;
+  depth-map auxiliary (non-alpha URN) ignored; one alpha pointing at
+  multiple masters emits one record per pairing; empty audit list
+  when no alpha auxiliaries present; multiple distinct alpha
+  auxiliaries in one file each emit their own record in iref order.
+  `decode_av1c_bit_depth` separately covers 8/10/12 + truncation.
+  2 new integration tests pin the audit on real fixtures:
+  `monochrome_fixture_has_no_alpha_bit_depth_audit_records` confirms
+  the no-alpha vacuum on the Microsoft monochrome fixture, and
+  `bbb_alpha_fixture_alpha_master_bit_depth_match` confirms the
+  end-to-end §4.1 compliant shape on `bbb_alpha_inverted.avif`
+  (both alpha and master carry `av1C` and agree on bit depth).
+
 - Round 176 — HEIF v1.2.0 §6.6.2.1 Identity Derived Image Item
   (`iden`) `shall`-level compliance audit. The HEIF §6.6.2.1
   constraints ("derived image item shall have no item body" and

@@ -26,7 +26,12 @@
 //!   * Grid items (HEIF §6.6.2) — decode each tile via `dimg` iref
 //!     and paste into the declared output rectangle (see [`grid`]).
 //!   * Alpha auxiliary — AV1-coded monochrome item referenced via
-//!     `auxl` + `auxC` URN (see [`alpha`]).
+//!     `auxl` + `auxC` URN (see [`alpha`]). The av1-avif v1.2.0 §4.1
+//!     `shall` "AV1 Alpha Image Item shall be encoded with the same
+//!     bit depth as the associated master AV1 Image Item" is audited
+//!     at the container layer via [`audit_alpha_bit_depth`] /
+//!     [`AlphaBitDepthAudit`], surfaced through
+//!     [`AvifInfo::alpha_bit_depth_compliance`].
 //!   * `irot` / `imir` / `clap` post-transforms (see [`transform`]).
 //! * AVIS image sequences — sample table walk via [`avis::parse_avis`]
 //!   produces a flat frame-offset list with `(timescale, display_dims,
@@ -98,8 +103,9 @@ pub use cicp::{
     primaries_name, transfer_name, CicpTriple,
 };
 pub use derived::{
-    audit_iden_derivations, audit_tone_map, parse_grpl, EntityGroup, IdenCompliance, ImageOverlay,
-    Mif1Compliance, OverlayEntry, SampleTransform, Token, ToneMapCompliance,
+    audit_alpha_bit_depth, audit_iden_derivations, audit_tone_map, parse_grpl, AlphaBitDepthAudit,
+    EntityGroup, IdenCompliance, ImageOverlay, Mif1Compliance, OverlayEntry, SampleTransform,
+    Token, ToneMapCompliance,
 };
 pub use error::{AvifError, Result};
 pub use grid::{composite_grid, ImageGrid};

@@ -44,7 +44,7 @@ still loses significant signal.
 | AV1 wrap pass-through                  | `av1C`-derived bit depth (8/10/12-bit), monochrome flag, and chroma subsampling `(x, y)` decoded and surfaced via `AvifInfo::{bit_depth, monochrome, chroma_subsampling}`; callers no longer need to re-parse `av1C` |
 | Primary item data                      | resolved via `iloc` construction_method 0 (file offset); single-extent items return a zero-copy slice; multi-extent items are concatenated via `item_bytes_owned()` (HEIF §8.11.3.3) |
 | Grid primary items (HEIF §6.6.2)       | grid descriptor parse + per-tile decode via `dimg` iref + composite into the declared output rectangle; plus av1-avif §7 derivation-chain audit (`audit_grid_derivations` / `GridDerivationAudit`) flagging any `clap` / `irot` / `imir` attached to a tile in violation of the "transformative properties only on the grid item itself" `shall`. Surfaced via `AvifInfo::grid_derivation_compliance` / `grid_derivations_strict_compliant()` |
-| Alpha auxiliary                        | `auxl` + `auxC` URN detection, AV1-coded monochrome item decoded, composited onto the color frame (`Gray8 → YA8`, `Yuv → YuvA`)                            |
+| Alpha auxiliary                        | `auxl` + `auxC` URN detection, AV1-coded monochrome item decoded, composited onto the color frame (`Gray8 → YA8`, `Yuv → YuvA`); plus av1-avif §4.1 alpha-vs-master bit-depth `shall` audit (`audit_alpha_bit_depth` / `AlphaBitDepthAudit`) surfaced via `AvifInfo::alpha_bit_depth_compliance` / `alpha_bit_depth_strict_compliant()` |
 | Post-transforms                        | `clap` (centre crop) → `irot` (90/180/270°) → `imir` (horizontal/vertical), applied in that order per §6.5.10                                              |
 | AV1 hand-off                           | `av1C` plumbed through `CodecParameters::extradata`; primary-item OBU payload fed to `oxideav_av1::Av1Decoder`; frame returned through `AvifDecoder`       |
 | MIAF profile dispatch                  | `BrandClass` flags `is_baseline_profile` (MA1B) + `is_advanced_profile` (MA1A) + `is_miaf`; surfaced through `AvifInfo::brands`                            |
@@ -83,6 +83,64 @@ still loses significant signal.
 
 See `examples/diag_decode.rs` for a drop-in report of exactly which
 stage each input reaches.
+
+### Round 176 — av1-avif §4.1 alpha bit-depth match audit
+
+The §4.1 Auxiliary-Image `shall` "An AV1 Alpha Image Item (respectively
+an AV1 Alpha Image Sequence) shall be encoded with the same bit depth
+as the associated master AV1 Image Item (respectively AV1 Image
+Sequence)" is now audited at the container layer, parallel to the
+existing §7 grid-derivation and §6.6.2.1 iden audits. The new
+`oxideav_avif::derived::audit_alpha_bit_depth(&Meta)` walker enumerates
+every `'auxl'` iref entry whose source carries an `'auxC'` URN starting
+with the alpha prefix (`urn:mpeg:mpegB:cicp:systems:auxiliary:alpha`),
+then emits one
+`AlphaBitDepthAudit { alpha_item_id, master_item_id, alpha_bit_depth,
+master_bit_depth, alpha_missing_av1c, master_missing_av1c,
+is_compliant(), missing() }` record per `(alpha, master)` pairing
+declared in the iref's `to_ids`, in iref declaration order. A single
+alpha attached to multiple masters emits one record per master.
+
+Bit depth is decoded directly from each item's `av1C` flag byte (`8`,
+`10`, or `12`) without re-parsing the full configuration record. The
+audit also surfaces two §2.1 violations that would defeat the §4.1
+check itself: missing `av1C` (`{alpha,master}_missing_av1c`) and
+present-but-truncated `av1C` (decoded depth is `None` with the missing
+flag still false). `missing()` enumerates failed `shall`s as static
+strings (`alpha-master-bit-depth-mismatch`,
+`alpha-item-missing-av1C`, `alpha-item-av1C-truncated`,
+`master-item-missing-av1C`, `master-item-av1C-truncated`).
+
+`AvifInfo::alpha_bit_depth_compliance: Vec<AlphaBitDepthAudit>` is
+populated by both the single-item and grid `build_info` paths (an
+alpha-free file trivially returns an empty vector).
+`AvifInfo::alpha_bit_depth_strict_compliant()` folds every record to
+a single boolean (vacuously `true` when no alpha auxiliaries exist;
+combine with `has_alpha` for a presence + compliance gate).
+
+Test delta: +10 unit (`derived::tests::audit_alpha_bit_depth_*` +
+`decode_av1c_bit_depth_*`) covering: matching 8-bit pairing compliant;
+10/8 bit mismatch flagged with the right `missing()` token; 12/12 also
+compliant; alpha missing `av1C`; master missing `av1C`; truncated
+`av1C` distinguishes from missing; depth-map auxiliary (non-alpha URN)
+ignored; one alpha pointing at multiple masters emits one record per
+pairing; empty-when-no-alpha vacuum; multiple distinct alpha
+auxiliaries in one file each emit their own record. +2 integration
+(`monochrome_fixture_has_no_alpha_bit_depth_audit_records` pins the
+no-alpha vacuum on the Microsoft monochrome fixture;
+`bbb_alpha_fixture_alpha_master_bit_depth_match` pins the §4.1
+compliant shape end-to-end on the real `bbb_alpha_inverted.avif`
+fixture, confirming both alpha and master carry an `av1C` and agree
+on bit depth). Default lib 210 (was 198); standalone lib 195 (was
+183); integration 52 + 1 ignored (was 50 + 1).
+
+Followup: §4.1's parallel `shall` on AV1 Alpha Image *Sequences*
+(matching bit depth between alpha and master sequences) needs a
+sample-table-level audit on `avis` — the per-frame `av1C` lives in
+`stsd.av01.av1C` rather than `iprp.ipco`. The current walker only
+covers single-item files; an `avis` extension would consume
+`avis::AvisMeta::av1_codec_config` for the alpha track once the AVIS
+walker grows multi-track support.
 
 ### Round 172 — av1-avif §7 grid-derivation transformative-property audit
 
