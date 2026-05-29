@@ -13,8 +13,8 @@
 //!   `tmap` item-type detection plus an av1-avif §4.2.2 `should`-
 //!   level compliance audit ([`audit_tone_map`] /
 //!   [`ToneMapCompliance`]) covering the `altr` pairing + hidden
-//!   gain-map signals (the HEIF-defined descriptor body parse is
-//!   pending an HEIF edition in `docs/image/heif/`).
+//!   gain-map signals, and the `tmap` descriptor body parse
+//!   ([`GainMapMetadata`], ISO 21496-1:2025 Annex C.2).
 //! * Primary item resolution via `pitm`, file-offset extent reads via
 //!   `iloc`, brand check accepting `avif` / `avis` / `mif1` / `msf1` /
 //!   `miaf`.
