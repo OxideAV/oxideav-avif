@@ -1372,6 +1372,268 @@ pub fn audit_alpha_bit_depth(meta: &crate::meta::Meta) -> Vec<AlphaBitDepthAudit
     out
 }
 
+/// Outcome of walking a single AV1 Image Item's OBU stream to count
+/// Sequence Header OBUs, per av1-avif v1.2.0 §2.1 — "The AV1 Image
+/// Item Data shall have exactly one Sequence Header OBU."
+///
+/// One record per AV1 Image Item (`item_type == 'av01'`) in declaration
+/// order. The audit is purely structural: it walks the framing defined
+/// in AV1 §5.3.1 (header byte plus leb128 `obu_size`) and reads the
+/// `obu_type` field from each OBU header (AV1 §5.3.2), incrementing
+/// [`Self::sequence_header_count`] each time the type equals
+/// `OBU_SEQUENCE_HEADER` (value `1`, per AV1 §6.2.1's `obu_type`
+/// enumeration). The OBU payload bodies themselves are not decoded — the
+/// walker only needs the framing.
+///
+/// Three structural failure modes are surfaced distinctly from a plain
+/// `sequence_header_count != 1` mismatch:
+///
+/// * [`Self::missing_iloc`] — the `iinf` lists the item but no `iloc`
+///   resolves its bytes. The OBU walk is not attempted.
+/// * [`Self::truncated_obu`] — the OBU framing walker hit the end of
+///   the stream mid-OBU (truncated leb128, or a declared `obu_size`
+///   that runs past the item payload). Any OBUs successfully walked
+///   before truncation are still counted; the flag tells the caller
+///   the count may be an undercount of the well-formed file the
+///   writer intended.
+/// * [`Self::has_size_field_zero`] — at least one OBU in the stream
+///   has `obu_has_size_field == 0`. AV1 §5.3.1 requires that OBUs
+///   carried inside a container that does not separately frame each
+///   OBU (which is the case for AVIF image items, see §2.1's
+///   "identical to the content of an AV1 Sample marked as 'sync'"
+///   constraint and [AV1-ISOBMFF] §2.3.2's requirement that the
+///   has_size flag be set when chaining OBUs inside one sample) must
+///   carry `obu_size`. We surface this as a separate signal because
+///   the walker cannot frame an OBU without an explicit size when
+///   chained — it stops at the first such OBU and the count from
+///   that point on is undefined.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct SequenceHeaderObuAudit {
+    /// AV1 Image Item id whose payload was walked.
+    pub item_id: u32,
+    /// Number of OBUs whose header byte decoded to
+    /// `obu_type == OBU_SEQUENCE_HEADER` (value `1`).
+    pub sequence_header_count: u32,
+    /// Total number of OBUs walked (successfully framed) in the
+    /// stream. Diagnostic; not a `shall` check on its own.
+    pub total_obu_count: u32,
+    /// `true` when no `iloc` entry resolved the item's bytes. The OBU
+    /// walk was skipped; [`Self::sequence_header_count`] and
+    /// [`Self::total_obu_count`] are both `0`.
+    pub missing_iloc: bool,
+    /// `true` when the framing walker hit end-of-stream mid-OBU
+    /// (truncated leb128 byte sequence, or a declared `obu_size` that
+    /// runs past the end of the item payload).
+    pub truncated_obu: bool,
+    /// `true` when the walker encountered an OBU whose header byte has
+    /// `obu_has_size_field == 0`. The walker stops at that OBU because
+    /// it has no in-band length to advance past it. Per AV1 §5.3.1 +
+    /// av1-avif §2.1, AV1 Image Item Data chains OBUs into one item
+    /// payload and the `has_size` bit is required.
+    pub has_size_field_zero: bool,
+}
+
+impl SequenceHeaderObuAudit {
+    /// True when the walk succeeded structurally (`!missing_iloc &&
+    /// !truncated_obu && !has_size_field_zero`) AND the OBU stream
+    /// contains exactly one Sequence Header OBU.
+    ///
+    /// Spec: av1-avif v1.2.0 §2.1.
+    pub fn is_compliant(&self) -> bool {
+        !self.missing_iloc
+            && !self.truncated_obu
+            && !self.has_size_field_zero
+            && self.sequence_header_count == 1
+    }
+
+    /// Human-readable list of `shall`-level failures. Empty when
+    /// [`Self::is_compliant`].
+    pub fn missing(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.missing_iloc {
+            out.push("av01-item-missing-iloc");
+        }
+        if self.has_size_field_zero {
+            out.push("av01-item-obu-has-size-field-zero");
+        }
+        if self.truncated_obu {
+            out.push("av01-item-obu-stream-truncated");
+        }
+        if !self.missing_iloc && !self.has_size_field_zero && !self.truncated_obu {
+            match self.sequence_header_count {
+                0 => out.push("av01-item-missing-sequence-header-obu"),
+                1 => {} // compliant
+                _ => out.push("av01-item-multiple-sequence-header-obus"),
+            }
+        }
+        out
+    }
+}
+
+/// `obu_type` value for `OBU_SEQUENCE_HEADER` per AV1 §6.2.1.
+const AV1_OBU_TYPE_SEQUENCE_HEADER: u8 = 1;
+
+/// Decode an AV1 leb128 `obu_size` value (AV1 §4.10.5) from `bytes`.
+///
+/// Returns the decoded value and the number of bytes consumed
+/// (`Leb128Bytes`, 1..=8). Returns `Err` when the bitstream ends in
+/// the middle of a leb128 byte sequence (continuation bit set on the
+/// last available byte) or when the leb128 sequence exceeds 8 bytes
+/// without terminating.
+fn read_leb128(bytes: &[u8]) -> core::result::Result<(u32, usize), ()> {
+    let mut value: u64 = 0;
+    for i in 0..8 {
+        if i >= bytes.len() {
+            return Err(());
+        }
+        let byte = bytes[i];
+        value |= u64::from(byte & 0x7f) << (i * 7);
+        if byte & 0x80 == 0 {
+            // §4.10.5 also requires value <= (1 << 32) - 1 for
+            // bitstream conformance; we surface a u32 so any wider
+            // claim trips the conversion.
+            if value > u64::from(u32::MAX) {
+                return Err(());
+            }
+            return Ok((value as u32, i + 1));
+        }
+    }
+    Err(())
+}
+
+/// Walk the OBU framing of one AV1 Image Item's payload and count
+/// Sequence Header OBUs. `payload` is the raw item bytes resolved via
+/// the iloc.
+///
+/// Per AV1 §5.3.1 / §5.3.2:
+///
+/// * OBU header byte: `obu_forbidden_bit(1) | obu_type(4) |
+///   obu_extension_flag(1) | obu_has_size_field(1) | obu_reserved_1bit(1)`.
+/// * If `obu_extension_flag == 1`, one extension header byte follows
+///   (§5.3.3 — temporal_id + spatial_id + reserved, total 8 bits).
+/// * If `obu_has_size_field == 1`, a `leb128()` `obu_size` follows;
+///   that many bytes are the OBU payload.
+/// * If `obu_has_size_field == 0` we cannot frame the next OBU — the
+///   walker stops and reports [`SequenceHeaderObuAudit::has_size_field_zero`].
+fn walk_obu_stream(item_id: u32, payload: &[u8]) -> SequenceHeaderObuAudit {
+    let mut out = SequenceHeaderObuAudit {
+        item_id,
+        ..SequenceHeaderObuAudit::default()
+    };
+    let mut cursor = 0usize;
+    while cursor < payload.len() {
+        // 1. OBU header byte.
+        let header = payload[cursor];
+        cursor += 1;
+        let obu_type = (header >> 3) & 0x0f;
+        let obu_extension_flag = (header >> 2) & 0x01;
+        let obu_has_size_field = (header >> 1) & 0x01;
+        // 2. Optional extension header.
+        if obu_extension_flag == 1 {
+            if cursor >= payload.len() {
+                out.truncated_obu = true;
+                return out;
+            }
+            cursor += 1;
+        }
+        // 3. Size field. AV1 §5.3.1 — when chained in a container that
+        // doesn't externally frame each OBU (which is exactly the
+        // AVIF Image Item Data case per av1-avif §2.1), this MUST be
+        // set or we cannot find the next OBU.
+        if obu_has_size_field == 0 {
+            out.has_size_field_zero = true;
+            // Still count this OBU's type — the header byte was
+            // successfully read.
+            if obu_type == AV1_OBU_TYPE_SEQUENCE_HEADER {
+                out.sequence_header_count = out.sequence_header_count.saturating_add(1);
+            }
+            out.total_obu_count = out.total_obu_count.saturating_add(1);
+            return out;
+        }
+        let (obu_size, leb_len) = match read_leb128(&payload[cursor..]) {
+            Ok(v) => v,
+            Err(()) => {
+                out.truncated_obu = true;
+                return out;
+            }
+        };
+        cursor += leb_len;
+        let obu_size = obu_size as usize;
+        if cursor
+            .checked_add(obu_size)
+            .map(|end| end > payload.len())
+            .unwrap_or(true)
+        {
+            out.truncated_obu = true;
+            // The header byte itself was readable, count it before
+            // bailing — this lets a caller see whether the truncation
+            // dropped a Sequence Header.
+            if obu_type == AV1_OBU_TYPE_SEQUENCE_HEADER {
+                out.sequence_header_count = out.sequence_header_count.saturating_add(1);
+            }
+            out.total_obu_count = out.total_obu_count.saturating_add(1);
+            return out;
+        }
+        cursor += obu_size;
+        if obu_type == AV1_OBU_TYPE_SEQUENCE_HEADER {
+            out.sequence_header_count = out.sequence_header_count.saturating_add(1);
+        }
+        out.total_obu_count = out.total_obu_count.saturating_add(1);
+    }
+    out
+}
+
+/// Audit every AV1 Image Item (`item_type == 'av01'`) in `meta`
+/// against the av1-avif v1.2.0 §2.1 `shall` "The AV1 Image Item Data
+/// shall have exactly one Sequence Header OBU."
+///
+/// The function walks each item's payload bytes (resolved via the
+/// item's `iloc` entry against `file`) and counts OBUs whose header
+/// byte decodes to `obu_type == OBU_SEQUENCE_HEADER` (value `1`, per
+/// AV1 §6.2.1). Items are reported in the same order as
+/// `Meta::item_ids_of_type(b"av01")`.
+///
+/// The returned vector is empty when the file ships no AV1 Image
+/// Items (a degenerate case, since an AVIF primary is required to
+/// have at least one).
+///
+/// Spec sources:
+/// * av1-avif v1.2.0 §2.1 — the `shall` audited.
+/// * AV1 (Bitstream & Decoding Process Specification v1.0.0-errata1)
+///   §5.3.1 (general OBU framing), §5.3.2 (OBU header byte layout),
+///   §4.10.5 (`leb128()` decoder), §6.2.1 (`obu_type` enumeration).
+pub fn audit_sequence_header_obu(
+    meta: &crate::meta::Meta,
+    file: &[u8],
+) -> Vec<SequenceHeaderObuAudit> {
+    let av01 = b(b"av01");
+    let mut out = Vec::new();
+    for item_id in meta.item_ids_of_type(&av01) {
+        let Some(loc) = meta.location_by_id(item_id) else {
+            out.push(SequenceHeaderObuAudit {
+                item_id,
+                missing_iloc: true,
+                ..SequenceHeaderObuAudit::default()
+            });
+            continue;
+        };
+        // Reuse the standard iloc resolver. A failure here (e.g.
+        // construction_method we don't support, or extent offsets
+        // outside `file`) is surfaced the same way as missing iloc —
+        // the audit can't reach the bytes either way.
+        let Ok(payload) = crate::parser::item_bytes(file, loc) else {
+            out.push(SequenceHeaderObuAudit {
+                item_id,
+                missing_iloc: true,
+                ..SequenceHeaderObuAudit::default()
+            });
+            continue;
+        };
+        out.push(walk_obu_stream(item_id, payload));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2973,5 +3235,309 @@ mod tests {
         assert_eq!(r[1].alpha_item_id, 4);
         assert_eq!(r[1].master_item_id, 2);
         assert!(r[1].is_compliant());
+    }
+
+    // -------------------------------------------------------------------
+    // §2.1 Sequence Header OBU count audit
+    // -------------------------------------------------------------------
+
+    /// Build one OBU framed per AV1 §5.3.1/§5.3.2 with `obu_has_size_field
+    /// == 1` and no extension header. `obu_type` goes in bits 6..3.
+    /// `payload` is the OBU body bytes (their content doesn't matter for
+    /// the audit — only the type and the framing are inspected).
+    fn obu_with_size(obu_type: u8, payload: &[u8]) -> Vec<u8> {
+        // header byte: 0|type(4)|ext(0)|has_size(1)|reserved(0)
+        let hdr = ((obu_type & 0x0f) << 3) | 0b10;
+        let mut out = vec![hdr];
+        // leb128 encode payload length.
+        let mut v = payload.len() as u32;
+        loop {
+            let mut b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v != 0 {
+                b |= 0x80;
+                out.push(b);
+            } else {
+                out.push(b);
+                break;
+            }
+        }
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// Build a one-byte OBU with `obu_has_size_field == 0` — illegal in
+    /// AVIF Image Item Data per av1-avif §2.1 + AV1 §5.3.1's container
+    /// chaining requirement.
+    fn obu_no_size(obu_type: u8) -> Vec<u8> {
+        // header byte: 0|type(4)|ext(0)|has_size(0)|reserved(0)
+        vec![(obu_type & 0x0f) << 3]
+    }
+
+    /// Build a synthetic file whose iloc resolves item `1`'s payload to
+    /// the given byte slice. Returns `(file_bytes, meta)`. The file
+    /// bytes are just a flat buffer with the payload at offset 0 (so
+    /// `iloc.base_offset = 0`, `extent.offset = 0`, `extent.length =
+    /// payload.len()`).
+    fn synth_av01_item(payload: &[u8]) -> (Vec<u8>, Meta) {
+        use crate::meta::{IlocExtent, ItemLocation};
+        let file = payload.to_vec();
+        let length = file.len() as u64;
+        let meta = Meta {
+            items: vec![make_infe(1, b"av01", 0)],
+            locations: vec![ItemLocation {
+                id: 1,
+                construction_method: 0,
+                data_reference_index: 0,
+                base_offset: 0,
+                extents: vec![IlocExtent { offset: 0, length }],
+            }],
+            ..Meta::default()
+        };
+        (file, meta)
+    }
+
+    /// leb128 round-trip on small + large values (within 32-bit range).
+    #[test]
+    fn read_leb128_decodes_single_and_multi_byte_values() {
+        // single-byte: 0x05 → 5 in 1 byte
+        assert_eq!(read_leb128(&[0x05, 0xff]), Ok((5, 1)));
+        // two-byte: 0x80 0x01 → 128 in 2 bytes
+        assert_eq!(read_leb128(&[0x80, 0x01, 0xff]), Ok((128, 2)));
+        // five-byte: largest u32: 0xff ff ff ff 0f
+        assert_eq!(
+            read_leb128(&[0xff, 0xff, 0xff, 0xff, 0x0f]),
+            Ok((0xffff_ffff, 5))
+        );
+    }
+
+    /// Truncation (continuation bit set on last byte) errors out.
+    #[test]
+    fn read_leb128_rejects_truncated_continuation() {
+        assert!(read_leb128(&[0x80]).is_err());
+        assert!(read_leb128(&[0x80, 0x80, 0x80]).is_err());
+    }
+
+    /// A leb128 sequence longer than 8 bytes errors out (the §4.10.5
+    /// loop bound).
+    #[test]
+    fn read_leb128_rejects_overlong_sequence() {
+        assert!(read_leb128(&[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80]).is_err());
+    }
+
+    /// Happy path: one Sequence Header + one Temporal Delimiter + one
+    /// Frame OBU → `sequence_header_count == 1`, compliant.
+    #[test]
+    fn audit_sequence_header_obu_single_count_compliant() {
+        let mut stream = Vec::new();
+        stream.extend(obu_with_size(2, &[])); // OBU_TEMPORAL_DELIMITER
+        stream.extend(obu_with_size(1, &[0x00, 0x01, 0x02])); // OBU_SEQUENCE_HEADER
+        stream.extend(obu_with_size(6, &[0xab; 7])); // OBU_FRAME
+        let (file, meta) = synth_av01_item(&stream);
+        let r = audit_sequence_header_obu(&meta, &file);
+        assert_eq!(r.len(), 1);
+        let rec = &r[0];
+        assert_eq!(rec.item_id, 1);
+        assert_eq!(rec.sequence_header_count, 1);
+        assert_eq!(rec.total_obu_count, 3);
+        assert!(rec.is_compliant());
+        assert!(rec.missing().is_empty());
+    }
+
+    /// Two Sequence Headers in one item → §2.1 violation, flagged as
+    /// `av01-item-multiple-sequence-header-obus`.
+    #[test]
+    fn audit_sequence_header_obu_two_count_flagged() {
+        let mut stream = Vec::new();
+        stream.extend(obu_with_size(1, &[0x00, 0x01])); // SH #1
+        stream.extend(obu_with_size(1, &[0x00, 0x01])); // SH #2
+        let (file, meta) = synth_av01_item(&stream);
+        let rec = &audit_sequence_header_obu(&meta, &file)[0];
+        assert_eq!(rec.sequence_header_count, 2);
+        assert!(!rec.is_compliant());
+        assert_eq!(
+            rec.missing(),
+            vec!["av01-item-multiple-sequence-header-obus"]
+        );
+    }
+
+    /// Zero Sequence Headers → §2.1 violation, flagged as
+    /// `av01-item-missing-sequence-header-obu`.
+    #[test]
+    fn audit_sequence_header_obu_zero_count_flagged() {
+        let mut stream = Vec::new();
+        stream.extend(obu_with_size(2, &[])); // TD only
+        stream.extend(obu_with_size(6, &[0xab; 4])); // FRAME
+        let (file, meta) = synth_av01_item(&stream);
+        let rec = &audit_sequence_header_obu(&meta, &file)[0];
+        assert_eq!(rec.sequence_header_count, 0);
+        assert_eq!(rec.total_obu_count, 2);
+        assert!(!rec.is_compliant());
+        assert_eq!(rec.missing(), vec!["av01-item-missing-sequence-header-obu"]);
+    }
+
+    /// `obu_has_size_field == 0` in a chained stream → walker stops and
+    /// reports `has_size_field_zero`. Per AV1 §5.3.1, an OBU without a
+    /// size field cannot be chained with subsequent OBUs.
+    #[test]
+    fn audit_sequence_header_obu_size_field_zero_flagged() {
+        let mut stream = Vec::new();
+        stream.extend(obu_no_size(1)); // SH with no size
+                                       // Following bytes can't be framed — anything after.
+        stream.extend([0xff, 0xff, 0xff]);
+        let (file, meta) = synth_av01_item(&stream);
+        let rec = &audit_sequence_header_obu(&meta, &file)[0];
+        assert!(rec.has_size_field_zero);
+        assert!(!rec.is_compliant());
+        // The SH header byte itself was decoded before we noticed the
+        // missing size — count surfaces but compliance still false.
+        assert_eq!(rec.sequence_header_count, 1);
+        assert!(rec.missing().contains(&"av01-item-obu-has-size-field-zero"));
+    }
+
+    /// A declared `obu_size` that runs past the item payload → walker
+    /// reports `truncated_obu`.
+    #[test]
+    fn audit_sequence_header_obu_truncated_payload_flagged() {
+        // Header for SH, claim 100-byte payload, but only give it 3.
+        let mut stream = vec![(1u8 << 3) | 0b10]; // SH + has_size
+        stream.push(100); // leb128(100), single byte
+        stream.extend([0xde, 0xad, 0xbe]); // only 3 bytes of payload
+        let (file, meta) = synth_av01_item(&stream);
+        let rec = &audit_sequence_header_obu(&meta, &file)[0];
+        assert!(rec.truncated_obu);
+        assert!(!rec.is_compliant());
+        assert!(rec.missing().contains(&"av01-item-obu-stream-truncated"));
+    }
+
+    /// Truncated leb128 mid-OBU (continuation bit set on last byte) →
+    /// `truncated_obu` flagged; no OBUs walked past the bad leb.
+    #[test]
+    fn audit_sequence_header_obu_truncated_leb128_flagged() {
+        // Header byte SH + has_size, then a single byte 0x80 (continuation
+        // bit set, no follow-on) — leb128 walker errors → truncated.
+        let stream = vec![(1u8 << 3) | 0b10, 0x80];
+        let (file, meta) = synth_av01_item(&stream);
+        let rec = &audit_sequence_header_obu(&meta, &file)[0];
+        assert!(rec.truncated_obu);
+        assert!(!rec.is_compliant());
+        // Header byte was readable, but the leb128 framing failure
+        // bailed before the type-credit step — SH counter does not
+        // fire because we cannot confirm we successfully framed an OBU.
+        assert_eq!(rec.sequence_header_count, 0);
+        assert_eq!(rec.total_obu_count, 0);
+    }
+
+    /// `iinf` lists an av01 item but no `iloc` resolves it → missing_iloc.
+    #[test]
+    fn audit_sequence_header_obu_missing_iloc_flagged() {
+        let meta = Meta {
+            items: vec![make_infe(1, b"av01", 0)],
+            // no locations
+            ..Meta::default()
+        };
+        let r = audit_sequence_header_obu(&meta, &[]);
+        assert_eq!(r.len(), 1);
+        let rec = &r[0];
+        assert!(rec.missing_iloc);
+        assert!(!rec.is_compliant());
+        assert_eq!(rec.missing(), vec!["av01-item-missing-iloc"]);
+    }
+
+    /// Non-av01 items (e.g. `Exif`, `iden`, `grid`) are ignored.
+    #[test]
+    fn audit_sequence_header_obu_ignores_non_av01_items() {
+        let meta = Meta {
+            items: vec![
+                make_infe(1, b"Exif", 0),
+                make_infe(2, b"iden", 0),
+                make_infe(3, b"grid", 0),
+            ],
+            ..Meta::default()
+        };
+        assert!(audit_sequence_header_obu(&meta, &[]).is_empty());
+    }
+
+    /// An `obu_extension_flag == 1` OBU correctly skips the extension
+    /// header byte before reading `obu_size`.
+    #[test]
+    fn audit_sequence_header_obu_handles_extension_header() {
+        // header byte: SH(1)|ext(1)|has_size(1)|reserved(0)
+        let hdr = (1u8 << 3) | 0b110;
+        let mut stream = vec![hdr];
+        stream.push(0x00); // extension header byte (temporal_id=0, spatial_id=0)
+        stream.push(2); // leb128(2)
+        stream.extend([0x11, 0x22]); // payload
+        let (file, meta) = synth_av01_item(&stream);
+        let rec = &audit_sequence_header_obu(&meta, &file)[0];
+        assert_eq!(rec.sequence_header_count, 1);
+        assert_eq!(rec.total_obu_count, 1);
+        assert!(rec.is_compliant());
+    }
+
+    /// Empty `av01` payload: 0 OBUs walked, 0 SH OBUs → flagged as
+    /// missing SH.
+    #[test]
+    fn audit_sequence_header_obu_empty_payload_flagged_missing() {
+        let (file, meta) = synth_av01_item(&[]);
+        let rec = &audit_sequence_header_obu(&meta, &file)[0];
+        assert_eq!(rec.sequence_header_count, 0);
+        assert_eq!(rec.total_obu_count, 0);
+        assert!(!rec.missing_iloc);
+        assert!(!rec.truncated_obu);
+        assert!(!rec.is_compliant());
+        assert_eq!(rec.missing(), vec!["av01-item-missing-sequence-header-obu"]);
+    }
+
+    /// Multiple AV1 Image Items in the same file each get their own
+    /// audit record, in `item_ids_of_type` (declaration) order.
+    #[test]
+    fn audit_sequence_header_obu_one_record_per_av01_item() {
+        use crate::meta::{IlocExtent, ItemLocation};
+        // Build two items back-to-back in the file: item 1 compliant
+        // (one SH), item 2 non-compliant (zero SH).
+        let mut s1 = Vec::new();
+        s1.extend(obu_with_size(2, &[])); // TD
+        s1.extend(obu_with_size(1, &[0x00; 3])); // SH
+        let mut s2 = Vec::new();
+        s2.extend(obu_with_size(2, &[])); // TD only — no SH
+        let mut file = Vec::new();
+        let off1 = file.len() as u64;
+        file.extend(&s1);
+        let off2 = file.len() as u64;
+        file.extend(&s2);
+        let meta = Meta {
+            items: vec![make_infe(1, b"av01", 0), make_infe(2, b"av01", 0)],
+            locations: vec![
+                ItemLocation {
+                    id: 1,
+                    construction_method: 0,
+                    data_reference_index: 0,
+                    base_offset: 0,
+                    extents: vec![IlocExtent {
+                        offset: off1,
+                        length: s1.len() as u64,
+                    }],
+                },
+                ItemLocation {
+                    id: 2,
+                    construction_method: 0,
+                    data_reference_index: 0,
+                    base_offset: 0,
+                    extents: vec![IlocExtent {
+                        offset: off2,
+                        length: s2.len() as u64,
+                    }],
+                },
+            ],
+            ..Meta::default()
+        };
+        let r = audit_sequence_header_obu(&meta, &file);
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].item_id, 1);
+        assert!(r[0].is_compliant());
+        assert_eq!(r[1].item_id, 2);
+        assert!(!r[1].is_compliant());
+        assert_eq!(r[1].sequence_header_count, 0);
     }
 }

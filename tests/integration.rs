@@ -3193,3 +3193,64 @@ fn bbb_alpha_fixture_alpha_master_bit_depth_match() {
         "every (alpha, master) pairing in bbb_alpha must agree on bit depth"
     );
 }
+
+/// The Microsoft monochrome conformance fixture is a single-item AVIF
+/// with one av01 image item. The av1-avif §2.1 audit must emit one
+/// record reporting exactly one Sequence Header OBU and report the
+/// file compliant.
+#[test]
+fn monochrome_fixture_sequence_header_obu_count_exactly_one() {
+    const MONOCHROME: &[u8] = include_bytes!("fixtures/monochrome.avif");
+    let info = inspect(MONOCHROME).expect("inspect monochrome");
+    assert_eq!(
+        info.sequence_header_obu_compliance.len(),
+        1,
+        "monochrome.avif has exactly one av01 item"
+    );
+    let rec = &info.sequence_header_obu_compliance[0];
+    assert!(!rec.missing_iloc, "iloc resolves the primary item");
+    assert!(!rec.truncated_obu, "OBU stream framing is well-formed");
+    assert!(
+        !rec.has_size_field_zero,
+        "every OBU in the stream carries obu_has_size_field == 1"
+    );
+    assert_eq!(
+        rec.sequence_header_count, 1,
+        "av1-avif §2.1 — exactly one Sequence Header OBU in the AV1 Image Item Data"
+    );
+    assert!(rec.is_compliant());
+    assert!(rec.missing().is_empty());
+    assert!(info.sequence_header_obu_strict_compliant());
+}
+
+/// The Microsoft `bbb_alpha_inverted.avif` carries TWO `av01` items
+/// (colour primary + alpha auxiliary). Both must carry exactly one
+/// Sequence Header OBU each per av1-avif §2.1.
+#[test]
+fn bbb_alpha_fixture_sequence_header_obu_count_exactly_one_per_av01_item() {
+    let info = inspect(BBB_ALPHA).expect("inspect bbb_alpha");
+    assert!(
+        !info.sequence_header_obu_compliance.is_empty(),
+        "bbb_alpha must report at least one av01 item"
+    );
+    for rec in &info.sequence_header_obu_compliance {
+        assert!(!rec.missing_iloc, "iloc must resolve item {}", rec.item_id);
+        assert!(
+            !rec.truncated_obu,
+            "OBU stream for item {} must be well-formed",
+            rec.item_id
+        );
+        assert!(
+            !rec.has_size_field_zero,
+            "item {} must carry obu_has_size_field == 1 throughout",
+            rec.item_id
+        );
+        assert_eq!(
+            rec.sequence_header_count, 1,
+            "av1-avif §2.1: item {} has {} Sequence Header OBUs",
+            rec.item_id, rec.sequence_header_count
+        );
+        assert!(rec.is_compliant());
+    }
+    assert!(info.sequence_header_obu_strict_compliant());
+}

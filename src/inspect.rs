@@ -222,6 +222,18 @@ pub struct AvifInfo {
     /// Item (respectively AV1 Image Sequence)." Combine with
     /// [`Self::alpha_bit_depth_strict_compliant`] for a one-call gate.
     pub alpha_bit_depth_compliance: Vec<crate::derived::AlphaBitDepthAudit>,
+    /// av1-avif v1.2.0 §2.1 `shall`-level audit results, one entry per
+    /// `'av01'` item in the file (in `iinf` declaration order). Each
+    /// entry reports the Sequence Header OBU count walked from the
+    /// item's payload and structural failure flags (missing iloc,
+    /// truncated OBU stream, an OBU with `obu_has_size_field == 0`).
+    /// Empty when the file ships no AV1 Image Items.
+    ///
+    /// Spec: av1-avif v1.2.0 §2.1 — "The AV1 Image Item Data shall
+    /// have exactly one Sequence Header OBU." Combine with
+    /// [`Self::sequence_header_obu_strict_compliant`] for a one-call
+    /// gate.
+    pub sequence_header_obu_compliance: Vec<crate::derived::SequenceHeaderObuAudit>,
 }
 
 impl AvifInfo {
@@ -374,6 +386,23 @@ impl AvifInfo {
             .all(|a| a.is_compliant())
     }
 
+    /// True when every AV1 Image Item in the file passes the av1-avif
+    /// v1.2.0 §2.1 `shall` "The AV1 Image Item Data shall have exactly
+    /// one Sequence Header OBU." A pass requires that the audit
+    /// could walk the item's bytes (no `missing_iloc`), the OBU
+    /// stream framing was well-formed (no `truncated_obu`, no
+    /// `has_size_field_zero`), and exactly one Sequence Header OBU
+    /// was counted.
+    ///
+    /// Trivially `true` for files with no AV1 Image Items (a
+    /// degenerate case — AVIF requires the primary item be an av01
+    /// or a derivation rooted on av01s).
+    pub fn sequence_header_obu_strict_compliant(&self) -> bool {
+        self.sequence_header_obu_compliance
+            .iter()
+            .all(|a| a.is_compliant())
+    }
+
     /// True when the file's `ftyp` claims the `mif1` brand and every
     /// HEIF §10.2.1.1 mandatory child box is present in `meta`. False
     /// when the file claims `mif1` but is missing required boxes, OR
@@ -430,6 +459,7 @@ pub fn inspect(file: &[u8]) -> Result<AvifInfo> {
             find_alpha_item_id(&hdr.meta, primary_id).is_some(),
             brands,
             mif1_compliance,
+            file,
         )
     }
 }
@@ -550,6 +580,7 @@ pub(crate) fn build_info(
     has_alpha: bool,
     brands: BrandClass,
     mif1_compliance: crate::derived::Mif1Compliance,
+    file: &[u8],
 ) -> Result<AvifInfo> {
     let av1c = img
         .av1c
@@ -619,6 +650,7 @@ pub(crate) fn build_info(
     let iden_item_ids = img.meta.item_ids_of_type(&crate::meta::ITEM_TYPE_IDEN);
     let iden_compliance = crate::derived::audit_iden_derivations(&img.meta);
     let alpha_bit_depth_compliance = crate::derived::audit_alpha_bit_depth(&img.meta);
+    let sequence_header_obu_compliance = crate::derived::audit_sequence_header_obu(&img.meta, file);
     Ok(AvifInfo {
         width,
         height,
@@ -655,6 +687,7 @@ pub(crate) fn build_info(
         iden_item_ids,
         iden_compliance,
         alpha_bit_depth_compliance,
+        sequence_header_obu_compliance,
     })
 }
 
@@ -791,6 +824,8 @@ pub(crate) fn build_info_grid(
     let iden_item_ids = hdr.meta.item_ids_of_type(&crate::meta::ITEM_TYPE_IDEN);
     let iden_compliance = crate::derived::audit_iden_derivations(&hdr.meta);
     let alpha_bit_depth_compliance = crate::derived::audit_alpha_bit_depth(&hdr.meta);
+    let sequence_header_obu_compliance =
+        crate::derived::audit_sequence_header_obu(&hdr.meta, hdr.file);
     Ok(AvifInfo {
         width: grid.output_width,
         height: grid.output_height,
@@ -827,6 +862,7 @@ pub(crate) fn build_info_grid(
         iden_item_ids,
         iden_compliance,
         alpha_bit_depth_compliance,
+        sequence_header_obu_compliance,
     })
 }
 

@@ -220,7 +220,7 @@ impl AvifDecoder {
                 img.ispe.map(|e| (e.width, e.height)),
             )?;
             let has_alpha = find_alpha_item_id(&hdr.meta, primary_id).is_some();
-            let info = build_info(&img, has_alpha, brands, mif1.clone()).map_err(core_err)?;
+            let info = build_info(&img, has_alpha, brands, mif1.clone(), file).map_err(core_err)?;
             (f, fmt, w, h, info)
         } else {
             return Err(Error::unsupported(format!(

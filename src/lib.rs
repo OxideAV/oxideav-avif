@@ -103,9 +103,9 @@ pub use cicp::{
     primaries_name, transfer_name, CicpTriple,
 };
 pub use derived::{
-    audit_alpha_bit_depth, audit_iden_derivations, audit_tone_map, parse_grpl, AlphaBitDepthAudit,
-    EntityGroup, IdenCompliance, ImageOverlay, Mif1Compliance, OverlayEntry, SampleTransform,
-    Token, ToneMapCompliance,
+    audit_alpha_bit_depth, audit_iden_derivations, audit_sequence_header_obu, audit_tone_map,
+    parse_grpl, AlphaBitDepthAudit, EntityGroup, IdenCompliance, ImageOverlay, Mif1Compliance,
+    OverlayEntry, SampleTransform, SequenceHeaderObuAudit, Token, ToneMapCompliance,
 };
 pub use error::{AvifError, Result};
 pub use grid::{composite_grid, ImageGrid};

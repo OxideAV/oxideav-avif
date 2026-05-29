@@ -42,6 +42,7 @@ still loses significant signal.
 | CICP color signalling                  | `colr` nclx → `CicpTriple` (primaries / transfer / matrix / full_range) with H.273 defaults (`Unspecified` = `2/2/2/false`); ICC + Unknown fall back to Unspecified; alpha auxiliary CICP constant carries `full_range = true` per av1-avif §4.1 |
 | HDR metadata                           | `mdcv` (SMPTE ST 2086 mastering display primaries + luminance), `clli` (MaxCLL / MaxFALL cd/m²), `cclv` (draft av1-avif extension, same layout as `clli`); surfaced via `AvifInfo::{mdcv, clli, cclv, has_hdr_metadata(), max_cll(), max_fall()}` |
 | AV1 wrap pass-through                  | `av1C`-derived bit depth (8/10/12-bit), monochrome flag, and chroma subsampling `(x, y)` decoded and surfaced via `AvifInfo::{bit_depth, monochrome, chroma_subsampling}`; callers no longer need to re-parse `av1C` |
+| Sequence Header OBU audit (§2.1)       | av1-avif §2.1 `shall` "The AV1 Image Item Data shall have exactly one Sequence Header OBU" audited at the container layer via `audit_sequence_header_obu(meta, file)` / `SequenceHeaderObuAudit`. One record per `'av01'` item walks the OBU framing (AV1 §5.3.1 header byte + §4.10.5 leb128 `obu_size` + §6.2.1 `obu_type` table) and reports `sequence_header_count`, `total_obu_count`, plus structural failure flags (`missing_iloc` / `truncated_obu` / `has_size_field_zero`). Surfaced via `AvifInfo::sequence_header_obu_compliance` / `sequence_header_obu_strict_compliant()` |
 | Primary item data                      | resolved via `iloc` construction_method 0 (file offset); single-extent items return a zero-copy slice; multi-extent items are concatenated via `item_bytes_owned()` (HEIF §8.11.3.3) |
 | Grid primary items (HEIF §6.6.2)       | grid descriptor parse + per-tile decode via `dimg` iref + composite into the declared output rectangle; plus av1-avif §7 derivation-chain audit (`audit_grid_derivations` / `GridDerivationAudit`) flagging any `clap` / `irot` / `imir` attached to a tile in violation of the "transformative properties only on the grid item itself" `shall`. Surfaced via `AvifInfo::grid_derivation_compliance` / `grid_derivations_strict_compliant()` |
 | Alpha auxiliary                        | `auxl` + `auxC` URN detection, AV1-coded monochrome item decoded, composited onto the color frame (`Gray8 → YA8`, `Yuv → YuvA`); plus av1-avif §4.1 alpha-vs-master bit-depth `shall` audit (`audit_alpha_bit_depth` / `AlphaBitDepthAudit`) surfaced via `AvifInfo::alpha_bit_depth_compliance` / `alpha_bit_depth_strict_compliant()` |
@@ -83,6 +84,44 @@ still loses significant signal.
 
 See `examples/diag_decode.rs` for a drop-in report of exactly which
 stage each input reaches.
+
+### Round 182 — av1-avif §2.1 Sequence Header OBU count audit
+
+av1-avif v1.2.0 §2.1 mandates that "The AV1 Image Item Data shall have
+exactly one Sequence Header OBU." Round 182 audits this `shall` at the
+container layer via `audit_sequence_header_obu(meta, file)`, parallel
+to the existing §4.1 alpha-bit-depth (round 176), §6.6.2.1 iden, and
+§7 grid-derivation audits.
+
+The walker resolves each `'av01'` item's payload via its `iloc` and
+parses the OBU framing per AV1 §5.3.1: header byte (with
+`obu_type` in bits 6..3 and `obu_has_size_field` in bit 1, per
+§5.3.2), the optional one-byte extension header when
+`obu_extension_flag == 1` (§5.3.3), and the leb128 `obu_size`
+(§4.10.5) when the size field is present. The OBU payload bodies
+themselves are skipped — only the type field is consulted, and a
+running count of OBUs whose `obu_type` equals
+`OBU_SEQUENCE_HEADER == 1` (per AV1 §6.2.1's enumeration) is
+returned per item.
+
+The `SequenceHeaderObuAudit` record distinguishes three structural
+failure modes from a plain count mismatch: `missing_iloc` when no
+location resolves the item's bytes; `truncated_obu` when the framing
+walker hits end-of-stream mid-OBU (truncated leb128, or a declared
+`obu_size` that runs past the item payload); and `has_size_field_zero`
+when an OBU in the chain carries `obu_has_size_field == 0` (AV1 §5.3.1
+requires the size field be set when chaining OBUs inside a
+container-framed unit, which is exactly the AVIF Image Item Data
+case). Two integration tests pin the audit on real fixtures: the
+Microsoft `monochrome.avif` (one `'av01'`, exactly one Sequence
+Header OBU) and `bbb_alpha_inverted.avif` (two `'av01'` items —
+colour primary + alpha auxiliary — each with exactly one SH OBU).
+
+`AvifInfo` exposes `sequence_header_obu_compliance` (the per-item
+record vector) plus `sequence_header_obu_strict_compliant()` (folds
+every record into a single boolean — trivially `true` for files
+without any `'av01'` items, so combine with the file's brand check
+for a presence + compliance gate).
 
 ### Round 176 — av1-avif §4.1 alpha bit-depth match audit
 

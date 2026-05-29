@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 182 — av1-avif v1.2.0 §2.1 "The AV1 Image Item Data shall have
+  exactly one Sequence Header OBU" container-layer compliance audit.
+  New API `oxideav_avif::derived::audit_sequence_header_obu(meta, file)`
+  enumerates every `'av01'` image item, resolves its payload via
+  `iloc`, walks the OBU framing per AV1 §5.3.1 / §5.3.2 (header byte
+  + leb128 `obu_size` per §4.10.5; optional one-byte extension header
+  when `obu_extension_flag == 1` per §5.3.3) and counts OBUs whose
+  `obu_type` equals `OBU_SEQUENCE_HEADER == 1` (per AV1 §6.2.1's
+  `obu_type` enumeration). One `SequenceHeaderObuAudit { item_id,
+  sequence_header_count, total_obu_count, missing_iloc, truncated_obu,
+  has_size_field_zero, is_compliant(), missing() }` record per av01
+  item, in `iinf` declaration order. The OBU payload bodies themselves
+  are not decoded — only the type field and framing are inspected.
+- `AvifInfo::sequence_header_obu_compliance:
+  Vec<crate::derived::SequenceHeaderObuAudit>` populated by both the
+  single-item and grid `build_info` paths, plus
+  `AvifInfo::sequence_header_obu_strict_compliant()` predicate folding
+  every record into a single boolean (trivially `true` when no av01
+  items are present — degenerate, since AVIF requires the primary
+  item be an av01 or a derivation rooted on av01s).
+- 14 new tests: 11 unit tests in `derived::tests` covering the happy
+  path (one SH OBU → compliant), §2.1 violations (zero SH OBUs flagged
+  `av01-item-missing-sequence-header-obu`; two SH OBUs flagged
+  `av01-item-multiple-sequence-header-obus`), structural failures
+  (truncated payload past declared `obu_size`, truncated leb128
+  mid-OBU, `obu_has_size_field == 0` chaining failure, missing iloc),
+  the extension-header skip path (`obu_extension_flag == 1`), one
+  record per av01 item ordering, and non-av01 item filtering; 3 unit
+  tests covering the `read_leb128` helper directly
+  (single/multi/maximum-width valid values, truncated continuation,
+  overlong 8-byte cap from AV1 §4.10.5). 2 new integration tests pin
+  the audit on real fixtures: `monochrome.avif` (one `'av01'` item, SH
+  count == 1, strict-compliant) and `bbb_alpha_inverted.avif` (two
+  `'av01'` items — colour primary + alpha auxiliary — each with SH
+  count == 1, strict-compliant).
+- `oxideav_avif::SequenceHeaderObuAudit` and
+  `oxideav_avif::audit_sequence_header_obu` re-exported at the crate
+  root. `build_info` signature extended with a trailing `file: &[u8]`
+  argument; `build_info_grid` reuses the `hdr.file` slice it already
+  carries.
+
 - Round 176 — av1-avif v1.2.0 §4.1 Auxiliary-Image bit-depth match
   audit. The §4.1 `shall` "An AV1 Alpha Image Item (respectively an
   AV1 Alpha Image Sequence) shall be encoded with the same bit depth
