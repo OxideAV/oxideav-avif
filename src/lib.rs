@@ -111,7 +111,7 @@ pub use derived::{
 pub use error::{AvifError, Result};
 pub use grid::{composite_grid, ImageGrid};
 pub use image::{AvifFrame, AvifPixelFormat, AvifPlane};
-pub use inspect::{inspect, item_payload_bytes, transforms_for, AvifInfo};
+pub use inspect::{gain_map_metadata, inspect, item_payload_bytes, transforms_for, AvifInfo};
 pub use meta::{
     A1lx, A1op, AuxC, AuxKind, Cclv, Clap, Clli, Colr, Imir, IrefEntry, Irot, Ispe, ItemInfo,
     ItemLocation, Lsel, Mdcv, Meta, Pasp, Pixi, Property, Rloc, AUX_URN_ALPHA_HEVC,

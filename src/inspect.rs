@@ -162,13 +162,14 @@ pub struct AvifInfo {
     pub sato_item_ids: Vec<u32>,
     /// Item IDs of every Tone Map Derived Image Item carried in the
     /// file (av1-avif v1.2.0 §4.2.2 — `'tmap'`). Detection: `infe.item_type
-    /// == 'tmap'`. The HEIF-defined descriptor body parse is not
-    /// implemented here yet (pending an HEIF edition in
-    /// `docs/image/heif/`); the field exists so callers can detect the
-    /// carrier and gracefully degrade. Empty for files without any
-    /// tone-map derivation. The av1-avif §4.2.2 file-shape `should`
-    /// constraints (altr pairing + hidden gain-map) are surfaced
-    /// separately via [`Self::tone_map_compliance`].
+    /// == 'tmap'`. The ISO 21496-1 gain map metadata descriptor body
+    /// each item points at via its `iloc` is parsed by
+    /// [`crate::derived::GainMapMetadata::parse`]; the one-call
+    /// extractor [`gain_map_metadata`] combines the byte resolve and
+    /// parse for a tmap item id picked out of this list. Empty for
+    /// files without any tone-map derivation. The av1-avif §4.2.2
+    /// file-shape `should` constraints (altr pairing + hidden gain-map)
+    /// are surfaced separately via [`Self::tone_map_compliance`].
     pub tmap_item_ids: Vec<u32>,
     /// av1-avif §4.2.2 compliance audit results, one entry per `'tmap'`
     /// item in [`Self::tmap_item_ids`] (same order). Each entry reports
@@ -544,6 +545,41 @@ pub fn item_payload_bytes(file: &[u8], item_id: u32) -> Result<Vec<u8>> {
         .location_by_id(item_id)
         .ok_or_else(|| Error::invalid(format!("avif: item {item_id} missing in iloc")))?;
     crate::parser::item_bytes_owned(file, loc)
+}
+
+/// Resolve a `'tmap'` item's payload bytes and parse them as an ISO
+/// 21496-1:2025 Annex C.2 gain map metadata descriptor.
+///
+/// One-call wrapper that combines [`item_payload_bytes`] (to pull the
+/// raw descriptor body out of `mdat` per the item's `iloc`) with
+/// [`crate::derived::GainMapMetadata::parse`] (to decode the binary
+/// layout). Callers that already hold the payload bytes can skip this
+/// and call `GainMapMetadata::parse` directly.
+///
+/// Pick `tmap_item_id` from [`AvifInfo::tmap_item_ids`] — every entry
+/// in that list is guaranteed to have an `infe` declaring `item_type ==
+/// 'tmap'`. Passing an arbitrary item id is accepted (the call returns
+/// whatever the byte resolver finds), but the parse will reject the
+/// payload as malformed when the resolved bytes do not match the C.2
+/// layout — callers that want a strict-checked extractor should gate
+/// on `tmap_item_ids` membership first.
+///
+/// Errors propagate from both stages: an [`crate::error::AvifError::InvalidData`]
+/// when the item is missing from `iloc`, when the iloc construction
+/// method isn't file-offset (0), when an extent runs off the end of
+/// `file`, or when the descriptor body violates a C.2.3 `shall`
+/// constraint (zero rational denominator, zero `gamma_numerator`,
+/// `writer_version < minimum_version`, truncated payload).
+/// [`crate::error::AvifError::Unsupported`] when the descriptor's
+/// `minimum_version` is one this parser doesn't recognise — the spec
+/// directs such a reader to display the base image rather than treat
+/// the bytes as malformed.
+pub fn gain_map_metadata(
+    file: &[u8],
+    tmap_item_id: u32,
+) -> Result<crate::derived::GainMapMetadata> {
+    let bytes = item_payload_bytes(file, tmap_item_id)?;
+    crate::derived::GainMapMetadata::parse(&bytes)
 }
 
 /// Decode `av1C` bytes into `(bit_depth, monochrome, chroma_subsampling)`.
@@ -1201,5 +1237,25 @@ mod tests {
         // Same iref does bind item 5, however.
         let (exif5, _) = resolve_metadata_items(&meta, 5);
         assert_eq!(exif5, Some(2));
+    }
+
+    /// `gain_map_metadata` against an unknown item id surfaces the
+    /// "missing in iloc" `InvalidData` error from `item_payload_bytes` —
+    /// the resolution stage runs first, so a non-existent tmap id never
+    /// reaches the descriptor parser. Pinned against the monochrome
+    /// conformance fixture, which has no `'tmap'` item; every id outside
+    /// the file's known set is therefore guaranteed to fail at iloc.
+    #[test]
+    fn gain_map_metadata_unknown_id_is_invalid_data() {
+        let err = gain_map_metadata(FIXTURE, 9999).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => {
+                assert!(
+                    msg.contains("missing in iloc"),
+                    "expected iloc-miss error message, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidData on unknown item id, got {other:?}"),
+        }
     }
 }

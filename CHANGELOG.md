@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 190 — one-call gain map metadata extractor
+  `oxideav_avif::gain_map_metadata(file, tmap_item_id)`. Resolves the
+  named `'tmap'` derived-image item's `iloc` payload via the existing
+  `item_payload_bytes` path, then feeds the result to
+  `GainMapMetadata::parse`. Pick a `tmap_item_id` from
+  `AvifInfo::tmap_item_ids`; the function propagates the same
+  `InvalidData` / `Unsupported` error split as the parser. Mirrors the
+  `item_payload_bytes` accessor shape so callers can extract the parsed
+  descriptor in one call rather than chaining the two steps themselves.
+  Stale doc on `AvifInfo::tmap_item_ids` (previously claimed the
+  descriptor body parse was deferred) updated to point at this
+  extractor and at `GainMapMetadata::parse`.
 - Round 188 — ISO 21496-1:2025 Annex C.2 gain map metadata descriptor
   body parser, the binary payload carried by the AVIF / HEIF `'tmap'`
   (tone map) derived image item (av1-avif §4.2.2 registers the item;
