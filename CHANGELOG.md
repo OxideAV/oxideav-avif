@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-avif/compare/v0.0.7...v0.0.8) - 2026-05-30
+
+### Other
+
+- gain_map_metadata one-call extractor for tmap descriptor body
+- refresh lib.rs crate-doc tmap line for the landed body parse
+- ISO 21496-1 gain map metadata (tmap descriptor body) parser
+- §2.1 Sequence Header OBU count shall-level compliance audit
+- §4.1 alpha-vs-master bit-depth shall-level compliance audit
+- §6.6.2.1 iden derived-image-item shall-level compliance audit
+- §7 grid-derivation transformative-property audit
+- tmap_item_ids docstring points at tone_map_compliance audit
+- tmap av1-avif §4.2.2 compliance audit (altr pairing + hidden gain map)
+- sato (Sample Transform) descriptor parser + evaluator (av1-avif §4.2.3)
+- a1op/a1lx layered-image properties + essential-property enforcement
+- local av1C parser + Av1Decoder stub after av1 clean-room rebuild
+- r81 docs: reflect revert + the av1 workspace caveat
+- keep AV1 calls on published 0.1.8 API for CI
+- derived-image + entity-grouping + MIAF compliance audit
+- HEIF item-properties + iref typed-relationship enumeration
+- harden AVIF→AV1 boundary against fuzz-discovered crashes
+- AVIS sequence decode + integration tests tolerate av1 coded_lossless
+
 ### Added
 
 - Round 190 — one-call gain map metadata extractor
