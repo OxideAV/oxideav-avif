@@ -1036,8 +1036,12 @@ impl GainMapMetadata {
     ///   base image rather than treat the bytes as malformed.
     /// * Returns [`AvifError::InvalidData`](crate::error::AvifError::InvalidData)
     ///   when the payload is truncated, when `writer_version <
-    ///   minimum_version`, or when any rational denominator (or the gamma
-    ///   numerator) is `0` — all `shall`-level constraints in C.2.3.
+    ///   minimum_version`, when any rational denominator (or the gamma
+    ///   numerator) is `0`, when any channel's `gain_map_max <
+    ///   gain_map_min` (§5.2.5.3 "shall be greater than or equal to"),
+    ///   or when `alternate_hdr_headroom == base_hdr_headroom` (§5.2.7
+    ///   "shall not be equal to") — all `shall`-level constraints from
+    ///   §5.2 / Annex C.2.3.
     /// * Trailing bytes after the last recognised field are ignored
     ///   (Annex C.2.1 padding / future-optional-metadata rule).
     pub fn parse(payload: &[u8]) -> Result<Self> {
@@ -1071,6 +1075,18 @@ impl GainMapMetadata {
         // base/alternate HDR headroom: 4 × u32 starting at offset 5.
         let base_hdr_headroom = read_unsigned_rational(payload, 5)?;
         let alternate_hdr_headroom = read_unsigned_rational(payload, 13)?;
+        // §5.2.7: "H_alternate shall not be equal to H_baseline". The
+        // headroom values are unsigned rationals; compare via the
+        // cross-multiplied i64 product so a different
+        // (numerator, denominator) pair that reduces to the same value
+        // is still flagged (e.g. 1/1 == 2/2). Denominators have already
+        // been rejected when zero by `read_unsigned_rational`.
+        if !rationals_differ(&base_hdr_headroom, &alternate_hdr_headroom) {
+            return Err(Error::invalid(
+                "avif: gain map metadata alternate_hdr_headroom equals base_hdr_headroom \
+                 (ISO 21496-1 §5.2.7)",
+            ));
+        }
 
         // GainMapChannel[channel_count] follow, each 10 × 32-bit fields
         // (40 bytes): min, max, gamma, base_offset, alternate_offset.
@@ -1079,6 +1095,18 @@ impl GainMapMetadata {
         for _ in 0..channel_count {
             let gain_map_min = read_signed_rational(payload, at)?;
             let gain_map_max = read_signed_rational(payload, at + 8)?;
+            // §5.2.5.3: "For each component, max(G) shall be greater
+            // than or equal to the min(G) value". Compare via the
+            // cross-multiplied i64 product so the predicate is exact
+            // for any (numerator, denominator) pair; denominators are
+            // already non-zero (and positive, being unsigned), so the
+            // product's sign is the sign of the difference.
+            if !rational_ge(&gain_map_max, &gain_map_min) {
+                return Err(Error::invalid(
+                    "avif: gain map metadata gain_map_max < gain_map_min \
+                     (ISO 21496-1 §5.2.5.3)",
+                ));
+            }
             let gamma = read_unsigned_rational(payload, at + 16)?;
             // C.2.3: gamma_numerator shall not be 0.
             if gamma.numerator == 0 {
@@ -1140,6 +1168,33 @@ fn read_signed_rational(buf: &[u8], at: usize) -> Result<GainMapRational> {
 /// when zero.
 fn read_unsigned_rational(buf: &[u8], at: usize) -> Result<GainMapRational> {
     read_signed_rational(buf, at)
+}
+
+/// True when the rational value of `a` is greater than or equal to
+/// the rational value of `b`. Computes the comparison via the
+/// cross-multiplied `i64` product so the predicate is exact across
+/// any (numerator, denominator) pair without floating-point rounding.
+///
+/// Both denominators are required to be non-zero (and positive — the
+/// underlying field is `unsigned int(32)` per Annex C.2.2 and the
+/// reader rejects zero in `read_signed_rational`). With positive
+/// denominators, `a/da >= b/db` iff `a*db >= b*da`. Numerators are
+/// `i32` and denominators fit in `u32`, so the products always fit in
+/// `i64` (max magnitude ~2^31 × 2^32 = 2^63, the i64 limit).
+fn rational_ge(a: &GainMapRational, b: &GainMapRational) -> bool {
+    let lhs = (a.numerator as i64) * (b.denominator as i64);
+    let rhs = (b.numerator as i64) * (a.denominator as i64);
+    lhs >= rhs
+}
+
+/// True when the rational values of `a` and `b` are not equal. Uses
+/// the same exact i64 cross-multiplication as [`rational_ge`] so
+/// `1/1` and `2/2` correctly compare as equal (and therefore are not
+/// reported as differing).
+fn rationals_differ(a: &GainMapRational, b: &GainMapRational) -> bool {
+    let lhs = (a.numerator as i64) * (b.denominator as i64);
+    let rhs = (b.numerator as i64) * (a.denominator as i64);
+    lhs != rhs
 }
 
 /// Per-grid `shall`-level compliance against av1-avif §7's
@@ -3839,7 +3894,9 @@ mod tests {
         buf.extend_from_slice(&1u16.to_be_bytes()); // writer_version
         buf.push(0x80); // is_multichannel=1, use_base_colour_space=0
         push_rational(&mut buf, 1, 1); // base_hdr_headroom
-        push_rational(&mut buf, 1, 1); // alternate_hdr_headroom
+                                       // alternate_hdr_headroom must differ from base_hdr_headroom
+                                       // (§5.2.7); 4/1 ≠ 1/1.
+        push_rational(&mut buf, 4, 1); // alternate_hdr_headroom
         for ch in 0..3i32 {
             push_rational(&mut buf, ch, 1); // gain_map_min (R=0,G=1,B=2)
             push_rational(&mut buf, 10, 1); // gain_map_max
@@ -3909,6 +3966,69 @@ mod tests {
     fn gain_map_metadata_rejects_truncated_channel() {
         let mut buf = build_singlechannel_gain_map();
         buf.truncate(buf.len() - 1); // drop last byte of the channel
+        let err = GainMapMetadata::parse(&buf).unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)));
+    }
+
+    /// §5.2.5.3: per-component `max(G)` "shall be greater than or
+    /// equal to the `min(G)` value". The default fixture has min=-1/4
+    /// (-0.25) and max=3/4 (0.75), so swapping the two numerators
+    /// flips the predicate and the parse must reject the payload.
+    #[test]
+    fn gain_map_metadata_rejects_max_below_min() {
+        let mut buf = build_singlechannel_gain_map();
+        // Channel record starts at offset 21; the gain_map_min and
+        // gain_map_max sint32 numerators sit at +0 and +8 within it.
+        // Swap them so max < min.
+        let orig_min = i32::from_be_bytes(buf[21..25].try_into().unwrap());
+        let orig_max = i32::from_be_bytes(buf[29..33].try_into().unwrap());
+        buf[21..25].copy_from_slice(&orig_max.to_be_bytes());
+        buf[29..33].copy_from_slice(&orig_min.to_be_bytes());
+        let err = GainMapMetadata::parse(&buf).unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)));
+    }
+
+    /// §5.2.5.3 boundary: `max(G) == min(G)` is permitted ("greater
+    /// than or equal to"). Build a channel where both equal 0/1 and
+    /// confirm the parse succeeds.
+    #[test]
+    fn gain_map_metadata_accepts_max_equal_to_min() {
+        let mut buf = build_singlechannel_gain_map();
+        // Force gain_map_min and gain_map_max to the same rational
+        // (0/1, the simplest legal value).
+        buf[21..25].copy_from_slice(&0i32.to_be_bytes()); // min numerator
+        buf[25..29].copy_from_slice(&1u32.to_be_bytes()); // min denominator
+        buf[29..33].copy_from_slice(&0i32.to_be_bytes()); // max numerator
+        buf[33..37].copy_from_slice(&1u32.to_be_bytes()); // max denominator
+        let m = GainMapMetadata::parse(&buf).expect("max==min is permitted");
+        assert_eq!(m.channels[0].gain_map_min.numerator, 0);
+        assert_eq!(m.channels[0].gain_map_max.numerator, 0);
+    }
+
+    /// §5.2.7: `alternate_hdr_headroom` "shall not be equal to" the
+    /// `base_hdr_headroom`. Overwrite the alternate headroom with the
+    /// base headroom's exact bytes and confirm the parse rejects it.
+    #[test]
+    fn gain_map_metadata_rejects_equal_hdr_headrooms() {
+        let mut buf = build_singlechannel_gain_map();
+        // base_hdr_headroom sits at offset 5..13; alternate at 13..21.
+        let base = buf[5..13].to_vec();
+        buf[13..21].copy_from_slice(&base);
+        let err = GainMapMetadata::parse(&buf).unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)));
+    }
+
+    /// §5.2.7 uses rational *value* equality, not byte equality:
+    /// 1/1 and 2/2 are the same value and so must trip the check
+    /// even though the encoded bytes differ.
+    #[test]
+    fn gain_map_metadata_rejects_value_equal_hdr_headrooms() {
+        let mut buf = build_singlechannel_gain_map();
+        // base = 1/1, alternate = 2/2 → both = 1.0, must reject.
+        buf[5..9].copy_from_slice(&1u32.to_be_bytes()); // base numerator
+        buf[9..13].copy_from_slice(&1u32.to_be_bytes()); // base denominator
+        buf[13..17].copy_from_slice(&2u32.to_be_bytes()); // alt numerator
+        buf[17..21].copy_from_slice(&2u32.to_be_bytes()); // alt denominator
         let err = GainMapMetadata::parse(&buf).unwrap_err();
         assert!(matches!(err, Error::InvalidData(_)));
     }

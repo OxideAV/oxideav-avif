@@ -32,6 +32,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 193 — `GainMapMetadata::parse` now enforces two additional
+  ISO 21496-1:2025 §5.2 `shall`-level constraints the round-188 parser
+  initially deferred:
+  - **§5.2.5.3** "For each component, `max(G)` shall be greater than
+    or equal to the `min(G)` value." Each channel's `gain_map_max`
+    and `gain_map_min` are now compared as exact rational values via
+    a cross-multiplied `i64` predicate, so a payload where the
+    per-component max is strictly below the per-component min is
+    rejected with `InvalidData`. The "greater than or equal to"
+    boundary is preserved — a channel where `max == min` is still
+    accepted (covered by a dedicated regression test).
+  - **§5.2.7** "`H_alternate` shall not be equal to `H_baseline`."
+    The baseline/alternate HDR headroom rationals are likewise
+    compared as values rather than bytes, so `1/1` and `2/2` (or
+    any other distinct (numerator, denominator) pairs that reduce
+    to the same value) trip the check. Rejected with `InvalidData`.
+  Two new private helpers (`rational_ge`, `rationals_differ`) wrap
+  the i64 cross-multiplication; both rely on the existing
+  denominator-non-zero invariant the reader enforces in
+  `read_signed_rational`. Five new tests cover the new failure
+  paths plus the `max == min` boundary and the value-equality (not
+  byte-equality) shape of §5.2.7. The pre-existing multichannel
+  fixture's `alternate_hdr_headroom` was nudged from `1/1` to `4/1`
+  to stay distinct from its `base_hdr_headroom`; no other test
+  fixture or public API surface changed. README's `tmap` row
+  refreshed to list the §5.2.5.3 + §5.2.7 enforcements alongside
+  the existing C.2.3 ones.
 - Round 190 — one-call gain map metadata extractor
   `oxideav_avif::gain_map_metadata(file, tmap_item_id)`. Resolves the
   named `'tmap'` derived-image item's `iloc` payload via the existing
