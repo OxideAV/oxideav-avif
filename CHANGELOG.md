@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- av1-avif v1.2.0 §8.2 / §8.3 AVIF profile compliance audit
+  (`audit_avif_profile_compliance` + `AvifProfileCompliance` +
+  `AvifProfile`). One record per `(AV1 Image Item, declared profile)`
+  pairing: Baseline (`MA1B`) requires AV1 Main Profile at level ≤ 5.1;
+  Advanced (`MA1A`) requires ≤ AV1 High Profile at level ≤ 6.0.
+  Surfaced through `AvifInfo::avif_profile_compliance` and
+  `AvifInfo::avif_profile_strict_compliant()`. Files declaring neither
+  brand skip the audit (returned vector is empty). Pinned end-to-end
+  against the Microsoft `monochrome.avif` (MA1B compliant), `red64.avif`
+  (MA1A compliant), and `bbb_alpha_inverted.avif` (MA1B compliant, two
+  `av01` items).
+
+### Changed
+
+- `CicpTriple::is_libavif_srgb_default` renamed to
+  `CicpTriple::is_sdr_srgb_bt601_default`. The triple it matches
+  (`(1, 13, 6)`) is the conventional 8-bit SDR sRGB shape for 4:2:0 /
+  4:2:2 inputs that any reference encoder defaults to; the new name is
+  spec-relative.
+
+### Other
+
+- Scrub decorative attributions to a specific reference AVIF
+  encoder / decoder family across `cicp.rs`, `meta.rs`, `inspect.rs`,
+  `tests/integration.rs`, `tests/fuzz_regressions.rs`, and `README.md`.
+  Replaced with spec-relative terminology (reference-encoder-produced,
+  BT.709/sRGB/BT.601 SDR triple, black-box oracle). No technical change.
+
 ## [0.0.8](https://github.com/OxideAV/oxideav-avif/compare/v0.0.7...v0.0.8) - 2026-05-30
 
 ### Other

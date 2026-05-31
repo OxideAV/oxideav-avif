@@ -2,12 +2,12 @@
 //!
 //! Each fixture under `tests/fixtures/fuzz/` is either:
 //!
-//! * A short AVIF bitstream produced by the libavif-encoder-driven
-//!   cross-decode fuzz harness, captured when the harness asserted a
-//!   pixel divergence between `oxideav-avif`'s decoded planes and
-//!   `libavif`'s decoded planes. The crash is **not** a panic — it's an
-//!   `assert_eq!` failure inside the fuzz harness. The bug is in
-//!   `oxideav-av1`'s decode path, not in AVIF parsing.
+//! * A short AVIF bitstream captured from a cross-decode fuzz harness
+//!   (oxideav-avif vs. an opaque external AVIF decoder used as a
+//!   black-box oracle), recorded when the harness asserted a pixel
+//!   divergence between the two decoded plane sets. The crash is **not**
+//!   a panic — it's an `assert_eq!` failure inside the fuzz harness.
+//!   The bug is in `oxideav-av1`'s decode path, not in AVIF parsing.
 //! * A short AVIF bitstream that previously tripped an arithmetic
 //!   overflow inside `oxideav-av1`'s coefficient decoder when fed an
 //!   adversarial AV1 OBU stream. The fix in `oxideav-av1` 0.1.7 closes
@@ -26,22 +26,22 @@ use oxideav_avif::AvifDecoder;
 use oxideav_core::{CodecId, Decoder, Packet, TimeBase};
 
 /// AVIF bitstream (309 bytes) captured from the
-/// `libavif_encode_oxideav_libavif_decode_match` fuzz harness on
-/// 2026-05-11. Encoded by libavif from a 6-byte fuzz seed; decodes
-/// cleanly through `oxideav-avif`'s container layer but the AV1 layer's
-/// Y plane diverges from libavif's reference decode. The AVIF-side
-/// regression contract is **must not panic**.
+/// black-box-encode/cross-decode fuzz harness on 2026-05-11. Produced
+/// by an external AVIF encoder from a 6-byte fuzz seed; decodes cleanly
+/// through `oxideav-avif`'s container layer but the AV1 layer's Y
+/// plane diverges from the external decoder's reference decode. The
+/// AVIF-side regression contract is **must not panic**.
 const Y_PLANE_DIVERGENCE_MATCH: &[u8] =
     include_bytes!("fixtures/fuzz/y_plane_divergence_match.avif");
 
-/// First half of the `libavif_oxideav_reencode_roundtrip` fuzz divergence
-/// (310 bytes) — the original libavif encode of the fuzz RGBA seed.
+/// First half of the re-encode-roundtrip fuzz divergence (310 bytes) —
+/// the original external-encoder output of the fuzz RGBA seed.
 const Y_PLANE_ROUNDTRIP_AVIF1: &[u8] = include_bytes!("fixtures/fuzz/y_plane_roundtrip_avif1.avif");
 
-/// Second half of the same round-trip fixture (297 bytes) — libavif's
-/// re-encode of `oxideav-avif`'s decoded planes from `..avif1`. Decoding
-/// this with `oxideav-avif` produces a Y plane that diverges from the
-/// original decode.
+/// Second half of the same round-trip fixture (297 bytes) — the
+/// external encoder's re-encode of `oxideav-avif`'s decoded planes
+/// from `..avif1`. Decoding this with `oxideav-avif` produces a Y
+/// plane that diverges from the original decode.
 const Y_PLANE_ROUNDTRIP_AVIF2: &[u8] = include_bytes!("fixtures/fuzz/y_plane_roundtrip_avif2.avif");
 
 /// Run a packet through `AvifDecoder` and pull frames until the queue

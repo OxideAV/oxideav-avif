@@ -98,7 +98,7 @@ pub struct AvifInfo {
     ///    `item_type == 'Exif'`, OR whose `item_type == 'mime'` with a
     ///    `content_type` of `application/octet-stream` or `image/tiff`
     ///    (both forms appear in the wild — see ISO/IEC 23008-12
-    ///    §A.2.1 + libheif writer patterns).
+    ///    §A.2.1 and §A.2.2 for the native and generic-mime carriers).
     pub exif_item_id: Option<u32>,
     /// Item ID of the XMP metadata item linked to the primary, when
     /// present. Detection rule: a `cdsc` iref source whose `infe`
@@ -235,6 +235,18 @@ pub struct AvifInfo {
     /// [`Self::sequence_header_obu_strict_compliant`] for a one-call
     /// gate.
     pub sequence_header_obu_compliance: Vec<crate::derived::SequenceHeaderObuAudit>,
+    /// av1-avif v1.2.0 §8.2 (`MA1B`) / §8.3 (`MA1A`) profile
+    /// `shall`-level audit, one entry per `(AV1 Image Item, declared
+    /// profile)` pairing. Each record inspects the item's `av1C` for
+    /// the `(seq_profile, seq_level_idx_0)` pair and reports whether
+    /// it satisfies the declared profile's bounds (Baseline: Main +
+    /// level ≤ 5.1; Advanced: ≤ High + level ≤ 6.0).
+    ///
+    /// Empty when (a) the file ships no AV1 Image Items, or (b) the
+    /// file declares neither `MA1B` nor `MA1A` in its `ftyp`
+    /// compatible-brands list. Combine with
+    /// [`Self::avif_profile_strict_compliant`] for a one-call gate.
+    pub avif_profile_compliance: Vec<crate::derived::AvifProfileCompliance>,
 }
 
 impl AvifInfo {
@@ -404,6 +416,22 @@ impl AvifInfo {
             .all(|a| a.is_compliant())
     }
 
+    /// True when every AV1 Image Item passes the av1-avif v1.2.0 §8.2
+    /// (`MA1B`) / §8.3 (`MA1A`) profile `shall`-level constraints for
+    /// every brand the file declares.
+    ///
+    /// Trivially `true` when [`Self::avif_profile_compliance`] is
+    /// empty — either the file makes no profile claim (neither `MA1B`
+    /// nor `MA1A` in the compatible-brands list) or the file has no
+    /// AV1 Image Items. Callers that want a presence + compliance
+    /// signal should check `brands.is_baseline_profile ||
+    /// brands.is_advanced_profile` first.
+    pub fn avif_profile_strict_compliant(&self) -> bool {
+        self.avif_profile_compliance
+            .iter()
+            .all(|a| a.is_compliant())
+    }
+
     /// True when the file's `ftyp` claims the `mif1` brand and every
     /// HEIF §10.2.1.1 mandatory child box is present in `meta`. False
     /// when the file claims `mif1` but is missing required boxes, OR
@@ -476,8 +504,8 @@ pub fn inspect(file: &[u8]) -> Result<AvifInfo> {
 ///
 /// * `item_type == 'Exif'` (HEIF §A.2.1 native form).
 /// * `item_type == 'mime'` with `content_type` matching
-///   `application/octet-stream` or `image/tiff` (libheif / Apple writer
-///   pattern — wraps the Exif TIFF blob behind the generic mime carrier).
+///   `application/octet-stream` or `image/tiff` — encoders that prefer
+///   the generic MIME carrier wrap the Exif TIFF blob this way.
 ///
 /// XMP follows the canonical form: `item_type == 'mime'` with
 /// `content_type == "application/rdf+xml"`.
@@ -687,6 +715,7 @@ pub(crate) fn build_info(
     let iden_compliance = crate::derived::audit_iden_derivations(&img.meta);
     let alpha_bit_depth_compliance = crate::derived::audit_alpha_bit_depth(&img.meta);
     let sequence_header_obu_compliance = crate::derived::audit_sequence_header_obu(&img.meta, file);
+    let avif_profile_compliance = crate::derived::audit_avif_profile_compliance(&img.meta, &brands);
     Ok(AvifInfo {
         width,
         height,
@@ -724,6 +753,7 @@ pub(crate) fn build_info(
         iden_compliance,
         alpha_bit_depth_compliance,
         sequence_header_obu_compliance,
+        avif_profile_compliance,
     })
 }
 
@@ -862,6 +892,7 @@ pub(crate) fn build_info_grid(
     let alpha_bit_depth_compliance = crate::derived::audit_alpha_bit_depth(&hdr.meta);
     let sequence_header_obu_compliance =
         crate::derived::audit_sequence_header_obu(&hdr.meta, hdr.file);
+    let avif_profile_compliance = crate::derived::audit_avif_profile_compliance(&hdr.meta, &brands);
     Ok(AvifInfo {
         width: grid.output_width,
         height: grid.output_height,
@@ -899,6 +930,7 @@ pub(crate) fn build_info_grid(
         iden_compliance,
         alpha_bit_depth_compliance,
         sequence_header_obu_compliance,
+        avif_profile_compliance,
     })
 }
 
@@ -1123,8 +1155,9 @@ mod tests {
     }
 
     /// `mime`-wrapped Exif: `item_type == 'mime'` +
-    /// `content_type == "application/octet-stream"` (libheif Exif writer
-    /// pattern). Same outcome as native Exif: resolves as Exif.
+    /// `content_type == "application/octet-stream"` (one of the
+    /// real-world generic-MIME Exif carriers). Same outcome as native
+    /// Exif: resolves as Exif.
     #[test]
     fn resolve_metadata_picks_mime_wrapped_exif() {
         let meta = Meta {

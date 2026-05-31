@@ -103,8 +103,9 @@ pub use cicp::{
     primaries_name, transfer_name, CicpTriple,
 };
 pub use derived::{
-    audit_alpha_bit_depth, audit_iden_derivations, audit_sequence_header_obu, audit_tone_map,
-    parse_grpl, AlphaBitDepthAudit, EntityGroup, GainMapChannel, GainMapMetadata, GainMapRational,
+    audit_alpha_bit_depth, audit_avif_profile_compliance, audit_iden_derivations,
+    audit_sequence_header_obu, audit_tone_map, parse_grpl, AlphaBitDepthAudit, AvifProfile,
+    AvifProfileCompliance, EntityGroup, GainMapChannel, GainMapMetadata, GainMapRational,
     IdenCompliance, ImageOverlay, Mif1Compliance, OverlayEntry, SampleTransform,
     SequenceHeaderObuAudit, Token, ToneMapCompliance,
 };

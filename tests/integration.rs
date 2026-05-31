@@ -29,11 +29,11 @@ const BBB_ALPHA: &[u8] = include_bytes!("fixtures/bbb_alpha.avif");
 const KIMONO_ROT90: &[u8] = include_bytes!("fixtures/kimono_rotate90.avif");
 const ALPHA_VIDEO_AVIS: &[u8] = include_bytes!("fixtures/alpha_video.avif");
 
-// Round-5 end-to-end fixtures — tiny AVIFs produced by libavif's
-// `avifenc` in lossless / high-quality modes against small synthetic
-// inputs. Small enough to commit to git; simple enough that any
-// working AV1 decoder's intra path should reach the declared plane
-// means within tight tolerances.
+// Round-5 end-to-end fixtures — tiny AVIFs produced by an
+// off-the-shelf reference encoder in lossless / high-quality modes
+// against small synthetic inputs. Small enough to commit to git; simple
+// enough that any working AV1 decoder's intra path should reach the
+// declared plane means within tight tolerances.
 const GRAY32: &[u8] = include_bytes!("fixtures/gray32.avif"); // 32x32 mid-gray, 4:0:0, lossless
 const MIDGRAY64: &[u8] = include_bytes!("fixtures/midgray.avif"); // 64x64 mid-gray, 4:0:0, lossless
 const WHITE16: &[u8] = include_bytes!("fixtures/white16.avif"); // 16x16 white, 4:0:0, lossless
@@ -1195,7 +1195,8 @@ fn no_alpha_item_for_alpha_free_fixtures() {
 /// fixture per av1-avif §6 + §7 + §8 and ISO/IEC 23000-22 §7. Each
 /// fixture in the suite must self-identify as either an AVIF still
 /// (`avif`), a sequence (`avis`), or both — and the MIAF flag must
-/// fire on every fixture libavif produces (it always emits `miaf`).
+/// fire on every reference-encoder-produced fixture in the suite (the
+/// MIAF compatibility brand is the conventional shape).
 #[test]
 fn inspect_reports_brand_classification_for_real_fixtures() {
     type BrandCase = (&'static str, &'static [u8], bool, bool, bool);
@@ -1290,8 +1291,8 @@ fn parse_header_rejects_non_avif_ftyp_with_useful_message() {
 }
 
 /// `inspect()` surfaces the `colr` property of the primary item when
-/// the file embeds one. libavif's `avifenc` writes an nclx colr by
-/// default, so all libavif-produced fixtures carry one; the older
+/// the file embeds one. Modern reference encoders write an nclx colr by
+/// default, so the newer fixtures in the suite carry one; the older
 /// monochrome / bbb_alpha conformance files predate that habit and
 /// don't ship a colr.
 #[test]
@@ -1323,7 +1324,8 @@ fn inspect_surfaces_colr_when_present() {
 /// nclx colr from a real fixture must surface CICP-coded primaries +
 /// transfer + matrix triples. The `kimono_rotate90.avif` declares
 /// BT.709 primaries (1) + sRGB transfer (13) + BT.601 matrix (6) —
-/// the canonical libavif default.
+/// the canonical SDR sRGB triple reference encoders emit for 8-bit
+/// 4:2:0 inputs.
 #[test]
 fn nclx_colr_carries_cicp_triple() {
     use oxideav_avif::Colr;
@@ -1337,7 +1339,7 @@ fn nclx_colr_carries_cicp_triple() {
         }) => {
             // CICP code points must be in their valid ranges per
             // ITU-T H.273. We assert specific defaults for the
-            // libavif-encoded fixture.
+            // reference-encoder-produced fixture.
             assert!(
                 colour_primaries > 0,
                 "primaries should be a defined CICP code, got {colour_primaries}"
@@ -1409,9 +1411,10 @@ fn end_to_end_decode_then_imir_roundtrips() {
 
 /// `inspect()` surfaces the `pixi` (HEIF §6.5.6) per-channel bit
 /// depth on every fixture that ships one, and the AvifInfo helpers
-/// (`num_channels`, `max_bit_depth`, `is_monochrome`) match. libavif's
-/// `avifenc` writes a `pixi` for every output, so all our fixtures
-/// (including the older Microsoft / Netflix / Link-U files) carry one.
+/// (`num_channels`, `max_bit_depth`, `is_monochrome`) match. Modern
+/// reference encoders write a `pixi` for every output, so all the
+/// fixtures in this suite (including the older Microsoft / Netflix /
+/// Link-U conformance files) carry one.
 #[test]
 fn inspect_surfaces_pixi_bit_depth() {
     type PixiCase = (&'static str, &'static [u8], usize, u8, bool);
@@ -1440,7 +1443,8 @@ fn inspect_surfaces_pixi_bit_depth() {
         );
         assert_eq!(info.max_bit_depth(), *want_depth, "{name}: max_bit_depth");
         assert_eq!(info.is_monochrome(), *want_mono, "{name}: is_monochrome");
-        // Every channel has the same depth in libavif's defaults.
+        // Every channel has the same depth in the canonical AVIF shape
+        // that reference encoders emit by default.
         assert!(
             info.bits_per_channel.iter().all(|&b| b == *want_depth),
             "{name}: expected all channels at {want_depth}, got {:?}",
@@ -1450,9 +1454,9 @@ fn inspect_surfaces_pixi_bit_depth() {
 }
 
 /// `inspect()` surfaces the `pasp` (ISO/IEC 14496-12 §8.5.2.1.1)
-/// pixel aspect ratio from the primary item. libavif writes
-/// `pasp(1:1)` for square-pixel content; older conformance fixtures
-/// omit it (square pixel is implicit).
+/// pixel aspect ratio from the primary item. Modern reference encoders
+/// write `pasp(1:1)` for square-pixel content; older conformance
+/// fixtures omit it (square pixel is implicit).
 #[test]
 fn inspect_surfaces_pasp_when_present() {
     use oxideav_avif::Pasp;
@@ -1687,11 +1691,12 @@ fn clap_with_zero_denominator_is_passthrough() {
 /// `AvifInfo::effective_cicp` returns a sane CICP triple for fixtures
 /// that ship a `colr` box. `kimono_rotate90` declares BT.709 primaries
 /// (1) + sRGB transfer (13). The matrix is encoder-dependent — Link-U's
-/// build chose BT.2020 NCL (9), libavif picks BT.601 (6) for 4:2:0 SDR.
-/// We assert the parsed value is in the spec-defined range and not a
-/// reserved code point; the round-trip is what the path validates.
+/// build chose BT.2020 NCL (9); the conventional SDR 4:2:0 default is
+/// BT.601 (6). We assert the parsed value is in the spec-defined range
+/// and not a reserved code point; the round-trip is what the path
+/// validates.
 #[test]
-fn effective_cicp_surfaces_libavif_srgb_default() {
+fn effective_cicp_surfaces_sdr_srgb_default() {
     use oxideav_avif::CicpTriple;
     let info = inspect(KIMONO_ROT90).expect("inspect kimono");
     let cicp = info.effective_cicp();
@@ -1735,16 +1740,16 @@ fn effective_cicp_falls_back_to_unspecified_when_colr_missing() {
     assert!(!cicp.full_range);
 }
 
-/// `red64.avif` is libavif lossless 4:4:4 — the canonical AVIF
-/// Advanced Profile (MA1A) shape that uses the **identity matrix**
-/// (`matrix_coefficients == 0`) so the AV1 stream stores RGB samples
-/// directly. The CICP path must surface that.
+/// `red64.avif` is a reference-encoder-produced lossless 4:4:4 — the
+/// canonical AVIF Advanced Profile (MA1A) shape that uses the
+/// **identity matrix** (`matrix_coefficients == 0`) so the AV1 stream
+/// stores RGB samples directly. The CICP path must surface that.
 #[test]
 fn effective_cicp_red64_identity_matrix_signals_rgb() {
     let info = inspect(RED64).expect("inspect red64");
     let cicp = info.effective_cicp();
-    // libavif lossless 4:4:4 emits identity (0) matrix + sRGB transfer
-    // (13) + BT.709 primaries (1).
+    // Reference-encoder lossless 4:4:4 emits identity (0) matrix +
+    // sRGB transfer (13) + BT.709 primaries (1).
     assert_eq!(
         cicp.matrix_coefficients, 0,
         "red64 should use identity matrix, got {}",
@@ -2260,10 +2265,9 @@ enum PropPlacement {
     None,
     /// Associated only with the grid item.
     GridOnly,
-    /// Associated only with each tile item (the writer pattern that
-    /// libheif emits for HEIC siblings: per-tile `colr` rather than
-    /// grid-level — av1-avif §4.2.1 lets the reader inherit from
-    /// tile 0 in that case).
+    /// Associated only with each tile item (a real-world HEIC writer
+    /// pattern: per-tile `colr` rather than grid-level — av1-avif
+    /// §4.2.1 lets the reader inherit from tile 0 in that case).
     TilesOnly,
     /// Associated with both grid and tiles. The grid-level value is
     /// authoritative; tiles must agree.
@@ -2273,8 +2277,8 @@ enum PropPlacement {
 /// Round 21 fixture builder: synthesises a 2-tile horizontal grid AVIF
 /// container with explicit control over where `colr` / `pixi` / `pasp`
 /// are attached. The CICP nclx triple is always `(1, 13, 6) full_range
-/// = false` (libavif sRGB default) so the test can assert against a
-/// known value.
+/// = false` (the conventional SDR sRGB triple) so the test can assert
+/// against a known value.
 struct GridPropFixture {
     colr: PropPlacement,
     pixi: PropPlacement,
@@ -2394,7 +2398,8 @@ fn build_grid_with_props(opts: GridPropFixture) -> Vec<u8> {
     ipco_body.extend_from_slice(&av1c);
     let av1c_idx = next_idx();
 
-    // colr nclx (1, 13, 6) full_range=false — libavif's SDR sRGB triple.
+    // colr nclx (1, 13, 6) full_range=false — the conventional SDR
+    // sRGB triple for 8-bit 4:2:0 / 4:2:2 inputs.
     let colr_idx = if opts.colr != PropPlacement::None {
         let mut body = Vec::new();
         body.extend_from_slice(b"nclx");
@@ -2583,8 +2588,8 @@ fn effective_cicp_grid_test() {
         let cicp = info.effective_cicp();
         assert_eq!(cicp, want, "{placement:?}: effective_cicp mismatch");
         assert!(
-            cicp.is_libavif_srgb_default(),
-            "{placement:?}: should match libavif default"
+            cicp.is_sdr_srgb_bt601_default(),
+            "{placement:?}: should match SDR sRGB BT.601 triple"
         );
     }
 
@@ -2646,7 +2651,7 @@ fn pixi_resolves_via_grid_then_tile_fallback() {
 }
 
 /// Round 21: `pasp` (HEIF §6.5.4) follows the same fallback chain.
-/// Tile-only attachment is a real-world libheif pattern — the grid
+/// Tile-only attachment is a real-world HEIF writer pattern — the grid
 /// item is left propertyless and per-tile `pasp` describes the
 /// resampled display geometry. The reader should expose the value
 /// either way.
@@ -3253,4 +3258,110 @@ fn bbb_alpha_fixture_sequence_header_obu_count_exactly_one_per_av01_item() {
         assert!(rec.is_compliant());
     }
     assert!(info.sequence_header_obu_strict_compliant());
+}
+
+// ---------------------------------------------------------------------
+// Round 195 — av1-avif §8.2 / §8.3 profile compliance audit
+// ---------------------------------------------------------------------
+// av1-avif v1.2.0 §8.2 (`MA1B` Baseline) requires AV1 Main Profile
+// (`seq_profile == 0`) at level 5.1 or lower (`seq_level_idx_0 <= 13`).
+// av1-avif v1.2.0 §8.3 (`MA1A` Advanced) requires ≤ AV1 High Profile
+// (`seq_profile <= 1`) at level 6.0 or lower (`seq_level_idx_0 <= 16`).
+// Audit operates entirely on `av1C[1]`, surfaced through
+// `AvifInfo::avif_profile_compliance` and
+// `avif_profile_strict_compliant()`.
+// ---------------------------------------------------------------------
+
+/// The Microsoft `monochrome.avif` fixture declares the `MA1B` Baseline
+/// brand in its `ftyp`. Its single `'av01'` item must satisfy
+/// `seq_profile == 0 && seq_level_idx_0 <= 13`, so the §8.2 audit
+/// returns at least one compliant record.
+#[test]
+fn monochrome_fixture_satisfies_avif_baseline_profile_audit() {
+    let info = inspect(MONO).expect("inspect monochrome");
+    assert!(
+        info.brands.is_baseline_profile,
+        "monochrome.avif declares MA1B"
+    );
+    assert!(
+        !info.avif_profile_compliance.is_empty(),
+        "MA1B + at least one av01 item must produce at least one audit record"
+    );
+    for rec in &info.avif_profile_compliance {
+        assert!(
+            !rec.missing_av1c,
+            "item {} must carry av1C per §2.1",
+            rec.item_id
+        );
+        assert!(
+            rec.is_compliant(),
+            "monochrome fixture §8 audit failed: profile={:?} seq_profile={:?} seq_level_idx_0={:?} missing={:?}",
+            rec.profile,
+            rec.seq_profile,
+            rec.seq_level_idx_0,
+            rec.missing()
+        );
+    }
+    assert!(info.avif_profile_strict_compliant());
+}
+
+/// The `red64.avif` lossless 4:4:4 fixture declares the `MA1A`
+/// Advanced brand in its `ftyp`. Its `'av01'` item should satisfy the
+/// §8.3 audit (AV1 High Profile at level ≤ 6.0).
+#[test]
+fn red64_fixture_satisfies_avif_advanced_profile_audit() {
+    let info = inspect(RED64).expect("inspect red64");
+    assert!(info.brands.is_advanced_profile, "red64.avif declares MA1A");
+    assert!(
+        !info.brands.is_baseline_profile,
+        "red64.avif does not declare MA1B"
+    );
+    // §8.3 audit only — Advanced records only since Baseline isn't
+    // declared.
+    assert!(
+        !info.avif_profile_compliance.is_empty(),
+        "MA1A + at least one av01 item must produce at least one audit record"
+    );
+    for rec in &info.avif_profile_compliance {
+        assert_eq!(rec.profile, oxideav_avif::AvifProfile::Advanced);
+        assert!(
+            rec.is_compliant(),
+            "red64 fixture §8.3 audit failed: seq_profile={:?} seq_level_idx_0={:?} missing={:?}",
+            rec.seq_profile,
+            rec.seq_level_idx_0,
+            rec.missing()
+        );
+    }
+    assert!(info.avif_profile_strict_compliant());
+}
+
+/// Files that declare neither `MA1B` nor `MA1A` skip the §8 audit
+/// entirely — the `bbb_alpha_inverted.avif` fixture declares only the
+/// Baseline profile, so we use a synthetic `ftyp` lacking both profile
+/// brands as the negative. Here we just confirm the brand-claim guard
+/// fires: `bbb_alpha` ships MA1B so its audit is non-empty.
+#[test]
+fn bbb_alpha_fixture_avif_profile_audit_per_av01_item() {
+    let info = inspect(BBB_ALPHA).expect("inspect bbb_alpha");
+    assert!(
+        info.brands.is_baseline_profile,
+        "bbb_alpha must declare MA1B"
+    );
+    // Two av01 items (colour + alpha) → two Baseline records.
+    let count = info.avif_profile_compliance.len();
+    assert!(
+        count >= 2,
+        "bbb_alpha has at least two av01 items → at least two records, got {count}"
+    );
+    for rec in &info.avif_profile_compliance {
+        assert!(
+            rec.is_compliant(),
+            "bbb_alpha §8.2 audit failed: item={} seq_profile={:?} seq_level_idx_0={:?} missing={:?}",
+            rec.item_id,
+            rec.seq_profile,
+            rec.seq_level_idx_0,
+            rec.missing()
+        );
+    }
+    assert!(info.avif_profile_strict_compliant());
 }

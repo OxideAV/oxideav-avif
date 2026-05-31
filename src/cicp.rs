@@ -139,11 +139,12 @@ impl CicpTriple {
             || is_matrix_reserved(self.matrix_coefficients)
     }
 
-    /// True when the triple is the canonical libavif default for
-    /// 8-bit SDR sRGB content: BT.709 primaries (1) + sRGB transfer
-    /// (13) + BT.601 matrix (6). avifenc emits this triple for every
-    /// SDR 4:2:0 / 4:2:2 input that doesn't override.
-    pub fn is_libavif_srgb_default(&self) -> bool {
+    /// True when the triple is the canonical SDR-sRGB shape for
+    /// 8-bit 4:2:0 / 4:2:2 AVIFs: BT.709 primaries (1) + sRGB transfer
+    /// (13) + BT.601 matrix (6). Reference encoders default to this
+    /// triple for SDR inputs that don't override the CICP axes; the
+    /// helper is useful as a fast-path classifier on the read side.
+    pub fn is_sdr_srgb_bt601_default(&self) -> bool {
         self.colour_primaries == 1
             && self.transfer_characteristics == 13
             && self.matrix_coefficients == 6
@@ -304,7 +305,7 @@ mod tests {
         assert_eq!(triple.transfer_characteristics, 13);
         assert_eq!(triple.matrix_coefficients, 6);
         assert!(!triple.full_range);
-        assert!(triple.is_libavif_srgb_default());
+        assert!(triple.is_sdr_srgb_bt601_default());
     }
 
     /// An ICC payload (`Colr::Icc`) is not a CICP triple — `effective_cicp`
@@ -463,24 +464,24 @@ mod tests {
         assert!(!t.has_reserved());
     }
 
-    /// `is_libavif_srgb_default` only matches the exact (1, 13, 6)
+    /// `is_sdr_srgb_bt601_default` only matches the exact (1, 13, 6)
     /// triple regardless of `full_range`. A close-but-not-identical
     /// triple ((1, 13, 5) or BT.709 matrix) doesn't trip it.
     #[test]
-    fn libavif_default_triple_check_strict() {
+    fn sdr_srgb_default_triple_check_strict() {
         let exact = CicpTriple {
             colour_primaries: 1,
             transfer_characteristics: 13,
             matrix_coefficients: 6,
             full_range: false,
         };
-        assert!(exact.is_libavif_srgb_default());
+        assert!(exact.is_sdr_srgb_bt601_default());
         let close = CicpTriple {
             colour_primaries: 1,
             transfer_characteristics: 13,
             matrix_coefficients: 5,
             full_range: false,
         };
-        assert!(!close.is_libavif_srgb_default());
+        assert!(!close.is_sdr_srgb_bt601_default());
     }
 }

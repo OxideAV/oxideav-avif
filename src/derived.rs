@@ -1906,6 +1906,218 @@ pub fn audit_sequence_header_obu(
     out
 }
 
+// ===========================================================================
+// AVIF Profile compliance — av1-avif v1.2.0 §8.2 / §8.3 (MA1B / MA1A)
+// ===========================================================================
+
+/// AV1 `seq_level_idx_0` decoded from `av1C[1]` low 5 bits, or `None`
+/// when `av1c` is too short to carry byte 1. av1-isobmff §2.3 packs
+/// `seq_profile (3) | seq_level_idx_0 (5)` into byte 1.
+fn decode_av1c_seq_level_idx_0(av1c: &[u8]) -> Option<u8> {
+    if av1c.len() < 2 {
+        return None;
+    }
+    Some(av1c[1] & 0x1F)
+}
+
+/// AV1 `seq_profile` decoded from `av1C[1]` high 3 bits, or `None`
+/// when `av1c` is too short. Per AV1 Annex A.2: `0` = Main,
+/// `1` = High, `2` = Professional.
+fn decode_av1c_seq_profile(av1c: &[u8]) -> Option<u8> {
+    if av1c.len() < 2 {
+        return None;
+    }
+    Some((av1c[1] >> 5) & 0x7)
+}
+
+/// Which AVIF profile brand a record was audited against — see
+/// [`AvifProfileCompliance::profile`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AvifProfile {
+    /// `MA1B` — AVIF Baseline Profile (av1-avif v1.2.0 §8.2). Requires
+    /// AV1 Main Profile (`seq_profile == 0`) at level 5.1 or lower
+    /// (`seq_level_idx_0 <= 13`).
+    Baseline,
+    /// `MA1A` — AVIF Advanced Profile (av1-avif v1.2.0 §8.3). For AV1
+    /// Image Items requires AV1 High Profile (`seq_profile <= 1`) at
+    /// level 6.0 or lower (`seq_level_idx_0 <= 16`).
+    Advanced,
+}
+
+/// Per-AV1-Image-Item compliance against the av1-avif v1.2.0 §8.2 /
+/// §8.3 profile `shall`-level constraints when the file's `ftyp`
+/// declares the corresponding brand.
+///
+/// One record is emitted by [`audit_avif_profile_compliance`] per
+/// `(AV1 Image Item, declared profile)` pairing — when a file
+/// declares both `MA1B` and `MA1A` brands (unusual but legal per §8.1
+/// since both are independent profile claims), each AV1 Image Item
+/// emits one record per declared brand.
+///
+/// The fields:
+///
+/// * [`Self::profile`] — which AVIF profile this record is checking.
+/// * [`Self::item_id`] — the AV1 Image Item's id.
+/// * [`Self::seq_profile`] — the AV1 `seq_profile` value decoded from
+///   the item's `av1C[1]` high 3 bits (`0` = Main, `1` = High,
+///   `2` = Professional). `None` when `av1C` is absent or truncated.
+/// * [`Self::seq_level_idx_0`] — the AV1 `seq_level_idx_0` value
+///   decoded from `av1C[1]` low 5 bits (`13` = level 5.1,
+///   `16` = level 6.0, `31` = unconstrained per AV1 §A.3). `None` when
+///   `av1C` is absent or truncated.
+/// * [`Self::missing_av1c`] — `true` when the item carries no `av1C`
+///   association at all (also a §2.1 violation; surfaced here so a
+///   single point of inspection covers both).
+///
+/// The check passes ([`Self::is_compliant`]) when the `av1C` is
+/// present and the (seq_profile, seq_level_idx_0) pair satisfies the
+/// declared profile's constraints. The seq_level_idx_0 = 31 "Maximum
+/// parameters" value is treated as not-compliant for either profile:
+/// the spec's profile clauses both bound the level (5.1 / 6.0), and
+/// the level-31 carve-out signals unconstrained sizing, which is
+/// outside either profile's reach.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AvifProfileCompliance {
+    /// The AVIF profile this record is checking the item against.
+    pub profile: AvifProfile,
+    /// The AV1 Image Item id whose `av1C` was inspected.
+    pub item_id: u32,
+    /// `seq_profile` decoded from `av1C[1]` high 3 bits, or `None`
+    /// when `av1C` is absent or truncated.
+    pub seq_profile: Option<u8>,
+    /// `seq_level_idx_0` decoded from `av1C[1]` low 5 bits, or `None`
+    /// when `av1C` is absent or truncated.
+    pub seq_level_idx_0: Option<u8>,
+    /// `true` when the item has no `av1C` property association at all
+    /// (distinct from a present-but-truncated `av1C`, which surfaces
+    /// as both fields `None` without setting this flag).
+    pub missing_av1c: bool,
+}
+
+impl AvifProfileCompliance {
+    /// True when the AV1 Image Item satisfies the declared AVIF
+    /// profile's `shall`-level constraints on AV1 profile + level.
+    ///
+    /// Baseline (`MA1B`, §8.2): `seq_profile == 0` (AV1 Main) AND
+    /// `seq_level_idx_0 <= 13` (level ≤ 5.1).
+    ///
+    /// Advanced (`MA1A`, §8.3): `seq_profile <= 1` (AV1 Main or
+    /// High) AND `seq_level_idx_0 <= 16` (level ≤ 6.0). The §8.3
+    /// `shall` is "The AV1 profile shall be the High Profile" — the
+    /// AV1 Annex A.2 definition of "High Profile decoders" includes
+    /// streams with `seq_profile == 0` (Main is a subset of High),
+    /// so a Main-Profile stream is also accepted under `MA1A`.
+    ///
+    /// Returns `false` when `av1C` is missing or truncated.
+    pub fn is_compliant(&self) -> bool {
+        match (self.seq_profile, self.seq_level_idx_0) {
+            (Some(p), Some(l)) => match self.profile {
+                AvifProfile::Baseline => p == 0 && l <= 13,
+                AvifProfile::Advanced => p <= 1 && l <= 16,
+            },
+            _ => false,
+        }
+    }
+
+    /// Human-readable list of failed `shall`s. Returns an empty vector
+    /// when [`Self::is_compliant`]. Tokens:
+    /// `item-missing-av1C`, `item-av1C-truncated`,
+    /// `seq-profile-out-of-range`, `seq-level-idx-out-of-range`.
+    pub fn missing(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.missing_av1c {
+            out.push("item-missing-av1C");
+            return out;
+        }
+        if self.seq_profile.is_none() || self.seq_level_idx_0.is_none() {
+            out.push("item-av1C-truncated");
+            return out;
+        }
+        let p = self.seq_profile.unwrap();
+        let l = self.seq_level_idx_0.unwrap();
+        let (max_p, max_l) = match self.profile {
+            AvifProfile::Baseline => (0u8, 13u8),
+            AvifProfile::Advanced => (1u8, 16u8),
+        };
+        if p > max_p {
+            out.push("seq-profile-out-of-range");
+        }
+        if l > max_l {
+            out.push("seq-level-idx-out-of-range");
+        }
+        out
+    }
+}
+
+/// Audit every AV1 Image Item in `meta` against the av1-avif v1.2.0
+/// §8.2 / §8.3 profile `shall`-level constraints, but only when the
+/// file's `ftyp` declares the corresponding brand. Items are reported
+/// in `iinf` declaration order; for files declaring both `MA1B` and
+/// `MA1A`, each item emits one record per declared brand (Baseline
+/// before Advanced).
+///
+/// The audit is independent of any AV1 OBU decode — it operates
+/// entirely on `av1C[1]` (which packs `seq_profile (3) |
+/// seq_level_idx_0 (5)` per av1-isobmff §2.3). For grid primaries the
+/// constraint is on the tile items, not the grid item itself — `'grid'`
+/// items carry no `av1C` and are skipped here (the per-tile records
+/// give the same coverage, since av1-avif §4.2 keeps the AV1 profile +
+/// level uniform across grid tiles).
+///
+/// The returned vector is empty when (a) the file ships no AV1 Image
+/// Items, or (b) the file declares neither `MA1B` nor `MA1A` in its
+/// `ftyp` compatible-brands list. The second case is a deliberate
+/// no-op: a file that doesn't claim a profile has nothing to fail.
+///
+/// Spec sources:
+/// * av1-avif v1.2.0 §8.2 — `MA1B` Baseline Profile constraints.
+/// * av1-avif v1.2.0 §8.3 — `MA1A` Advanced Profile constraints.
+/// * AV1 §A.2 — Profiles (Main / High / Professional).
+/// * AV1 §A.3 — Levels (seq_level_idx_0 ↔ X.Y mapping; 13 = 5.1,
+///   16 = 6.0, 31 = unconstrained).
+/// * av1-isobmff §2.3 — `av1C` byte layout.
+pub fn audit_avif_profile_compliance(
+    meta: &crate::meta::Meta,
+    brands: &crate::parser::BrandClass,
+) -> Vec<AvifProfileCompliance> {
+    let av01 = b(b"av01");
+    let av1c_kind = b(b"av1C");
+    let mut out = Vec::new();
+    if !brands.is_baseline_profile && !brands.is_advanced_profile {
+        return out;
+    }
+    for item_id in meta.item_ids_of_type(&av01) {
+        let (seq_profile, seq_level_idx_0, missing_av1c) =
+            match meta.property_for(item_id, &av1c_kind) {
+                Some(crate::meta::Property::Av1C(bytes)) => (
+                    decode_av1c_seq_profile(bytes),
+                    decode_av1c_seq_level_idx_0(bytes),
+                    false,
+                ),
+                _ => (None, None, true),
+            };
+        if brands.is_baseline_profile {
+            out.push(AvifProfileCompliance {
+                profile: AvifProfile::Baseline,
+                item_id,
+                seq_profile,
+                seq_level_idx_0,
+                missing_av1c,
+            });
+        }
+        if brands.is_advanced_profile {
+            out.push(AvifProfileCompliance {
+                profile: AvifProfile::Advanced,
+                item_id,
+                seq_profile,
+                seq_level_idx_0,
+                missing_av1c,
+            });
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4031,5 +4243,297 @@ mod tests {
         buf[17..21].copy_from_slice(&2u32.to_be_bytes()); // alt denominator
         let err = GainMapMetadata::parse(&buf).unwrap_err();
         assert!(matches!(err, Error::InvalidData(_)));
+    }
+
+    // -------------------------------------------------------------------
+    // AVIF Profile compliance audit (av1-avif v1.2.0 §8.2 / §8.3)
+    // -------------------------------------------------------------------
+
+    /// Build an `av1C` payload whose byte 1 packs
+    /// `seq_profile (3) | seq_level_idx_0 (5)` per av1-isobmff §2.3.
+    /// Other bytes are filled with conventional values (marker=1,
+    /// version=1, chroma 4:2:0 mono-cleared).
+    fn av1c_with_profile_level(seq_profile: u8, seq_level_idx_0: u8) -> Vec<u8> {
+        assert!(seq_profile <= 7);
+        assert!(seq_level_idx_0 <= 31);
+        let b1 = (seq_profile << 5) | (seq_level_idx_0 & 0x1F);
+        vec![0x81, b1, 0x00, 0x00]
+    }
+
+    fn brands_with(baseline: bool, advanced: bool) -> crate::parser::BrandClass {
+        crate::parser::BrandClass {
+            is_image: true,
+            is_miaf: true,
+            is_baseline_profile: baseline,
+            is_advanced_profile: advanced,
+            ..crate::parser::BrandClass::default()
+        }
+    }
+
+    /// Decoded `seq_profile` / `seq_level_idx_0` round-trip through
+    /// the byte-1 helpers across the boundary values that the spec's
+    /// §8.2 / §8.3 audit branches on.
+    #[test]
+    fn decode_av1c_byte1_round_trips_profile_and_level() {
+        // (seq_profile, seq_level_idx_0) coverage: 0/13 (Baseline edge),
+        // 0/14 (over Baseline level), 1/16 (Advanced edge), 1/17 (over
+        // Advanced level), 2/0 (Professional disallowed), 7/31 (max bits).
+        let cases = [(0, 13), (0, 14), (1, 16), (1, 17), (2, 0), (7, 31)];
+        for (p, l) in cases {
+            let bytes = av1c_with_profile_level(p, l);
+            assert_eq!(decode_av1c_seq_profile(&bytes), Some(p), "p={p} l={l}");
+            assert_eq!(decode_av1c_seq_level_idx_0(&bytes), Some(l), "p={p} l={l}");
+        }
+    }
+
+    /// Both helpers tolerate truncation without panicking.
+    #[test]
+    fn decode_av1c_byte1_handles_truncation() {
+        assert_eq!(decode_av1c_seq_profile(&[]), None);
+        assert_eq!(decode_av1c_seq_profile(&[0x81]), None);
+        assert_eq!(decode_av1c_seq_level_idx_0(&[]), None);
+        assert_eq!(decode_av1c_seq_level_idx_0(&[0x81]), None);
+    }
+
+    /// MA1B + Main Profile + level 5.1 (`seq_profile=0, idx=13`) is the
+    /// spec-canonical Baseline shape. Compliant.
+    #[test]
+    fn audit_profile_baseline_main_level_5_1_compliant() {
+        let meta = Meta {
+            items: vec![make_infe(1, b"av01", 0)],
+            properties: vec![Property::Av1C(av1c_with_profile_level(0, 13))],
+            associations: vec![ipa(1, &[0])],
+            ..Meta::default()
+        };
+        let r = audit_avif_profile_compliance(&meta, &brands_with(true, false));
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].profile, AvifProfile::Baseline);
+        assert_eq!(r[0].seq_profile, Some(0));
+        assert_eq!(r[0].seq_level_idx_0, Some(13));
+        assert!(r[0].is_compliant());
+        assert!(r[0].missing().is_empty());
+    }
+
+    /// MA1B + Main + level 5.2 (`idx=14`) tips the level over the
+    /// §8.2 bound. Flagged with `seq-level-idx-out-of-range`.
+    #[test]
+    fn audit_profile_baseline_level_above_5_1_flagged() {
+        let meta = Meta {
+            items: vec![make_infe(1, b"av01", 0)],
+            properties: vec![Property::Av1C(av1c_with_profile_level(0, 14))],
+            associations: vec![ipa(1, &[0])],
+            ..Meta::default()
+        };
+        let r = audit_avif_profile_compliance(&meta, &brands_with(true, false));
+        assert_eq!(r.len(), 1);
+        assert!(!r[0].is_compliant());
+        assert_eq!(r[0].missing(), vec!["seq-level-idx-out-of-range"]);
+    }
+
+    /// MA1B + High Profile (`seq_profile=1`) violates §8.2's "Main
+    /// Profile" requirement. Flagged with `seq-profile-out-of-range`.
+    #[test]
+    fn audit_profile_baseline_high_profile_flagged() {
+        let meta = Meta {
+            items: vec![make_infe(1, b"av01", 0)],
+            properties: vec![Property::Av1C(av1c_with_profile_level(1, 13))],
+            associations: vec![ipa(1, &[0])],
+            ..Meta::default()
+        };
+        let r = audit_avif_profile_compliance(&meta, &brands_with(true, false));
+        assert_eq!(r.len(), 1);
+        assert!(!r[0].is_compliant());
+        assert_eq!(r[0].missing(), vec!["seq-profile-out-of-range"]);
+    }
+
+    /// MA1A + High Profile + level 6.0 (`idx=16`) is the spec-canonical
+    /// Advanced shape. Compliant.
+    #[test]
+    fn audit_profile_advanced_high_level_6_0_compliant() {
+        let meta = Meta {
+            items: vec![make_infe(1, b"av01", 0)],
+            properties: vec![Property::Av1C(av1c_with_profile_level(1, 16))],
+            associations: vec![ipa(1, &[0])],
+            ..Meta::default()
+        };
+        let r = audit_avif_profile_compliance(&meta, &brands_with(false, true));
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].profile, AvifProfile::Advanced);
+        assert!(r[0].is_compliant());
+    }
+
+    /// MA1A + Main Profile (`seq_profile=0`) is also compliant — Main
+    /// is a subset of High per AV1 §A.2.
+    #[test]
+    fn audit_profile_advanced_main_profile_compliant() {
+        let meta = Meta {
+            items: vec![make_infe(1, b"av01", 0)],
+            properties: vec![Property::Av1C(av1c_with_profile_level(0, 13))],
+            associations: vec![ipa(1, &[0])],
+            ..Meta::default()
+        };
+        let r = audit_avif_profile_compliance(&meta, &brands_with(false, true));
+        assert!(r[0].is_compliant());
+    }
+
+    /// MA1A + Professional (`seq_profile=2`) breaches §8.3's "≤ High"
+    /// requirement. Flagged.
+    #[test]
+    fn audit_profile_advanced_professional_flagged() {
+        let meta = Meta {
+            items: vec![make_infe(1, b"av01", 0)],
+            properties: vec![Property::Av1C(av1c_with_profile_level(2, 16))],
+            associations: vec![ipa(1, &[0])],
+            ..Meta::default()
+        };
+        let r = audit_avif_profile_compliance(&meta, &brands_with(false, true));
+        assert!(!r[0].is_compliant());
+        assert_eq!(r[0].missing(), vec!["seq-profile-out-of-range"]);
+    }
+
+    /// MA1A + level 6.1 (`idx=17`) breaches §8.3's "≤ 6.0".
+    #[test]
+    fn audit_profile_advanced_level_above_6_0_flagged() {
+        let meta = Meta {
+            items: vec![make_infe(1, b"av01", 0)],
+            properties: vec![Property::Av1C(av1c_with_profile_level(1, 17))],
+            associations: vec![ipa(1, &[0])],
+            ..Meta::default()
+        };
+        let r = audit_avif_profile_compliance(&meta, &brands_with(false, true));
+        assert!(!r[0].is_compliant());
+        assert_eq!(r[0].missing(), vec!["seq-level-idx-out-of-range"]);
+    }
+
+    /// AV1 §A.3's `seq_level_idx_0 == 31` "Maximum parameters" carve-out
+    /// signals unconstrained sizing, which is outside either profile's
+    /// reach — even though Main Profile (`seq_profile=0`) is compliant
+    /// with §8.2's profile clause, the level clause is unmet.
+    #[test]
+    fn audit_profile_level_31_max_parameters_flagged_for_baseline() {
+        let meta = Meta {
+            items: vec![make_infe(1, b"av01", 0)],
+            properties: vec![Property::Av1C(av1c_with_profile_level(0, 31))],
+            associations: vec![ipa(1, &[0])],
+            ..Meta::default()
+        };
+        let r = audit_avif_profile_compliance(&meta, &brands_with(true, false));
+        assert!(!r[0].is_compliant());
+        assert_eq!(r[0].missing(), vec!["seq-level-idx-out-of-range"]);
+    }
+
+    /// Missing `av1C` surfaces the missing-av1c flag distinctly from
+    /// a truncated `av1C`.
+    #[test]
+    fn audit_profile_missing_av1c_flagged() {
+        let meta = Meta {
+            items: vec![make_infe(1, b"av01", 0)],
+            properties: vec![],
+            associations: vec![],
+            ..Meta::default()
+        };
+        let r = audit_avif_profile_compliance(&meta, &brands_with(true, false));
+        assert_eq!(r.len(), 1);
+        assert!(r[0].missing_av1c);
+        assert_eq!(r[0].seq_profile, None);
+        assert_eq!(r[0].seq_level_idx_0, None);
+        assert!(!r[0].is_compliant());
+        assert_eq!(r[0].missing(), vec!["item-missing-av1C"]);
+    }
+
+    /// Truncated `av1C` (`< 2` bytes) surfaces as item-av1C-truncated,
+    /// distinct from missing-av1c.
+    #[test]
+    fn audit_profile_truncated_av1c_flagged() {
+        let meta = Meta {
+            items: vec![make_infe(1, b"av01", 0)],
+            properties: vec![Property::Av1C(vec![0x81])], // only 1 byte
+            associations: vec![ipa(1, &[0])],
+            ..Meta::default()
+        };
+        let r = audit_avif_profile_compliance(&meta, &brands_with(true, false));
+        assert_eq!(r.len(), 1);
+        assert!(!r[0].missing_av1c);
+        assert_eq!(r[0].seq_profile, None);
+        assert_eq!(r[0].seq_level_idx_0, None);
+        assert!(!r[0].is_compliant());
+        assert_eq!(r[0].missing(), vec!["item-av1C-truncated"]);
+    }
+
+    /// File declaring both `MA1B` and `MA1A` emits one record per
+    /// brand, Baseline before Advanced.
+    #[test]
+    fn audit_profile_both_brands_emit_two_records_per_item() {
+        let meta = Meta {
+            items: vec![make_infe(1, b"av01", 0)],
+            // Main profile + level 5.1 — compliant with both brands.
+            properties: vec![Property::Av1C(av1c_with_profile_level(0, 13))],
+            associations: vec![ipa(1, &[0])],
+            ..Meta::default()
+        };
+        let r = audit_avif_profile_compliance(&meta, &brands_with(true, true));
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].profile, AvifProfile::Baseline);
+        assert_eq!(r[1].profile, AvifProfile::Advanced);
+        assert!(r[0].is_compliant());
+        assert!(r[1].is_compliant());
+    }
+
+    /// File declaring neither `MA1B` nor `MA1A` skips the audit
+    /// entirely. The §8 constraints only apply to files claiming the
+    /// brand; an unbranded AVIF has nothing to fail.
+    #[test]
+    fn audit_profile_no_brand_claim_returns_empty() {
+        let meta = Meta {
+            items: vec![make_infe(1, b"av01", 0)],
+            properties: vec![Property::Av1C(av1c_with_profile_level(2, 31))], // would fail both
+            associations: vec![ipa(1, &[0])],
+            ..Meta::default()
+        };
+        let r = audit_avif_profile_compliance(&meta, &brands_with(false, false));
+        assert!(r.is_empty());
+    }
+
+    /// File with no AV1 Image Items returns an empty audit even when
+    /// the brand is declared (degenerate case — `meta.item_ids_of_type`
+    /// returns nothing).
+    #[test]
+    fn audit_profile_no_av01_items_returns_empty() {
+        let meta = Meta {
+            items: vec![make_infe(1, b"mime", 0)],
+            ..Meta::default()
+        };
+        let r = audit_avif_profile_compliance(&meta, &brands_with(true, false));
+        assert!(r.is_empty());
+    }
+
+    /// Two AV1 Image Items in a file declaring both brands → 4
+    /// records, paired (Baseline, Advanced) per item in iinf order.
+    #[test]
+    fn audit_profile_two_items_two_brands_four_records() {
+        let meta = Meta {
+            items: vec![make_infe(1, b"av01", 0), make_infe(2, b"av01", 0)],
+            properties: vec![
+                Property::Av1C(av1c_with_profile_level(0, 13)), // item 1: compliant both
+                Property::Av1C(av1c_with_profile_level(2, 16)), // item 2: Advanced-fails profile
+            ],
+            associations: vec![ipa(1, &[0]), ipa(2, &[1])],
+            ..Meta::default()
+        };
+        let r = audit_avif_profile_compliance(&meta, &brands_with(true, true));
+        assert_eq!(r.len(), 4);
+        // Item 1 first (iinf order), then item 2.
+        assert_eq!(r[0].item_id, 1);
+        assert_eq!(r[0].profile, AvifProfile::Baseline);
+        assert!(r[0].is_compliant());
+        assert_eq!(r[1].item_id, 1);
+        assert_eq!(r[1].profile, AvifProfile::Advanced);
+        assert!(r[1].is_compliant());
+        assert_eq!(r[2].item_id, 2);
+        assert_eq!(r[2].profile, AvifProfile::Baseline);
+        assert!(!r[2].is_compliant()); // seq_profile=2 fails Baseline
+        assert_eq!(r[3].item_id, 2);
+        assert_eq!(r[3].profile, AvifProfile::Advanced);
+        assert!(!r[3].is_compliant()); // seq_profile=2 fails Advanced too
     }
 }

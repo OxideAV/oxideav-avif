@@ -48,14 +48,14 @@ still loses significant signal.
 | Alpha auxiliary                        | `auxl` + `auxC` URN detection, AV1-coded monochrome item decoded, composited onto the color frame (`Gray8 → YA8`, `Yuv → YuvA`); plus av1-avif §4.1 alpha-vs-master bit-depth `shall` audit (`audit_alpha_bit_depth` / `AlphaBitDepthAudit`) surfaced via `AvifInfo::alpha_bit_depth_compliance` / `alpha_bit_depth_strict_compliant()` |
 | Post-transforms                        | `clap` (centre crop) → `irot` (90/180/270°) → `imir` (horizontal/vertical), applied in that order per §6.5.10                                              |
 | AV1 hand-off                           | `av1C` plumbed through `CodecParameters::extradata`; primary-item OBU payload fed to `oxideav_av1::Av1Decoder`; frame returned through `AvifDecoder`       |
-| MIAF profile dispatch                  | `BrandClass` flags `is_baseline_profile` (MA1B) + `is_advanced_profile` (MA1A) + `is_miaf`; surfaced through `AvifInfo::brands`                            |
+| MIAF profile dispatch                  | `BrandClass` flags `is_baseline_profile` (MA1B) + `is_advanced_profile` (MA1A) + `is_miaf`; surfaced through `AvifInfo::brands`. Plus av1-avif §8.2 / §8.3 `shall`-level audit (`audit_avif_profile_compliance` / `AvifProfileCompliance`) that walks each AV1 Image Item's `av1C[1]` for the `(seq_profile, seq_level_idx_0)` pair and reports whether it satisfies the declared brand's bounds (Baseline: Main + level ≤ 5.1; Advanced: ≤ High + level ≤ 6.0); surfaced via `AvifInfo::avif_profile_compliance` / `avif_profile_strict_compliant()` |
 | AVIS image sequences                   | sample-table walk (`parse_avis` / `sample_table`) emits a flat frame-offset list; caller feeds each sample to `oxideav_av1` for sequential decode          |
 | Encoder                                | **not implemented**: no AV1 encoder exists in oxideav                                                                                                      |
 
 ### What decodes
 
-- Tiny flat-content AVIFs (avifenc-produced 16x16..64x64 mono or
-  lossless 4:4:4) — sample means land within 1-2 units of the target
+- Tiny flat-content AVIFs (reference-encoder-produced 16x16..64x64 mono
+  or lossless 4:4:4) — sample means land within 1-2 units of the target
   value. See `tests/fixtures/{gray32,midgray,white16,red,black420}.avif`
   and the `decodes_flat_gray_to_mid_value` integration test.
 - The 1280×720 `monochrome.avif` conformance fixture —
@@ -84,6 +84,65 @@ still loses significant signal.
 
 See `examples/diag_decode.rs` for a drop-in report of exactly which
 stage each input reaches.
+
+### Round 195 — av1-avif §8.2 / §8.3 AVIF profile compliance audit
+
+av1-avif v1.2.0 §8.2 (`MA1B` Baseline) requires every AV1 Image Item to
+satisfy AV1 Main Profile (`seq_profile == 0`) at level 5.1 or lower
+(`seq_level_idx_0 <= 13`); §8.3 (`MA1A` Advanced) requires AV1 High
+Profile (`seq_profile <= 1`) at level 6.0 or lower
+(`seq_level_idx_0 <= 16`). Round 195 audits these `shall`s at the
+container layer via `audit_avif_profile_compliance(meta, brands)`,
+parallel to the existing §2.1 / §4.1 / §6.6.2.1 / §7 audits.
+
+One `AvifProfileCompliance { profile, item_id, seq_profile,
+seq_level_idx_0, missing_av1c, is_compliant(), missing() }` record is
+emitted per `(AV1 Image Item, declared profile)` pairing — when a file
+declares both `MA1B` and `MA1A`, each item emits one record per brand
+(Baseline before Advanced). The audit operates entirely on `av1C[1]`,
+which packs `seq_profile (3) | seq_level_idx_0 (5)` per av1-isobmff
+§2.3 (AV1 §A.3 maps `seq_level_idx_0 == 13` → level 5.1, `16` → level
+6.0, `31` → unconstrained "Maximum parameters", deliberately treated
+here as out-of-range for both profiles).
+
+Files declaring neither `MA1B` nor `MA1A` skip the audit entirely (the
+returned vector is empty) — a file that doesn't claim a profile has
+nothing to fail. `AvifInfo::avif_profile_compliance` is populated by
+both the single-item and grid `build_info` paths;
+`AvifInfo::avif_profile_strict_compliant()` folds every record to a
+single boolean (trivially `true` for the empty-vector case, so combine
+with `brands.is_baseline_profile || brands.is_advanced_profile` for a
+presence + compliance gate).
+
+This round also completes the scrub of pre-existing decorative
+attributions to a specific reference AVIF encoder/decoder family across
+`cicp.rs`, `meta.rs`, `inspect.rs`, `tests/integration.rs`, and
+`tests/fuzz_regressions.rs` — text has been re-anchored to spec-relative
+terminology (BT.709/sRGB/BT.601 SDR triple, "reference encoder",
+"black-box oracle") so the in-tree wording follows the project's
+clean-room conventions for paraphrased docs. The one public API rename
+that fell out — `CicpTriple::is_libavif_srgb_default` →
+`CicpTriple::is_sdr_srgb_bt601_default` — has no external consumers (no
+other crate referenced the helper).
+
+Test delta: +21 unit (`derived::tests::audit_profile_*` +
+`decode_av1c_byte1_*` covering the Baseline + Advanced edges, the
+Professional / level-31 rejection cases, the missing / truncated
+`av1C` cases, the no-brand-claim short-circuit, and the
+multi-item / multi-brand record-count semantics). +3 integration
+(`monochrome_fixture_satisfies_avif_baseline_profile_audit` and
+`bbb_alpha_fixture_avif_profile_audit_per_av01_item` both pin §8.2
+compliance on the real Microsoft fixtures; the `red64` fixture pins
+§8.3 Advanced compliance). Default lib 252 (was 210); standalone lib
+237 (was 195); integration 57 + 1 ignored (was 54 + 1).
+
+Followup: av1-avif §8 also bounds AV1 Image *Sequence* tracks
+(`avis`): the per-frame `av1C` lives in `stsd.av01.av1C` rather than
+`iprp.ipco`, so a sample-table-level extension to the audit would
+cover those when needed. The current walker only inspects single-item
+items via `iprp.ipco` — image-sequence coverage is the natural next
+step alongside the parallel sample-table follow-up already noted on
+the §4.1 alpha-bit-depth audit.
 
 ### Round 182 — av1-avif §2.1 Sequence Header OBU count audit
 
@@ -462,7 +521,7 @@ the AV1 decoder.
   `xmp_item_id: Option<u32>`, `premultiplied_alpha: bool`.
   Helpers: `has_thumbnails()`, `has_descriptive_metadata()`. The
   Exif detector accepts the native `'Exif'` item type AND the
-  libheif-style `mime` carrier with
+  generic `mime` carrier with
   `application/octet-stream` / `image/tiff` / `image/x-exif`
   content_type. XMP is detected via
   `mime` + `application/rdf+xml` (case-insensitive — encoders
@@ -517,10 +576,10 @@ layer so the host stops handing garbage to the AV1 entropy stage.
   divergence is tracked as a sibling follow-up in `oxideav-av1`).
 
 The remaining fuzz-discovered divergence (Y-plane pixels diverging
-between `oxideav-avif` and `libavif` on the same AV1 bitstream)
-is a sibling-crate issue: the AVIF container layer hands identical
-OBU bytes to both decoders, so any divergence is an `oxideav-av1`
-decode-path bug, not an AVIF wrap issue.
+between `oxideav-avif` and an external AVIF decoder used as a black-box
+oracle on the same AV1 bitstream) is a sibling-crate issue: the AVIF
+container layer hands identical OBU bytes to both decoders, so any
+divergence is an `oxideav-av1` decode-path bug, not an AVIF wrap issue.
 
 ### Round 22 — HDR metadata + AV1 wrap pass-through + multi-extent items
 
@@ -570,8 +629,8 @@ av1-avif §4.2.1):
   luma-derived ceiling, and against tiles that overhang the canvas.
 * **Grid `colr` / `pixi` / `pasp` resolution**: every descriptive
   property now follows the canonical HEIF chain — grid item first
-  (describes the reconstructed canvas), tile-0 second (the libheif
-  writer pattern; av1-avif §4.2 keeps per-tile values uniform).
+  (describes the reconstructed canvas), tile-0 second (a real-world
+  HEIF writer pattern; av1-avif §4.2 keeps per-tile values uniform).
   Previously only `colr` had the fallback wiring; `pixi` looked
   only at tile 0 and `pasp` only at the grid item, so two real
   encoder placement patterns went unread.
@@ -599,7 +658,7 @@ the samples occupy. The crate now exposes a resolved
 
 `CicpTriple` ships predicates for the common decision points
 (`is_unspecified`, `is_identity_matrix` for matrix=0 RGB AVIFs,
-`is_libavif_srgb_default` for the `(1, 13, 6)` libavif default,
+`is_sdr_srgb_bt601_default` for the `(1, 13, 6)` SDR-sRGB triple,
 `has_reserved` flagging any axis in an ITU-T H.273 reserved range)
 plus three name lookup helpers (`primaries_name`, `transfer_name`,
 `matrix_name`) covering BT.709, BT.2020, Display P3, sRGB, PQ, HLG,
@@ -701,11 +760,10 @@ its complete HEIF hierarchy, extract the primary item, and decode it
 end-to-end through `oxideav-av1`.
 
 `tests/fixtures/{gray32,midgray,white16,red,black420}.avif` are tiny
-(16×16 … 64×64) AVIFs produced by libavif's `avifenc` in lossless
-mode (monochrome + 4:4:4) or q60 (4:2:0). They exist so the CI
-decode-gate covers every colour-plane layout we support without
-depending on an AV1 implementation that decodes rich photos
-perfectly.
+(16×16 … 64×64) AVIFs produced by an off-the-shelf reference encoder
+in lossless mode (monochrome + 4:4:4) or q60 (4:2:0). They exist so the
+CI decode-gate covers every colour-plane layout we support without
+depending on an AV1 implementation that decodes rich photos perfectly.
 
 ## License
 

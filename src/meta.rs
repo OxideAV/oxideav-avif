@@ -1670,9 +1670,10 @@ mod tests {
     }
 
     /// A 'mime' v2 infe carries both content_type and an optional
-    /// content_encoding after item_name. The XMP item shape that
-    /// libheif / libavif emit (`application/rdf+xml`) is the canonical
-    /// case the AVIF metadata path needs to recognise.
+    /// content_encoding after item_name. The canonical XMP item shape
+    /// (HEIF §A.2 + RFC 3023 `application/rdf+xml`) is what AVIF
+    /// readers most commonly see, so the metadata path needs to
+    /// recognise it.
     #[test]
     fn infe_v2_mime_parses_content_type_and_encoding() {
         let mut tail = Vec::new();
@@ -1692,8 +1693,10 @@ mod tests {
     }
 
     /// 'mime' v3 infe shape (32-bit item_ID), Exif TIFF blob wrapped
-    /// with content_type=application/octet-stream — the libheif Exif
-    /// writer pattern.
+    /// with content_type=application/octet-stream — one of the
+    /// real-world Exif carriers seen in HEIF / AVIF files (alongside
+    /// the native `item_type == 'Exif'` form and the `image/tiff` MIME
+    /// variant).
     #[test]
     fn infe_v3_mime_octet_stream_for_exif() {
         // FullBox header: version=3, flags=0
