@@ -24,6 +24,7 @@ const MVHD: BoxType = b(b"mvhd");
 const TRAK: BoxType = b(b"trak");
 const TKHD: BoxType = b(b"tkhd");
 const MDIA: BoxType = b(b"mdia");
+const HDLR: BoxType = b(b"hdlr");
 const MINF: BoxType = b(b"minf");
 const STBL: BoxType = b(b"stbl");
 const STTS: BoxType = b(b"stts");
@@ -35,6 +36,11 @@ const STSS: BoxType = b(b"stss");
 const STSD: BoxType = b(b"stsd");
 const AV01: BoxType = b(b"av01");
 const AV1C: BoxType = b(b"av1C");
+
+/// Four-CC for the picture track handler (ISO/IEC 14496-12 §8.4.3).
+/// `mdia/hdlr/handler_type` carries this for any image sequence track,
+/// and av1-avif v1.2.0 §3 requires it for an AV1 Image Sequence track.
+pub const HANDLER_PICT: BoxType = *b"pict";
 
 /// One sample in the AVIS track. `offset` is absolute inside the source
 /// file; `size` is the sample's byte length; `duration` is expressed in
@@ -65,6 +71,18 @@ pub struct AvisMeta {
     /// Required by the AV1 decoder to bootstrap the sequence header.
     /// Spec: AV1-AVIF §2.2.1, ISO/IEC 14496-12 §8.5.2 (`stsd`).
     pub av1_codec_config: Option<Vec<u8>>,
+    /// `handler_type` four-CC extracted from the track's
+    /// `mdia/hdlr` box (ISO/IEC 14496-12 §8.4.3). `None` when the
+    /// `hdlr` box is missing or its body is truncated. av1-avif v1.2.0
+    /// §3 requires this to equal [`HANDLER_PICT`] (`'pict'`) for an
+    /// AV1 Image Sequence track.
+    pub handler: Option<BoxType>,
+    /// Four-CC sample-entry types decoded from the track's
+    /// `stbl/stsd` box in declaration order (ISO/IEC 14496-12 §8.5.2).
+    /// For a compliant AV1 Image Sequence (av1-avif v1.2.0 §3) this
+    /// list shall be `['av01']`. An empty list signals a missing or
+    /// truncated `stsd`.
+    pub sample_description_types: Vec<BoxType>,
 }
 
 /// Walk the container and build a sample table. The input buffer must
@@ -78,17 +96,21 @@ pub fn parse_avis(file: &[u8]) -> Result<AvisMeta> {
 
     let timescale = find_mvhd_timescale(moov_payload).unwrap_or(1000);
     let display_dims = find_tkhd_display_size(moov_payload);
+    let handler = find_first_track_handler(moov_payload);
 
     // Locate the first track's stbl — AVIS carries a single image track.
     let stbl = find_first_track_stbl(moov_payload)
         .ok_or_else(|| Error::InvalidData("avis: missing trak/mdia/minf/stbl".to_string()))?;
     let samples = sample_table(stbl)?;
     let av1_codec_config = find_av1c_in_stbl(stbl);
+    let sample_description_types = sample_description_types_in_stbl(stbl);
     Ok(AvisMeta {
         timescale,
         display_dims,
         samples,
         av1_codec_config,
+        handler,
+        sample_description_types,
     })
 }
 
@@ -236,6 +258,66 @@ fn find_first_track_stbl(moov_payload: &[u8]) -> Option<&[u8]> {
         return Some(stbl);
     }
     None
+}
+
+/// Extract the four-CC `handler_type` from the first track's
+/// `mdia/hdlr` box. ISO/IEC 14496-12 §8.4.3 FullBox layout:
+/// `version(1) + flags(3) + pre_defined(4) + handler_type(4) +
+/// reserved(12) + name(string)`. Returns `None` when the box is
+/// missing or the body cannot fit the `handler_type` field.
+fn find_first_track_handler(moov_payload: &[u8]) -> Option<BoxType> {
+    for hdr in iter_boxes(moov_payload) {
+        let hdr = hdr.ok()?;
+        if hdr.box_type != TRAK {
+            continue;
+        }
+        let trak_payload = &moov_payload[hdr.payload_start..hdr.end()];
+        let (mdia, _) = find_box(trak_payload, &MDIA).ok()??;
+        let (hdlr_payload, _) = find_box(mdia, &HDLR).ok()??;
+        let (_v, _f, body) = parse_full_box(hdlr_payload).ok()?;
+        // body: pre_defined(4) + handler_type(4) + reserved(12) + name
+        if body.len() < 8 {
+            return None;
+        }
+        return Some([body[4], body[5], body[6], body[7]]);
+    }
+    None
+}
+
+/// Decode the `stsd` FullBox in `stbl` and return the four-CC of each
+/// SampleEntry in declaration order. Returns an empty `Vec` when
+/// `stsd` is missing, the FullBox body is truncated, or the declared
+/// `entry_count` is zero.
+///
+/// av1-avif v1.2.0 §3 mandates that for an AV1 Image Sequence the
+/// track shall have only one AV1 Sample description entry — i.e. the
+/// returned slice shall be exactly `['av01']`. This walker is
+/// permissive: it surfaces every SampleEntry four-CC, regardless of
+/// type, so the audit layer can distinguish "wrong count" from "wrong
+/// type" failure modes.
+fn sample_description_types_in_stbl(stbl: &[u8]) -> Vec<BoxType> {
+    let mut out = Vec::new();
+    let Ok(Some((stsd_payload, _))) = find_box(stbl, &STSD) else {
+        return out;
+    };
+    let Ok((_v, _f, body)) = parse_full_box(stsd_payload) else {
+        return out;
+    };
+    if body.len() < 4 {
+        return out;
+    }
+    let entry_count = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
+    if entry_count == 0 {
+        return out;
+    }
+    let entries = &body[4..];
+    for hdr in iter_boxes(entries).flatten() {
+        out.push(hdr.box_type);
+        if out.len() as u32 >= entry_count {
+            break;
+        }
+    }
+    out
 }
 
 /// Build a flat list of samples from an `stbl` payload by expanding
@@ -495,6 +577,247 @@ fn parse_stss(payload: &[u8]) -> Result<Vec<u32>> {
     // Spec says sorted ascending — enforce it so binary_search works.
     out.sort_unstable();
     Ok(out)
+}
+
+// ===========================================================================
+// AV1 Image Sequence (`avis`) §3 compliance audit
+// ===========================================================================
+//
+// av1-avif v1.2.0 §3 layers four `shall`-level constraints on top of a
+// MIAF image-sequence track:
+//
+//   1. The track shall be a valid MIAF image sequence (audited
+//      elsewhere — handler == `pict` is the local proxy here).
+//   2. The track handler shall be `'pict'`.
+//   3. The track shall have only one AV1 Sample description entry.
+//   4. If multiple Sequence Header OBUs are present across the track
+//      payload, they shall be identical.
+//
+// `audit_avis_sequence` walks a parsed `AvisMeta` plus the source
+// file bytes once and emits a single `AvisSequenceCompliance` record
+// that surfaces each `shall` independently — callers can either gate
+// on the aggregated `is_compliant()` or report individual failures via
+// `missing()`.
+
+/// av1-avif v1.2.0 §3 AV1 Image Sequence compliance record.
+///
+/// Emitted by [`audit_avis_sequence`]. Each boolean field tracks one
+/// normative `shall`; the spec-source mapping is on each field. The
+/// record is a single-instance audit (one record per file): unlike
+/// the per-item `'av01'` audits in [`crate::derived`], an AVIS file
+/// has at most one image-sequence track.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct AvisSequenceCompliance {
+    /// `true` when the first track's `mdia/hdlr/handler_type` equals
+    /// `'pict'`. Spec: av1-avif v1.2.0 §3 (handler `shall` be
+    /// `'pict'`); ISO/IEC 14496-12 §8.4.3 (`hdlr` box layout).
+    pub handler_is_pict: bool,
+    /// `true` when `stbl/stsd` carries exactly one SampleEntry. Spec:
+    /// av1-avif v1.2.0 §3 (sample description count `shall` be 1).
+    pub single_sample_description: bool,
+    /// `true` when the single SampleEntry's type is `'av01'`. Implied
+    /// by §3 (the one entry shall be an AV1 sample entry). Distinct
+    /// from [`Self::single_sample_description`] so the audit can
+    /// report "right count, wrong type" separately from "wrong count".
+    pub sample_description_is_av01: bool,
+    /// `true` when every Sequence Header OBU encountered across the
+    /// track's sample payloads is byte-identical to the first one.
+    /// Vacuously `true` when zero or one Sequence Header OBUs are
+    /// present. Spec: av1-avif v1.2.0 §3 (multiple SH OBUs `shall` be
+    /// identical).
+    pub sequence_headers_identical: bool,
+    /// Diagnostic — actual four-CC found at `mdia/hdlr/handler_type`.
+    /// `None` when no `hdlr` could be located.
+    pub observed_handler: Option<BoxType>,
+    /// Diagnostic — number of SampleEntries declared by `stsd`.
+    pub sample_description_count: u32,
+    /// Diagnostic — total Sequence Header OBUs encountered across
+    /// every sample.
+    pub sequence_header_obu_count: u32,
+    /// Diagnostic — total samples whose byte range could not be
+    /// resolved against `file` (offset/size out of range). Such
+    /// samples are skipped for the SH-OBU walk and do not flip
+    /// [`Self::sequence_headers_identical`].
+    pub samples_out_of_range: u32,
+}
+
+impl AvisSequenceCompliance {
+    /// `true` when every audited `shall` passes:
+    /// handler is `'pict'`, sample description count is 1, the entry
+    /// type is `'av01'`, and any Sequence Header OBUs encountered
+    /// across samples are byte-identical.
+    pub fn is_compliant(&self) -> bool {
+        self.handler_is_pict
+            && self.single_sample_description
+            && self.sample_description_is_av01
+            && self.sequence_headers_identical
+    }
+
+    /// Human-readable list of `shall`-level failures. Empty when
+    /// [`Self::is_compliant`] returns `true`. Token shapes mirror
+    /// other AVIF audits (`avis-…`).
+    pub fn missing(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if !self.handler_is_pict {
+            out.push("avis-handler-not-pict");
+        }
+        if !self.single_sample_description {
+            out.push("avis-sample-description-not-single");
+        }
+        if !self.sample_description_is_av01 {
+            out.push("avis-sample-description-not-av01");
+        }
+        if !self.sequence_headers_identical {
+            out.push("avis-sequence-header-obus-differ");
+        }
+        out
+    }
+}
+
+/// Audit an [`AvisMeta`] + the source file bytes against the
+/// av1-avif v1.2.0 §3 `shall`-level constraints on an AV1 Image
+/// Sequence.
+///
+/// Walks every sample's OBU stream once. The function reads only
+/// from the parsed metadata and the supplied `file` slice — no IO,
+/// no decode. Sample payloads that fall outside the file bounds
+/// are reported via [`AvisSequenceCompliance::samples_out_of_range`]
+/// and skipped from the Sequence-Header-identity check.
+///
+/// OBU framing follows AV1 §5.3.1 / §5.3.2 / §4.10.5 — see the
+/// implementation of [`crate::derived::audit_sequence_header_obu`]
+/// for the parallel still-image walker.
+pub fn audit_avis_sequence(meta: &AvisMeta, file: &[u8]) -> AvisSequenceCompliance {
+    let handler_is_pict = meta.handler == Some(HANDLER_PICT);
+    let single_sample_description = meta.sample_description_types.len() == 1;
+    let sample_description_is_av01 = meta
+        .sample_description_types
+        .first()
+        .map(|t| t == &AV01)
+        .unwrap_or(false);
+
+    let mut first_sh: Option<Vec<u8>> = None;
+    let mut sh_total: u32 = 0;
+    let mut sh_identical = true;
+    let mut samples_out_of_range: u32 = 0;
+    for s in &meta.samples {
+        let payload = match sample_bytes(file, s) {
+            Ok(p) => p,
+            Err(_) => {
+                samples_out_of_range = samples_out_of_range.saturating_add(1);
+                continue;
+            }
+        };
+        for sh in walk_sequence_header_obus(payload) {
+            sh_total = sh_total.saturating_add(1);
+            match &first_sh {
+                None => first_sh = Some(sh),
+                Some(canonical) => {
+                    if canonical != &sh {
+                        sh_identical = false;
+                    }
+                }
+            }
+        }
+    }
+
+    AvisSequenceCompliance {
+        handler_is_pict,
+        single_sample_description,
+        sample_description_is_av01,
+        sequence_headers_identical: sh_identical,
+        observed_handler: meta.handler,
+        sample_description_count: meta.sample_description_types.len() as u32,
+        sequence_header_obu_count: sh_total,
+        samples_out_of_range,
+    }
+}
+
+/// Walk one AV1 sample payload and return the raw byte slices of
+/// every OBU whose `obu_type` equals `OBU_SEQUENCE_HEADER` (value
+/// `1`, per AV1 §6.2.1). The returned slice for each SH OBU starts
+/// at the OBU header byte and runs through the end of the OBU
+/// payload — i.e. byte-equality on these slices is what
+/// av1-avif §3 calls "identical".
+///
+/// Parsing follows AV1 §5.3.1 (general OBU framing), §5.3.2 (OBU
+/// header byte layout: `obu_forbidden_bit(1) | obu_type(4) |
+/// obu_extension_flag(1) | obu_has_size_field(1) |
+/// obu_reserved_1bit(1)`), §5.3.3 (extension byte when
+/// `obu_extension_flag == 1`), and §4.10.5 (`leb128()` for
+/// `obu_size`). A malformed framing (truncated leb128, payload
+/// running past EOF, or `obu_has_size_field == 0`) stops the walk
+/// for that sample — every SH OBU successfully framed up to that
+/// point is still returned.
+fn walk_sequence_header_obus(payload: &[u8]) -> Vec<Vec<u8>> {
+    const AV1_OBU_TYPE_SEQUENCE_HEADER: u8 = 1;
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < payload.len() {
+        let obu_start = cursor;
+        let header = payload[cursor];
+        cursor += 1;
+        let obu_type = (header >> 3) & 0x0f;
+        let obu_extension_flag = (header >> 2) & 0x01;
+        let obu_has_size_field = (header >> 1) & 0x01;
+        if obu_extension_flag == 1 {
+            if cursor >= payload.len() {
+                return out;
+            }
+            cursor += 1;
+        }
+        if obu_has_size_field == 0 {
+            // Without the size field, the next OBU's start is
+            // undefined inside an item-framed container per AV1
+            // §5.3.1 — bail. The header byte we already read is
+            // surfaced only when this OBU is itself a SH OBU.
+            if obu_type == AV1_OBU_TYPE_SEQUENCE_HEADER {
+                out.push(payload[obu_start..].to_vec());
+            }
+            return out;
+        }
+        // leb128 obu_size, per AV1 §4.10.5.
+        let mut size: u64 = 0;
+        let mut leb_len = 0usize;
+        let mut bad = false;
+        for i in 0..8 {
+            if cursor + i >= payload.len() {
+                bad = true;
+                break;
+            }
+            let b = payload[cursor + i];
+            size |= u64::from(b & 0x7f) << (i * 7);
+            if b & 0x80 == 0 {
+                leb_len = i + 1;
+                break;
+            }
+            if i == 7 {
+                bad = true;
+                break;
+            }
+        }
+        if bad || size > u64::from(u32::MAX) {
+            return out;
+        }
+        cursor += leb_len;
+        let payload_end = match cursor.checked_add(size as usize) {
+            Some(e) if e <= payload.len() => e,
+            _ => {
+                // Truncated OBU body — surface the SH header if this
+                // was an SH OBU (matches the still-image audit's
+                // "count it before bailing" behaviour) then stop.
+                if obu_type == AV1_OBU_TYPE_SEQUENCE_HEADER {
+                    out.push(payload[obu_start..].to_vec());
+                }
+                return out;
+            }
+        };
+        if obu_type == AV1_OBU_TYPE_SEQUENCE_HEADER {
+            out.push(payload[obu_start..payload_end].to_vec());
+        }
+        cursor = payload_end;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -825,5 +1148,405 @@ mod tests {
             "av1C[0] marker bit must be set, got {:#04x}",
             av1c[0]
         );
+    }
+
+    // -----------------------------------------------------------------
+    // av1-avif v1.2.0 §3 AvisSequenceCompliance audit
+    // -----------------------------------------------------------------
+
+    /// Build a one-byte-payload OBU whose header carries the given
+    /// `obu_type` and `obu_has_size_field == 1`. Used by the audit
+    /// unit tests to synthesize compliant + non-compliant SH streams
+    /// without depending on a full AV1 fixture.
+    fn obu_with_size(obu_type: u8, payload_byte: u8) -> Vec<u8> {
+        // header byte: forbidden(0)|type(4)|ext(0)|has_size(1)|reserved(0)
+        let header = (obu_type & 0x0f) << 3 | 0b0000_0010;
+        // leb128(1) = 0x01
+        vec![header, 0x01, payload_byte]
+    }
+
+    #[test]
+    fn walk_sequence_header_obus_pulls_out_sh_obus_only() {
+        // One non-SH OBU (type 6 = OBU_FRAME) followed by one SH OBU
+        // (type 1) followed by one OBU_TEMPORAL_DELIMITER (type 2).
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&obu_with_size(6, 0xaa));
+        buf.extend_from_slice(&obu_with_size(1, 0xbb));
+        buf.extend_from_slice(&obu_with_size(2, 0xcc));
+        let shs = walk_sequence_header_obus(&buf);
+        assert_eq!(shs.len(), 1, "exactly one SH OBU expected");
+        // SH OBU header byte for has_size=1: (1<<3)|2 == 0x0a.
+        assert_eq!(shs[0][0], 0x0a);
+        assert_eq!(shs[0][2], 0xbb);
+    }
+
+    #[test]
+    fn walk_sequence_header_obus_empty_input_returns_empty_vec() {
+        assert!(walk_sequence_header_obus(&[]).is_empty());
+    }
+
+    #[test]
+    fn walk_sequence_header_obus_truncated_size_stops_walk() {
+        // SH header byte with has_size=1 but missing the leb128 size
+        // byte entirely.
+        let buf = vec![0x0a];
+        let shs = walk_sequence_header_obus(&buf);
+        // Truncated leb means the SH framing failed — we get nothing.
+        assert!(shs.is_empty(), "truncated leb must skip the SH OBU");
+    }
+
+    #[test]
+    fn walk_sequence_header_obus_truncated_body_still_surfaces_sh_header() {
+        // SH header byte (has_size=1) + leb128(3) but only 1 byte of
+        // body — body extends past EOF. The audit's truncated-body
+        // branch still includes the SH header in the output so an
+        // identical-SH check can spot mismatched SH headers even
+        // when the encoder mis-sized one.
+        let buf = vec![0x0a, 0x03, 0xff];
+        let shs = walk_sequence_header_obus(&buf);
+        assert_eq!(shs.len(), 1);
+        assert_eq!(shs[0][0], 0x0a);
+    }
+
+    #[test]
+    fn walk_sequence_header_obus_has_size_zero_stops_walk_after_sh() {
+        // SH header byte with has_size=0 — walker can't continue but
+        // still surfaces this OBU's bytes (header through EOF) since
+        // its type is SH.
+        let buf = vec![0x08, 0xff, 0xee]; // (1<<3)|0 = 0x08
+        let shs = walk_sequence_header_obus(&buf);
+        assert_eq!(shs.len(), 1);
+        assert_eq!(shs[0], vec![0x08, 0xff, 0xee]);
+    }
+
+    /// `audit_avis_sequence` against a synthetic `AvisMeta` that
+    /// satisfies every §3 `shall` reports `is_compliant() == true`
+    /// with no `missing()` tokens.
+    #[test]
+    fn audit_avis_sequence_all_shalls_satisfied() {
+        let sh_obu = obu_with_size(1, 0xab);
+        let mut file = vec![0u8; 100];
+        file.splice(50..50, sh_obu.iter().copied());
+        // Re-truncate file to a known length.
+        let _ = file;
+        let mut file = vec![0u8; 50];
+        file.extend_from_slice(&sh_obu);
+        file.extend_from_slice(&sh_obu); // second sample with identical SH
+        let sh_len = sh_obu.len();
+        let meta = AvisMeta {
+            timescale: 1000,
+            display_dims: Some((16, 16)),
+            samples: vec![
+                Sample {
+                    offset: 50,
+                    size: sh_len as u32,
+                    duration: 33,
+                    is_sync: true,
+                },
+                Sample {
+                    offset: (50 + sh_len) as u64,
+                    size: sh_len as u32,
+                    duration: 33,
+                    is_sync: false,
+                },
+            ],
+            av1_codec_config: Some(vec![0x81, 0x04, 0x0c, 0x00]),
+            handler: Some(HANDLER_PICT),
+            sample_description_types: vec![AV01],
+        };
+        let audit = audit_avis_sequence(&meta, &file);
+        assert!(
+            audit.is_compliant(),
+            "compliance audit must pass: {audit:?}"
+        );
+        assert!(audit.missing().is_empty());
+        assert_eq!(audit.sequence_header_obu_count, 2);
+        assert!(audit.sequence_headers_identical);
+        assert_eq!(audit.samples_out_of_range, 0);
+    }
+
+    #[test]
+    fn audit_avis_sequence_handler_not_pict_flagged() {
+        let meta = AvisMeta {
+            timescale: 1000,
+            display_dims: None,
+            samples: Vec::new(),
+            av1_codec_config: None,
+            handler: Some(*b"vide"),
+            sample_description_types: vec![AV01],
+        };
+        let audit = audit_avis_sequence(&meta, &[]);
+        assert!(!audit.is_compliant());
+        assert_eq!(audit.observed_handler, Some(*b"vide"));
+        assert!(audit.missing().contains(&"avis-handler-not-pict"));
+        // The other two shalls still pass — the missing() list should
+        // contain only the handler token.
+        assert_eq!(audit.missing(), vec!["avis-handler-not-pict"]);
+    }
+
+    #[test]
+    fn audit_avis_sequence_handler_missing_flagged_as_not_pict() {
+        let meta = AvisMeta {
+            timescale: 1000,
+            display_dims: None,
+            samples: Vec::new(),
+            av1_codec_config: None,
+            handler: None,
+            sample_description_types: vec![AV01],
+        };
+        let audit = audit_avis_sequence(&meta, &[]);
+        assert!(!audit.handler_is_pict);
+        assert_eq!(audit.observed_handler, None);
+        assert!(audit.missing().contains(&"avis-handler-not-pict"));
+    }
+
+    #[test]
+    fn audit_avis_sequence_multiple_sample_descriptions_flagged() {
+        let meta = AvisMeta {
+            timescale: 1000,
+            display_dims: None,
+            samples: Vec::new(),
+            av1_codec_config: None,
+            handler: Some(HANDLER_PICT),
+            sample_description_types: vec![AV01, AV01],
+        };
+        let audit = audit_avis_sequence(&meta, &[]);
+        assert!(!audit.is_compliant());
+        assert_eq!(audit.sample_description_count, 2);
+        assert!(audit
+            .missing()
+            .contains(&"avis-sample-description-not-single"));
+        // Type-of-first still passes since first is av01.
+        assert!(audit.sample_description_is_av01);
+    }
+
+    #[test]
+    fn audit_avis_sequence_zero_sample_descriptions_flagged() {
+        let meta = AvisMeta {
+            timescale: 1000,
+            display_dims: None,
+            samples: Vec::new(),
+            av1_codec_config: None,
+            handler: Some(HANDLER_PICT),
+            sample_description_types: Vec::new(),
+        };
+        let audit = audit_avis_sequence(&meta, &[]);
+        assert!(!audit.single_sample_description);
+        assert!(!audit.sample_description_is_av01);
+        assert!(audit
+            .missing()
+            .contains(&"avis-sample-description-not-single"));
+        assert!(audit
+            .missing()
+            .contains(&"avis-sample-description-not-av01"));
+    }
+
+    #[test]
+    fn audit_avis_sequence_non_av01_sample_description_flagged() {
+        let meta = AvisMeta {
+            timescale: 1000,
+            display_dims: None,
+            samples: Vec::new(),
+            av1_codec_config: None,
+            handler: Some(HANDLER_PICT),
+            sample_description_types: vec![*b"hvc1"],
+        };
+        let audit = audit_avis_sequence(&meta, &[]);
+        assert!(audit.single_sample_description);
+        assert!(!audit.sample_description_is_av01);
+        assert_eq!(
+            audit.missing(),
+            vec!["avis-sample-description-not-av01"],
+            "right count, wrong type must surface only the av01 token"
+        );
+    }
+
+    #[test]
+    fn audit_avis_sequence_diverging_sequence_headers_flagged() {
+        // Two samples each with a SH OBU; the second SH has a different
+        // payload byte from the first — the audit must flag them as
+        // diverging per av1-avif §3.
+        let sh_a = obu_with_size(1, 0xaa);
+        let sh_b = obu_with_size(1, 0xbb);
+        let mut file = Vec::new();
+        file.extend_from_slice(&sh_a);
+        file.extend_from_slice(&sh_b);
+        let meta = AvisMeta {
+            timescale: 1000,
+            display_dims: None,
+            samples: vec![
+                Sample {
+                    offset: 0,
+                    size: sh_a.len() as u32,
+                    duration: 1,
+                    is_sync: true,
+                },
+                Sample {
+                    offset: sh_a.len() as u64,
+                    size: sh_b.len() as u32,
+                    duration: 1,
+                    is_sync: false,
+                },
+            ],
+            av1_codec_config: None,
+            handler: Some(HANDLER_PICT),
+            sample_description_types: vec![AV01],
+        };
+        let audit = audit_avis_sequence(&meta, &file);
+        assert_eq!(audit.sequence_header_obu_count, 2);
+        assert!(!audit.sequence_headers_identical);
+        assert!(audit
+            .missing()
+            .contains(&"avis-sequence-header-obus-differ"));
+    }
+
+    #[test]
+    fn audit_avis_sequence_single_sequence_header_is_vacuously_identical() {
+        let sh = obu_with_size(1, 0x42);
+        let meta = AvisMeta {
+            timescale: 1000,
+            display_dims: None,
+            samples: vec![Sample {
+                offset: 0,
+                size: sh.len() as u32,
+                duration: 1,
+                is_sync: true,
+            }],
+            av1_codec_config: None,
+            handler: Some(HANDLER_PICT),
+            sample_description_types: vec![AV01],
+        };
+        let audit = audit_avis_sequence(&meta, &sh);
+        assert!(audit.is_compliant());
+        assert_eq!(audit.sequence_header_obu_count, 1);
+        assert!(audit.sequence_headers_identical);
+    }
+
+    #[test]
+    fn audit_avis_sequence_zero_sequence_headers_is_vacuously_identical() {
+        // Samples that contain only non-SH OBUs (type 6 = OBU_FRAME).
+        let frame = obu_with_size(6, 0xff);
+        let meta = AvisMeta {
+            timescale: 1000,
+            display_dims: None,
+            samples: vec![Sample {
+                offset: 0,
+                size: frame.len() as u32,
+                duration: 1,
+                is_sync: true,
+            }],
+            av1_codec_config: None,
+            handler: Some(HANDLER_PICT),
+            sample_description_types: vec![AV01],
+        };
+        let audit = audit_avis_sequence(&meta, &frame);
+        assert!(audit.is_compliant());
+        assert_eq!(audit.sequence_header_obu_count, 0);
+        assert!(audit.sequence_headers_identical);
+    }
+
+    #[test]
+    fn audit_avis_sequence_out_of_range_samples_counted_and_skipped() {
+        // Two samples; the first resolves to a valid SH OBU, the
+        // second declares an offset beyond the file. The audit must
+        // bump samples_out_of_range without flipping sequence_headers_
+        // identical (the second sample is simply skipped).
+        let sh = obu_with_size(1, 0x42);
+        let meta = AvisMeta {
+            timescale: 1000,
+            display_dims: None,
+            samples: vec![
+                Sample {
+                    offset: 0,
+                    size: sh.len() as u32,
+                    duration: 1,
+                    is_sync: true,
+                },
+                Sample {
+                    offset: 1_000_000,
+                    size: 10,
+                    duration: 1,
+                    is_sync: false,
+                },
+            ],
+            av1_codec_config: None,
+            handler: Some(HANDLER_PICT),
+            sample_description_types: vec![AV01],
+        };
+        let audit = audit_avis_sequence(&meta, &sh);
+        assert_eq!(audit.sequence_header_obu_count, 1);
+        assert!(audit.sequence_headers_identical);
+        assert_eq!(audit.samples_out_of_range, 1);
+        // Out-of-range samples don't flip a `shall` field — the
+        // overall audit still passes if the resolvable samples were
+        // self-consistent.
+        assert!(audit.is_compliant());
+    }
+
+    /// `parse_avis` on the Netflix `alpha_video.avif` fixture
+    /// populates the new fields with their declared values and the
+    /// audit passes every §3 `shall`.
+    #[test]
+    fn alpha_video_avis_meets_section_3_compliance() {
+        let bytes = include_bytes!("../tests/fixtures/alpha_video.avif");
+        let meta = parse_avis(bytes).expect("parse_avis alpha_video");
+        assert_eq!(meta.handler, Some(HANDLER_PICT));
+        assert_eq!(meta.sample_description_types, vec![AV01]);
+        let audit = audit_avis_sequence(&meta, bytes);
+        assert!(
+            audit.is_compliant(),
+            "alpha_video.avif must satisfy av1-avif §3: {audit:?}"
+        );
+        assert_eq!(audit.observed_handler, Some(HANDLER_PICT));
+        assert_eq!(audit.sample_description_count, 1);
+        assert_eq!(audit.samples_out_of_range, 0);
+        // Each AVIS sample carries a Temporal Delimiter + Frame
+        // (no SH in non-first samples — the SH OBU lives only in
+        // the very first sample under the still-image cadence) so
+        // the total SH count is at least 1.
+        assert!(audit.sequence_header_obu_count >= 1);
+    }
+
+    /// `sample_description_types_in_stbl` returns the declared
+    /// SampleEntry types in order — three synthesized entries
+    /// should round-trip verbatim.
+    #[test]
+    fn sample_description_types_round_trip() {
+        let av1c_body: &[u8] = &[0x81, 0x04, 0x0c, 0x00];
+        let mut av1c_box = Vec::new();
+        av1c_box.extend_from_slice(&((8 + av1c_body.len()) as u32).to_be_bytes());
+        av1c_box.extend_from_slice(b"av1C");
+        av1c_box.extend_from_slice(av1c_body);
+        let mut visual_header = vec![0u8; 78];
+        visual_header[7] = 1;
+        let mut av01_box = Vec::new();
+        let av01_payload_len = visual_header.len() + av1c_box.len();
+        av01_box.extend_from_slice(&((8 + av01_payload_len) as u32).to_be_bytes());
+        av01_box.extend_from_slice(b"av01");
+        av01_box.extend_from_slice(&visual_header);
+        av01_box.extend_from_slice(&av1c_box);
+        // A second entry of a foreign type to exercise the walker.
+        let mut hvc1_box = Vec::new();
+        hvc1_box.extend_from_slice(&8u32.to_be_bytes());
+        hvc1_box.extend_from_slice(b"hvc1");
+        let mut stsd_body = Vec::new();
+        stsd_body.extend_from_slice(&[0, 0, 0, 0]); // version + flags
+        stsd_body.extend_from_slice(&2u32.to_be_bytes()); // entry_count
+        stsd_body.extend_from_slice(&av01_box);
+        stsd_body.extend_from_slice(&hvc1_box);
+        let mut stsd_box = Vec::new();
+        stsd_box.extend_from_slice(&((8 + stsd_body.len()) as u32).to_be_bytes());
+        stsd_box.extend_from_slice(b"stsd");
+        stsd_box.extend_from_slice(&stsd_body);
+        let types = sample_description_types_in_stbl(&stsd_box);
+        assert_eq!(types, vec![*b"av01", *b"hvc1"]);
+    }
+
+    /// `sample_description_types_in_stbl` returns an empty vector
+    /// for a malformed (missing `stsd`) stbl rather than panicking.
+    #[test]
+    fn sample_description_types_missing_stsd_returns_empty() {
+        let types = sample_description_types_in_stbl(&[]);
+        assert!(types.is_empty());
     }
 }

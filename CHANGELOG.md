@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- av1-avif v1.2.0 §3 AV1 Image Sequence compliance audit
+  (`audit_avis_sequence` + `AvisSequenceCompliance` + `HANDLER_PICT`).
+  Single record per file (one image-sequence track per AVIS) covers
+  three `shall`-level constraints: track `mdia/hdlr/handler_type`
+  equals `'pict'`; `stbl/stsd` carries exactly one SampleEntry of
+  type `'av01'`; every Sequence Header OBU surfaced across the
+  track's sample payloads is byte-identical to the others (vacuously
+  true for zero or one SH OBU). `AvisMeta` gains `handler:
+  Option<BoxType>` and `sample_description_types: Vec<BoxType>`
+  populated by `parse_avis`. The §3 SH-identity check walks AV1 OBU
+  framing per AV1 §5.3.1 / §5.3.2 / §4.10.5; out-of-range sample
+  payloads are counted via `samples_out_of_range` and skipped from
+  the identity check rather than flipping a `shall` token. Pinned
+  end-to-end against the Netflix `alpha_video.avif` AVIS fixture.
 - av1-avif v1.2.0 §8.2 / §8.3 AVIF profile compliance audit
   (`audit_avif_profile_compliance` + `AvifProfileCompliance` +
   `AvifProfile`). One record per `(AV1 Image Item, declared profile)`

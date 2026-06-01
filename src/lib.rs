@@ -35,14 +35,20 @@
 //!   * `irot` / `imir` / `clap` post-transforms (see [`transform`]).
 //! * AVIS image sequences — sample table walk via [`avis::parse_avis`]
 //!   produces a flat frame-offset list with `(timescale, display_dims,
-//!   samples, av1_codec_config)`. [`avis::sample_bytes`] resolves a
-//!   sample's byte slice inside the source file. The registry-gated
-//!   decoder ([`decoder::AvifDecoder::decode_avis_file`]) walks the
-//!   table end to end, lifts the `AV1CodecConfigurationRecord` from
-//!   `stsd` → `av01` → `av1C`, and fans every sample through a shared
+//!   samples, av1_codec_config, handler, sample_description_types)`.
+//!   [`avis::sample_bytes`] resolves a sample's byte slice inside the
+//!   source file. The registry-gated decoder
+//!   ([`decoder::AvifDecoder::decode_avis_file`]) walks the table end
+//!   to end, lifts the `AV1CodecConfigurationRecord` from `stsd` →
+//!   `av01` → `av1C`, and fans every sample through a shared
 //!   [`oxideav_av1::Av1Decoder`] so inter-frame state is preserved.
 //!   `Decoder::send_packet` dispatches to this path automatically
-//!   when the file's brand classification flags it as a sequence.
+//!   when the file's brand classification flags it as a sequence. The
+//!   av1-avif v1.2.0 §3 `shall`s on an AV1 Image Sequence track
+//!   (handler `'pict'`, single `'av01'` sample description, identical
+//!   Sequence Header OBUs across samples) are audited at the
+//!   container layer via [`audit_avis_sequence`] /
+//!   [`AvisSequenceCompliance`].
 //! * `pixi` (HEIF §6.5.6) and `pasp` (HEIF §6.5.4 / ISO/IEC 14496-12
 //!   §8.5.2.1.1) are surfaced through [`AvifInfo`] — see
 //!   [`AvifInfo::num_channels`], [`AvifInfo::max_bit_depth`],
@@ -97,7 +103,10 @@ mod av1_stub;
 pub mod decoder;
 
 pub use alpha::{composite_alpha, find_alpha_item_id, ALPHA_URN_PREFIX};
-pub use avis::{parse_avis, sample_bytes, sample_table, AvisMeta, Sample};
+pub use avis::{
+    audit_avis_sequence, parse_avis, sample_bytes, sample_table, AvisMeta, AvisSequenceCompliance,
+    Sample, HANDLER_PICT,
+};
 pub use cicp::{
     effective_cicp, is_matrix_reserved, is_primaries_reserved, is_transfer_reserved, matrix_name,
     primaries_name, transfer_name, CicpTriple,

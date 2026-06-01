@@ -301,6 +301,30 @@ fn avis_sample_duration_to_rational() {
     let _ = sample_table; // keep the import live.
 }
 
+/// `audit_avis_sequence` on the Netflix `alpha_video.avif` fixture
+/// passes every av1-avif v1.2.0 §3 `shall`: track handler is `pict`,
+/// `stsd` carries one entry of type `av01`, and every Sequence
+/// Header OBU surfaced across the track's sample payloads is
+/// byte-identical to the others. This pins the §3 audit on real
+/// fixture bytes (the standalone lib test covers the same shape;
+/// this is the end-to-end re-export path through `oxideav_avif::*`).
+#[test]
+fn alpha_video_avis_passes_section_3_compliance_audit() {
+    use oxideav_avif::{audit_avis_sequence, HANDLER_PICT};
+    let meta = parse_avis(ALPHA_VIDEO_AVIS).expect("parse_avis");
+    let audit = audit_avis_sequence(&meta, ALPHA_VIDEO_AVIS);
+    assert!(
+        audit.is_compliant(),
+        "alpha_video.avif must satisfy av1-avif §3: {audit:?}"
+    );
+    assert_eq!(audit.observed_handler, Some(HANDLER_PICT));
+    assert_eq!(audit.sample_description_count, 1);
+    assert!(audit.sequence_header_obu_count >= 1);
+    assert!(audit.sequence_headers_identical);
+    assert_eq!(audit.samples_out_of_range, 0);
+    assert!(audit.missing().is_empty());
+}
+
 /// End-to-end AVIS decode dispatch: feeding an AVIS file through the
 /// `Decoder::send_packet` trait must take the sequence path, surface
 /// every successfully-decoded sample as a `Frame::Video` on the

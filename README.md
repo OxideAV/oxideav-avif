@@ -49,7 +49,7 @@ still loses significant signal.
 | Post-transforms                        | `clap` (centre crop) → `irot` (90/180/270°) → `imir` (horizontal/vertical), applied in that order per §6.5.10                                              |
 | AV1 hand-off                           | `av1C` plumbed through `CodecParameters::extradata`; primary-item OBU payload fed to `oxideav_av1::Av1Decoder`; frame returned through `AvifDecoder`       |
 | MIAF profile dispatch                  | `BrandClass` flags `is_baseline_profile` (MA1B) + `is_advanced_profile` (MA1A) + `is_miaf`; surfaced through `AvifInfo::brands`. Plus av1-avif §8.2 / §8.3 `shall`-level audit (`audit_avif_profile_compliance` / `AvifProfileCompliance`) that walks each AV1 Image Item's `av1C[1]` for the `(seq_profile, seq_level_idx_0)` pair and reports whether it satisfies the declared brand's bounds (Baseline: Main + level ≤ 5.1; Advanced: ≤ High + level ≤ 6.0); surfaced via `AvifInfo::avif_profile_compliance` / `avif_profile_strict_compliant()` |
-| AVIS image sequences                   | sample-table walk (`parse_avis` / `sample_table`) emits a flat frame-offset list; caller feeds each sample to `oxideav_av1` for sequential decode          |
+| AVIS image sequences                   | sample-table walk (`parse_avis` / `sample_table`) emits a flat frame-offset list; caller feeds each sample to `oxideav_av1` for sequential decode. Plus av1-avif §3 `shall`-level audit (`audit_avis_sequence` / `AvisSequenceCompliance`): track `mdia/hdlr/handler_type == 'pict'`, `stsd` carries exactly one `'av01'` SampleEntry, and Sequence Header OBUs across samples are byte-identical. `AvisMeta` surfaces `handler` + `sample_description_types` |
 | Encoder                                | **not implemented**: no AV1 encoder exists in oxideav                                                                                                      |
 
 ### What decodes
@@ -84,6 +84,79 @@ still loses significant signal.
 
 See `examples/diag_decode.rs` for a drop-in report of exactly which
 stage each input reaches.
+
+### Round 201 — av1-avif §3 AV1 Image Sequence compliance audit
+
+av1-avif v1.2.0 §3 layers three `shall`-level constraints on top of a
+MIAF image-sequence track:
+
+1. The track handler `shall` be `'pict'` (`mdia/hdlr/handler_type`).
+2. The track `shall` have only one AV1 Sample description entry
+   (`stbl/stsd` `entry_count == 1` with `SampleEntry` type `'av01'`).
+3. If multiple Sequence Header OBUs are present across the track
+   payload, they `shall` be byte-identical.
+
+Round 201 audits these `shall`s at the container layer via
+`audit_avis_sequence(meta, file)`, mirroring the existing per-item
+audits in [`derived`] (§2.1, §4.1, §6.6.2.1, §7, §8.2/§8.3) but
+scoped to AVIS — one record per file (each AVIS carries a single
+image-sequence track).
+
+`AvisMeta` grows two fields populated by `parse_avis`:
+`handler: Option<BoxType>` (the four-CC at
+`mdia/hdlr/handler_type`, per ISO/IEC 14496-12 §8.4.3) and
+`sample_description_types: Vec<BoxType>` (the four-CC of every
+SampleEntry declared by `stsd`, in declaration order). The audit
+walks every sample's payload exactly once, framing OBUs per AV1
+§5.3.1 / §5.3.2 (header byte + optional extension byte) plus
+§4.10.5 (`leb128()` for `obu_size`), and collects the byte-slice
+of every OBU whose `obu_type` decodes to `OBU_SEQUENCE_HEADER`
+(value `1`, per AV1 §6.2.1). The SH-identity check then compares
+each collected slice against the first one.
+
+The resulting `AvisSequenceCompliance` record carries one bool per
+`shall`, four diagnostic fields (`observed_handler`,
+`sample_description_count`, `sequence_header_obu_count`,
+`samples_out_of_range`), and `is_compliant()` / `missing()`
+helpers shaped exactly like the existing audits. The
+`samples_out_of_range` counter tracks samples whose declared
+`(offset, size)` falls outside `file`; such samples are skipped
+from the SH-identity walk rather than flipping a `shall` to
+non-compliant (the audit reports cleanly on partial files).
+
+Files declaring an `'av01'`-typed SampleEntry that's the only
+entry, with a `'pict'` handler and per-sample SH OBUs that match
+byte-for-byte, satisfy every audited `shall`. The
+`sample_description_is_av01` field is reported independently of
+`single_sample_description` so the audit distinguishes
+"right count, wrong type" (e.g. an `hvc1` track masquerading as
+AVIS) from "wrong count" (e.g. dual av01/hevc tracks).
+
+Test delta: +18 unit (`avis::tests::audit_avis_sequence_*` covering
+the four `shall` failure modes individually + the diverging-SH
+case + the vacuous one-SH / zero-SH compliance paths +
+out-of-range sample handling + the real `alpha_video.avif`
+fixture's pass; plus `walk_sequence_header_obus_*` covering
+SH-only extraction, truncated leb / truncated body / has_size=0
+edges; plus `sample_description_types_*` round-trip + the missing-
+`stsd` empty-vector shape). +1 integration
+(`alpha_video_avis_passes_section_3_compliance_audit` pins the
+audit on the real Netflix fixture through the
+`oxideav_avif::audit_avis_sequence` re-export). Default lib 270
+(was 252); standalone lib 255 (was 237); integration 58 + 1
+ignored (was 57 + 1).
+
+Followup: this round audits the §3 sample-description shape
+permissively — a non-`'av01'` first SampleEntry passes the
+single-description check (since the count is 1) but fails the
+type check; encoders that ship dual SampleEntries also trip the
+count check first. The descriptive-property side of an AVIS track
+(`tkhd` colr / pixi / pasp at the SampleEntry level, parallel to
+the still-image `iprp` audits) is still container-side TODO — the
+existing per-item audits in [`derived`] do not yet have an AVIS
+counterpart. An `avis` companion to `audit_alpha_bit_depth` (the
+§4.1 sequence shall on matching alpha + master sequence bit
+depths) lands naturally once `AvisMeta` grows multi-track support.
 
 ### Round 195 — av1-avif §8.2 / §8.3 AVIF profile compliance audit
 
