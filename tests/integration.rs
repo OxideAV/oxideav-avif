@@ -325,6 +325,39 @@ fn alpha_video_avis_passes_section_3_compliance_audit() {
     assert!(audit.missing().is_empty());
 }
 
+/// `audit_avis_profile_compliance` on the Netflix `alpha_video.avif`
+/// fixture. The fixture declares `MA1B` in its compatible-brands list,
+/// so the audit emits one Baseline record; the track's `av1C` byte 1
+/// (decoded from `stsd → av01 → av1C`) must satisfy AV1 Main Profile
+/// (`seq_profile == 0`) at level ≤ 5.1 (`seq_level_idx_0 <= 13`).
+/// Pins the §8.2 audit on the real sample-table carrier (parallel to
+/// the existing per-item audits which inspect `iprp.ipco`).
+#[test]
+fn alpha_video_avis_satisfies_section_8_2_baseline_profile_audit() {
+    use oxideav_avif::{
+        audit_avis_profile_compliance, classify_brands, parse_avis, parse_header, AvifProfile,
+    };
+    let hdr = parse_header(ALPHA_VIDEO_AVIS).expect("parse_header");
+    let brands = classify_brands(&hdr.major_brand, &hdr.compatible_brands).expect("brands");
+    assert!(brands.is_baseline_profile, "alpha_video.avif declares MA1B");
+    let meta = parse_avis(ALPHA_VIDEO_AVIS).expect("parse_avis");
+    let audit = audit_avis_profile_compliance(&meta, &brands);
+    assert_eq!(audit.len(), 1, "single MA1B record expected");
+    assert_eq!(audit[0].profile, AvifProfile::Baseline);
+    assert!(
+        audit[0].is_compliant(),
+        "MA1B audit must pass on real fixture: {:?}",
+        audit[0]
+    );
+    assert!(audit[0].missing().is_empty());
+    // Sanity-check the decoded (seq_profile, seq_level_idx_0) pair.
+    let p = audit[0].seq_profile.expect("seq_profile decoded");
+    let l = audit[0].seq_level_idx_0.expect("seq_level_idx_0 decoded");
+    assert_eq!(p, 0, "Main Profile required by §8.2");
+    assert!(l <= 13, "level ≤ 5.1 required by §8.2");
+    assert!(!audit[0].missing_av1c);
+}
+
 /// End-to-end AVIS decode dispatch: feeding an AVIS file through the
 /// `Decoder::send_packet` trait must take the sequence path, surface
 /// every successfully-decoded sample as a `Frame::Video` on the

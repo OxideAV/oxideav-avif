@@ -49,7 +49,7 @@ still loses significant signal.
 | Post-transforms                        | `clap` (centre crop) → `irot` (90/180/270°) → `imir` (horizontal/vertical), applied in that order per §6.5.10                                              |
 | AV1 hand-off                           | `av1C` plumbed through `CodecParameters::extradata`; primary-item OBU payload fed to `oxideav_av1::Av1Decoder`; frame returned through `AvifDecoder`       |
 | MIAF profile dispatch                  | `BrandClass` flags `is_baseline_profile` (MA1B) + `is_advanced_profile` (MA1A) + `is_miaf`; surfaced through `AvifInfo::brands`. Plus av1-avif §8.2 / §8.3 `shall`-level audit (`audit_avif_profile_compliance` / `AvifProfileCompliance`) that walks each AV1 Image Item's `av1C[1]` for the `(seq_profile, seq_level_idx_0)` pair and reports whether it satisfies the declared brand's bounds (Baseline: Main + level ≤ 5.1; Advanced: ≤ High + level ≤ 6.0); surfaced via `AvifInfo::avif_profile_compliance` / `avif_profile_strict_compliant()` |
-| AVIS image sequences                   | sample-table walk (`parse_avis` / `sample_table`) emits a flat frame-offset list; caller feeds each sample to `oxideav_av1` for sequential decode. Plus av1-avif §3 `shall`-level audit (`audit_avis_sequence` / `AvisSequenceCompliance`): track `mdia/hdlr/handler_type == 'pict'`, `stsd` carries exactly one `'av01'` SampleEntry, and Sequence Header OBUs across samples are byte-identical. `AvisMeta` surfaces `handler` + `sample_description_types` |
+| AVIS image sequences                   | sample-table walk (`parse_avis` / `sample_table`) emits a flat frame-offset list; caller feeds each sample to `oxideav_av1` for sequential decode. Plus av1-avif §3 `shall`-level audit (`audit_avis_sequence` / `AvisSequenceCompliance`): track `mdia/hdlr/handler_type == 'pict'`, `stsd` carries exactly one `'av01'` SampleEntry, and Sequence Header OBUs across samples are byte-identical. `AvisMeta` surfaces `handler` + `sample_description_types`. Plus av1-avif §8.2 / §8.3 sequence-track profile compliance audit (`audit_avis_profile_compliance` / `AvisProfileCompliance`): when the file declares `MA1B` and/or `MA1A`, the track's `stsd → av01 → av1C` byte 1 (`(seq_profile, seq_level_idx_0)`) is checked against the per-profile bounds (Baseline: Main + level ≤ 5.1; Advanced: ≤ High + level ≤ 6.0), one record per declared brand |
 | Encoder                                | **not implemented**: no AV1 encoder exists in oxideav                                                                                                      |
 
 ### What decodes
@@ -84,6 +84,67 @@ still loses significant signal.
 
 See `examples/diag_decode.rs` for a drop-in report of exactly which
 stage each input reaches.
+
+### Round 206 — av1-avif §8.2 / §8.3 AVIS profile compliance audit
+
+The §8.2 `MA1B` Baseline / §8.3 `MA1A` Advanced profile audit (landed
+round 195 for still-image AV1 Image Items via
+[`audit_avif_profile_compliance`]) now has a sequence-track companion
+that inspects the AVIS track's `AV1CodecConfigurationRecord` instead of
+the per-item `iprp.ipco` association:
+
+```text
+audit_avis_profile_compliance(&AvisMeta, &BrandClass)
+    -> Vec<AvisProfileCompliance>
+```
+
+The audit reads only the track-level `av1C` byte 1 (already surfaced as
+`AvisMeta::av1_codec_config` and decoded with the same byte-1 helpers
+the still-image audit uses — `seq_profile` from the high 3 bits,
+`seq_level_idx_0` from the low 5, per av1-isobmff §2.3). One
+`AvisProfileCompliance { profile, seq_profile, seq_level_idx_0,
+missing_av1c, is_compliant(), missing() }` record is emitted per
+declared brand: a file claiming both `MA1B` and `MA1A` produces two
+records (Baseline before Advanced); a file claiming neither
+short-circuits to an empty vector.
+
+The single-track shape of AVIS (one image-sequence track per file)
+means there is no per-item fan-out — the still-image audit's
+`(item_id, profile)` Cartesian collapses to `(track, profile)` here.
+The same level-31 carve-out applies: AV1 §A.3 "Maximum parameters" is
+treated as out-of-range for either profile since both §8.2 and §8.3
+bound the level (5.1 / 6.0).
+
+The Baseline check is `seq_profile == 0 && seq_level_idx_0 <= 13`; the
+Advanced check is `seq_profile <= 1 && seq_level_idx_0 <= 16` (per AV1
+§A.2 a Main-Profile stream is also a valid High-Profile stream, so
+`seq_profile == 0` passes the Advanced check too). Diagnostic tokens
+are prefixed `avis-` (`avis-track-missing-av1C`,
+`avis-track-av1C-truncated`, `avis-seq-profile-out-of-range`,
+`avis-seq-level-idx-out-of-range`) so callers folding both audits into
+one `missing()` list can tell the carriers apart.
+
+Test delta: +11 unit (`avis::tests::audit_avis_profile_*` covering the
+no-brand-claim short-circuit, the Baseline + Advanced boundary values
+(5.1 / 6.0), the High-Profile rejection under MA1B, the level-above-5.1
+rejection under MA1B, the Main-Profile acceptance under MA1A, the
+Professional-Profile rejection under MA1A, the level-31 rejection
+under both profiles, the `missing_av1c` versus `av1C-truncated`
+distinction, and the dual-brand record-count / ordering shape). +1
+integration
+(`alpha_video_avis_satisfies_section_8_2_baseline_profile_audit`)
+pins the §8.2 audit on the real Netflix `alpha_video.avif` fixture
+(which declares `MA1B` in its `compatible-brands` list). Default lib
+281 (was 270); standalone lib 266 (was 255); integration 59 + 1
+ignored (was 58 + 1).
+
+Followup: the AVIS path's `AvifInfo` (a single-record builder
+parallel to the still-image `AvifInfo`) does not yet surface the audit
+the way `AvifInfo::avif_profile_compliance` does for items; today the
+caller pairs `parse_avis` + `classify_brands` + the new audit
+directly. An `inspect_avis` shape that aggregates these signals into
+one record is the natural next step alongside the §4.1
+alpha-bit-depth sequence-track follow-up still on the table.
 
 ### Round 201 — av1-avif §3 AV1 Image Sequence compliance audit
 

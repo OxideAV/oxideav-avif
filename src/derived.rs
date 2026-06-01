@@ -1913,7 +1913,10 @@ pub fn audit_sequence_header_obu(
 /// AV1 `seq_level_idx_0` decoded from `av1C[1]` low 5 bits, or `None`
 /// when `av1c` is too short to carry byte 1. av1-isobmff §2.3 packs
 /// `seq_profile (3) | seq_level_idx_0 (5)` into byte 1.
-fn decode_av1c_seq_level_idx_0(av1c: &[u8]) -> Option<u8> {
+///
+/// Crate-visible so the AVIS audit ([`crate::avis::audit_avis_profile_compliance`])
+/// can decode the per-track av1C surfaced via `stsd → av01 → av1C`.
+pub(crate) fn decode_av1c_seq_level_idx_0(av1c: &[u8]) -> Option<u8> {
     if av1c.len() < 2 {
         return None;
     }
@@ -1923,7 +1926,10 @@ fn decode_av1c_seq_level_idx_0(av1c: &[u8]) -> Option<u8> {
 /// AV1 `seq_profile` decoded from `av1C[1]` high 3 bits, or `None`
 /// when `av1c` is too short. Per AV1 Annex A.2: `0` = Main,
 /// `1` = High, `2` = Professional.
-fn decode_av1c_seq_profile(av1c: &[u8]) -> Option<u8> {
+///
+/// Crate-visible so the AVIS audit ([`crate::avis::audit_avis_profile_compliance`])
+/// can decode the per-track av1C surfaced via `stsd → av01 → av1C`.
+pub(crate) fn decode_av1c_seq_profile(av1c: &[u8]) -> Option<u8> {
     if av1c.len() < 2 {
         return None;
     }

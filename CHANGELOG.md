@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- av1-avif v1.2.0 §8.2 / §8.3 AVIS profile compliance audit
+  (`audit_avis_profile_compliance` + `AvisProfileCompliance`), the
+  sequence-track companion to round 195's still-image
+  `audit_avif_profile_compliance`. Reads only the AVIS track's
+  `AV1CodecConfigurationRecord` byte 1 (surfaced via
+  `AvisMeta::av1_codec_config`, packed as `seq_profile (3) |
+  seq_level_idx_0 (5)` per av1-isobmff §2.3); no AV1 OBU decode is
+  performed. One record per declared profile brand (Baseline before
+  Advanced); a file declaring neither `MA1B` nor `MA1A` short-circuits
+  to an empty vector. Compliance bounds: Baseline (`MA1B`) requires
+  AV1 Main Profile at level ≤ 5.1 (`seq_profile == 0 &&
+  seq_level_idx_0 <= 13`); Advanced (`MA1A`) requires ≤ AV1 High
+  Profile at level ≤ 6.0 (`seq_profile <= 1 && seq_level_idx_0 <=
+  16`). The level-31 "Maximum parameters" carve-out is out-of-range
+  for either profile (both clauses bound the level). Diagnostic
+  tokens are prefixed `avis-` to disambiguate from the still-image
+  audit (`avis-track-missing-av1C`, `avis-track-av1C-truncated`,
+  `avis-seq-profile-out-of-range`, `avis-seq-level-idx-out-of-range`).
+  Pinned end-to-end against the Netflix `alpha_video.avif` AVIS
+  fixture (which declares `MA1B` and satisfies §8.2). The
+  `decode_av1c_seq_profile` / `decode_av1c_seq_level_idx_0`
+  byte-1 helpers in `derived.rs` are now `pub(crate)` so the AVIS
+  audit can reuse them.
 - av1-avif v1.2.0 §3 AV1 Image Sequence compliance audit
   (`audit_avis_sequence` + `AvisSequenceCompliance` + `HANDLER_PICT`).
   Single record per file (one image-sequence track per AVIS) covers
