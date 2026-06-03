@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- ISO/IEC 14496-12 §8.6.6 AVIS edit list (`edts/elst`) parse +
+  §8.6.6.3 `shall`-level audit. `AvisMeta` grows one field —
+  `edit_list: Vec<EditListEntry>` — populated by `parse_avis` from
+  the first track's `trak/edts/elst`. v0 (32-bit `segment_duration`
+  / signed-32 `media_time`) and v1 (64-bit / signed-64) entries are
+  widened to the same `EditListEntry` shape so callers stay
+  version-agnostic; future-version (v2+) payloads silently produce
+  an empty entry list and a truncated entry table stops the walk at
+  the last well-formed entry (no error). `EditListEntry::is_empty_edit()`
+  flags the §8.6.6.3 sentinel `media_time == -1`;
+  `EditListEntry::is_dwell()` flags `media_rate_integer == 0`. The
+  new `audit_edit_list(&AvisMeta) -> EditListCompliance` audits both
+  §8.6.6.3 normative `shall`s: (a) the trailing entry shall not be
+  an empty edit and (b) every `media_rate_integer` shall be `0`
+  (dwell) or `1` (normal-rate). A track without `edts` (the §8.6.5
+  implicit-identity case) trivially passes both checks. Diagnostic
+  fields surface `entry_count`, `empty_edit_count`,
+  `dwell_entry_count`, and `out_of_range_rate_count`; `missing()`
+  emits `avis-edit-list-last-entry-empty` and/or
+  `avis-edit-list-media-rate-out-of-range`. Coverage: +14 unit
+  tests; default + standalone lib 281 → 295. Re-exports:
+  `oxideav_avif::{audit_edit_list, EditListCompliance,
+  EditListEntry}`.
 - av1-avif v1.2.0 §8.2 / §8.3 AVIS profile compliance audit
   (`audit_avis_profile_compliance` + `AvisProfileCompliance`), the
   sequence-track companion to round 195's still-image

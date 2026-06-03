@@ -23,6 +23,8 @@ const MOOV: BoxType = b(b"moov");
 const MVHD: BoxType = b(b"mvhd");
 const TRAK: BoxType = b(b"trak");
 const TKHD: BoxType = b(b"tkhd");
+const EDTS: BoxType = b(b"edts");
+const ELST: BoxType = b(b"elst");
 const MDIA: BoxType = b(b"mdia");
 const HDLR: BoxType = b(b"hdlr");
 const MINF: BoxType = b(b"minf");
@@ -55,6 +57,62 @@ pub struct Sample {
     pub is_sync: bool,
 }
 
+/// One `elst` entry: a single segment of the track's presentation
+/// timeline.
+///
+/// Spec: ISO/IEC 14496-12 §8.6.6 (`EditListBox`). Each entry is one of
+/// three shapes:
+///
+/// * **Normal segment** — `media_time >= 0` and `media_rate_integer ==
+///   1`. The slice of the media starting at `media_time` (in media
+///   timescale units) plays for `segment_duration` (movie timescale
+///   units) at native rate.
+/// * **Empty edit** — `media_time == -1`. The presentation timeline
+///   advances by `segment_duration` while no media is presented (used
+///   to offset a track's start). §8.6.6.3: "The last edit in a track
+///   shall never be an empty edit."
+/// * **Dwell** — `media_rate_integer == 0`. The single media frame at
+///   `media_time` is held for `segment_duration`. §8.6.6.3 constrains
+///   the rate field: "Otherwise this field shall contain the value 1"
+///   (i.e. `media_rate_integer` is exactly `0` or exactly `1`).
+///
+/// `segment_duration` and `media_time` widen v0's 32-bit fields to the
+/// v1 64-bit shape so the entry shape stays version-agnostic for
+/// callers. `media_rate_fraction` is preserved as a diagnostic — the
+/// spec sets it to `0` and gives no use for non-zero values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EditListEntry {
+    /// `segment_duration` in movie-timescale (`mvhd::timescale`) units.
+    pub segment_duration: u64,
+    /// `media_time` in media-timescale (`mdhd::timescale`, not surfaced
+    /// here) units. `-1` flags an empty edit. v0 sign-extends the
+    /// signed-32 wire field to `i64`.
+    pub media_time: i64,
+    /// `media_rate_integer` from the wire (16-bit signed; almost
+    /// always `0` for dwell or `1` for normal-rate playback).
+    pub media_rate_integer: i16,
+    /// `media_rate_fraction` from the wire (16-bit signed; spec
+    /// equation: rate = `integer + fraction / 65536`. Almost always
+    /// `0`).
+    pub media_rate_fraction: i16,
+}
+
+impl EditListEntry {
+    /// `true` when this entry signals an empty edit
+    /// (`media_time == -1`, §8.6.6.3): the presentation advances by
+    /// `segment_duration` with no media presented.
+    pub fn is_empty_edit(&self) -> bool {
+        self.media_time == -1
+    }
+
+    /// `true` when this entry signals a dwell (`media_rate_integer ==
+    /// 0`, §8.6.6.3): the single frame at `media_time` is held for
+    /// `segment_duration`.
+    pub fn is_dwell(&self) -> bool {
+        self.media_rate_integer == 0
+    }
+}
+
 /// Container-side description of an AVIS image sequence.
 #[derive(Clone, Debug)]
 pub struct AvisMeta {
@@ -83,6 +141,14 @@ pub struct AvisMeta {
     /// list shall be `['av01']`. An empty list signals a missing or
     /// truncated `stsd`.
     pub sample_description_types: Vec<BoxType>,
+    /// Entries from the first track's `edts/elst` box in declaration
+    /// order (ISO/IEC 14496-12 §8.6.6, `EditListBox`). Empty when the
+    /// track carries no `edts` (the §8.6.5 implicit-identity case) or
+    /// the `elst` body is truncated. v0 (32-bit `segment_duration` /
+    /// signed-32 `media_time`) and v1 (64-bit / signed-64) entries are
+    /// widened to a single shape so callers stay version-agnostic;
+    /// `audit_edit_list` consumes this field directly.
+    pub edit_list: Vec<EditListEntry>,
 }
 
 /// Walk the container and build a sample table. The input buffer must
@@ -97,6 +163,7 @@ pub fn parse_avis(file: &[u8]) -> Result<AvisMeta> {
     let timescale = find_mvhd_timescale(moov_payload).unwrap_or(1000);
     let display_dims = find_tkhd_display_size(moov_payload);
     let handler = find_first_track_handler(moov_payload);
+    let edit_list = find_first_track_edit_list(moov_payload);
 
     // Locate the first track's stbl — AVIS carries a single image track.
     let stbl = find_first_track_stbl(moov_payload)
@@ -111,6 +178,7 @@ pub fn parse_avis(file: &[u8]) -> Result<AvisMeta> {
         av1_codec_config,
         handler,
         sample_description_types,
+        edit_list,
     })
 }
 
@@ -258,6 +326,93 @@ fn find_first_track_stbl(moov_payload: &[u8]) -> Option<&[u8]> {
         return Some(stbl);
     }
     None
+}
+
+/// Walk the first track's `trak/edts/elst` and decode its entries.
+/// Returns an empty `Vec` when `edts` or `elst` is absent (the §8.6.5
+/// implicit identity case), the FullBox body is truncated, or
+/// `entry_count` is zero. Both v0 (32-bit) and v1 (64-bit) shapes are
+/// supported per ISO/IEC 14496-12 §8.6.6.2.
+fn find_first_track_edit_list(moov_payload: &[u8]) -> Vec<EditListEntry> {
+    for hdr in iter_boxes(moov_payload) {
+        let Ok(hdr) = hdr else {
+            return Vec::new();
+        };
+        if hdr.box_type != TRAK {
+            continue;
+        }
+        let trak_payload = &moov_payload[hdr.payload_start..hdr.end()];
+        let Ok(Some((edts_payload, _))) = find_box(trak_payload, &EDTS) else {
+            return Vec::new();
+        };
+        let Ok(Some((elst_payload, _))) = find_box(edts_payload, &ELST) else {
+            return Vec::new();
+        };
+        return parse_edit_list_box(elst_payload).unwrap_or_default();
+    }
+    Vec::new()
+}
+
+/// Decode an `EditListBox` payload (ISO/IEC 14496-12 §8.6.6.2). The
+/// FullBox body layout is `entry_count(32)` followed by `entry_count`
+/// records sized by `version`:
+///
+/// * **v0:** `segment_duration(32) + media_time(s32) + media_rate(32)`
+///   per entry (12 bytes).
+/// * **v1:** `segment_duration(64) + media_time(s64) + media_rate(32)`
+///   per entry (20 bytes).
+///
+/// `media_rate` packs `media_rate_integer(s16)` followed by
+/// `media_rate_fraction(s16)` — they're decoded into separate fields
+/// on [`EditListEntry`] so callers can inspect either half.
+///
+/// Returns `Err(InvalidData)` only when the FullBox header itself is
+/// malformed; a truncated entry table is treated as the boundary of
+/// the recognised entries (every well-formed entry up to that point
+/// is returned). A `version > 1` payload is treated as having no
+/// recognised entries.
+fn parse_edit_list_box(elst_payload: &[u8]) -> Result<Vec<EditListEntry>> {
+    let (version, _flags, body) = parse_full_box(elst_payload)?;
+    if body.len() < 4 {
+        return Ok(Vec::new());
+    }
+    let entry_count = read_u32(body, 0)? as usize;
+    let mut out = Vec::with_capacity(entry_count.min(64));
+    let mut cursor = 4usize;
+    let entry_size = match version {
+        0 => 12usize,
+        1 => 20usize,
+        _ => return Ok(Vec::new()),
+    };
+    for _ in 0..entry_count {
+        if cursor + entry_size > body.len() {
+            break;
+        }
+        let (segment_duration, media_time) = match version {
+            0 => {
+                let seg = read_u32(body, cursor)? as u64;
+                let mt = read_u32(body, cursor + 4)? as i32 as i64;
+                (seg, mt)
+            }
+            _ => {
+                // version == 1.
+                let seg = read_u64(body, cursor)?;
+                let mt = read_u64(body, cursor + 8)? as i64;
+                (seg, mt)
+            }
+        };
+        let rate_at = cursor + entry_size - 4;
+        let media_rate_integer = i16::from_be_bytes([body[rate_at], body[rate_at + 1]]);
+        let media_rate_fraction = i16::from_be_bytes([body[rate_at + 2], body[rate_at + 3]]);
+        out.push(EditListEntry {
+            segment_duration,
+            media_time,
+            media_rate_integer,
+            media_rate_fraction,
+        });
+        cursor += entry_size;
+    }
+    Ok(out)
 }
 
 /// Extract the four-CC `handler_type` from the first track's
@@ -889,6 +1044,124 @@ pub fn audit_avis_profile_compliance(
     out
 }
 
+// ===========================================================================
+// Edit List (`edts/elst`) compliance — ISO/IEC 14496-12 §8.6.6.3
+// ===========================================================================
+//
+// `elst` maps the AVIS track's presentation timeline onto its media
+// timeline. The Edit Box is optional (§8.6.5); in its absence the
+// mapping is implicit identity. When present, §8.6.6.3 layers two
+// per-entry `shall`-level constraints:
+//
+//   1. "The last edit in a track shall never be an empty edit"
+//      (i.e. the trailing entry's `media_time` shall not be `-1`).
+//   2. `media_rate` shall be either `0` (dwell) or `1` (normal-rate);
+//      no other `media_rate_integer` value is permitted.
+//
+// `audit_edit_list` walks the parsed entries on [`AvisMeta`] once and
+// emits a single [`EditListCompliance`] record — mirroring the shape
+// of `audit_avis_sequence` and `audit_avis_profile_compliance`. A
+// file that ships no `edts` (or whose `edts` carries no entries)
+// trivially passes the audit.
+
+/// ISO/IEC 14496-12 §8.6.6.3 edit-list compliance record.
+///
+/// Emitted by [`audit_edit_list`]. Each boolean field tracks one
+/// normative `shall`; tally fields surface diagnostic counts for
+/// callers wanting a single-record summary. An AVIS file without an
+/// `edts/elst` (the implicit-identity case) produces a record where
+/// every `shall` passes vacuously.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct EditListCompliance {
+    /// `true` when no entry's `media_rate_integer` is outside the
+    /// `{0, 1}` set sanctioned by §8.6.6.3 ("Otherwise this field
+    /// shall contain the value 1"). Vacuously `true` when the
+    /// edit list is empty.
+    pub media_rate_in_range: bool,
+    /// `true` when the trailing entry is not an empty edit. Spec
+    /// §8.6.6.3: "The last edit in a track shall never be an empty
+    /// edit." Vacuously `true` when the edit list is empty.
+    pub last_entry_not_empty: bool,
+    /// Diagnostic — total number of `elst` entries decoded. `0` when
+    /// the track has no `edts` or the `elst` body parsed as zero
+    /// entries.
+    pub entry_count: u32,
+    /// Diagnostic — number of entries whose `media_time == -1` (empty
+    /// edits). At most one is normally expected (the leading offset),
+    /// but the count is surfaced so callers can spot encoders that
+    /// pack multiple empties.
+    pub empty_edit_count: u32,
+    /// Diagnostic — number of entries whose `media_rate_integer == 0`
+    /// (dwells). §8.6.6.3 permits dwell entries explicitly.
+    pub dwell_entry_count: u32,
+    /// Diagnostic — number of entries flagged for
+    /// [`Self::media_rate_in_range`]. `0` when every entry passes.
+    pub out_of_range_rate_count: u32,
+}
+
+impl EditListCompliance {
+    /// `true` when every audited §8.6.6.3 `shall` passes (trivially
+    /// `true` for an empty edit list).
+    pub fn is_compliant(&self) -> bool {
+        self.media_rate_in_range && self.last_entry_not_empty
+    }
+
+    /// Human-readable list of `shall`-level failures. Empty when
+    /// [`Self::is_compliant`] returns `true`. Token shapes mirror the
+    /// other AVIS audits (`avis-…` prefix).
+    pub fn missing(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if !self.media_rate_in_range {
+            out.push("avis-edit-list-media-rate-out-of-range");
+        }
+        if !self.last_entry_not_empty {
+            out.push("avis-edit-list-last-entry-empty");
+        }
+        out
+    }
+}
+
+/// Audit an [`AvisMeta`]'s `edit_list` against the ISO/IEC 14496-12
+/// §8.6.6.3 `shall`-level constraints.
+///
+/// Returns a single record — an AVIS file carries at most one image
+/// sequence track and therefore at most one `edts/elst`. The audit
+/// reads only the parsed entries: no file IO, no decode, no
+/// `mvhd`/`tkhd` cross-checks (those have their own §8 audits).
+///
+/// Empty input (no `edts`, no `elst`, or `entry_count == 0`)
+/// trivially satisfies both `shall`s — the record's
+/// [`EditListCompliance::is_compliant`] returns `true` and the
+/// diagnostic counters are zero.
+pub fn audit_edit_list(meta: &AvisMeta) -> EditListCompliance {
+    let entry_count = meta.edit_list.len() as u32;
+    let empty_edit_count = meta.edit_list.iter().filter(|e| e.is_empty_edit()).count() as u32;
+    let dwell_entry_count = meta.edit_list.iter().filter(|e| e.is_dwell()).count() as u32;
+    let out_of_range_rate_count = meta
+        .edit_list
+        .iter()
+        .filter(|e| e.media_rate_integer != 0 && e.media_rate_integer != 1)
+        .count() as u32;
+    let media_rate_in_range = out_of_range_rate_count == 0;
+    // §8.6.6.3 "The last edit in a track shall never be an empty
+    // edit." Vacuously satisfied when the edit list is empty (a
+    // file without an `edts` has no "last edit" to constrain).
+    let last_entry_not_empty = meta
+        .edit_list
+        .last()
+        .map(|e| !e.is_empty_edit())
+        .unwrap_or(true);
+
+    EditListCompliance {
+        media_rate_in_range,
+        last_entry_not_empty,
+        entry_count,
+        empty_edit_count,
+        dwell_entry_count,
+        out_of_range_rate_count,
+    }
+}
+
 /// Walk one AV1 sample payload and return the raw byte slices of
 /// every OBU whose `obu_type` equals `OBU_SEQUENCE_HEADER` (value
 /// `1`, per AV1 §6.2.1). The returned slice for each SH OBU starts
@@ -1409,6 +1682,7 @@ mod tests {
             av1_codec_config: Some(vec![0x81, 0x04, 0x0c, 0x00]),
             handler: Some(HANDLER_PICT),
             sample_description_types: vec![AV01],
+            edit_list: Vec::new(),
         };
         let audit = audit_avis_sequence(&meta, &file);
         assert!(
@@ -1430,6 +1704,7 @@ mod tests {
             av1_codec_config: None,
             handler: Some(*b"vide"),
             sample_description_types: vec![AV01],
+            edit_list: Vec::new(),
         };
         let audit = audit_avis_sequence(&meta, &[]);
         assert!(!audit.is_compliant());
@@ -1449,6 +1724,7 @@ mod tests {
             av1_codec_config: None,
             handler: None,
             sample_description_types: vec![AV01],
+            edit_list: Vec::new(),
         };
         let audit = audit_avis_sequence(&meta, &[]);
         assert!(!audit.handler_is_pict);
@@ -1465,6 +1741,7 @@ mod tests {
             av1_codec_config: None,
             handler: Some(HANDLER_PICT),
             sample_description_types: vec![AV01, AV01],
+            edit_list: Vec::new(),
         };
         let audit = audit_avis_sequence(&meta, &[]);
         assert!(!audit.is_compliant());
@@ -1485,6 +1762,7 @@ mod tests {
             av1_codec_config: None,
             handler: Some(HANDLER_PICT),
             sample_description_types: Vec::new(),
+            edit_list: Vec::new(),
         };
         let audit = audit_avis_sequence(&meta, &[]);
         assert!(!audit.single_sample_description);
@@ -1506,6 +1784,7 @@ mod tests {
             av1_codec_config: None,
             handler: Some(HANDLER_PICT),
             sample_description_types: vec![*b"hvc1"],
+            edit_list: Vec::new(),
         };
         let audit = audit_avis_sequence(&meta, &[]);
         assert!(audit.single_sample_description);
@@ -1547,6 +1826,7 @@ mod tests {
             av1_codec_config: None,
             handler: Some(HANDLER_PICT),
             sample_description_types: vec![AV01],
+            edit_list: Vec::new(),
         };
         let audit = audit_avis_sequence(&meta, &file);
         assert_eq!(audit.sequence_header_obu_count, 2);
@@ -1571,6 +1851,7 @@ mod tests {
             av1_codec_config: None,
             handler: Some(HANDLER_PICT),
             sample_description_types: vec![AV01],
+            edit_list: Vec::new(),
         };
         let audit = audit_avis_sequence(&meta, &sh);
         assert!(audit.is_compliant());
@@ -1594,6 +1875,7 @@ mod tests {
             av1_codec_config: None,
             handler: Some(HANDLER_PICT),
             sample_description_types: vec![AV01],
+            edit_list: Vec::new(),
         };
         let audit = audit_avis_sequence(&meta, &frame);
         assert!(audit.is_compliant());
@@ -1628,6 +1910,7 @@ mod tests {
             av1_codec_config: None,
             handler: Some(HANDLER_PICT),
             sample_description_types: vec![AV01],
+            edit_list: Vec::new(),
         };
         let audit = audit_avis_sequence(&meta, &sh);
         assert_eq!(audit.sequence_header_obu_count, 1);
@@ -1739,6 +2022,7 @@ mod tests {
             av1_codec_config: av1c,
             handler: Some(HANDLER_PICT),
             sample_description_types: vec![AV01],
+            edit_list: Vec::new(),
         }
     }
 
@@ -1867,5 +2151,291 @@ mod tests {
         // Both pass — Main + level ≤ 5.1.
         assert!(r[0].is_compliant());
         assert!(r[1].is_compliant());
+    }
+
+    // -----------------------------------------------------------------
+    // Edit list (`edts/elst`) — ISO/IEC 14496-12 §8.6.6
+    // -----------------------------------------------------------------
+
+    fn full_box_bytes(version: u8, flags: u32, body: &[u8]) -> Vec<u8> {
+        let mut out = vec![
+            version,
+            (flags >> 16) as u8,
+            (flags >> 8) as u8,
+            flags as u8,
+        ];
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn wrap_box(btype: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let size = (8 + payload.len()) as u32;
+        let mut out = size.to_be_bytes().to_vec();
+        out.extend_from_slice(btype);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// Build a v0 `elst` payload from `(segment_duration, media_time,
+    /// media_rate_integer, media_rate_fraction)` tuples.
+    fn build_elst_v0(entries: &[(u32, i32, i16, i16)]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+        for &(seg, mt, ri, rf) in entries {
+            body.extend_from_slice(&seg.to_be_bytes());
+            body.extend_from_slice(&mt.to_be_bytes());
+            body.extend_from_slice(&ri.to_be_bytes());
+            body.extend_from_slice(&rf.to_be_bytes());
+        }
+        wrap_box(b"elst", &full_box_bytes(0, 0, &body))
+    }
+
+    /// Build a v1 `elst` payload from `(segment_duration, media_time,
+    /// media_rate_integer, media_rate_fraction)` tuples.
+    fn build_elst_v1(entries: &[(u64, i64, i16, i16)]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+        for &(seg, mt, ri, rf) in entries {
+            body.extend_from_slice(&seg.to_be_bytes());
+            body.extend_from_slice(&mt.to_be_bytes());
+            body.extend_from_slice(&ri.to_be_bytes());
+            body.extend_from_slice(&rf.to_be_bytes());
+        }
+        wrap_box(b"elst", &full_box_bytes(1, 0, &body))
+    }
+
+    /// Wrap a sequence of boxes as a `trak` containing an `edts`
+    /// wrapping the given `elst`, then a `moov` wrapping that `trak`.
+    fn wrap_moov_with_edts(elst_box: &[u8]) -> Vec<u8> {
+        let edts = wrap_box(b"edts", elst_box);
+        let trak = wrap_box(b"trak", &edts);
+        wrap_box(b"moov", &trak)
+    }
+
+    /// A v0 single-entry normal edit round-trips into one
+    /// `EditListEntry` with the same numeric fields, widened.
+    #[test]
+    fn parse_edit_list_v0_single_normal_entry_round_trips() {
+        let elst = build_elst_v0(&[(1000, 200, 1, 0)]);
+        let entries = parse_edit_list_box(&elst[8..]).expect("parse v0");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].segment_duration, 1000);
+        assert_eq!(entries[0].media_time, 200);
+        assert_eq!(entries[0].media_rate_integer, 1);
+        assert_eq!(entries[0].media_rate_fraction, 0);
+        assert!(!entries[0].is_empty_edit());
+        assert!(!entries[0].is_dwell());
+    }
+
+    /// A v0 `media_time == -1` decodes to a sign-extended `-1` as the
+    /// signed 64-bit field — the empty-edit predicate flips.
+    #[test]
+    fn parse_edit_list_v0_empty_edit_sign_extends_to_minus_one() {
+        let elst = build_elst_v0(&[(500, -1, 1, 0)]);
+        let entries = parse_edit_list_box(&elst[8..]).expect("parse v0");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].media_time, -1);
+        assert!(entries[0].is_empty_edit());
+    }
+
+    /// A v1 entry's 64-bit `media_time` survives the round trip
+    /// unaltered, including a value that cannot fit in v0's 32-bit
+    /// field.
+    #[test]
+    fn parse_edit_list_v1_large_media_time_round_trips() {
+        let big = 0x1_0000_0000i64; // > i32::MAX, only representable in v1
+        let elst = build_elst_v1(&[(0xFFFF_FFFFu64 + 1, big, 1, 0)]);
+        let entries = parse_edit_list_box(&elst[8..]).expect("parse v1");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].segment_duration, 0xFFFF_FFFFu64 + 1);
+        assert_eq!(entries[0].media_time, big);
+    }
+
+    /// A truncated entry table stops the walk cleanly: every
+    /// well-formed entry up to the truncation point is returned.
+    #[test]
+    fn parse_edit_list_truncated_entry_table_stops_walk() {
+        // Build 3 entries on the wire, then truncate the payload after
+        // entry 2.
+        let full = build_elst_v0(&[(10, 0, 1, 0), (20, 5, 1, 0), (30, 9, 1, 0)]);
+        // Drop the trailing 6 bytes — entry 3 becomes truncated.
+        let truncated = &full[..full.len() - 6];
+        let entries = parse_edit_list_box(&truncated[8..]).expect("parse v0");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].segment_duration, 10);
+        assert_eq!(entries[1].segment_duration, 20);
+    }
+
+    /// `parse_avis` plumbs the edit list through a synthetic file:
+    /// `moov[trak[edts[elst]] + trak2[stbl…]]` — but the AVIS parse
+    /// requires the first track to also have an `stbl`, so synthesize a
+    /// `trak` carrying both `edts` and an `mdia/minf/stbl`.
+    #[test]
+    fn find_first_track_edit_list_reads_v0_elst() {
+        let elst = build_elst_v0(&[(0, -1, 1, 0), (200, 0, 1, 0)]);
+        let moov = wrap_moov_with_edts(&elst);
+        // `find_first_track_edit_list` takes a `moov_payload`
+        // (interior of the `moov` box).
+        let entries = find_first_track_edit_list(&moov[8..]);
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].is_empty_edit());
+        assert_eq!(entries[1].segment_duration, 200);
+    }
+
+    /// A track without `edts` produces an empty edit list.
+    #[test]
+    fn find_first_track_edit_list_absent_edts_returns_empty() {
+        let trak = wrap_box(b"trak", &[]);
+        let moov = wrap_box(b"moov", &trak);
+        let entries = find_first_track_edit_list(&moov[8..]);
+        assert!(entries.is_empty());
+    }
+
+    /// A future-version (v2+) `elst` is silently ignored — we surface
+    /// no entries rather than reject the file. The §8.6.6.3 audit
+    /// trivially passes for the resulting empty edit list (a forward-
+    /// compatible reader can fall back to identity mapping).
+    #[test]
+    fn parse_edit_list_unknown_version_returns_empty() {
+        let body = vec![0u8, 0, 0, 1, 0, 0, 0, 0]; // entry_count = 1, garbage entry
+        let elst = wrap_box(b"elst", &full_box_bytes(2, 0, &body));
+        let entries = parse_edit_list_box(&elst[8..]).expect("parse box");
+        assert!(entries.is_empty());
+    }
+
+    /// `audit_edit_list` against a meta with an empty `edit_list` (no
+    /// `edts` in the file) reports both `shall`s as vacuously
+    /// satisfied — `is_compliant()` is `true`, `missing()` is empty.
+    #[test]
+    fn audit_edit_list_empty_is_vacuously_compliant() {
+        let meta = avis_meta_with_av1c(None);
+        let r = audit_edit_list(&meta);
+        assert!(r.is_compliant());
+        assert!(r.missing().is_empty());
+        assert_eq!(r.entry_count, 0);
+        assert_eq!(r.empty_edit_count, 0);
+        assert_eq!(r.dwell_entry_count, 0);
+    }
+
+    /// A two-entry edit list with a leading empty edit followed by a
+    /// normal segment (the canonical "offset the start by N units"
+    /// shape from §8.6.6.1) satisfies both audited `shall`s.
+    #[test]
+    fn audit_edit_list_leading_empty_then_normal_is_compliant() {
+        let mut meta = avis_meta_with_av1c(None);
+        meta.edit_list = vec![
+            EditListEntry {
+                segment_duration: 1000,
+                media_time: -1,
+                media_rate_integer: 1,
+                media_rate_fraction: 0,
+            },
+            EditListEntry {
+                segment_duration: 5000,
+                media_time: 0,
+                media_rate_integer: 1,
+                media_rate_fraction: 0,
+            },
+        ];
+        let r = audit_edit_list(&meta);
+        assert!(r.is_compliant());
+        assert_eq!(r.entry_count, 2);
+        assert_eq!(r.empty_edit_count, 1);
+        assert_eq!(r.dwell_entry_count, 0);
+    }
+
+    /// A trailing empty edit trips §8.6.6.3 ("The last edit in a
+    /// track shall never be an empty edit").
+    #[test]
+    fn audit_edit_list_trailing_empty_flagged() {
+        let mut meta = avis_meta_with_av1c(None);
+        meta.edit_list = vec![
+            EditListEntry {
+                segment_duration: 500,
+                media_time: 0,
+                media_rate_integer: 1,
+                media_rate_fraction: 0,
+            },
+            EditListEntry {
+                segment_duration: 100,
+                media_time: -1,
+                media_rate_integer: 1,
+                media_rate_fraction: 0,
+            },
+        ];
+        let r = audit_edit_list(&meta);
+        assert!(!r.is_compliant());
+        assert_eq!(r.empty_edit_count, 1);
+        assert_eq!(r.missing(), vec!["avis-edit-list-last-entry-empty"]);
+    }
+
+    /// A dwell entry (`media_rate_integer == 0`) is permitted by
+    /// §8.6.6.3 and increments `dwell_entry_count` without flipping
+    /// `media_rate_in_range`.
+    #[test]
+    fn audit_edit_list_dwell_entry_is_compliant_and_counted() {
+        let mut meta = avis_meta_with_av1c(None);
+        meta.edit_list = vec![EditListEntry {
+            segment_duration: 250,
+            media_time: 33,
+            media_rate_integer: 0,
+            media_rate_fraction: 0,
+        }];
+        let r = audit_edit_list(&meta);
+        assert!(r.is_compliant());
+        assert_eq!(r.dwell_entry_count, 1);
+        assert_eq!(r.out_of_range_rate_count, 0);
+    }
+
+    /// A `media_rate_integer` other than `0` or `1` (here, `2`)
+    /// trips the §8.6.6.3 rate `shall`.
+    #[test]
+    fn audit_edit_list_out_of_range_media_rate_flagged() {
+        let mut meta = avis_meta_with_av1c(None);
+        meta.edit_list = vec![EditListEntry {
+            segment_duration: 100,
+            media_time: 0,
+            media_rate_integer: 2,
+            media_rate_fraction: 0,
+        }];
+        let r = audit_edit_list(&meta);
+        assert!(!r.is_compliant());
+        assert_eq!(r.out_of_range_rate_count, 1);
+        assert_eq!(r.missing(), vec!["avis-edit-list-media-rate-out-of-range"]);
+    }
+
+    /// A negative `media_rate_integer` also fails the §8.6.6.3 set
+    /// constraint — the audit doesn't carve out negative values.
+    #[test]
+    fn audit_edit_list_negative_media_rate_flagged() {
+        let mut meta = avis_meta_with_av1c(None);
+        meta.edit_list = vec![EditListEntry {
+            segment_duration: 100,
+            media_time: 0,
+            media_rate_integer: -1,
+            media_rate_fraction: 0,
+        }];
+        let r = audit_edit_list(&meta);
+        assert!(!r.is_compliant());
+        assert_eq!(r.out_of_range_rate_count, 1);
+    }
+
+    /// Both `shall`s can fail simultaneously — a trailing empty edit
+    /// with an out-of-range rate flips both flags + emits both
+    /// diagnostic tokens.
+    #[test]
+    fn audit_edit_list_both_shalls_fail_simultaneously() {
+        let mut meta = avis_meta_with_av1c(None);
+        meta.edit_list = vec![EditListEntry {
+            segment_duration: 100,
+            media_time: -1,
+            media_rate_integer: 7,
+            media_rate_fraction: 0,
+        }];
+        let r = audit_edit_list(&meta);
+        assert!(!r.is_compliant());
+        let m = r.missing();
+        assert!(m.contains(&"avis-edit-list-media-rate-out-of-range"));
+        assert!(m.contains(&"avis-edit-list-last-entry-empty"));
     }
 }
