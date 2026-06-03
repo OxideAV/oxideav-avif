@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- AVIS aggregator `inspect_avis(file) -> AvisInfo` — the AVIS
+  counterpart to the still-image `inspect()` / `AvifInfo` one-call
+  builder. A single call walks `ftyp` + `moov` once and folds every
+  AVIS-side container audit into one record (`sequence_compliance`
+  for av1-avif §3, `profile_compliance` for §8.2 / §8.3,
+  `edit_list_compliance` for ISO/IEC 14496-12 §8.6.6.3) alongside
+  summary fields (`timescale`, `display_dims`, `sample_count`,
+  `total_sample_duration`, `has_av1_codec_config`, `handler`,
+  `sample_description_types`, `brands`, `has_edit_list`). Helpers:
+  `is_compliant_all()` (AND of every `shall` across the three audits,
+  trivially `true` when the file claims no AVIF profile brand),
+  `missing_all()` (deterministic concatenation of the three audits'
+  `missing()` lists in §3 → §8.2/§8.3 → §8.6.6.3 order),
+  `duration_seconds()` (`total_sample_duration / timescale`, `None`
+  when `timescale == 0`), `is_avis_brand()` (mirrors
+  `BrandClass::is_sequence`), `frame_count()` (mirrors
+  `sample_count`). The aggregator introduces no new normative
+  material — every audited rule is forwarded verbatim from the
+  existing per-audit walkers; the value is one-call ergonomics. Pins
+  on the real Netflix `alpha_video.avif` fixture
+  (`inspect_avis_aggregates_alpha_video_fixture_to_compliant`) end
+  to end. Coverage: +9 unit; +1 integration. Re-exports:
+  `oxideav_avif::{inspect_avis, AvisInfo}`. Resolves the repeated
+  r201 / r206 / r212 follow-up ("the AVIS path's `AvifInfo` does not
+  yet surface the audit the way `AvifInfo::avif_profile_compliance`
+  does for items").
+
 - ISO/IEC 14496-12 §8.6.6 AVIS edit list (`edts/elst`) parse +
   §8.6.6.3 `shall`-level audit. `AvisMeta` grows one field —
   `edit_list: Vec<EditListEntry>` — populated by `parse_avis` from

@@ -104,9 +104,9 @@ pub mod decoder;
 
 pub use alpha::{composite_alpha, find_alpha_item_id, ALPHA_URN_PREFIX};
 pub use avis::{
-    audit_avis_profile_compliance, audit_avis_sequence, audit_edit_list, parse_avis, sample_bytes,
-    sample_table, AvisMeta, AvisProfileCompliance, AvisSequenceCompliance, EditListCompliance,
-    EditListEntry, Sample, HANDLER_PICT,
+    audit_avis_profile_compliance, audit_avis_sequence, audit_edit_list, inspect_avis, parse_avis,
+    sample_bytes, sample_table, AvisInfo, AvisMeta, AvisProfileCompliance, AvisSequenceCompliance,
+    EditListCompliance, EditListEntry, Sample, HANDLER_PICT,
 };
 pub use cicp::{
     effective_cicp, is_matrix_reserved, is_primaries_reserved, is_transfer_reserved, matrix_name,

@@ -1249,6 +1249,212 @@ fn walk_sequence_header_obus(payload: &[u8]) -> Vec<Vec<u8>> {
     out
 }
 
+// ===========================================================================
+// AVIS aggregator — `inspect_avis` / `AvisInfo`
+// ===========================================================================
+//
+// Mirror of the still-image [`crate::inspect::AvifInfo`] one-call builder
+// for AVIS files. A single call to [`inspect_avis`] parses the `ftyp` +
+// `moov` chain once and fans every available container-side audit
+// (`audit_avis_sequence`, `audit_avis_profile_compliance`, `audit_edit_list`)
+// into a single record so callers do not have to thread `parse_avis`
+// + `classify_brands` + each audit by hand. The shape parallels the
+// repeated "Followup: the AVIS path's `AvifInfo` does not yet surface
+// the audit the way `AvifInfo::avif_profile_compliance` does for items"
+// notes in the per-round README sections (r201 / r206 / r212).
+//
+// The aggregator does not introduce new `shall`-level normative
+// material — every audited rule is forwarded verbatim from the
+// existing per-audit walkers; the value is one-call ergonomics +
+// a `Vec`-free record shape `AvifInfo` already exposes downstream.
+
+/// High-level container-side description of an AVIS (AV1 Image
+/// Sequence) file — the AVIS counterpart to the still-image
+/// [`crate::inspect::AvifInfo`].
+///
+/// Built by [`inspect_avis`]: one call walks `ftyp` + `moov` + the
+/// first track's `stbl` once, then runs every container-side audit
+/// the crate publishes. Callers that want a single record summarising
+/// "what does this AVIS look like, and which AVIS-level `shall`s does
+/// it satisfy?" can replace a hand-rolled
+/// `parse_header` + `classify_brands` + `parse_avis` + N audits with
+/// this one record.
+///
+/// The struct deliberately omits AVIS-internal byte-level material
+/// (sample byte offsets, full `av1C` payload, full edit-list entries)
+/// — those remain accessible via [`parse_avis`] when needed. The
+/// fields surfaced here are summary signals + the three compliance
+/// records.
+#[derive(Clone, Debug)]
+pub struct AvisInfo {
+    /// `mvhd::timescale` — clock-ticks per second for the movie
+    /// timeline. ISO/IEC 14496-12 §8.2.2.
+    pub timescale: u32,
+    /// `tkhd` width / height. `None` when `tkhd` is missing.
+    pub display_dims: Option<(u32, u32)>,
+    /// Number of samples (frames) walked from the first track's
+    /// `stbl`. `0` when the track has no samples — a degenerate but
+    /// parseable case.
+    pub sample_count: u32,
+    /// Sum of every sample's `stts` delta in movie-timescale units.
+    /// This is the track media duration as carried by the sample
+    /// table; `tkhd::duration` may differ (it is reported in movie
+    /// timescale via `mvhd`). Callers can convert to seconds via
+    /// `(total_sample_duration as f64) / (timescale as f64)`.
+    pub total_sample_duration: u64,
+    /// `true` when the track's `stsd → av01 → av1C` walk produced a
+    /// valid configuration record. `false` when the AVIS track is
+    /// not AV1-coded or the config record is missing — the file is
+    /// then not decodable as an AV1 Image Sequence regardless of
+    /// brand claims.
+    pub has_av1_codec_config: bool,
+    /// `mdia/hdlr/handler_type` four-CC. av1-avif v1.2.0 §3 mandates
+    /// [`HANDLER_PICT`] (`'pict'`). `None` when no `hdlr` could be
+    /// located.
+    pub handler: Option<BoxType>,
+    /// `stbl/stsd` SampleEntry types in declaration order. For a
+    /// compliant AVIS this is `['av01']`.
+    pub sample_description_types: Vec<BoxType>,
+    /// Brand classification from `ftyp` (av1-avif §6 / §8, ISO/IEC
+    /// 23000-22 §7). Useful for callers deciding whether the file
+    /// claims a specific profile gate.
+    pub brands: crate::parser::BrandClass,
+    /// `true` when the first track carries an `edts/elst` with at
+    /// least one entry (the §8.6.5 implicit-identity case is `false`).
+    pub has_edit_list: bool,
+    /// av1-avif v1.2.0 §3 `shall`-level audit (track handler `'pict'`,
+    /// single `'av01'` SampleEntry, identical Sequence Header OBUs
+    /// across samples). One record per AVIS file (each AVIS carries
+    /// one image-sequence track).
+    pub sequence_compliance: AvisSequenceCompliance,
+    /// av1-avif v1.2.0 §8.2 / §8.3 profile `shall`-level audit, one
+    /// entry per declared AVIF profile brand. Empty when the file
+    /// declares neither `MA1B` nor `MA1A`. Spec: §8.2 (`MA1B`),
+    /// §8.3 (`MA1A`).
+    pub profile_compliance: Vec<AvisProfileCompliance>,
+    /// ISO/IEC 14496-12 §8.6.6.3 edit-list `shall`-level audit. A
+    /// file without an `edts` produces a vacuously-compliant record
+    /// (both `shall`s trivially satisfied).
+    pub edit_list_compliance: EditListCompliance,
+}
+
+impl AvisInfo {
+    /// Number of samples (frames) in the track. Shorthand for
+    /// [`Self::sample_count`].
+    pub fn frame_count(&self) -> u32 {
+        self.sample_count
+    }
+
+    /// Total track media duration in seconds, computed from
+    /// [`Self::total_sample_duration`] and [`Self::timescale`].
+    /// Returns `None` when `timescale == 0` (the conversion is
+    /// undefined).
+    pub fn duration_seconds(&self) -> Option<f64> {
+        if self.timescale == 0 {
+            None
+        } else {
+            Some(self.total_sample_duration as f64 / self.timescale as f64)
+        }
+    }
+
+    /// `true` when every audited `shall` across §3, §8.2/§8.3, and
+    /// ISO/IEC 14496-12 §8.6.6.3 passes for this AVIS file.
+    ///
+    /// Trivially `true` for the empty edit list (the implicit-identity
+    /// case) and for a file that declares no AVIF profile brand
+    /// (`profile_compliance` empty). Callers that want a "compliance
+    /// AND a profile claim was made" gate should combine this with
+    /// `brands.is_baseline_profile || brands.is_advanced_profile`.
+    pub fn is_compliant_all(&self) -> bool {
+        self.sequence_compliance.is_compliant()
+            && self.profile_compliance.iter().all(|c| c.is_compliant())
+            && self.edit_list_compliance.is_compliant()
+    }
+
+    /// Aggregated list of every audited `shall` that failed across
+    /// the three AVIS audits, in deterministic order: §3 sequence
+    /// tokens (`avis-*`) first, then §8.2/§8.3 profile tokens (one
+    /// group per record, in `Baseline`-then-`Advanced` order), then
+    /// §8.6.6.3 edit-list tokens.
+    ///
+    /// Empty when [`Self::is_compliant_all`] returns `true`.
+    pub fn missing_all(&self) -> Vec<&'static str> {
+        let mut out = self.sequence_compliance.missing();
+        for rec in &self.profile_compliance {
+            out.extend(rec.missing());
+        }
+        out.extend(self.edit_list_compliance.missing());
+        out
+    }
+
+    /// `true` when the file's `ftyp` declares the `avis` brand —
+    /// i.e. the AVIS classification was claimed by the encoder, not
+    /// just inferred from a `moov` presence.
+    pub fn is_avis_brand(&self) -> bool {
+        self.brands.is_sequence
+    }
+}
+
+/// One-call AVIS inspector — parses the `ftyp` + `moov` chain once
+/// and folds every container-side audit into a single
+/// [`AvisInfo`] record.
+///
+/// Returns an error when:
+///
+/// * `ftyp` is missing or its brands cannot be classified (per
+///   [`crate::parser::classify_brands`]).
+/// * `moov` is missing or the first track lacks an `stbl` — both
+///   surface as `Error::InvalidData` from [`parse_avis`].
+///
+/// Mirrors the still-image [`crate::inspect::inspect`] entry point.
+/// The AVIS path does not need the still-image grid / alpha
+/// composition logic because every AVIS frame is a single AV1 sample
+/// and the per-frame structure is owned by the AV1 decoder.
+pub fn inspect_avis(file: &[u8]) -> Result<AvisInfo> {
+    let hdr = crate::parser::parse_header(file)?;
+    let brands = crate::parser::classify_brands(&hdr.major_brand, &hdr.compatible_brands)?;
+    let meta = parse_avis(file)?;
+    Ok(build_avis_info(meta, brands, file))
+}
+
+/// Internal aggregator: fold a parsed [`AvisMeta`] + classified
+/// [`crate::parser::BrandClass`] + the source file bytes into a single
+/// [`AvisInfo`] record by running every container-side AVIS audit.
+///
+/// Exposed at module scope so the test harness can drive it on
+/// synthetic `AvisMeta` values without round-tripping through
+/// `parse_avis` — every behaviour walker in here is also covered by
+/// the per-audit unit tests above; `AvisInfo`'s role is to surface
+/// the three audit records together with a small number of summary
+/// fields.
+fn build_avis_info(meta: AvisMeta, brands: crate::parser::BrandClass, file: &[u8]) -> AvisInfo {
+    let total_sample_duration: u64 = meta
+        .samples
+        .iter()
+        .map(|s| u64::from(s.duration))
+        .sum::<u64>();
+    let sample_count = meta.samples.len() as u32;
+
+    let sequence_compliance = audit_avis_sequence(&meta, file);
+    let profile_compliance = audit_avis_profile_compliance(&meta, &brands);
+    let edit_list_compliance = audit_edit_list(&meta);
+
+    AvisInfo {
+        timescale: meta.timescale,
+        display_dims: meta.display_dims,
+        sample_count,
+        total_sample_duration,
+        has_av1_codec_config: meta.av1_codec_config.is_some(),
+        handler: meta.handler,
+        sample_description_types: meta.sample_description_types,
+        brands,
+        has_edit_list: !meta.edit_list.is_empty(),
+        sequence_compliance,
+        profile_compliance,
+        edit_list_compliance,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2437,5 +2643,201 @@ mod tests {
         let m = r.missing();
         assert!(m.contains(&"avis-edit-list-media-rate-out-of-range"));
         assert!(m.contains(&"avis-edit-list-last-entry-empty"));
+    }
+
+    // -----------------------------------------------------------------
+    // AVIS aggregator (`inspect_avis` / `AvisInfo` / `build_avis_info`)
+    // -----------------------------------------------------------------
+
+    /// A fully-compliant synthetic AVIS aggregates to every audit
+    /// passing + the four summary fields agreeing with the underlying
+    /// `AvisMeta`. The §3 sequence audit's SH-identity check is
+    /// vacuously satisfied (no samples → zero SH OBUs walked, which
+    /// trivially passes the §3 byte-identity `shall`).
+    #[test]
+    fn build_avis_info_aggregates_a_clean_avis() {
+        let mut meta = avis_meta_with_av1c(Some(av1c_with(0, 8)));
+        meta.timescale = 24_000;
+        meta.display_dims = Some((640, 480));
+        meta.samples = vec![
+            Sample {
+                offset: 0,
+                size: 0,
+                duration: 1000,
+                is_sync: true,
+            },
+            Sample {
+                offset: 0,
+                size: 0,
+                duration: 1000,
+                is_sync: false,
+            },
+        ];
+
+        let info = build_avis_info(meta, brands_with(true, false), &[]);
+        assert_eq!(info.timescale, 24_000);
+        assert_eq!(info.display_dims, Some((640, 480)));
+        assert_eq!(info.sample_count, 2);
+        assert_eq!(info.total_sample_duration, 2_000);
+        assert_eq!(info.frame_count(), 2);
+        assert!(info.has_av1_codec_config);
+        assert_eq!(info.handler, Some(HANDLER_PICT));
+        assert_eq!(info.sample_description_types, vec![AV01]);
+        assert!(info.brands.is_baseline_profile);
+        assert!(!info.has_edit_list);
+        assert!(info.sequence_compliance.is_compliant());
+        assert_eq!(info.profile_compliance.len(), 1);
+        assert_eq!(info.profile_compliance[0].profile, AvifProfile::Baseline);
+        assert!(info.profile_compliance[0].is_compliant());
+        assert!(info.edit_list_compliance.is_compliant());
+        assert!(info.is_compliant_all());
+        assert!(info.missing_all().is_empty());
+        // 2 samples / 24_000 ticks-per-second = 1/12 s.
+        let d = info.duration_seconds().unwrap();
+        assert!((d - (2000.0 / 24_000.0)).abs() < 1e-9);
+    }
+
+    /// `duration_seconds()` returns `None` for the degenerate
+    /// `timescale == 0` case (division undefined).
+    #[test]
+    fn build_avis_info_duration_seconds_undefined_when_timescale_zero() {
+        let mut meta = avis_meta_with_av1c(Some(av1c_with(0, 8)));
+        meta.timescale = 0;
+        let info = build_avis_info(meta, brands_with(false, false), &[]);
+        assert!(info.duration_seconds().is_none());
+    }
+
+    /// A file declaring neither `MA1B` nor `MA1A` produces an empty
+    /// `profile_compliance` vector, and `is_compliant_all()` reflects
+    /// the §3 + §8.6.6.3 outcome alone. With the synth meta being
+    /// otherwise clean, both pass — the empty profile vector is
+    /// vacuously compliant.
+    #[test]
+    fn build_avis_info_no_brand_claim_empty_profile_records() {
+        let meta = avis_meta_with_av1c(Some(av1c_with(0, 8)));
+        let info = build_avis_info(meta, brands_with(false, false), &[]);
+        assert!(info.profile_compliance.is_empty());
+        assert!(info.is_compliant_all());
+        assert!(!info.is_avis_brand());
+    }
+
+    /// A file declaring both `MA1B` and `MA1A` produces two profile
+    /// records in `Baseline`-then-`Advanced` order. The aggregator
+    /// preserves the per-audit ordering.
+    #[test]
+    fn build_avis_info_dual_brand_records_in_order() {
+        let meta = avis_meta_with_av1c(Some(av1c_with(0, 8)));
+        let info = build_avis_info(meta, brands_with(true, true), &[]);
+        assert_eq!(info.profile_compliance.len(), 2);
+        assert_eq!(info.profile_compliance[0].profile, AvifProfile::Baseline);
+        assert_eq!(info.profile_compliance[1].profile, AvifProfile::Advanced);
+    }
+
+    /// `is_avis_brand()` reflects the `BrandClass::is_sequence` flag
+    /// — i.e. did `ftyp` actually list the `avis` brand. A file with a
+    /// `moov` but no `avis` claim still parses but is not classified
+    /// as AVIS by the encoder.
+    #[test]
+    fn build_avis_info_is_avis_brand_tracks_sequence_flag() {
+        let meta = avis_meta_with_av1c(Some(av1c_with(0, 8)));
+        let mut brands = brands_with(false, false);
+        brands.is_sequence = true;
+        let info = build_avis_info(meta, brands, &[]);
+        assert!(info.is_avis_brand());
+    }
+
+    /// A track failing both §3 (handler mismatch) and §8.6.6.3
+    /// (trailing empty edit) flips `is_compliant_all()` to false and
+    /// emits both groups of tokens in `missing_all()`, deterministically
+    /// ordered: §3 tokens first, then §8.6.6.3 tokens.
+    #[test]
+    fn build_avis_info_missing_all_concatenates_in_audit_order() {
+        let mut meta = avis_meta_with_av1c(Some(av1c_with(0, 8)));
+        meta.handler = Some(*b"vide"); // not 'pict' → §3 failure
+        meta.edit_list = vec![EditListEntry {
+            segment_duration: 100,
+            media_time: -1, // empty edit at the trailing position
+            media_rate_integer: 1,
+            media_rate_fraction: 0,
+        }];
+
+        let info = build_avis_info(meta, brands_with(true, false), &[]);
+        assert!(!info.is_compliant_all());
+        let m = info.missing_all();
+        assert!(
+            m.contains(&"avis-handler-not-pict"),
+            "§3 token must be present: {m:?}"
+        );
+        assert!(
+            m.contains(&"avis-edit-list-last-entry-empty"),
+            "§8.6.6.3 token must be present: {m:?}"
+        );
+        // Ordering invariant: §3 tokens precede §8.6.6.3 tokens.
+        let i_seq = m
+            .iter()
+            .position(|t| *t == "avis-handler-not-pict")
+            .unwrap();
+        let i_elst = m
+            .iter()
+            .position(|t| *t == "avis-edit-list-last-entry-empty")
+            .unwrap();
+        assert!(
+            i_seq < i_elst,
+            "§3 tokens must precede §8.6.6.3 tokens: {m:?}"
+        );
+    }
+
+    /// `total_sample_duration` is the sum of every sample's `duration`
+    /// widened to u64 — guards against accidental `u32` overflow when
+    /// the track ships many large-duration samples.
+    #[test]
+    fn build_avis_info_total_sample_duration_widens_to_u64() {
+        let mut meta = avis_meta_with_av1c(Some(av1c_with(0, 8)));
+        meta.samples = vec![
+            Sample {
+                offset: 0,
+                size: 0,
+                duration: u32::MAX,
+                is_sync: true,
+            },
+            Sample {
+                offset: 0,
+                size: 0,
+                duration: u32::MAX,
+                is_sync: false,
+            },
+        ];
+        let info = build_avis_info(meta, brands_with(false, false), &[]);
+        assert_eq!(info.total_sample_duration, 2 * u64::from(u32::MAX));
+    }
+
+    /// `has_edit_list` is `true` when the parsed edit list has any
+    /// entries — the §8.6.5 implicit-identity case (empty edit list)
+    /// reports `false`.
+    #[test]
+    fn build_avis_info_has_edit_list_reflects_entry_presence() {
+        let empty = avis_meta_with_av1c(Some(av1c_with(0, 8)));
+        let info_empty = build_avis_info(empty, brands_with(false, false), &[]);
+        assert!(!info_empty.has_edit_list);
+
+        let mut with_elst = avis_meta_with_av1c(Some(av1c_with(0, 8)));
+        with_elst.edit_list = vec![EditListEntry {
+            segment_duration: 100,
+            media_time: 0,
+            media_rate_integer: 1,
+            media_rate_fraction: 0,
+        }];
+        let info_present = build_avis_info(with_elst, brands_with(false, false), &[]);
+        assert!(info_present.has_edit_list);
+    }
+
+    /// `has_av1_codec_config` is `false` when `av1C` could not be
+    /// located in the track's `stsd → av01` chain — the AVIS is then
+    /// not decodable even if every brand claim is otherwise sound.
+    #[test]
+    fn build_avis_info_has_av1_codec_config_tracks_av1c_presence() {
+        let meta = avis_meta_with_av1c(None);
+        let info = build_avis_info(meta, brands_with(false, false), &[]);
+        assert!(!info.has_av1_codec_config);
     }
 }

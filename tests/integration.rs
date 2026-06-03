@@ -358,6 +358,57 @@ fn alpha_video_avis_satisfies_section_8_2_baseline_profile_audit() {
     assert!(!audit[0].missing_av1c);
 }
 
+/// `inspect_avis` on the Netflix `alpha_video.avif` fixture
+/// aggregates the parse + three audits in one call. The fixture must
+/// satisfy every audited AVIS-level `shall`: §3 (handler `'pict'`,
+/// one `'av01'` SampleEntry, identical SH OBUs), §8.2 (Baseline
+/// profile — the fixture declares `MA1B`), and ISO/IEC 14496-12
+/// §8.6.6.3 (the fixture either lacks an `edts` or its entries
+/// satisfy the trailing-not-empty + rate-in-`{0,1}` `shall`s). Pins
+/// the aggregator entry point end-to-end on real container bytes.
+#[test]
+fn inspect_avis_aggregates_alpha_video_fixture_to_compliant() {
+    use oxideav_avif::{inspect_avis, AvifProfile, HANDLER_PICT};
+    let info = inspect_avis(ALPHA_VIDEO_AVIS).expect("inspect_avis");
+
+    // Summary fields agree with the underlying parse_avis call.
+    assert_eq!(info.display_dims, Some((640, 480)));
+    assert!(info.sample_count >= 1, "alpha_video carries samples");
+    assert!(info.has_av1_codec_config);
+    assert_eq!(info.handler, Some(HANDLER_PICT));
+    assert!(info.timescale > 0);
+
+    // Brand classification: the fixture ships the `avis` brand and
+    // claims the §8.2 Baseline (`MA1B`) profile per its
+    // `compatible-brands` list.
+    assert!(info.is_avis_brand());
+    assert!(info.brands.is_baseline_profile);
+
+    // §3 sequence audit clears every `shall`.
+    assert!(
+        info.sequence_compliance.is_compliant(),
+        "alpha_video must satisfy §3: {:?}",
+        info.sequence_compliance
+    );
+
+    // §8.2 profile audit: one record (Baseline only), compliant.
+    assert_eq!(info.profile_compliance.len(), 1);
+    assert_eq!(info.profile_compliance[0].profile, AvifProfile::Baseline);
+    assert!(info.profile_compliance[0].is_compliant());
+
+    // §8.6.6.3 edit-list audit clears every `shall` (the fixture
+    // either lacks edts entirely or carries compliant ones).
+    assert!(info.edit_list_compliance.is_compliant());
+
+    // Aggregate gate: every audited `shall` passes.
+    assert!(
+        info.is_compliant_all(),
+        "alpha_video AvisInfo must pass every audited shall, got missing: {:?}",
+        info.missing_all()
+    );
+    assert!(info.missing_all().is_empty());
+}
+
 /// End-to-end AVIS decode dispatch: feeding an AVIS file through the
 /// `Decoder::send_packet` trait must take the sequence path, surface
 /// every successfully-decoded sample as a `Frame::Video` on the

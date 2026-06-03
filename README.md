@@ -49,7 +49,7 @@ still loses significant signal.
 | Post-transforms                        | `clap` (centre crop) → `irot` (90/180/270°) → `imir` (horizontal/vertical), applied in that order per §6.5.10                                              |
 | AV1 hand-off                           | `av1C` plumbed through `CodecParameters::extradata`; primary-item OBU payload fed to `oxideav_av1::Av1Decoder`; frame returned through `AvifDecoder`       |
 | MIAF profile dispatch                  | `BrandClass` flags `is_baseline_profile` (MA1B) + `is_advanced_profile` (MA1A) + `is_miaf`; surfaced through `AvifInfo::brands`. Plus av1-avif §8.2 / §8.3 `shall`-level audit (`audit_avif_profile_compliance` / `AvifProfileCompliance`) that walks each AV1 Image Item's `av1C[1]` for the `(seq_profile, seq_level_idx_0)` pair and reports whether it satisfies the declared brand's bounds (Baseline: Main + level ≤ 5.1; Advanced: ≤ High + level ≤ 6.0); surfaced via `AvifInfo::avif_profile_compliance` / `avif_profile_strict_compliant()` |
-| AVIS image sequences                   | sample-table walk (`parse_avis` / `sample_table`) emits a flat frame-offset list; caller feeds each sample to `oxideav_av1` for sequential decode. Plus av1-avif §3 `shall`-level audit (`audit_avis_sequence` / `AvisSequenceCompliance`): track `mdia/hdlr/handler_type == 'pict'`, `stsd` carries exactly one `'av01'` SampleEntry, and Sequence Header OBUs across samples are byte-identical. `AvisMeta` surfaces `handler` + `sample_description_types`. Plus av1-avif §8.2 / §8.3 sequence-track profile compliance audit (`audit_avis_profile_compliance` / `AvisProfileCompliance`): when the file declares `MA1B` and/or `MA1A`, the track's `stsd → av01 → av1C` byte 1 (`(seq_profile, seq_level_idx_0)`) is checked against the per-profile bounds (Baseline: Main + level ≤ 5.1; Advanced: ≤ High + level ≤ 6.0), one record per declared brand. Plus ISO/IEC 14496-12 §8.6.6 `edts/elst` edit list parsed into `AvisMeta::edit_list` (v0 + v1 entry shapes widened; per-entry `is_empty_edit()` / `is_dwell()` helpers) + §8.6.6.3 `shall`-level audit (`audit_edit_list` / `EditListCompliance`): no trailing empty edit (`media_time == -1`) and every `media_rate_integer ∈ {0, 1}` (0 = dwell, 1 = normal-rate). Vacuous-pass for tracks without `edts` (the §8.6.5 implicit-identity case) |
+| AVIS image sequences                   | sample-table walk (`parse_avis` / `sample_table`) emits a flat frame-offset list; caller feeds each sample to `oxideav_av1` for sequential decode. Plus av1-avif §3 `shall`-level audit (`audit_avis_sequence` / `AvisSequenceCompliance`): track `mdia/hdlr/handler_type == 'pict'`, `stsd` carries exactly one `'av01'` SampleEntry, and Sequence Header OBUs across samples are byte-identical. `AvisMeta` surfaces `handler` + `sample_description_types`. Plus av1-avif §8.2 / §8.3 sequence-track profile compliance audit (`audit_avis_profile_compliance` / `AvisProfileCompliance`): when the file declares `MA1B` and/or `MA1A`, the track's `stsd → av01 → av1C` byte 1 (`(seq_profile, seq_level_idx_0)`) is checked against the per-profile bounds (Baseline: Main + level ≤ 5.1; Advanced: ≤ High + level ≤ 6.0), one record per declared brand. Plus ISO/IEC 14496-12 §8.6.6 `edts/elst` edit list parsed into `AvisMeta::edit_list` (v0 + v1 entry shapes widened; per-entry `is_empty_edit()` / `is_dwell()` helpers) + §8.6.6.3 `shall`-level audit (`audit_edit_list` / `EditListCompliance`): no trailing empty edit (`media_time == -1`) and every `media_rate_integer ∈ {0, 1}` (0 = dwell, 1 = normal-rate). Vacuous-pass for tracks without `edts` (the §8.6.5 implicit-identity case). Plus the [`AvisInfo`] aggregator surfaced via `inspect_avis(file)`: one call folds `parse_avis` + `classify_brands` + every AVIS-side audit into one record (with summary fields `timescale`, `display_dims`, `sample_count`, `total_sample_duration`, `has_av1_codec_config`, `has_edit_list`, `brands`) and exposes `is_compliant_all()` + `missing_all()` + `duration_seconds()` + `is_avis_brand()` |
 | Encoder                                | **not implemented**: no AV1 encoder exists in oxideav                                                                                                      |
 
 ### What decodes
@@ -84,6 +84,99 @@ still loses significant signal.
 
 See `examples/diag_decode.rs` for a drop-in report of exactly which
 stage each input reaches.
+
+### Round 218 — AVIS aggregator (`inspect_avis` / `AvisInfo`)
+
+The repeated r201 / r206 / r212 follow-up — "the AVIS path's `AvifInfo`
+does not yet surface the audit the way `AvifInfo::avif_profile_compliance`
+does for items; today the caller pairs `parse_avis` + `classify_brands` +
+the new audit directly" — lands as a single-record builder paralleling
+the still-image [`inspect`] entry point:
+
+```text
+inspect_avis(file: &[u8]) -> Result<AvisInfo>
+```
+
+`AvisInfo` carries summary fields populated from the underlying parse
+(`timescale`, `display_dims`, `sample_count`, `total_sample_duration`,
+`has_av1_codec_config`, `handler`, `sample_description_types`, `brands`,
+`has_edit_list`) plus the three AVIS-side compliance records folded in
+the same call:
+
+```rust,ignore
+pub struct AvisInfo {
+    pub timescale: u32,
+    pub display_dims: Option<(u32, u32)>,
+    pub sample_count: u32,
+    pub total_sample_duration: u64,
+    pub has_av1_codec_config: bool,
+    pub handler: Option<BoxType>,
+    pub sample_description_types: Vec<BoxType>,
+    pub brands: BrandClass,
+    pub has_edit_list: bool,
+    pub sequence_compliance: AvisSequenceCompliance,    // §3
+    pub profile_compliance: Vec<AvisProfileCompliance>, // §8.2 / §8.3
+    pub edit_list_compliance: EditListCompliance,       // §8.6.6.3
+}
+```
+
+Helpers: `is_compliant_all()` ANDs every audited `shall` across the
+three records (vacuously `true` when `profile_compliance` is empty —
+i.e. the file claims neither `MA1B` nor `MA1A`); `missing_all()`
+concatenates the three `missing()` lists in deterministic audit order
+(§3 → §8.2/§8.3 → §8.6.6.3); `duration_seconds()` folds
+`total_sample_duration / timescale` (and returns `None` when
+`timescale == 0`); `is_avis_brand()` reflects `BrandClass::is_sequence`
+(`ftyp` actually claimed `avis`, not just "had a `moov`"); `frame_count()`
+mirrors `sample_count`.
+
+The aggregator introduces no new `shall`-level normative material:
+every audited rule is forwarded verbatim from the existing per-audit
+walkers. The value is one-call ergonomics + a record shape that
+matches the still-image `AvifInfo` pattern (single record carrying
+every compliance flag + summary signal needed to make presence-
+versus-correctness decisions without re-walking the file).
+
+Coverage details:
+
+- `inspect_avis` errors on a missing `ftyp` / `moov` / `stbl` (every
+  failure mode surfaces verbatim from `parse_header` /
+  `classify_brands` / `parse_avis` — the aggregator does not change
+  the error surface).
+- An AVIS file that ships no `edts` produces
+  `edit_list_compliance.is_compliant() == true` (the §8.6.5
+  implicit-identity case) and `has_edit_list == false`. Callers
+  wanting "explicit edit list ∧ compliant" should AND both.
+- A file declaring neither `MA1B` nor `MA1A` produces an empty
+  `profile_compliance` vector; `is_compliant_all()` is then trivially
+  `true` for the profile dimension. Callers wanting "profile claim ∧
+  compliant" should combine `is_compliant_all()` with `brands.is_baseline_profile
+  || brands.is_advanced_profile`.
+
+Test delta: +9 unit (`avis::tests::build_avis_info_*` covering the
+clean-aggregate happy path, `duration_seconds` undefined for
+`timescale == 0`, no-brand-claim empty profile vector, dual-brand
+record ordering, `is_avis_brand` reflecting the sequence flag,
+`missing_all` token ordering across audits, `total_sample_duration`
+u64 widening, `has_edit_list` presence flag, and `has_av1_codec_config`
+tracking the `av1C` presence). +1 integration
+(`inspect_avis_aggregates_alpha_video_fixture_to_compliant`) pins
+the aggregator on the real Netflix `alpha_video.avif` fixture
+(640×480, declares `MA1B`, all three audits clear). Default lib 304
+(was 295); standalone lib 289 (was 280); integration 60 + 1 ignored
+(was 59 + 1).
+
+Followup: plumbing `mdhd` (the media timescale, as noted in the
+r212 section) is still on the table — today `media_time` is in raw
+media-timescale units and `total_sample_duration` is in
+movie-timescale units, so reconstructing a single presentation
+duration that respects both still requires reading `tkhd::duration`
+plus the edit list's `segment_duration` outside the aggregator.
+The §4.1 alpha-bit-depth sequence-track follow-up (covering AVIS
+files with an alpha auxiliary stream) is unchanged from r206 — it
+needs `AvisMeta` to grow multi-track support before `inspect_avis`
+can surface an `alpha_bit_depth_compliance` field analogous to the
+still-image one.
 
 ### Round 212 — ISO/IEC 14496-12 §8.6.6 AVIS edit list (`edts/elst`)
 
