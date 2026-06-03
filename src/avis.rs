@@ -26,6 +26,7 @@ const TKHD: BoxType = b(b"tkhd");
 const EDTS: BoxType = b(b"edts");
 const ELST: BoxType = b(b"elst");
 const MDIA: BoxType = b(b"mdia");
+const MDHD: BoxType = b(b"mdhd");
 const HDLR: BoxType = b(b"hdlr");
 const MINF: BoxType = b(b"minf");
 const STBL: BoxType = b(b"stbl");
@@ -111,6 +112,38 @@ impl EditListEntry {
     pub fn is_dwell(&self) -> bool {
         self.media_rate_integer == 0
     }
+
+    /// Convert this entry's [`Self::media_time`] (in media-timescale
+    /// units, per ISO/IEC 14496-12 §8.6.6) to seconds using the
+    /// supplied `media_timescale` (`mdhd::timescale`, §8.4.2.2).
+    ///
+    /// Returns `None` when:
+    ///
+    /// * `media_timescale == 0` — the conversion is undefined.
+    /// * `self.is_empty_edit()` — the entry signals "no media is
+    ///   presented" rather than a position on the media timeline, so
+    ///   "seconds into the media" is meaningless. Callers wanting the
+    ///   raw `-1` sentinel use [`Self::media_time`] directly.
+    pub fn media_time_seconds(&self, media_timescale: u32) -> Option<f64> {
+        if media_timescale == 0 || self.is_empty_edit() {
+            None
+        } else {
+            Some(self.media_time as f64 / media_timescale as f64)
+        }
+    }
+
+    /// Convert this entry's [`Self::segment_duration`] (in
+    /// movie-timescale units, per ISO/IEC 14496-12 §8.6.6) to
+    /// seconds using the supplied `movie_timescale`
+    /// (`mvhd::timescale`, §8.2.2). Returns `None` when
+    /// `movie_timescale == 0` (the conversion is undefined).
+    pub fn segment_duration_seconds(&self, movie_timescale: u32) -> Option<f64> {
+        if movie_timescale == 0 {
+            None
+        } else {
+            Some(self.segment_duration as f64 / movie_timescale as f64)
+        }
+    }
 }
 
 /// Container-side description of an AVIS image sequence.
@@ -118,6 +151,18 @@ impl EditListEntry {
 pub struct AvisMeta {
     /// Movie timescale from `mvhd`. A duration of `timescale` == 1s.
     pub timescale: u32,
+    /// Media timescale from the first track's `mdia/mdhd`
+    /// (ISO/IEC 14496-12 §8.4.2.2). Clock-ticks per second for the
+    /// media timeline (the timeline `media_time` and sample
+    /// `delta`s live on). `None` when `mdhd` is missing or
+    /// malformed — callers can either fall back to assuming
+    /// `media_timescale == timescale` (a common encoder default
+    /// per §8.6.5) or surface the absence to the caller. Distinct
+    /// from `timescale` (which is movie-level via `mvhd`): an
+    /// `EditListBox` entry's `segment_duration` is in
+    /// movie-timescale units, but its `media_time` and every
+    /// sample table delta are in media-timescale units.
+    pub media_timescale: Option<u32>,
     /// Declared display width / height from `tkhd`. `None` when tkhd is
     /// missing or malformed.
     pub display_dims: Option<(u32, u32)>,
@@ -163,6 +208,7 @@ pub fn parse_avis(file: &[u8]) -> Result<AvisMeta> {
     let timescale = find_mvhd_timescale(moov_payload).unwrap_or(1000);
     let display_dims = find_tkhd_display_size(moov_payload);
     let handler = find_first_track_handler(moov_payload);
+    let media_timescale = find_first_track_media_timescale(moov_payload);
     let edit_list = find_first_track_edit_list(moov_payload);
 
     // Locate the first track's stbl — AVIS carries a single image track.
@@ -173,6 +219,7 @@ pub fn parse_avis(file: &[u8]) -> Result<AvisMeta> {
     let sample_description_types = sample_description_types_in_stbl(stbl);
     Ok(AvisMeta {
         timescale,
+        media_timescale,
         display_dims,
         samples,
         av1_codec_config,
@@ -435,6 +482,52 @@ fn find_first_track_handler(moov_payload: &[u8]) -> Option<BoxType> {
             return None;
         }
         return Some([body[4], body[5], body[6], body[7]]);
+    }
+    None
+}
+
+/// Extract the media timescale from the first track's
+/// `mdia/mdhd` box.
+///
+/// ISO/IEC 14496-12 §8.4.2.2 `MediaHeaderBox` FullBox layout:
+///
+/// * **v0:** `creation_time(32) + modification_time(32) +
+///   timescale(32) + duration(32) + language(16) + pre_defined(16)`
+///   — timescale at body offset 8.
+/// * **v1:** `creation_time(64) + modification_time(64) +
+///   timescale(32) + duration(64) + language(16) + pre_defined(16)`
+///   — timescale at body offset 16.
+///
+/// Returns `None` when `mdhd` is missing, its FullBox body is
+/// truncated, or its declared `version` is neither 0 nor 1
+/// (forward-compatible silence).
+fn find_first_track_media_timescale(moov_payload: &[u8]) -> Option<u32> {
+    for hdr in iter_boxes(moov_payload) {
+        let hdr = hdr.ok()?;
+        if hdr.box_type != TRAK {
+            continue;
+        }
+        let trak_payload = &moov_payload[hdr.payload_start..hdr.end()];
+        let (mdia, _) = find_box(trak_payload, &MDIA).ok()??;
+        let (mdhd_payload, _) = find_box(mdia, &MDHD).ok()??;
+        let (version, _flags, body) = parse_full_box(mdhd_payload).ok()?;
+        return match version {
+            0 => {
+                if body.len() < 12 {
+                    None
+                } else {
+                    Some(u32::from_be_bytes([body[8], body[9], body[10], body[11]]))
+                }
+            }
+            1 => {
+                if body.len() < 20 {
+                    None
+                } else {
+                    Some(u32::from_be_bytes([body[16], body[17], body[18], body[19]]))
+                }
+            }
+            _ => None,
+        };
     }
     None
 }
@@ -1290,6 +1383,14 @@ pub struct AvisInfo {
     /// `mvhd::timescale` — clock-ticks per second for the movie
     /// timeline. ISO/IEC 14496-12 §8.2.2.
     pub timescale: u32,
+    /// `mdhd::timescale` from the first track's `mdia/mdhd`
+    /// (ISO/IEC 14496-12 §8.4.2.2) — clock-ticks per second for the
+    /// media timeline. `None` when `mdhd` is missing or malformed.
+    /// `EditListEntry::media_time` and every `stts` per-sample
+    /// `delta` live on this timeline. Distinct from
+    /// [`Self::timescale`] (movie-level via `mvhd`); the two often
+    /// agree but are independent fields per the spec.
+    pub media_timescale: Option<u32>,
     /// `tkhd` width / height. `None` when `tkhd` is missing.
     pub display_dims: Option<(u32, u32)>,
     /// Number of samples (frames) walked from the first track's
@@ -1354,6 +1455,28 @@ impl AvisInfo {
             None
         } else {
             Some(self.total_sample_duration as f64 / self.timescale as f64)
+        }
+    }
+
+    /// Total track media duration in seconds, computed from
+    /// [`Self::total_sample_duration`] (the sum of every sample's
+    /// `stts` delta) and [`Self::media_timescale`]. This is the
+    /// spec-correct conversion: `stts` per-sample `delta` values are
+    /// in media-timescale units per ISO/IEC 14496-12 §8.6.1.2.
+    ///
+    /// Returns `None` when [`Self::media_timescale`] is `None`
+    /// (`mdhd` missing) or `0` (the conversion is undefined).
+    /// Callers that lack a media timescale can either:
+    ///
+    /// * Fall back to [`Self::duration_seconds`] when the encoder
+    ///   sets `mvhd::timescale == mdhd::timescale` (a common
+    ///   default), or
+    /// * Surface the absence to the caller (no presentation-duration
+    ///   answer is available without an `mdhd`).
+    pub fn media_duration_seconds(&self) -> Option<f64> {
+        match self.media_timescale {
+            Some(ts) if ts != 0 => Some(self.total_sample_duration as f64 / ts as f64),
+            _ => None,
         }
     }
 
@@ -1441,6 +1564,7 @@ fn build_avis_info(meta: AvisMeta, brands: crate::parser::BrandClass, file: &[u8
 
     AvisInfo {
         timescale: meta.timescale,
+        media_timescale: meta.media_timescale,
         display_dims: meta.display_dims,
         sample_count,
         total_sample_duration,
@@ -1870,6 +1994,7 @@ mod tests {
         let sh_len = sh_obu.len();
         let meta = AvisMeta {
             timescale: 1000,
+            media_timescale: Some(1000),
             display_dims: Some((16, 16)),
             samples: vec![
                 Sample {
@@ -1905,6 +2030,7 @@ mod tests {
     fn audit_avis_sequence_handler_not_pict_flagged() {
         let meta = AvisMeta {
             timescale: 1000,
+            media_timescale: Some(1000),
             display_dims: None,
             samples: Vec::new(),
             av1_codec_config: None,
@@ -1925,6 +2051,7 @@ mod tests {
     fn audit_avis_sequence_handler_missing_flagged_as_not_pict() {
         let meta = AvisMeta {
             timescale: 1000,
+            media_timescale: Some(1000),
             display_dims: None,
             samples: Vec::new(),
             av1_codec_config: None,
@@ -1942,6 +2069,7 @@ mod tests {
     fn audit_avis_sequence_multiple_sample_descriptions_flagged() {
         let meta = AvisMeta {
             timescale: 1000,
+            media_timescale: Some(1000),
             display_dims: None,
             samples: Vec::new(),
             av1_codec_config: None,
@@ -1963,6 +2091,7 @@ mod tests {
     fn audit_avis_sequence_zero_sample_descriptions_flagged() {
         let meta = AvisMeta {
             timescale: 1000,
+            media_timescale: Some(1000),
             display_dims: None,
             samples: Vec::new(),
             av1_codec_config: None,
@@ -1985,6 +2114,7 @@ mod tests {
     fn audit_avis_sequence_non_av01_sample_description_flagged() {
         let meta = AvisMeta {
             timescale: 1000,
+            media_timescale: Some(1000),
             display_dims: None,
             samples: Vec::new(),
             av1_codec_config: None,
@@ -2014,6 +2144,7 @@ mod tests {
         file.extend_from_slice(&sh_b);
         let meta = AvisMeta {
             timescale: 1000,
+            media_timescale: Some(1000),
             display_dims: None,
             samples: vec![
                 Sample {
@@ -2047,6 +2178,7 @@ mod tests {
         let sh = obu_with_size(1, 0x42);
         let meta = AvisMeta {
             timescale: 1000,
+            media_timescale: Some(1000),
             display_dims: None,
             samples: vec![Sample {
                 offset: 0,
@@ -2071,6 +2203,7 @@ mod tests {
         let frame = obu_with_size(6, 0xff);
         let meta = AvisMeta {
             timescale: 1000,
+            media_timescale: Some(1000),
             display_dims: None,
             samples: vec![Sample {
                 offset: 0,
@@ -2098,6 +2231,7 @@ mod tests {
         let sh = obu_with_size(1, 0x42);
         let meta = AvisMeta {
             timescale: 1000,
+            media_timescale: Some(1000),
             display_dims: None,
             samples: vec![
                 Sample {
@@ -2223,6 +2357,7 @@ mod tests {
     fn avis_meta_with_av1c(av1c: Option<Vec<u8>>) -> AvisMeta {
         AvisMeta {
             timescale: 1000,
+            media_timescale: Some(1000),
             display_dims: None,
             samples: Vec::new(),
             av1_codec_config: av1c,
@@ -2495,6 +2630,157 @@ mod tests {
         let moov = wrap_box(b"moov", &trak);
         let entries = find_first_track_edit_list(&moov[8..]);
         assert!(entries.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // `mdhd` media-timescale plumb (ISO/IEC 14496-12 §8.4.2.2)
+    // -----------------------------------------------------------------
+
+    /// Build a v0 `mdhd` payload (FullBox) with the given timescale.
+    /// Layout: creation(4) + modification(4) + timescale(4) +
+    /// duration(4) + language(2) + pre_defined(2).
+    fn build_mdhd_v0(timescale: u32) -> Vec<u8> {
+        let mut body = vec![0u8; 20];
+        body[8..12].copy_from_slice(&timescale.to_be_bytes());
+        wrap_box(b"mdhd", &full_box_bytes(0, 0, &body))
+    }
+
+    /// Build a v1 `mdhd` payload (FullBox) with the given timescale.
+    /// Layout: creation(8) + modification(8) + timescale(4) +
+    /// duration(8) + language(2) + pre_defined(2).
+    fn build_mdhd_v1(timescale: u32) -> Vec<u8> {
+        let mut body = vec![0u8; 36];
+        body[16..20].copy_from_slice(&timescale.to_be_bytes());
+        wrap_box(b"mdhd", &full_box_bytes(1, 0, &body))
+    }
+
+    /// Wrap an `mdhd` box inside `mdia` inside `trak` inside `moov`.
+    fn wrap_moov_with_mdhd(mdhd_box: &[u8]) -> Vec<u8> {
+        let mdia = wrap_box(b"mdia", mdhd_box);
+        let trak = wrap_box(b"trak", &mdia);
+        wrap_box(b"moov", &trak)
+    }
+
+    /// v0 `mdhd` extracts its 32-bit timescale field.
+    #[test]
+    fn find_first_track_media_timescale_v0_reads_timescale() {
+        let mdhd = build_mdhd_v0(24_000);
+        let moov = wrap_moov_with_mdhd(&mdhd);
+        let ts = find_first_track_media_timescale(&moov[8..]);
+        assert_eq!(ts, Some(24_000));
+    }
+
+    /// v1 `mdhd` (64-bit creation/modification/duration; 32-bit
+    /// timescale) extracts the same timescale field.
+    #[test]
+    fn find_first_track_media_timescale_v1_reads_timescale() {
+        let mdhd = build_mdhd_v1(90_000);
+        let moov = wrap_moov_with_mdhd(&mdhd);
+        let ts = find_first_track_media_timescale(&moov[8..]);
+        assert_eq!(ts, Some(90_000));
+    }
+
+    /// A `trak` without an `mdia/mdhd` produces `None`.
+    #[test]
+    fn find_first_track_media_timescale_absent_mdhd_returns_none() {
+        let mdia = wrap_box(b"mdia", &[]);
+        let trak = wrap_box(b"trak", &mdia);
+        let moov = wrap_box(b"moov", &trak);
+        let ts = find_first_track_media_timescale(&moov[8..]);
+        assert_eq!(ts, None);
+    }
+
+    /// A future-version (v2+) `mdhd` is silently ignored — we surface
+    /// `None` rather than guessing a layout.
+    #[test]
+    fn find_first_track_media_timescale_unknown_version_returns_none() {
+        // body filled with zero — enough bytes to look plausible for
+        // either v0 or v1 but the version field is 2.
+        let mdhd = wrap_box(b"mdhd", &full_box_bytes(2, 0, &[0u8; 36]));
+        let moov = wrap_moov_with_mdhd(&mdhd);
+        let ts = find_first_track_media_timescale(&moov[8..]);
+        assert_eq!(ts, None);
+    }
+
+    /// A truncated v0 `mdhd` (body shorter than the timescale offset
+    /// + 4 bytes) silently returns `None` rather than panicking.
+    #[test]
+    fn find_first_track_media_timescale_truncated_v0_returns_none() {
+        // Only 8 body bytes — not enough to reach the timescale field at
+        // offset 8.
+        let mdhd = wrap_box(b"mdhd", &full_box_bytes(0, 0, &[0u8; 8]));
+        let moov = wrap_moov_with_mdhd(&mdhd);
+        let ts = find_first_track_media_timescale(&moov[8..]);
+        assert_eq!(ts, None);
+    }
+
+    /// `EditListEntry::media_time_seconds` divides `media_time` by
+    /// the supplied media-timescale.
+    #[test]
+    fn edit_list_entry_media_time_seconds_v0_normal_entry() {
+        let e = EditListEntry {
+            segment_duration: 1000,
+            media_time: 9000,
+            media_rate_integer: 1,
+            media_rate_fraction: 0,
+        };
+        // 9000 ticks / 90_000 ticks-per-second = 0.1 s
+        let s = e.media_time_seconds(90_000).expect("seconds");
+        assert!((s - 0.1).abs() < 1e-9);
+    }
+
+    /// An empty edit (`media_time == -1`) reports `None` rather than
+    /// `-1/timescale` — the sentinel is not a position on the media
+    /// timeline.
+    #[test]
+    fn edit_list_entry_media_time_seconds_empty_edit_returns_none() {
+        let e = EditListEntry {
+            segment_duration: 1000,
+            media_time: -1,
+            media_rate_integer: 1,
+            media_rate_fraction: 0,
+        };
+        assert!(e.media_time_seconds(90_000).is_none());
+    }
+
+    /// A media-timescale of zero is the undefined-conversion case and
+    /// surfaces `None`.
+    #[test]
+    fn edit_list_entry_media_time_seconds_zero_timescale_returns_none() {
+        let e = EditListEntry {
+            segment_duration: 1000,
+            media_time: 50,
+            media_rate_integer: 1,
+            media_rate_fraction: 0,
+        };
+        assert!(e.media_time_seconds(0).is_none());
+    }
+
+    /// `segment_duration_seconds` divides `segment_duration` by the
+    /// supplied movie-timescale.
+    #[test]
+    fn edit_list_entry_segment_duration_seconds_typical_case() {
+        let e = EditListEntry {
+            segment_duration: 12_000,
+            media_time: 0,
+            media_rate_integer: 1,
+            media_rate_fraction: 0,
+        };
+        // 12_000 ticks / 24_000 movie ticks-per-second = 0.5 s
+        let s = e.segment_duration_seconds(24_000).expect("seconds");
+        assert!((s - 0.5).abs() < 1e-9);
+    }
+
+    /// Zero movie-timescale is the undefined-conversion case.
+    #[test]
+    fn edit_list_entry_segment_duration_seconds_zero_timescale_returns_none() {
+        let e = EditListEntry {
+            segment_duration: 12_000,
+            media_time: 0,
+            media_rate_integer: 1,
+            media_rate_fraction: 0,
+        };
+        assert!(e.segment_duration_seconds(0).is_none());
     }
 
     /// A future-version (v2+) `elst` is silently ignored — we surface
@@ -2839,5 +3125,89 @@ mod tests {
         let meta = avis_meta_with_av1c(None);
         let info = build_avis_info(meta, brands_with(false, false), &[]);
         assert!(!info.has_av1_codec_config);
+    }
+
+    /// `AvisInfo::media_timescale` carries forward the `AvisMeta`
+    /// field set by `parse_avis` from the first track's `mdia/mdhd`.
+    #[test]
+    fn build_avis_info_media_timescale_carries_forward() {
+        let mut meta = avis_meta_with_av1c(Some(av1c_with(0, 8)));
+        meta.media_timescale = Some(90_000);
+        let info = build_avis_info(meta, brands_with(false, false), &[]);
+        assert_eq!(info.media_timescale, Some(90_000));
+    }
+
+    /// `AvisInfo::media_timescale` is `None` when the underlying
+    /// `mdhd` could not be located — distinguishes "no mdhd" from
+    /// "explicit 0" (the latter also returns None from the helper but
+    /// is a separate signal callers can branch on if they walk the
+    /// raw meta).
+    #[test]
+    fn build_avis_info_media_timescale_none_when_mdhd_absent() {
+        let mut meta = avis_meta_with_av1c(Some(av1c_with(0, 8)));
+        meta.media_timescale = None;
+        let info = build_avis_info(meta, brands_with(false, false), &[]);
+        assert_eq!(info.media_timescale, None);
+        // media_duration_seconds inherits the None — there's no
+        // timescale to convert against.
+        assert!(info.media_duration_seconds().is_none());
+    }
+
+    /// `media_duration_seconds` divides `total_sample_duration` (the
+    /// sum of `stts` per-sample deltas, in media-timescale units) by
+    /// the media timescale — distinct from `duration_seconds` (which
+    /// uses the movie timescale). When the two timescales agree the
+    /// two helpers report the same number; when they differ this
+    /// helper is the spec-correct one.
+    #[test]
+    fn build_avis_info_media_duration_seconds_uses_media_timescale() {
+        let mut meta = avis_meta_with_av1c(Some(av1c_with(0, 8)));
+        // mvhd timescale: 1000 (movie ticks/sec).
+        // mdhd timescale: 90_000 (media ticks/sec — 90 kHz, a common
+        // MPEG-TS-style choice independent of the movie timeline).
+        meta.timescale = 1000;
+        meta.media_timescale = Some(90_000);
+        meta.samples = vec![
+            Sample {
+                offset: 0,
+                size: 0,
+                duration: 3000,
+                is_sync: true,
+            },
+            Sample {
+                offset: 0,
+                size: 0,
+                duration: 3000,
+                is_sync: false,
+            },
+        ];
+        let info = build_avis_info(meta, brands_with(false, false), &[]);
+        // total = 6000 media ticks; / 90_000 = 1/15 s.
+        let media_s = info.media_duration_seconds().expect("media seconds");
+        assert!((media_s - 6000.0 / 90_000.0).abs() < 1e-12);
+        // duration_seconds divides by the movie timescale (1000) — same
+        // accumulator interpreted under a different unit. Documents
+        // why this round added the explicit media-timescale helper.
+        let movie_s = info.duration_seconds().expect("movie seconds");
+        assert!((movie_s - 6.0).abs() < 1e-9);
+        assert!((media_s - movie_s).abs() > 1e-3);
+    }
+
+    /// `media_duration_seconds` returns `None` when the underlying
+    /// `media_timescale` is `Some(0)` (degenerate) — division would
+    /// be undefined. Distinct from the `None` case (mdhd absent),
+    /// which also short-circuits to `None` via the helper.
+    #[test]
+    fn build_avis_info_media_duration_seconds_zero_media_timescale_none() {
+        let mut meta = avis_meta_with_av1c(Some(av1c_with(0, 8)));
+        meta.media_timescale = Some(0);
+        meta.samples = vec![Sample {
+            offset: 0,
+            size: 0,
+            duration: 50,
+            is_sync: true,
+        }];
+        let info = build_avis_info(meta, brands_with(false, false), &[]);
+        assert!(info.media_duration_seconds().is_none());
     }
 }

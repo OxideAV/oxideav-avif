@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- ISO/IEC 14496-12 §8.4.2.2 `mdhd` media-timescale plumb. `AvisMeta`
+  grows one field — `media_timescale: Option<u32>` — populated by
+  `parse_avis` from the first track's `mdia/mdhd` (the FullBox's
+  v0 32-bit / v1 32-bit timescale field at body offset 8 / 16).
+  `AvisInfo` exposes the same `media_timescale` field; both report
+  `None` when the box is missing, truncated, or its declared
+  `version` is neither 0 nor 1 (forward-compatible silence).
+  Two new helpers consume the field: `EditListEntry::media_time_seconds(media_timescale)`
+  divides `media_time` by the supplied media timescale (returns
+  `None` for the `media_time == -1` empty-edit sentinel or a zero
+  timescale); `EditListEntry::segment_duration_seconds(movie_timescale)`
+  is the parallel divide-by-`mvhd::timescale` helper for the
+  movie-timeline `segment_duration`. `AvisInfo::media_duration_seconds()`
+  computes `total_sample_duration / media_timescale` — the
+  spec-correct conversion for the accumulated `stts` per-sample
+  deltas (in media-timescale units per §8.6.1.2). Distinct from
+  the existing `duration_seconds()`, which divides by
+  `mvhd::timescale`. When `mvhd::timescale == mdhd::timescale`
+  (a common encoder default) the two helpers report the same
+  number; when they differ this helper is the spec-correct one.
+  Resolves the r212 / r218 follow-up ("plumbing `mdhd` is still on
+  the table — today `media_time` is in raw media-timescale units
+  and `total_sample_duration` is in movie-timescale units"; this
+  round corrects the second half of that statement — both
+  `total_sample_duration` and `media_time` are in media-timescale
+  units per §8.6.1.2, and `media_duration_seconds` reflects that).
+  Coverage: +14 unit (mdhd v0/v1 timescale read, absent `mdhd`,
+  truncated v0 body, unknown version, `media_time_seconds` normal
+  / empty / zero-timescale paths, `segment_duration_seconds`
+  normal / zero-timescale paths, `AvisInfo::media_timescale`
+  carry-through, `media_duration_seconds` differs from
+  `duration_seconds` when timescales diverge, zero
+  media-timescale undefined). +1 integration
+  (`inspect_avis_resolves_media_timescale_for_alpha_video_fixture`)
+  pins the resolved field on the real Netflix `alpha_video.avif`.
+
 - AVIS aggregator `inspect_avis(file) -> AvisInfo` — the AVIS
   counterpart to the still-image `inspect()` / `AvifInfo` one-call
   builder. A single call walks `ftyp` + `moov` once and folds every

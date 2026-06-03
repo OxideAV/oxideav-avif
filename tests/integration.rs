@@ -409,6 +409,26 @@ fn inspect_avis_aggregates_alpha_video_fixture_to_compliant() {
     assert!(info.missing_all().is_empty());
 }
 
+/// `inspect_avis` resolves the media timescale from the first
+/// track's `mdia/mdhd` (ISO/IEC 14496-12 §8.4.2.2) on the Netflix
+/// `alpha_video.avif` fixture. The `media_timescale` field must be
+/// populated (`Some(_)`, non-zero) and `media_duration_seconds`
+/// must yield a positive presentation duration — the spec-correct
+/// answer for `stts`-derived per-sample durations.
+#[test]
+fn inspect_avis_resolves_media_timescale_for_alpha_video_fixture() {
+    use oxideav_avif::inspect_avis;
+    let info = inspect_avis(ALPHA_VIDEO_AVIS).expect("inspect_avis");
+
+    let mts = info.media_timescale.expect("mdhd timescale present");
+    assert!(mts > 0, "media timescale must be non-zero");
+
+    // `media_duration_seconds` divides the accumulated stts deltas
+    // (in media-timescale units) by the media timescale.
+    let secs = info.media_duration_seconds().expect("media duration");
+    assert!(secs > 0.0, "duration must be positive, got {secs}");
+}
+
 /// End-to-end AVIS decode dispatch: feeding an AVIS file through the
 /// `Decoder::send_packet` trait must take the sequence path, surface
 /// every successfully-decoded sample as a `Frame::Video` on the

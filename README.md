@@ -49,7 +49,7 @@ still loses significant signal.
 | Post-transforms                        | `clap` (centre crop) → `irot` (90/180/270°) → `imir` (horizontal/vertical), applied in that order per §6.5.10                                              |
 | AV1 hand-off                           | `av1C` plumbed through `CodecParameters::extradata`; primary-item OBU payload fed to `oxideav_av1::Av1Decoder`; frame returned through `AvifDecoder`       |
 | MIAF profile dispatch                  | `BrandClass` flags `is_baseline_profile` (MA1B) + `is_advanced_profile` (MA1A) + `is_miaf`; surfaced through `AvifInfo::brands`. Plus av1-avif §8.2 / §8.3 `shall`-level audit (`audit_avif_profile_compliance` / `AvifProfileCompliance`) that walks each AV1 Image Item's `av1C[1]` for the `(seq_profile, seq_level_idx_0)` pair and reports whether it satisfies the declared brand's bounds (Baseline: Main + level ≤ 5.1; Advanced: ≤ High + level ≤ 6.0); surfaced via `AvifInfo::avif_profile_compliance` / `avif_profile_strict_compliant()` |
-| AVIS image sequences                   | sample-table walk (`parse_avis` / `sample_table`) emits a flat frame-offset list; caller feeds each sample to `oxideav_av1` for sequential decode. Plus av1-avif §3 `shall`-level audit (`audit_avis_sequence` / `AvisSequenceCompliance`): track `mdia/hdlr/handler_type == 'pict'`, `stsd` carries exactly one `'av01'` SampleEntry, and Sequence Header OBUs across samples are byte-identical. `AvisMeta` surfaces `handler` + `sample_description_types`. Plus av1-avif §8.2 / §8.3 sequence-track profile compliance audit (`audit_avis_profile_compliance` / `AvisProfileCompliance`): when the file declares `MA1B` and/or `MA1A`, the track's `stsd → av01 → av1C` byte 1 (`(seq_profile, seq_level_idx_0)`) is checked against the per-profile bounds (Baseline: Main + level ≤ 5.1; Advanced: ≤ High + level ≤ 6.0), one record per declared brand. Plus ISO/IEC 14496-12 §8.6.6 `edts/elst` edit list parsed into `AvisMeta::edit_list` (v0 + v1 entry shapes widened; per-entry `is_empty_edit()` / `is_dwell()` helpers) + §8.6.6.3 `shall`-level audit (`audit_edit_list` / `EditListCompliance`): no trailing empty edit (`media_time == -1`) and every `media_rate_integer ∈ {0, 1}` (0 = dwell, 1 = normal-rate). Vacuous-pass for tracks without `edts` (the §8.6.5 implicit-identity case). Plus the [`AvisInfo`] aggregator surfaced via `inspect_avis(file)`: one call folds `parse_avis` + `classify_brands` + every AVIS-side audit into one record (with summary fields `timescale`, `display_dims`, `sample_count`, `total_sample_duration`, `has_av1_codec_config`, `has_edit_list`, `brands`) and exposes `is_compliant_all()` + `missing_all()` + `duration_seconds()` + `is_avis_brand()` |
+| AVIS image sequences                   | sample-table walk (`parse_avis` / `sample_table`) emits a flat frame-offset list; caller feeds each sample to `oxideav_av1` for sequential decode. Plus av1-avif §3 `shall`-level audit (`audit_avis_sequence` / `AvisSequenceCompliance`): track `mdia/hdlr/handler_type == 'pict'`, `stsd` carries exactly one `'av01'` SampleEntry, and Sequence Header OBUs across samples are byte-identical. `AvisMeta` surfaces `handler` + `sample_description_types`. Plus av1-avif §8.2 / §8.3 sequence-track profile compliance audit (`audit_avis_profile_compliance` / `AvisProfileCompliance`): when the file declares `MA1B` and/or `MA1A`, the track's `stsd → av01 → av1C` byte 1 (`(seq_profile, seq_level_idx_0)`) is checked against the per-profile bounds (Baseline: Main + level ≤ 5.1; Advanced: ≤ High + level ≤ 6.0), one record per declared brand. Plus ISO/IEC 14496-12 §8.6.6 `edts/elst` edit list parsed into `AvisMeta::edit_list` (v0 + v1 entry shapes widened; per-entry `is_empty_edit()` / `is_dwell()` helpers) + §8.6.6.3 `shall`-level audit (`audit_edit_list` / `EditListCompliance`): no trailing empty edit (`media_time == -1`) and every `media_rate_integer ∈ {0, 1}` (0 = dwell, 1 = normal-rate). Vacuous-pass for tracks without `edts` (the §8.6.5 implicit-identity case). Plus the [`AvisInfo`] aggregator surfaced via `inspect_avis(file)`: one call folds `parse_avis` + `classify_brands` + every AVIS-side audit into one record (with summary fields `timescale`, `media_timescale`, `display_dims`, `sample_count`, `total_sample_duration`, `has_av1_codec_config`, `has_edit_list`, `brands`) and exposes `is_compliant_all()` + `missing_all()` + `duration_seconds()` + `media_duration_seconds()` + `is_avis_brand()`. Plus ISO/IEC 14496-12 §8.4.2.2 `mdhd` media-timescale plumb: `AvisMeta::media_timescale` + `AvisInfo::media_timescale` populated from the first track's `mdia/mdhd` (v0 + v1), forward-compatible silence for missing / truncated / `version > 1` shapes. `EditListEntry::media_time_seconds(media_timescale)` + `segment_duration_seconds(movie_timescale)` consume the field for spec-correct timeline conversions |
 | Encoder                                | **not implemented**: no AV1 encoder exists in oxideav                                                                                                      |
 
 ### What decodes
@@ -84,6 +84,89 @@ still loses significant signal.
 
 See `examples/diag_decode.rs` for a drop-in report of exactly which
 stage each input reaches.
+
+### Round 224 — `mdhd` media-timescale plumb (ISO/IEC 14496-12 §8.4.2.2)
+
+The repeated r212 / r218 follow-up — "plumbing `mdhd` (the media
+timescale) is still on the table; today `media_time` is in raw
+media-timescale units" — lands as one field on `AvisMeta` and one
+field on [`AvisInfo`] plus a small set of conversion helpers:
+
+```text
+parse_avis(file).media_timescale: Option<u32>
+inspect_avis(file).media_timescale: Option<u32>
+EditListEntry::media_time_seconds(media_timescale) -> Option<f64>
+EditListEntry::segment_duration_seconds(movie_timescale) -> Option<f64>
+AvisInfo::media_duration_seconds() -> Option<f64>
+```
+
+`parse_avis` walks the first track's `trak/mdia/mdhd` and pulls the
+32-bit `timescale` field per ISO/IEC 14496-12 §8.4.2.2:
+
+- **v0:** `creation_time(32) + modification_time(32) + timescale(32) +
+  duration(32) + language(16) + pre_defined(16)` — timescale at body
+  offset 8.
+- **v1:** `creation_time(64) + modification_time(64) + timescale(32) +
+  duration(64) + language(16) + pre_defined(16)` — timescale at body
+  offset 16.
+
+A missing `mdhd`, a truncated body, or a future `version > 1` value
+silently surfaces as `None` (forward-compatible — no error returned
+to callers; the AVIS still parses).
+
+`EditListEntry::media_time_seconds` divides `media_time` (a media-
+timescale signed-integer) by the supplied `media_timescale`. Returns
+`None` for the §8.6.6.3 empty-edit sentinel (`media_time == -1`,
+which isn't a position on the media timeline) and for the
+degenerate `media_timescale == 0` case. The parallel
+`segment_duration_seconds` divides `segment_duration` (a
+movie-timescale unsigned) by `mvhd::timescale` — they're separate
+helpers because the two fields live on different timelines per the
+spec.
+
+`AvisInfo::media_duration_seconds` computes
+`total_sample_duration / media_timescale` — the spec-correct
+conversion for the accumulated `stts` per-sample deltas. Per
+ISO/IEC 14496-12 §8.6.1.2 (`stts`), per-sample `delta` values are
+in media-timescale units, so dividing by `mvhd::timescale`
+(`AvisInfo::duration_seconds`) is only correct when the encoder
+sets `mvhd::timescale == mdhd::timescale`, a common but not
+universal default. When the two differ this helper is the
+spec-correct one; when they agree both report the same number.
+
+Coverage details:
+
+- A truncated v0 `mdhd` body (shorter than the 12-byte cursor
+  needed to reach `timescale + 4`) returns `None` rather than
+  panicking; same for a v1 body shorter than 20 bytes.
+- A future-version (`version > 1`) `mdhd` returns `None` — the
+  layout past v1 isn't defined here, so we don't guess.
+- `AvisInfo::media_duration_seconds` short-circuits to `None` when
+  either `media_timescale` is `None` (no `mdhd`) or `Some(0)`
+  (degenerate timescale). Callers wanting a fallback gate should
+  `media_duration_seconds().or_else(|| duration_seconds())`.
+
+Test delta: +14 unit (`find_first_track_media_timescale_*`
+covering v0 / v1 reads, absent / truncated / future-version cases;
+`edit_list_entry_media_time_seconds_*` covering normal entry, the
+empty-edit `None`, and the zero-timescale `None`;
+`edit_list_entry_segment_duration_seconds_*` covering the normal
+case and the zero-timescale `None`;
+`build_avis_info_media_timescale_*` covering carry-through, the
+absent-`mdhd` case, the differing-timescale case where
+`media_duration_seconds` and `duration_seconds` diverge, and the
+zero `media_timescale` short-circuit). +1 integration
+(`inspect_avis_resolves_media_timescale_for_alpha_video_fixture`)
+pins the resolved field on the real Netflix `alpha_video.avif`
+fixture. Default lib 318 (was 304); standalone lib 303 (was 289);
+integration 61 + 1 ignored (was 60 + 1).
+
+Followup: this round resolves the second half of the r212 follow-up
+statement. The r206 §4.1 alpha-bit-depth sequence-track audit
+(covering AVIS files with an alpha auxiliary stream) is unchanged
+— it still needs `AvisMeta` to grow multi-track support before
+`inspect_avis` can surface an `alpha_bit_depth_compliance` field
+analogous to the still-image one.
 
 ### Round 218 — AVIS aggregator (`inspect_avis` / `AvisInfo`)
 
