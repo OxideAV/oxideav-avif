@@ -26,7 +26,7 @@ still loses significant signal.
 |----------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `ftyp` brand check                     | accepts `avif` / `avis` / `mif1` / `msf1` / `miaf`                                                                                                         |
 | `meta` sub-boxes                       | `hdlr`, `pitm` (v0/v1), `iinf` (v0/v1) + `infe` (v2/v3), `iloc` (v0/v1/v2), `iref`, `iprp` / `ipco` / `ipma` (v0/v1, small + large property indices)       |
-| Item properties                        | `av1C`, `ispe`, `colr` (nclx + ICC), `pixi`, `pasp`, `irot`, `imir`, `clap`, `auxC`, `mdcv`, `clli`, `cclv`, `rloc`, `lsel`, `a1op`, `a1lx`; unknown boxes retained as `Property::Other` so indices stay valid |
+| Item properties                        | `av1C`, `ispe`, `colr` (nclx + ICC), `pixi`, `pasp`, `irot`, `imir`, `clap`, `auxC`, `mdcv`, `clli`, `cclv`, `rloc`, `lsel`, `a1op`, `a1lx`, `iscl` (HEIF §6.5.13 image scaling — four u16 ratio fields + `Iscl::is_well_formed` + `Iscl::scaled_dims`), `rref` (HEIF §6.5.17 required reference types — typed `Vec<BoxType>` + `Rref::{count, requires}`); unknown boxes retained as `Property::Other` so indices stay valid |
 | Sample Transform (`sato`)              | descriptor parser + per-sample evaluator for av1-avif §4.2.3 — full operator table (negation/abs/not/bsr unary + sum/difference/product/quotient/and/or/xor/pow/min/max binary), all 4 bit-depth widths (8/16/32/64-bit intermediate), every spec assertion enforced (`token_count >= 1`, sample index ≤ `reference_count`, postfix order, stack discipline, single-element terminal stack, reserved-token rejection); composition into a reconstructed image deferred until oxideav-av1 ships a decoder |
 | Tone Map (`tmap`)                      | item-type four-CC detection + `AvifInfo::tmap_item_ids` enumeration + av1-avif §4.2.2 `should`-level compliance audit (`audit_tone_map` / `ToneMapCompliance`): `altr` group pairs the tmap with its base item; gain-map inputs (`dimg to_ids[1..]`) flagged hidden via `infe` flags low bit; aggregate via `AvifInfo::tone_map_compliance` / `tone_map_strict_compliant()`. **`tmap` descriptor body parse** lands via `GainMapMetadata::parse` (ISO 21496-1:2025 Annex C.2): `GainMapVersion` + flags (`is_multichannel` → 1 or 3 R/G/B channels, `use_base_colour_space`), base/alternate HDR headroom, and per-channel `GainMapChannel` rationals (min/max/gamma/base+alternate offset). Enforces every §5.2 / Annex C.2.3 `shall` (non-zero denominators, non-zero `gamma_numerator`, `writer_version ≥ minimum_version`, per-channel `gain_map_max ≥ gain_map_min` per §5.2.5.3 — value-comparison via cross-multiplied i64 so `max == min` is permitted, `alternate_hdr_headroom ≠ base_hdr_headroom` per §5.2.7 — also value-comparison so e.g. `1/1` and `2/2` trip the check), returns `Unsupported` for an unknown `minimum_version`, and ignores trailing padding / future-optional bytes. One-call extractor `gain_map_metadata(file, tmap_item_id)` resolves a tmap item's `iloc` payload and runs the parse, mirroring the existing `item_payload_bytes` accessor pattern |
 | AV1 layered properties (`a1op`/`a1lx`) | `a1op` operating-point selector (u8 `op_index`) + `a1lx` layered-image index (`layer_size[3]`, 16/32-bit fields, `documented_layers()`) parsed per av1-avif §2.3.2; surfaced via `AvifInfo::{operating_point, layered_index}` |
@@ -44,7 +44,7 @@ still loses significant signal.
 | AV1 wrap pass-through                  | `av1C`-derived bit depth (8/10/12-bit), monochrome flag, and chroma subsampling `(x, y)` decoded and surfaced via `AvifInfo::{bit_depth, monochrome, chroma_subsampling}`; callers no longer need to re-parse `av1C` |
 | Sequence Header OBU audit (§2.1)       | av1-avif §2.1 `shall` "The AV1 Image Item Data shall have exactly one Sequence Header OBU" audited at the container layer via `audit_sequence_header_obu(meta, file)` / `SequenceHeaderObuAudit`. One record per `'av01'` item walks the OBU framing (AV1 §5.3.1 header byte + §4.10.5 leb128 `obu_size` + §6.2.1 `obu_type` table) and reports `sequence_header_count`, `total_obu_count`, plus structural failure flags (`missing_iloc` / `truncated_obu` / `has_size_field_zero`). Surfaced via `AvifInfo::sequence_header_obu_compliance` / `sequence_header_obu_strict_compliant()` |
 | Primary item data                      | resolved via `iloc` construction_method 0 (file offset); single-extent items return a zero-copy slice; multi-extent items are concatenated via `item_bytes_owned()` (HEIF §8.11.3.3) |
-| Grid primary items (HEIF §6.6.2)       | grid descriptor parse + per-tile decode via `dimg` iref + composite into the declared output rectangle; plus av1-avif §7 derivation-chain audit (`audit_grid_derivations` / `GridDerivationAudit`) flagging any `clap` / `irot` / `imir` attached to a tile in violation of the "transformative properties only on the grid item itself" `shall`. Surfaced via `AvifInfo::grid_derivation_compliance` / `grid_derivations_strict_compliant()` |
+| Grid primary items (HEIF §6.6.2)       | grid descriptor parse + per-tile decode via `dimg` iref + composite into the declared output rectangle; plus av1-avif §7 derivation-chain audit (`audit_grid_derivations` / `GridDerivationAudit`) flagging any `clap` / `irot` / `imir` / `iscl` attached to a tile in violation of the "transformative properties only on the grid item itself" `shall` — `rref` is descriptive and is not flagged. Surfaced via `AvifInfo::grid_derivation_compliance` / `grid_derivations_strict_compliant()` |
 | Alpha auxiliary                        | `auxl` + `auxC` URN detection, AV1-coded monochrome item decoded, composited onto the color frame (`Gray8 → YA8`, `Yuv → YuvA`); plus av1-avif §4.1 alpha-vs-master bit-depth `shall` audit (`audit_alpha_bit_depth` / `AlphaBitDepthAudit`) surfaced via `AvifInfo::alpha_bit_depth_compliance` / `alpha_bit_depth_strict_compliant()` |
 | Post-transforms                        | `clap` (centre crop) → `irot` (90/180/270°) → `imir` (horizontal/vertical), applied in that order per §6.5.10                                              |
 | AV1 hand-off                           | `av1C` plumbed through `CodecParameters::extradata`; primary-item OBU payload fed to `oxideav_av1::Av1Decoder`; frame returned through `AvifDecoder`       |
@@ -84,6 +84,91 @@ still loses significant signal.
 
 See `examples/diag_decode.rs` for a drop-in report of exactly which
 stage each input reaches.
+
+### Round 230 — HEIF §6.5.13 `iscl` + §6.5.17 `rref` item properties
+
+The r172 follow-up — "HEIF defines additional transformative properties
+(`'iscl'` image scaling, `'rref'` required reference) the audit doesn't
+yet flag" — lands as a two-property parse + a §7 audit extension. Both
+property bodies are taken straight from ISO/IEC 23008-12:2025 §6.5.13
+(ImageScaling) and §6.5.17 (RequiredReferenceTypesProperty); both are
+exposed as typed [`Property`] variants and dispatched through
+[`parse_ipco`] alongside the other recognised properties.
+
+```text
+parse_ipco(...) -> Vec<Property>
+    ... + Property::Iscl(Iscl) | Property::Rref(Rref)
+
+audit_grid_derivations(meta) -> Vec<GridDerivationAudit>
+    ... offenders now include (tile_id, 'iscl') as well as
+        (tile_id, 'clap' | 'irot' | 'imir')
+```
+
+`Iscl` carries the four `unsigned int(16)` fields verbatim
+(`target_width_numerator`, `target_width_denominator`,
+`target_height_numerator`, `target_height_denominator`). The §6.5.13.3
+non-zero-numerator-and-denominator `shall` is exposed as
+[`Iscl::is_well_formed`] (the parser surfaces the bytes as written so a
+file that ships a zero field still decodes — the semantic check sits on
+the type, matching the pattern used by the existing rational-bearing
+property parsers in this module). [`Iscl::scaled_dims`] folds the
+§6.5.13.1 formula — `ceil((input * numerator) / denominator)` — using
+u64 intermediate arithmetic so no `u16 × u32` product overflows, with
+the result saturating to `u32::MAX` if it would otherwise wrap.
+
+`Rref` carries the §6.5.17.2 list as a typed `Vec<BoxType>` (each
+`reference_type[i]` is a `u32` four-CC), plus convenience helpers
+[`Rref::count`] and [`Rref::requires`]. The `reference_type_count`
+field is captured implicitly as `reference_types.len()`. A declared
+count that exceeds the available body bytes is rejected at parse time
+(per §6.5.17 a reader that fails to honour every listed type `shall`
+refuse to process the associated item, so a partial read defeats the
+property's purpose).
+
+Both parsers reject unknown `version` values (per the spec's
+`version = 0` declaration in the syntax block); a future-version
+layout cannot be misread as v0.
+
+The av1-avif §7 grid-derivation audit was extended to flag `iscl` as a
+transformative property on tiles (HEIF §6.5.13 explicitly classifies
+it as a transformative item property). `rref` is descriptive and is
+therefore **not** flagged — the §7 `shall` is scoped to transformative
+properties only.
+
+Recognised `iscl` and `rref` essential associations no longer trip
+[`Meta::unsupported_essential_properties`] (the doc enumerates them
+alongside the previously-recognised `clap` / `irot` / `imir` / `lsel`
+/ `a1op` / `a1lx`).
+
+Test delta: +18 unit (`iscl_round_trip_reads_all_four_fields`,
+`iscl_rejects_truncated_body`, `iscl_rejects_unknown_version`,
+`iscl_is_well_formed_rejects_zero_field` covering each of the four
+fields, `iscl_scaled_dims_applies_ceil_division` with three ratio
+shapes including the identity 1:1 case,
+`iscl_scaled_dims_short_circuits_zero_denominator`,
+`iscl_scaled_dims_saturates_on_u32_overflow`,
+`iscl_dispatched_through_parse_ipco`,
+`rref_round_trip_reads_typed_four_ccs`, `rref_empty_list_parses`,
+`rref_rejects_truncated_table`, `rref_rejects_unknown_version`,
+`rref_rejects_missing_count`, `rref_dispatched_through_parse_ipco`,
+`iscl_and_rref_essential_associations_are_recognised`,
+`audit_grid_derivations_tile_iscl_flagged`,
+`audit_grid_derivations_tile_rref_not_flagged`,
+`audit_grid_derivations_grid_level_iscl_permitted`); the
+pre-existing `tile_with_all_three_kinds` test widened to
+`tile_with_all_four_kinds` to cover the new `iscl` kind without
+losing the original three-kind shape. Default lib 336 (was 318);
+standalone lib 321 (was 303); integration 61 + 1 ignored unchanged.
+
+Followup: the §4.1 alpha-bit-depth sequence-track audit (covering
+AVIS files with an alpha auxiliary stream, noted as a r206 / r224
+follow-up) is unchanged — it still needs [`AvisMeta`] to grow
+multi-track support before [`inspect_avis`] can surface an
+`alpha_bit_depth_compliance` field analogous to the still-image one.
+The §6.5.13 `iscl` transformative composition path (actually applying
+the scaling to the reconstructed image) is deferred — the property is
+now surfaced at the container layer, but the pixel-side scaler still
+needs to land in [`transform`].
 
 ### Round 224 — `mdhd` media-timescale plumb (ISO/IEC 14496-12 §8.4.2.2)
 

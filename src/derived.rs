@@ -1227,9 +1227,10 @@ pub struct GridDerivationAudit {
     /// grid; the audit still emits the record).
     pub tile_item_ids: Vec<u32>,
     /// `(tile_item_id, property_kind)` pairs where a tile carries a
-    /// transformative property (`'clap'` / `'irot'` / `'imir'`). One
-    /// entry per (tile, kind) — a tile that carries all three lands as
-    /// three entries. Empty when the grid is compliant.
+    /// transformative property (`'clap'` / `'irot'` / `'imir'` /
+    /// `'iscl'`). One entry per (tile, kind) — a tile that carries
+    /// all four lands as four entries. Empty when the grid is
+    /// compliant.
     pub offenders: Vec<(u32, BoxType)>,
 }
 
@@ -1259,11 +1260,11 @@ impl GridDerivationAudit {
 /// properties shall not be associated with items in a derivation chain
 /// that serves as an input to a grid derived image item." The
 /// transformative properties this crate recognises are `'clap'`
-/// (cropping), `'irot'` (rotation), and `'imir'` (mirroring) per HEIF
-/// §6.5.10 / §6.5.13. Other transformative properties defined in HEIF
-/// (e.g. `'iscl'`, `'rref'`) are not yet parsed here and so are not
-/// flagged; an explicit `Property::Other` association on a tile is
-/// surfaced by the existing
+/// (cropping, HEIF §6.5.5), `'irot'` (rotation, HEIF §6.5.10),
+/// `'imir'` (mirroring, HEIF §6.5.11), and `'iscl'` (image scaling,
+/// HEIF §6.5.13). `'rref'` is descriptive (not transformative) and
+/// is therefore not flagged; an explicit `Property::Other`
+/// association on a tile is surfaced by the existing
 /// [`crate::meta::Meta::unsupported_essential_properties`] path.
 pub fn audit_grid_derivations(meta: &crate::meta::Meta) -> Vec<GridDerivationAudit> {
     let grid_type = crate::parser::ITEM_TYPE_GRID;
@@ -1271,18 +1272,19 @@ pub fn audit_grid_derivations(meta: &crate::meta::Meta) -> Vec<GridDerivationAud
     let irot = b(b"irot");
     let imir = b(b"imir");
     let clap = b(b"clap");
+    let iscl = b(b"iscl");
     meta.item_ids_of_type(&grid_type)
         .into_iter()
         .map(|grid_id| {
             let tile_item_ids = meta.iref_targets(&dimg, grid_id);
             let mut offenders = Vec::new();
             for tile_id in &tile_item_ids {
-                // For each tile we check the three transformative property
+                // For each tile we check the four transformative property
                 // kinds explicitly so the output preserves a stable
-                // (clap, irot, imir) ordering per offending tile — easier
-                // for callers (and tests) to diff than association order,
-                // which depends on `ipma` writer choice.
-                for kind in [clap, irot, imir] {
+                // (clap, irot, imir, iscl) ordering per offending tile —
+                // easier for callers (and tests) to diff than association
+                // order, which depends on `ipma` writer choice.
+                for kind in [clap, irot, imir, iscl] {
                     if meta.property_for(*tile_id, &kind).is_some() {
                         offenders.push((*tile_id, kind));
                     }
@@ -2979,7 +2981,7 @@ mod tests {
     /// three offender entries in the stable `(clap, irot, imir)` order
     /// the audit produces.
     #[test]
-    fn audit_grid_derivations_tile_with_all_three_kinds() {
+    fn audit_grid_derivations_tile_with_all_four_kinds() {
         let meta = Meta {
             items: vec![make_infe(1, b"grid", 0), make_infe(2, b"av01", 0)],
             irefs: vec![IrefEntry {
@@ -2991,17 +2993,105 @@ mod tests {
                 Property::Clap(sample_clap()),
                 Property::Irot(Irot { angle: 1 }),
                 Property::Imir(Imir { axis: 0 }),
+                Property::Iscl(crate::meta::Iscl {
+                    target_width_numerator: 1,
+                    target_width_denominator: 2,
+                    target_height_numerator: 1,
+                    target_height_denominator: 2,
+                }),
             ],
-            associations: vec![assoc(2, &[0, 1, 2])],
+            associations: vec![assoc(2, &[0, 1, 2, 3])],
             ..Meta::default()
         };
         let r = &audit_grid_derivations(&meta)[0];
         assert_eq!(
             r.offenders,
-            vec![(2, *b"clap"), (2, *b"irot"), (2, *b"imir")]
+            vec![(2, *b"clap"), (2, *b"irot"), (2, *b"imir"), (2, *b"iscl"),]
         );
-        // Tile id is unique even though it offends three times.
+        // Tile id is unique even though it offends four times.
         assert_eq!(r.offending_tile_ids(), vec![2]);
+    }
+
+    /// HEIF §6.5.13 `'iscl'` is a transformative item property; av1-avif
+    /// §7 forbids any transformative property on a `'dimg'` input tile.
+    /// A solo `'iscl'` on a tile must surface as an offender.
+    #[test]
+    fn audit_grid_derivations_tile_iscl_flagged() {
+        let meta = Meta {
+            items: vec![
+                make_infe(1, b"grid", 0),
+                make_infe(2, b"av01", 0),
+                make_infe(3, b"av01", 0),
+            ],
+            irefs: vec![IrefEntry {
+                reference_type: *b"dimg",
+                from_id: 1,
+                to_ids: vec![2, 3],
+            }],
+            properties: vec![Property::Iscl(crate::meta::Iscl {
+                target_width_numerator: 1,
+                target_width_denominator: 2,
+                target_height_numerator: 1,
+                target_height_denominator: 2,
+            })],
+            // Only tile 2 carries the iscl; tile 3 is clean.
+            associations: vec![assoc(2, &[0])],
+            ..Meta::default()
+        };
+        let r = &audit_grid_derivations(&meta)[0];
+        assert!(!r.is_compliant());
+        assert_eq!(r.offenders, vec![(2, *b"iscl")]);
+        assert_eq!(r.offending_tile_ids(), vec![2]);
+    }
+
+    /// HEIF §6.5.17 `'rref'` is descriptive (not transformative). A
+    /// tile carrying `'rref'` must NOT be reported by the §7 audit —
+    /// the §7 `shall` is scoped to transformative properties only.
+    #[test]
+    fn audit_grid_derivations_tile_rref_not_flagged() {
+        let meta = Meta {
+            items: vec![make_infe(1, b"grid", 0), make_infe(2, b"av01", 0)],
+            irefs: vec![IrefEntry {
+                reference_type: *b"dimg",
+                from_id: 1,
+                to_ids: vec![2],
+            }],
+            properties: vec![Property::Rref(crate::meta::Rref {
+                reference_types: vec![*b"dimg"],
+            })],
+            associations: vec![assoc(2, &[0])],
+            ..Meta::default()
+        };
+        let r = &audit_grid_derivations(&meta)[0];
+        assert!(r.is_compliant());
+        assert!(r.offenders.is_empty());
+    }
+
+    /// An `'iscl'` on the grid item itself is explicitly permitted by
+    /// §7 ("transformations are only permitted on the grid item
+    /// itself"), so it must not surface as an offender.
+    #[test]
+    fn audit_grid_derivations_grid_level_iscl_permitted() {
+        let meta = Meta {
+            items: vec![make_infe(1, b"grid", 0), make_infe(2, b"av01", 0)],
+            irefs: vec![IrefEntry {
+                reference_type: *b"dimg",
+                from_id: 1,
+                to_ids: vec![2],
+            }],
+            properties: vec![Property::Iscl(crate::meta::Iscl {
+                target_width_numerator: 1,
+                target_width_denominator: 2,
+                target_height_numerator: 1,
+                target_height_denominator: 2,
+            })],
+            // Iscl associated with the grid (id 1), tile 2 clean.
+            associations: vec![assoc(1, &[0])],
+            ..Meta::default()
+        };
+        let r = &audit_grid_derivations(&meta)[0];
+        assert!(r.is_compliant());
+        assert!(r.offenders.is_empty());
     }
 
     /// Two tiles offending in different ways. Both surface; the unique

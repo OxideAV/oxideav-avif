@@ -65,6 +65,10 @@ const LSEL: BoxType = b(b"lsel");
 const A1OP: BoxType = b(b"a1op");
 /// av1-avif §2.3.2.3 — AV1 Layered Image Indexing property.
 const A1LX: BoxType = b(b"a1lx");
+/// HEIF §6.5.13 — Image Scaling transformative property.
+const ISCL: BoxType = b(b"iscl");
+/// HEIF §6.5.17 — Required Reference Types descriptive property.
+const RREF: BoxType = b(b"rref");
 
 /// HEIF §6.6.2.2 — image overlay derived-image type.
 pub const ITEM_TYPE_IOVL: BoxType = b(b"iovl");
@@ -489,6 +493,142 @@ pub struct Cclv {
     pub max_pic_average_light_level: u16,
 }
 
+/// Image Scaling transformative property (`iscl`) — HEIF §6.5.13.
+///
+/// Scales an input image by independent horizontal and vertical
+/// rational factors. The input image is the output of the previous
+/// transformative item property, if any, or the reconstructed image
+/// of the associated image item. The target dimensions are computed
+/// as `ceil((input_width * target_width_numerator) /
+/// target_width_denominator)` and the parallel formula for height
+/// (the spec is explicit that the division is floating-point and
+/// the result is then ceiled — see HEIF §6.5.13.1 NOTE 1).
+///
+/// Spec: ISO/IEC 23008-12 §6.5.13.2 — FullBox(`iscl`, version=0,
+/// flags=0) carrying four big-endian `unsigned int(16)` fields:
+///
+/// ```text
+/// unsigned int(16) target_width_numerator;
+/// unsigned int(16) target_width_denominator;
+/// unsigned int(16) target_height_numerator;
+/// unsigned int(16) target_height_denominator;
+/// ```
+///
+/// Per §6.5.13.3 every numerator and denominator `shall` be non-zero;
+/// the parser surfaces the raw values and a separate
+/// [`Iscl::is_well_formed`] helper exposes the §6.5.13.3 check
+/// without conflating "syntactically parseable" with "semantically
+/// valid" — both are useful signals at distinct layers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Iscl {
+    /// Numerator of the horizontal scaling ratio.
+    pub target_width_numerator: u16,
+    /// Denominator of the horizontal scaling ratio.
+    pub target_width_denominator: u16,
+    /// Numerator of the vertical scaling ratio.
+    pub target_height_numerator: u16,
+    /// Denominator of the vertical scaling ratio.
+    pub target_height_denominator: u16,
+}
+
+impl Iscl {
+    /// True when every numerator and denominator is non-zero (the
+    /// §6.5.13.3 `shall`). A property that parses with a zero
+    /// field is malformed per spec; callers can route to a strict
+    /// rejection path.
+    pub fn is_well_formed(&self) -> bool {
+        self.target_width_numerator != 0
+            && self.target_width_denominator != 0
+            && self.target_height_numerator != 0
+            && self.target_height_denominator != 0
+    }
+
+    /// Compute the scaled output dimensions for an input of
+    /// `(input_width, input_height)` per the HEIF §6.5.13.1
+    /// formula: `ceil((input * numerator) / denominator)`. Returns
+    /// `None` when either denominator is zero (avoids dividing by
+    /// zero); callers wanting strict §6.5.13.3 enforcement should
+    /// gate on [`Iscl::is_well_formed`] first.
+    ///
+    /// The arithmetic is carried out in `u64` so the intermediate
+    /// `input * numerator` cannot overflow for any pair of `u32`
+    /// input dimension and `u16` numerator.
+    pub fn scaled_dims(&self, input_width: u32, input_height: u32) -> Option<(u32, u32)> {
+        if self.target_width_denominator == 0 || self.target_height_denominator == 0 {
+            return None;
+        }
+        let w = div_ceil_u64(
+            u64::from(input_width) * u64::from(self.target_width_numerator),
+            u64::from(self.target_width_denominator),
+        );
+        let h = div_ceil_u64(
+            u64::from(input_height) * u64::from(self.target_height_numerator),
+            u64::from(self.target_height_denominator),
+        );
+        // The scaled dimensions can legally exceed `u32::MAX` only if
+        // the writer picked extreme numerators; saturate so the helper
+        // never panics.
+        Some((
+            u32::try_from(w).unwrap_or(u32::MAX),
+            u32::try_from(h).unwrap_or(u32::MAX),
+        ))
+    }
+}
+
+#[inline]
+fn div_ceil_u64(n: u64, d: u64) -> u64 {
+    // d != 0 enforced at the only call site; defensively guard anyway.
+    if d == 0 {
+        return 0;
+    }
+    n / d + u64::from(n % d != 0)
+}
+
+/// Required Reference Types descriptive property (`rref`) —
+/// HEIF §6.5.17.
+///
+/// Lists the item reference (`iref`) types a reader `shall`
+/// understand and process to decode the associated image item. Per
+/// §6.5.17.1 the property is mandatory on a predictively coded
+/// image item and forbidden as an essential-bit "downgrade" — the
+/// associated `essential` flag in the `ipma` association `shall`
+/// equal `1`, so a reader that doesn't recognise every listed
+/// `iref` type must refuse to process the item.
+///
+/// Spec: ISO/IEC 23008-12 §6.5.17.2 — FullBox(`rref`, version=0,
+/// flags=0):
+///
+/// ```text
+/// unsigned int(8) reference_type_count;
+/// for (i=0; i< reference_type_count; i++) {
+///     unsigned int(32) reference_type[i];
+/// }
+/// ```
+///
+/// Each `reference_type[i]` is a four-CC carried as a big-endian
+/// `u32`; the four ASCII bytes (high → low byte order) form the
+/// `BoxType` of the required iref category.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Rref {
+    /// The list of required `iref` four-CCs in declaration order.
+    /// The §6.5.17.2 `reference_type_count` is captured implicitly
+    /// as `reference_types.len()`.
+    pub reference_types: Vec<BoxType>,
+}
+
+impl Rref {
+    /// Number of declared required reference types — equivalent to
+    /// `reference_types.len()`.
+    pub fn count(&self) -> usize {
+        self.reference_types.len()
+    }
+
+    /// True when `four_cc` appears in the declared list.
+    pub fn requires(&self, four_cc: &BoxType) -> bool {
+        self.reference_types.iter().any(|t| t == four_cc)
+    }
+}
+
 /// One property box, kept typed for the boxes AVIF cares about + a raw
 /// fallback so an unknown property still gets an index for association.
 #[derive(Clone, Debug)]
@@ -516,6 +656,10 @@ pub enum Property {
     A1op(A1op),
     /// AV1 layered-image indexing property (av1-avif §2.3.2.3).
     A1lx(A1lx),
+    /// Image-scaling transformative property (HEIF §6.5.13).
+    Iscl(Iscl),
+    /// Required-reference-types descriptive property (HEIF §6.5.17).
+    Rref(Rref),
     Other(BoxType, Vec<u8>),
 }
 
@@ -538,6 +682,8 @@ impl Property {
             Property::Lsel(_) => LSEL,
             Property::A1op(_) => A1OP,
             Property::A1lx(_) => A1LX,
+            Property::Iscl(_) => ISCL,
+            Property::Rref(_) => RREF,
             Property::Other(t, _) => *t,
         }
     }
@@ -705,8 +851,8 @@ impl Meta {
     ///
     /// `a1lx` is treated as recognised even when its bytes are not acted
     /// upon, because the spec forbids marking it essential; a `clap`,
-    /// `irot`, `imir`, `lsel`, `a1op`, etc. that we parse counts as
-    /// recognised regardless of the essential bit.
+    /// `irot`, `imir`, `lsel`, `a1op`, `iscl`, `rref`, etc. that we
+    /// parse counts as recognised regardless of the essential bit.
     pub fn unsupported_essential_properties(&self, item_id: u32) -> Vec<BoxType> {
         let Some(assoc) = self.assoc_by_id(item_id) else {
             return Vec::new();
@@ -1036,6 +1182,8 @@ fn parse_ipco(payload: &[u8]) -> Result<Vec<Property>> {
             x if x == &LSEL => Property::Lsel(parse_lsel(body)?),
             x if x == &A1OP => Property::A1op(parse_a1op(body)?),
             x if x == &A1LX => Property::A1lx(parse_a1lx(body)?),
+            x if x == &ISCL => Property::Iscl(parse_iscl(body)?),
+            x if x == &RREF => Property::Rref(parse_rref(body)?),
             other => Property::Other(*other, body.to_vec()),
         };
         out.push(prop);
@@ -1292,6 +1440,90 @@ fn parse_a1lx(body: &[u8]) -> Result<A1lx> {
         large_size,
         layer_size,
     })
+}
+
+/// Parse `iscl` (ImageScaling — HEIF §6.5.13). FullBox(`iscl`,
+/// version=0, flags=0) followed by four big-endian
+/// `unsigned int(16)` fields totalling 8 bytes:
+///
+/// ```text
+/// unsigned int(16) target_width_numerator;
+/// unsigned int(16) target_width_denominator;
+/// unsigned int(16) target_height_numerator;
+/// unsigned int(16) target_height_denominator;
+/// ```
+///
+/// The §6.5.13.3 `shall` that every numerator and denominator be
+/// non-zero is not enforced at parse time — the parser surfaces
+/// the bytes as written and the caller routes to
+/// [`Iscl::is_well_formed`] for the §6.5.13.3 check. This keeps the
+/// "did the bytes decode" and "did they satisfy the normative
+/// constraint" signals separate, matching the pattern used by the
+/// other HEIF property parsers in this module.
+///
+/// An unknown `version` is rejected so a future v1 layout never
+/// gets misread as v0.
+fn parse_iscl(body: &[u8]) -> Result<Iscl> {
+    let (version, _flags, rest) = parse_full_box(body)?;
+    if version != 0 {
+        return Err(Error::invalid(format!("avif: iscl version {version} != 0")));
+    }
+    if rest.len() < 8 {
+        return Err(Error::invalid(format!(
+            "avif: iscl too short ({} < 8)",
+            rest.len()
+        )));
+    }
+    Ok(Iscl {
+        target_width_numerator: read_u16(rest, 0)?,
+        target_width_denominator: read_u16(rest, 2)?,
+        target_height_numerator: read_u16(rest, 4)?,
+        target_height_denominator: read_u16(rest, 6)?,
+    })
+}
+
+/// Parse `rref` (RequiredReferenceTypesProperty — HEIF §6.5.17).
+/// FullBox(`rref`, version=0, flags=0) followed by:
+///
+/// ```text
+/// unsigned int(8) reference_type_count;
+/// for (i=0; i< reference_type_count; i++) {
+///     unsigned int(32) reference_type[i];
+/// }
+/// ```
+///
+/// A declared `reference_type_count` that exceeds the available
+/// body bytes returns an error rather than silently truncating —
+/// per §6.5.17 a reader that fails to honour every listed type
+/// `shall` refuse to process the associated item, so a partial
+/// read would defeat the property's purpose.
+///
+/// An unknown `version` is rejected so a future-version layout
+/// can't be misread.
+fn parse_rref(body: &[u8]) -> Result<Rref> {
+    let (version, _flags, rest) = parse_full_box(body)?;
+    if version != 0 {
+        return Err(Error::invalid(format!("avif: rref version {version} != 0")));
+    }
+    if rest.is_empty() {
+        return Err(Error::invalid("avif: rref too short (0 < 1)"));
+    }
+    let count = rest[0] as usize;
+    let need = 1 + count * 4;
+    if rest.len() < need {
+        return Err(Error::invalid(format!(
+            "avif: rref reference_type table truncated ({} < {need})",
+            rest.len()
+        )));
+    }
+    let mut reference_types = Vec::with_capacity(count);
+    for i in 0..count {
+        let at = 1 + i * 4;
+        let mut t = [0u8; 4];
+        t.copy_from_slice(&rest[at..at + 4]);
+        reference_types.push(t);
+    }
+    Ok(Rref { reference_types })
 }
 
 /// Parse an `iref` box: FullBox header followed by a sequence of typed
@@ -2112,5 +2344,237 @@ mod tests {
             ..Meta::default()
         };
         assert!(m.has_unsupported_essential_property(1));
+    }
+
+    // -----------------------------------------------------------------
+    // HEIF §6.5.13 ImageScaling (`iscl`) — parse + helpers
+    // -----------------------------------------------------------------
+
+    fn iscl_body(wn: u16, wd: u16, hn: u16, hd: u16) -> Vec<u8> {
+        // FullBox(v=0, f=0) + four u16 fields.
+        let mut buf = vec![0u8; 4];
+        buf.extend_from_slice(&wn.to_be_bytes());
+        buf.extend_from_slice(&wd.to_be_bytes());
+        buf.extend_from_slice(&hn.to_be_bytes());
+        buf.extend_from_slice(&hd.to_be_bytes());
+        buf
+    }
+
+    #[test]
+    fn iscl_round_trip_reads_all_four_fields() {
+        let buf = iscl_body(3, 2, 5, 4);
+        let s = parse_iscl(&buf).unwrap();
+        assert_eq!(s.target_width_numerator, 3);
+        assert_eq!(s.target_width_denominator, 2);
+        assert_eq!(s.target_height_numerator, 5);
+        assert_eq!(s.target_height_denominator, 4);
+        assert!(s.is_well_formed());
+    }
+
+    #[test]
+    fn iscl_rejects_truncated_body() {
+        // FullBox header present but only 7 of the 8 body bytes.
+        let mut buf = vec![0u8; 4];
+        buf.extend_from_slice(&[0, 1, 0, 1, 0, 1, 0]);
+        assert!(parse_iscl(&buf).is_err());
+    }
+
+    #[test]
+    fn iscl_rejects_unknown_version() {
+        let mut buf = vec![1u8, 0, 0, 0]; // version=1, flags=0
+        buf.extend_from_slice(&iscl_body(1, 1, 1, 1)[4..]);
+        assert!(parse_iscl(&buf).is_err());
+    }
+
+    #[test]
+    fn iscl_is_well_formed_rejects_zero_field() {
+        // Parser surfaces the bytes; the semantic check sits on the type.
+        let s = parse_iscl(&iscl_body(0, 2, 5, 4)).unwrap();
+        assert!(!s.is_well_formed());
+        let s = parse_iscl(&iscl_body(3, 0, 5, 4)).unwrap();
+        assert!(!s.is_well_formed());
+        let s = parse_iscl(&iscl_body(3, 2, 0, 4)).unwrap();
+        assert!(!s.is_well_formed());
+        let s = parse_iscl(&iscl_body(3, 2, 5, 0)).unwrap();
+        assert!(!s.is_well_formed());
+    }
+
+    #[test]
+    fn iscl_scaled_dims_applies_ceil_division() {
+        // 100 × 3 / 2 = 150 (exact)
+        // 100 × 5 / 4 = 125 (exact)
+        let s = parse_iscl(&iscl_body(3, 2, 5, 4)).unwrap();
+        assert_eq!(s.scaled_dims(100, 100), Some((150, 125)));
+
+        // ceil((100 * 1) / 3) = ceil(33.33...) = 34
+        // ceil((100 * 1) / 7) = ceil(14.28...) = 15
+        let s = parse_iscl(&iscl_body(1, 3, 1, 7)).unwrap();
+        assert_eq!(s.scaled_dims(100, 100), Some((34, 15)));
+
+        // 1:1 → identity
+        let s = parse_iscl(&iscl_body(1, 1, 1, 1)).unwrap();
+        assert_eq!(s.scaled_dims(640, 480), Some((640, 480)));
+    }
+
+    #[test]
+    fn iscl_scaled_dims_short_circuits_zero_denominator() {
+        // Parser allows zero; the helper guards.
+        let s = parse_iscl(&iscl_body(1, 0, 1, 1)).unwrap();
+        assert_eq!(s.scaled_dims(100, 100), None);
+        let s = parse_iscl(&iscl_body(1, 1, 1, 0)).unwrap();
+        assert_eq!(s.scaled_dims(100, 100), None);
+    }
+
+    #[test]
+    fn iscl_scaled_dims_saturates_on_u32_overflow() {
+        // Numerator = max u16, denominator = 1, input = max u32 → product
+        // overflows u32 but is well within u64; the saturating cast on
+        // the back end keeps the helper total.
+        let s = parse_iscl(&iscl_body(u16::MAX, 1, u16::MAX, 1)).unwrap();
+        let dims = s.scaled_dims(u32::MAX, u32::MAX).unwrap();
+        assert_eq!(dims, (u32::MAX, u32::MAX));
+    }
+
+    #[test]
+    fn iscl_dispatched_through_parse_ipco() {
+        // Wrap an iscl property in a single-property ipco container and
+        // confirm the dispatch produces `Property::Iscl`.
+        let body = iscl_body(7, 5, 11, 3);
+        let mut ipco = Vec::new();
+        let s = 8 + body.len() as u32;
+        ipco.extend_from_slice(&s.to_be_bytes());
+        ipco.extend_from_slice(b"iscl");
+        ipco.extend_from_slice(&body);
+        let props = parse_ipco(&ipco).unwrap();
+        assert_eq!(props.len(), 1);
+        match &props[0] {
+            Property::Iscl(s) => {
+                assert_eq!(s.target_width_numerator, 7);
+                assert_eq!(s.target_height_denominator, 3);
+            }
+            other => panic!("expected Iscl, got {other:?}"),
+        }
+        assert_eq!(props[0].kind(), *b"iscl");
+    }
+
+    // -----------------------------------------------------------------
+    // HEIF §6.5.17 RequiredReferenceTypesProperty (`rref`) — parse + helpers
+    // -----------------------------------------------------------------
+
+    fn rref_body(types: &[&[u8; 4]]) -> Vec<u8> {
+        // FullBox(v=0, f=0) + u8 count + N u32 four-CCs.
+        let mut buf = vec![0u8; 4];
+        buf.push(types.len() as u8);
+        for t in types {
+            buf.extend_from_slice(&t[..]);
+        }
+        buf
+    }
+
+    #[test]
+    fn rref_round_trip_reads_typed_four_ccs() {
+        let buf = rref_body(&[b"dimg", b"auxl", b"thmb"]);
+        let r = parse_rref(&buf).unwrap();
+        assert_eq!(r.count(), 3);
+        assert_eq!(r.reference_types[0], *b"dimg");
+        assert_eq!(r.reference_types[1], *b"auxl");
+        assert_eq!(r.reference_types[2], *b"thmb");
+        assert!(r.requires(&b(b"dimg")));
+        assert!(r.requires(&b(b"thmb")));
+        assert!(!r.requires(&b(b"pred")));
+    }
+
+    #[test]
+    fn rref_empty_list_parses() {
+        // reference_type_count = 0 → no four-CC follows. Empty list is
+        // syntactically valid even if §6.5.17 expects at least one type
+        // on a predictively coded image item — the parser accepts and
+        // the count helper reports zero.
+        let buf = rref_body(&[]);
+        let r = parse_rref(&buf).unwrap();
+        assert_eq!(r.count(), 0);
+        assert!(!r.requires(&b(b"dimg")));
+    }
+
+    #[test]
+    fn rref_rejects_truncated_table() {
+        // Declares 2 types but only ships one full four-CC + 2 bytes.
+        let mut buf = vec![0u8; 4];
+        buf.push(2);
+        buf.extend_from_slice(b"dimg");
+        buf.extend_from_slice(&[0x00, 0x00]); // 2 of the 4 bytes of the next type
+        assert!(parse_rref(&buf).is_err());
+    }
+
+    #[test]
+    fn rref_rejects_unknown_version() {
+        let mut buf = vec![1u8, 0, 0, 0]; // version=1, flags=0
+        buf.push(0);
+        assert!(parse_rref(&buf).is_err());
+    }
+
+    #[test]
+    fn rref_rejects_missing_count() {
+        // FullBox header only — no `reference_type_count` byte.
+        let buf = vec![0u8; 4];
+        assert!(parse_rref(&buf).is_err());
+    }
+
+    #[test]
+    fn rref_dispatched_through_parse_ipco() {
+        // Wrap an rref property in a single-property ipco container.
+        let body = rref_body(&[b"dimg"]);
+        let mut ipco = Vec::new();
+        let s = 8 + body.len() as u32;
+        ipco.extend_from_slice(&s.to_be_bytes());
+        ipco.extend_from_slice(b"rref");
+        ipco.extend_from_slice(&body);
+        let props = parse_ipco(&ipco).unwrap();
+        assert_eq!(props.len(), 1);
+        match &props[0] {
+            Property::Rref(r) => {
+                assert_eq!(r.count(), 1);
+                assert_eq!(r.reference_types[0], *b"dimg");
+            }
+            other => panic!("expected Rref, got {other:?}"),
+        }
+        assert_eq!(props[0].kind(), *b"rref");
+    }
+
+    /// Recognised `iscl` and `rref` properties — even when flagged
+    /// essential — do **not** trip
+    /// [`Meta::unsupported_essential_properties`]; only
+    /// [`Property::Other`] essential associations should be reported.
+    #[test]
+    fn iscl_and_rref_essential_associations_are_recognised() {
+        let m = Meta {
+            properties: vec![
+                Property::Iscl(Iscl {
+                    target_width_numerator: 1,
+                    target_width_denominator: 1,
+                    target_height_numerator: 1,
+                    target_height_denominator: 1,
+                }),
+                Property::Rref(Rref {
+                    reference_types: vec![*b"dimg"],
+                }),
+            ],
+            associations: vec![ItemPropertyAssociation {
+                item_id: 1,
+                entries: vec![
+                    PropertyAssociation {
+                        index: 0,
+                        essential: true,
+                    },
+                    PropertyAssociation {
+                        index: 1,
+                        essential: true,
+                    },
+                ],
+            }],
+            ..Meta::default()
+        };
+        assert!(!m.has_unsupported_essential_property(1));
+        assert!(m.unsupported_essential_properties(1).is_empty());
     }
 }

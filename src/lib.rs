@@ -124,8 +124,8 @@ pub use grid::{composite_grid, ImageGrid};
 pub use image::{AvifFrame, AvifPixelFormat, AvifPlane};
 pub use inspect::{gain_map_metadata, inspect, item_payload_bytes, transforms_for, AvifInfo};
 pub use meta::{
-    A1lx, A1op, AuxC, AuxKind, Cclv, Clap, Clli, Colr, Imir, IrefEntry, Irot, Ispe, ItemInfo,
-    ItemLocation, Lsel, Mdcv, Meta, Pasp, Pixi, Property, Rloc, AUX_URN_ALPHA_HEVC,
+    A1lx, A1op, AuxC, AuxKind, Cclv, Clap, Clli, Colr, Imir, IrefEntry, Irot, Iscl, Ispe, ItemInfo,
+    ItemLocation, Lsel, Mdcv, Meta, Pasp, Pixi, Property, Rloc, Rref, AUX_URN_ALPHA_HEVC,
     AUX_URN_ALPHA_MPEG, AUX_URN_DEPTH_HEVC, AUX_URN_DEPTH_MPEG, AUX_URN_HDR_GAINMAP,
     ITEM_TYPE_EXIF, ITEM_TYPE_IDEN, ITEM_TYPE_IOVL, ITEM_TYPE_MIME, ITEM_TYPE_SATO, ITEM_TYPE_TMAP,
     ITEM_TYPE_URI,

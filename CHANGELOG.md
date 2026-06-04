@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- ISO/IEC 23008-12 §6.5.13 ImageScaling (`iscl`) + §6.5.17
+  RequiredReferenceTypesProperty (`rref`) item-property parsers + §7
+  grid-derivation audit extension. The two property bodies join the
+  existing typed-property dispatch in `parse_ipco`:
+  `Property::Iscl(Iscl)` holds the four §6.5.13.2 `unsigned int(16)`
+  ratio fields (`target_width_numerator`, `target_width_denominator`,
+  `target_height_numerator`, `target_height_denominator`);
+  `Property::Rref(Rref)` holds the §6.5.17.2 list as a typed
+  `Vec<BoxType>` (each `reference_type[i]` is a u32 four-CC). Helpers:
+  `Iscl::is_well_formed` exposes the §6.5.13.3 non-zero-everywhere
+  `shall` (separated from the parse-time check so a malformed file
+  still decodes structurally); `Iscl::scaled_dims(input_width,
+  input_height)` folds the §6.5.13.1 formula
+  `ceil((input * numerator) / denominator)` in u64 with saturating
+  conversion back to u32 (returns `None` when either denominator is
+  zero); `Rref::count` mirrors `reference_types.len()`;
+  `Rref::requires(four_cc)` is a one-call membership check. Both
+  parsers reject unknown `version` values (per the spec's
+  `version = 0` declaration). The av1-avif §7 grid-derivation audit
+  was extended to flag `iscl` as a transformative property on `dimg`
+  input tiles (HEIF §6.5.13 explicitly classifies it as
+  transformative); `rref` is descriptive and is **not** flagged.
+  Recognised `iscl` and `rref` essential associations no longer trip
+  `Meta::unsupported_essential_properties`. Coverage: +18 unit (iscl
+  round-trip, truncated-body / unknown-version / zero-field-per-axis
+  rejection paths, scaled_dims with three ratio shapes including
+  identity, zero-denominator short-circuit, u32-overflow saturation,
+  ipco dispatch; rref round-trip with three typed four-CCs, empty
+  list, truncated-table / unknown-version / missing-count rejection,
+  ipco dispatch; essential-association recognition for both kinds;
+  §7 audit flagging an iscl on a tile, NOT flagging an rref on a
+  tile, NOT flagging an iscl on the grid item itself). The
+  pre-existing `tile_with_all_three_kinds` audit test widened to
+  `tile_with_all_four_kinds` to cover the new `iscl` kind without
+  losing the original three-kind shape. Re-exports:
+  `oxideav_avif::{Iscl, Rref}`. Resolves the r172 follow-up "HEIF
+  defines additional transformative properties (`'iscl'` image
+  scaling, `'rref'` required reference) the audit doesn't yet flag".
+
 - ISO/IEC 14496-12 §8.4.2.2 `mdhd` media-timescale plumb. `AvisMeta`
   grows one field — `media_timescale: Option<u32>` — populated by
   `parse_avis` from the first track's `mdia/mdhd` (the FullBox's
