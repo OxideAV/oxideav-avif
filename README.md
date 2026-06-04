@@ -26,7 +26,7 @@ still loses significant signal.
 |----------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `ftyp` brand check                     | accepts `avif` / `avis` / `mif1` / `msf1` / `miaf`                                                                                                         |
 | `meta` sub-boxes                       | `hdlr`, `pitm` (v0/v1), `iinf` (v0/v1) + `infe` (v2/v3), `iloc` (v0/v1/v2), `iref`, `iprp` / `ipco` / `ipma` (v0/v1, small + large property indices)       |
-| Item properties                        | `av1C`, `ispe`, `colr` (nclx + ICC), `pixi`, `pasp`, `irot`, `imir`, `clap`, `auxC`, `mdcv`, `clli`, `cclv`, `rloc`, `lsel`, `a1op`, `a1lx`, `iscl` (HEIF §6.5.13 image scaling — four u16 ratio fields + `Iscl::is_well_formed` + `Iscl::scaled_dims`), `rref` (HEIF §6.5.17 required reference types — typed `Vec<BoxType>` + `Rref::{count, requires}`); unknown boxes retained as `Property::Other` so indices stay valid |
+| Item properties                        | `av1C`, `ispe`, `colr` (nclx + ICC), `pixi`, `pasp`, `irot`, `imir`, `clap`, `auxC`, `mdcv`, `clli`, `cclv`, `rloc`, `lsel`, `a1op`, `a1lx`, `iscl` (HEIF §6.5.13 image scaling — four u16 ratio fields + `Iscl::is_well_formed` + `Iscl::scaled_dims`), `rref` (HEIF §6.5.17 required reference types — typed `Vec<BoxType>` + `Rref::{count, requires}`), `crtt` (HEIF §6.5.18 creation time — u64 microseconds since 1904-01-01 UTC + `Crtt::{seconds_since_unix_epoch, subsecond_micros}`); unknown boxes retained as `Property::Other` so indices stay valid |
 | Sample Transform (`sato`)              | descriptor parser + per-sample evaluator for av1-avif §4.2.3 — full operator table (negation/abs/not/bsr unary + sum/difference/product/quotient/and/or/xor/pow/min/max binary), all 4 bit-depth widths (8/16/32/64-bit intermediate), every spec assertion enforced (`token_count >= 1`, sample index ≤ `reference_count`, postfix order, stack discipline, single-element terminal stack, reserved-token rejection); composition into a reconstructed image deferred until oxideav-av1 ships a decoder |
 | Tone Map (`tmap`)                      | item-type four-CC detection + `AvifInfo::tmap_item_ids` enumeration + av1-avif §4.2.2 `should`-level compliance audit (`audit_tone_map` / `ToneMapCompliance`): `altr` group pairs the tmap with its base item; gain-map inputs (`dimg to_ids[1..]`) flagged hidden via `infe` flags low bit; aggregate via `AvifInfo::tone_map_compliance` / `tone_map_strict_compliant()`. **`tmap` descriptor body parse** lands via `GainMapMetadata::parse` (ISO 21496-1:2025 Annex C.2): `GainMapVersion` + flags (`is_multichannel` → 1 or 3 R/G/B channels, `use_base_colour_space`), base/alternate HDR headroom, and per-channel `GainMapChannel` rationals (min/max/gamma/base+alternate offset). Enforces every §5.2 / Annex C.2.3 `shall` (non-zero denominators, non-zero `gamma_numerator`, `writer_version ≥ minimum_version`, per-channel `gain_map_max ≥ gain_map_min` per §5.2.5.3 — value-comparison via cross-multiplied i64 so `max == min` is permitted, `alternate_hdr_headroom ≠ base_hdr_headroom` per §5.2.7 — also value-comparison so e.g. `1/1` and `2/2` trip the check), returns `Unsupported` for an unknown `minimum_version`, and ignores trailing padding / future-optional bytes. One-call extractor `gain_map_metadata(file, tmap_item_id)` resolves a tmap item's `iloc` payload and runs the parse, mirroring the existing `item_payload_bytes` accessor pattern |
 | AV1 layered properties (`a1op`/`a1lx`) | `a1op` operating-point selector (u8 `op_index`) + `a1lx` layered-image index (`layer_size[3]`, 16/32-bit fields, `documented_layers()`) parsed per av1-avif §2.3.2; surfaced via `AvifInfo::{operating_point, layered_index}` |
@@ -84,6 +84,66 @@ still loses significant signal.
 
 See `examples/diag_decode.rs` for a drop-in report of exactly which
 stage each input reaches.
+
+### Round 233 — HEIF §6.5.18 `crtt` creation-time item property
+
+The HEIF item-properties rollout continues with §6.5.18
+CreationTimeProperty, a descriptive item property documenting the
+creation time of the associated item or entity group. The body shape
+is taken verbatim from ISO/IEC 23008-12:2025 §6.5.18.2 — a
+FullBox(`crtt`, version=0, flags=0) carrying a single
+`unsigned int(64) creation_time` field — and the time unit is
+microseconds since midnight, Jan. 1, 1904 UTC per §6.5.18.3.
+
+```text
+parse_ipco(...) -> Vec<Property>
+    ... + Property::Crtt(Crtt { creation_time: u64 })
+
+Crtt::seconds_since_unix_epoch() -> Option<u64>
+Crtt::subsecond_micros()         -> u32
+```
+
+The 1904 epoch matches the legacy QuickTime / ISOBMFF movie-header
+epoch (ISO/IEC 14496-12 §8.2.2), but the §6.5.18 unit is
+*microseconds* rather than the *seconds* used by `mvhd` / `tkhd` /
+`mdhd`, so a reader comparing this property against an AVIS track
+timestamp must scale by `10^6` in the appropriate direction. The
+1904→1970 offset is `2_082_844_800` seconds (66 calendar years × 365
+days + 17 leap-year days × 86 400 s/day), captured as a single
+module-level constant for direct inspection. `seconds_since_unix_epoch`
+returns `None` for a pre-1970 timestamp (the `u64` field cannot
+represent a signed offset, so the helper avoids underflow by
+returning the option rather than wrapping into a nonsense future
+date).
+
+The parser rejects unknown `version` values so a future-version
+layout cannot be misread as v0, and a body shorter than the 8-byte
+`creation_time` field is rejected at parse time rather than silently
+zero-extended.
+
+A recognised `crtt` property — even when unusually flagged essential
+in the `ipma` association — does not trip
+[`Meta::unsupported_essential_properties`], joining the previously
+recognised `clap` / `irot` / `imir` / `lsel` / `a1op` / `a1lx` /
+`iscl` / `rref` properties on the always-honoured list. (`crtt` is
+descriptive per §6.5.18.1, so the §7 grid-derivation audit is
+untouched — transformative-property scope only.)
+
+Test delta: +8 unit (`crtt_round_trip_reads_creation_time`,
+`crtt_rejects_truncated_body`, `crtt_rejects_unknown_version`,
+`crtt_rejects_missing_payload`, `crtt_dispatched_through_parse_ipco`,
+`crtt_seconds_since_unix_epoch_matches_documented_offset`,
+`crtt_subsecond_micros_isolates_remainder`,
+`crtt_essential_association_is_recognised`). Default lib 344 (was
+336); standalone lib 329 (was 321); integration 61 + 1 ignored
+unchanged. Re-exports: `oxideav_avif::Crtt`.
+
+Followups: §6.5.19 ModificationTimeProperty (`mdft`) is the obvious
+sibling — identical FullBox + u64 µs layout, so the same shape can
+be lifted from the `crtt` parser; §6.5.20 UserDescriptionProperty
+(`udes`) adds the first multi-`utf8string` body in the item-property
+plane (lang / name / description / tags). §6.5.21 AccessibilityText
+(`altt`) follows the same string-pair shape.
 
 ### Round 230 — HEIF §6.5.13 `iscl` + §6.5.17 `rref` item properties
 

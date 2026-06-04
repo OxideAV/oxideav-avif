@@ -15,7 +15,7 @@ use crate::error::{AvifError as Error, Result};
 
 use crate::box_parser::{
     b, find_box, iter_boxes, parse_box_header, parse_full_box, read_cstr, read_u16, read_u32,
-    read_var_uint, type_str, BoxType,
+    read_u64, read_var_uint, type_str, BoxType,
 };
 
 const HDLR: BoxType = b(b"hdlr");
@@ -69,6 +69,8 @@ const A1LX: BoxType = b(b"a1lx");
 const ISCL: BoxType = b(b"iscl");
 /// HEIF §6.5.17 — Required Reference Types descriptive property.
 const RREF: BoxType = b(b"rref");
+/// HEIF §6.5.18 — Creation Time Information descriptive property.
+const CRTT: BoxType = b(b"crtt");
 
 /// HEIF §6.6.2.2 — image overlay derived-image type.
 pub const ITEM_TYPE_IOVL: BoxType = b(b"iovl");
@@ -629,6 +631,69 @@ impl Rref {
     }
 }
 
+/// Creation Time Information descriptive property (`crtt`) —
+/// HEIF §6.5.18.
+///
+/// Documents the creation time of the associated item or entity group.
+/// The semantic field is a single `unsigned int(64)` `creation_time`
+/// counted in **microseconds since midnight, Jan. 1, 1904, in UTC time**
+/// (§6.5.18.3). The 1904 epoch matches the legacy QuickTime / ISOBMFF
+/// movie-header epoch (ISO/IEC 14496-12 §8.2.2), but the unit here is
+/// microseconds rather than the seconds used by `mvhd` / `tkhd` /
+/// `mdhd` — readers that compare or convert against ISOBMFF track
+/// timestamps must scale by 10^6 in the appropriate direction.
+///
+/// Per §6.5.18.1 the property is a descriptive item property with
+/// `Quantity (per associated item_ID): At most one`, and is not
+/// mandatory; absent property means the creation time is unspecified.
+///
+/// Spec: ISO/IEC 23008-12 §6.5.18.2 — FullBox(`crtt`, version=0,
+/// flags=0):
+///
+/// ```text
+/// unsigned int(64) creation_time;
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Crtt {
+    /// Creation time in microseconds since midnight, Jan. 1, 1904 UTC.
+    pub creation_time: u64,
+}
+
+/// Number of whole seconds between the 1904-01-01 UTC epoch used by
+/// HEIF §6.5.18 / ISOBMFF §8.2.2 and the 1970-01-01 UTC Unix epoch.
+///
+/// `66` calendar years (1904..1970) of which `17` are leap years
+/// (1904, 1908, 1912, 1916, 1920, 1924, 1928, 1932, 1936, 1940, 1944,
+/// 1948, 1952, 1956, 1960, 1964, 1968 — 1900 is excluded by the
+/// Gregorian century rule), giving
+/// `66 * 365 + 17 = 24107` days × `86_400` s/day = `2_082_844_800` s.
+const HEIF_EPOCH_TO_UNIX_EPOCH_SECONDS: u64 = 2_082_844_800;
+
+impl Crtt {
+    /// Convert the §6.5.18.3 `creation_time` (microseconds since
+    /// 1904-01-01 UTC) to whole seconds since the Unix epoch
+    /// (1970-01-01 UTC), discarding the sub-second remainder.
+    ///
+    /// Returns `None` when the value predates the Unix epoch
+    /// (i.e. less than [`HEIF_EPOCH_TO_UNIX_EPOCH_SECONDS`] seconds
+    /// after 1904-01-01) — `creation_time` is unsigned so a pre-1970
+    /// HEIF timestamp would underflow on subtraction. Callers wanting
+    /// the raw 1904-epoch value can read [`Self::creation_time`]
+    /// directly.
+    pub fn seconds_since_unix_epoch(&self) -> Option<u64> {
+        let secs_since_1904 = self.creation_time / 1_000_000;
+        secs_since_1904.checked_sub(HEIF_EPOCH_TO_UNIX_EPOCH_SECONDS)
+    }
+
+    /// Sub-second component of `creation_time` in microseconds
+    /// (`0..1_000_000`). Pairs with [`Self::seconds_since_unix_epoch`]
+    /// when a caller needs full-resolution time reconstruction.
+    pub fn subsecond_micros(&self) -> u32 {
+        // `% 1_000_000` always fits in a `u32`.
+        (self.creation_time % 1_000_000) as u32
+    }
+}
+
 /// One property box, kept typed for the boxes AVIF cares about + a raw
 /// fallback so an unknown property still gets an index for association.
 #[derive(Clone, Debug)]
@@ -660,6 +725,8 @@ pub enum Property {
     Iscl(Iscl),
     /// Required-reference-types descriptive property (HEIF §6.5.17).
     Rref(Rref),
+    /// Creation-time descriptive property (HEIF §6.5.18).
+    Crtt(Crtt),
     Other(BoxType, Vec<u8>),
 }
 
@@ -684,6 +751,7 @@ impl Property {
             Property::A1lx(_) => A1LX,
             Property::Iscl(_) => ISCL,
             Property::Rref(_) => RREF,
+            Property::Crtt(_) => CRTT,
             Property::Other(t, _) => *t,
         }
     }
@@ -851,8 +919,8 @@ impl Meta {
     ///
     /// `a1lx` is treated as recognised even when its bytes are not acted
     /// upon, because the spec forbids marking it essential; a `clap`,
-    /// `irot`, `imir`, `lsel`, `a1op`, `iscl`, `rref`, etc. that we
-    /// parse counts as recognised regardless of the essential bit.
+    /// `irot`, `imir`, `lsel`, `a1op`, `iscl`, `rref`, `crtt`, etc. that
+    /// we parse counts as recognised regardless of the essential bit.
     pub fn unsupported_essential_properties(&self, item_id: u32) -> Vec<BoxType> {
         let Some(assoc) = self.assoc_by_id(item_id) else {
             return Vec::new();
@@ -1184,6 +1252,7 @@ fn parse_ipco(payload: &[u8]) -> Result<Vec<Property>> {
             x if x == &A1LX => Property::A1lx(parse_a1lx(body)?),
             x if x == &ISCL => Property::Iscl(parse_iscl(body)?),
             x if x == &RREF => Property::Rref(parse_rref(body)?),
+            x if x == &CRTT => Property::Crtt(parse_crtt(body)?),
             other => Property::Other(*other, body.to_vec()),
         };
         out.push(prop);
@@ -1524,6 +1593,38 @@ fn parse_rref(body: &[u8]) -> Result<Rref> {
         reference_types.push(t);
     }
     Ok(Rref { reference_types })
+}
+
+/// Parse `crtt` (CreationTimeProperty — HEIF §6.5.18). FullBox(`crtt`,
+/// version=0, flags=0) followed by a single big-endian
+/// `unsigned int(64)` field totalling 8 bytes:
+///
+/// ```text
+/// unsigned int(64) creation_time;
+/// ```
+///
+/// `creation_time` is in microseconds since midnight, Jan. 1, 1904 UTC
+/// per §6.5.18.3 — the parser surfaces the value as written; the
+/// [`Crtt::seconds_since_unix_epoch`] / [`Crtt::subsecond_micros`]
+/// helpers convert to the Unix epoch when a caller wants a directly
+/// comparable timestamp.
+///
+/// An unknown `version` is rejected so a future-version layout cannot
+/// be misread as v0.
+fn parse_crtt(body: &[u8]) -> Result<Crtt> {
+    let (version, _flags, rest) = parse_full_box(body)?;
+    if version != 0 {
+        return Err(Error::invalid(format!("avif: crtt version {version} != 0")));
+    }
+    if rest.len() < 8 {
+        return Err(Error::invalid(format!(
+            "avif: crtt too short ({} < 8)",
+            rest.len()
+        )));
+    }
+    Ok(Crtt {
+        creation_time: read_u64(rest, 0)?,
+    })
 }
 
 /// Parse an `iref` box: FullBox header followed by a sequence of typed
@@ -2571,6 +2672,134 @@ mod tests {
                         essential: true,
                     },
                 ],
+            }],
+            ..Meta::default()
+        };
+        assert!(!m.has_unsupported_essential_property(1));
+        assert!(m.unsupported_essential_properties(1).is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // HEIF §6.5.18 CreationTimeProperty (`crtt`) — parse + helpers
+    // -----------------------------------------------------------------
+
+    fn crtt_body(creation_time: u64) -> Vec<u8> {
+        // FullBox(v=0, f=0) + one u64.
+        let mut buf = vec![0u8; 4];
+        buf.extend_from_slice(&creation_time.to_be_bytes());
+        buf
+    }
+
+    #[test]
+    fn crtt_round_trip_reads_creation_time() {
+        // Pick a recognisable big-endian pattern so a byte swap in the
+        // reader would surface immediately.
+        let raw = 0x0102_0304_0506_0708u64;
+        let c = parse_crtt(&crtt_body(raw)).unwrap();
+        assert_eq!(c.creation_time, raw);
+    }
+
+    #[test]
+    fn crtt_rejects_truncated_body() {
+        // FullBox header present but only 7 of the 8 body bytes follow.
+        let mut buf = vec![0u8; 4];
+        buf.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0]);
+        assert!(parse_crtt(&buf).is_err());
+    }
+
+    #[test]
+    fn crtt_rejects_unknown_version() {
+        // version=1, flags=0; body bytes are otherwise well-formed.
+        let mut buf = vec![1u8, 0, 0, 0];
+        buf.extend_from_slice(&0u64.to_be_bytes());
+        assert!(parse_crtt(&buf).is_err());
+    }
+
+    #[test]
+    fn crtt_rejects_missing_payload() {
+        // FullBox header only — the u64 timestamp is absent entirely.
+        let buf = vec![0u8; 4];
+        assert!(parse_crtt(&buf).is_err());
+    }
+
+    #[test]
+    fn crtt_dispatched_through_parse_ipco() {
+        // Wrap a `crtt` property in a single-property `ipco` container
+        // and confirm the dispatch produces `Property::Crtt`.
+        let body = crtt_body(0xDEAD_BEEF_CAFE_F00Du64);
+        let mut ipco = Vec::new();
+        let s = 8 + body.len() as u32;
+        ipco.extend_from_slice(&s.to_be_bytes());
+        ipco.extend_from_slice(b"crtt");
+        ipco.extend_from_slice(&body);
+        let props = parse_ipco(&ipco).unwrap();
+        assert_eq!(props.len(), 1);
+        match &props[0] {
+            Property::Crtt(c) => assert_eq!(c.creation_time, 0xDEAD_BEEF_CAFE_F00Du64),
+            other => panic!("expected Crtt, got {other:?}"),
+        }
+        assert_eq!(props[0].kind(), *b"crtt");
+    }
+
+    #[test]
+    fn crtt_seconds_since_unix_epoch_matches_documented_offset() {
+        // `creation_time == 0` is exactly the 1904-01-01 UTC epoch —
+        // precedes the Unix epoch, so the helper underflows to None.
+        let c = Crtt { creation_time: 0 };
+        assert_eq!(c.seconds_since_unix_epoch(), None);
+
+        // Exactly the Unix epoch — 1970-01-01 00:00:00 UTC — sits
+        // HEIF_EPOCH_TO_UNIX_EPOCH_SECONDS seconds after the HEIF
+        // epoch, so it maps to 0 Unix seconds. Express in microseconds.
+        let c = Crtt {
+            creation_time: HEIF_EPOCH_TO_UNIX_EPOCH_SECONDS * 1_000_000,
+        };
+        assert_eq!(c.seconds_since_unix_epoch(), Some(0));
+
+        // 1970-01-01 00:00:01 UTC → 1 Unix second.
+        let c = Crtt {
+            creation_time: (HEIF_EPOCH_TO_UNIX_EPOCH_SECONDS + 1) * 1_000_000,
+        };
+        assert_eq!(c.seconds_since_unix_epoch(), Some(1));
+    }
+
+    #[test]
+    fn crtt_subsecond_micros_isolates_remainder() {
+        // 1.5 seconds past the Unix epoch in 1904-epoch microseconds.
+        let secs = HEIF_EPOCH_TO_UNIX_EPOCH_SECONDS;
+        let c = Crtt {
+            creation_time: secs * 1_000_000 + 500_000,
+        };
+        assert_eq!(c.seconds_since_unix_epoch(), Some(0));
+        assert_eq!(c.subsecond_micros(), 500_000);
+
+        // No sub-second component → returns 0.
+        let c = Crtt {
+            creation_time: secs * 1_000_000,
+        };
+        assert_eq!(c.subsecond_micros(), 0);
+
+        // Highest legal sub-second value (999_999 µs).
+        let c = Crtt {
+            creation_time: secs * 1_000_000 + 999_999,
+        };
+        assert_eq!(c.subsecond_micros(), 999_999);
+    }
+
+    /// A recognised `crtt` property — even when flagged essential
+    /// (unusual for a descriptive property, but the parser doesn't
+    /// reject the bit) — does NOT trip
+    /// [`Meta::unsupported_essential_properties`].
+    #[test]
+    fn crtt_essential_association_is_recognised() {
+        let m = Meta {
+            properties: vec![Property::Crtt(Crtt { creation_time: 0 })],
+            associations: vec![ItemPropertyAssociation {
+                item_id: 1,
+                entries: vec![PropertyAssociation {
+                    index: 0,
+                    essential: true,
+                }],
             }],
             ..Meta::default()
         };

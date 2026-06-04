@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- ISO/IEC 23008-12 §6.5.18 CreationTimeProperty (`crtt`) descriptive
+  item-property parser. The body shape is taken verbatim from
+  §6.5.18.2 — a FullBox(`crtt`, version=0, flags=0) carrying a single
+  `unsigned int(64) creation_time` field; the unit is microseconds
+  since midnight, Jan. 1, 1904 UTC per §6.5.18.3. Lands as a new
+  `Property::Crtt(Crtt)` variant dispatched through `parse_ipco`
+  alongside the other recognised properties. Helpers:
+  `Crtt::seconds_since_unix_epoch` converts the 1904-epoch
+  microsecond field to whole seconds since the Unix epoch
+  (1970-01-01 UTC), returning `None` for a pre-1970 timestamp
+  (the `u64` field cannot represent a signed offset);
+  `Crtt::subsecond_micros` exposes the residual `0..1_000_000` µs
+  remainder so callers can reconstruct full-resolution time. The
+  1904→1970 offset is `2_082_844_800` seconds (66 years × 365 days +
+  17 leap-year days × 86 400 s/day), captured as a single
+  module-level constant. The parser rejects unknown `version` values
+  (per the spec's `version = 0` declaration in the syntax block) so
+  a future-version layout cannot be misread as v0, and a body
+  shorter than the 8-byte `creation_time` field is rejected rather
+  than silently zero-extended. A recognised `crtt` property — even
+  when unusually flagged essential in the `ipma` association — does
+  not trip `Meta::unsupported_essential_properties`. Coverage: +8
+  unit (round-trip read of the u64 field, truncated-body /
+  unknown-version / missing-payload rejection paths, ipco dispatch,
+  `seconds_since_unix_epoch` matching the documented 1904↔1970
+  offset including the pre-epoch underflow branch,
+  `subsecond_micros` isolating the residual at both ends of the
+  legal range, essential-association recognition). Default lib 344
+  (was 336); standalone lib 329 (was 321); integration 61 + 1
+  ignored unchanged. Re-exports: `oxideav_avif::Crtt`.
+
 - ISO/IEC 23008-12 §6.5.13 ImageScaling (`iscl`) + §6.5.17
   RequiredReferenceTypesProperty (`rref`) item-property parsers + §7
   grid-derivation audit extension. The two property bodies join the
