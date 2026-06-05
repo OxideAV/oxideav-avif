@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- ISO/IEC 23008-12 §6.5.19 ModificationTimeProperty (`mdft`) descriptive
+  item-property parser. The body shape is taken verbatim from
+  §6.5.19.2 — a FullBox(`mdft`, version=0, flags=0) carrying a single
+  `unsigned int(64) modification_time` field; the unit is microseconds
+  since midnight, Jan. 1, 1904 UTC per §6.5.19.3, identical to the
+  `crtt` creation-time epoch / unit. Lands as a new
+  `Property::Mdft(Mdft)` variant dispatched through `parse_ipco`
+  alongside the other recognised properties. Helpers:
+  `Mdft::seconds_since_unix_epoch` converts the 1904-epoch
+  microsecond field to whole seconds since the Unix epoch
+  (1970-01-01 UTC), returning `None` for a pre-1970 timestamp;
+  `Mdft::subsecond_micros` exposes the residual `0..1_000_000` µs
+  remainder. Both helpers mirror the existing `Crtt` shape exactly
+  and reuse the module-level `HEIF_EPOCH_TO_UNIX_EPOCH_SECONDS`
+  constant (`2_082_844_800`) introduced for `crtt`. The parser
+  rejects unknown `version` values (per the spec's `version = 0`
+  declaration in the syntax block) so a future-version layout cannot
+  be misread as v0, and a body shorter than the 8-byte
+  `modification_time` field is rejected rather than silently
+  zero-extended. A recognised `mdft` property — even when unusually
+  flagged essential in the `ipma` association — does not trip
+  `Meta::unsupported_essential_properties`. `mdft` and `crtt` may
+  legally co-occur on the same item; the dispatch returns both
+  properties in insertion order and `Meta::property_for` resolves
+  each kind independently to yield a creation/modification time
+  pair. Coverage: +9 unit (round-trip read of the u64 field with a
+  distinct sentinel that would catch a `crtt` cross-wire,
+  truncated-body / unknown-version / missing-payload rejection
+  paths, `ipco` dispatch, `seconds_since_unix_epoch` matching the
+  documented 1904↔1970 offset including the pre-epoch underflow
+  branch, `subsecond_micros` isolating the residual at both ends of
+  the legal range, essential-association recognition, and
+  `crtt`+`mdft` coexistence on a single item). Default lib 353 (was
+  344); standalone lib 338 (was 329); integration 61 + 1 ignored
+  unchanged. Re-exports add `Mdft`. Spec: ISO/IEC 23008-12:2025
+  §6.5.19.
+
 - ISO/IEC 23008-12 §6.5.18 CreationTimeProperty (`crtt`) descriptive
   item-property parser. The body shape is taken verbatim from
   §6.5.18.2 — a FullBox(`crtt`, version=0, flags=0) carrying a single

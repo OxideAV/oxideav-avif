@@ -8,7 +8,8 @@
 //!   `ipco` / `ipma` (v0/v1, small + large indices), plus item
 //!   properties `av1C`, `ispe`, `colr` (nclx + ICC), `pixi`, `pasp`,
 //!   `irot`, `imir`, `clap`, `auxC`, `mdcv`, `clli`, `cclv`,
-//!   `a1op`, `a1lx`. Derived-image carriers: `iovl` / `iden` /
+//!   `a1op`, `a1lx`, `iscl`, `rref`, `crtt`, `mdft`. Derived-image
+//!   carriers: `iovl` / `iden` /
 //!   `grid` / `sato` (Sample Transform — av1-avif v1.2.0 §4.2.3) /
 //!   `tmap` item-type detection plus an av1-avif §4.2.2 `should`-
 //!   level compliance audit ([`audit_tone_map`] /
@@ -125,10 +126,10 @@ pub use image::{AvifFrame, AvifPixelFormat, AvifPlane};
 pub use inspect::{gain_map_metadata, inspect, item_payload_bytes, transforms_for, AvifInfo};
 pub use meta::{
     A1lx, A1op, AuxC, AuxKind, Cclv, Clap, Clli, Colr, Crtt, Imir, IrefEntry, Irot, Iscl, Ispe,
-    ItemInfo, ItemLocation, Lsel, Mdcv, Meta, Pasp, Pixi, Property, Rloc, Rref, AUX_URN_ALPHA_HEVC,
-    AUX_URN_ALPHA_MPEG, AUX_URN_DEPTH_HEVC, AUX_URN_DEPTH_MPEG, AUX_URN_HDR_GAINMAP,
-    ITEM_TYPE_EXIF, ITEM_TYPE_IDEN, ITEM_TYPE_IOVL, ITEM_TYPE_MIME, ITEM_TYPE_SATO, ITEM_TYPE_TMAP,
-    ITEM_TYPE_URI,
+    ItemInfo, ItemLocation, Lsel, Mdcv, Mdft, Meta, Pasp, Pixi, Property, Rloc, Rref,
+    AUX_URN_ALPHA_HEVC, AUX_URN_ALPHA_MPEG, AUX_URN_DEPTH_HEVC, AUX_URN_DEPTH_MPEG,
+    AUX_URN_HDR_GAINMAP, ITEM_TYPE_EXIF, ITEM_TYPE_IDEN, ITEM_TYPE_IOVL, ITEM_TYPE_MIME,
+    ITEM_TYPE_SATO, ITEM_TYPE_TMAP, ITEM_TYPE_URI,
 };
 pub use parser::{
     audit_mif1, classify_brands, item_bytes_owned, parse, parse_header, AvifHeader, AvifImage,
