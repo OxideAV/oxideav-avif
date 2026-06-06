@@ -75,6 +75,8 @@ const CRTT: BoxType = b(b"crtt");
 const MDFT: BoxType = b(b"mdft");
 /// HEIF §6.5.20 — User Description descriptive property.
 const UDES: BoxType = b(b"udes");
+/// HEIF §6.5.21 — Accessibility Text descriptive property.
+const ALTT: BoxType = b(b"altt");
 
 /// HEIF §6.6.2.2 — image overlay derived-image type.
 pub const ITEM_TYPE_IOVL: BoxType = b(b"iovl");
@@ -866,6 +868,90 @@ impl Udes {
     }
 }
 
+/// Accessibility Text descriptive property (`altt`) — HEIF §6.5.21.
+///
+/// Carries an alternate text string suitable for use when the
+/// associated image cannot be displayed — the role is analogous to the
+/// HTML `alt` attribute. The language of the alternate text is
+/// signalled by an RFC 5646 language tag string carried alongside.
+///
+/// Per §6.5.21.1 the property is a descriptive item property with
+/// `Quantity (per item): Zero or more`. When multiple instances of
+/// `AccessibilityTextProperty` are associated with the same item, they
+/// represent alternatives possibly expressed in different languages;
+/// a reader picks the most appropriate. The spec adds a "should" that
+/// at most one instance with the same `alt_lang` value applies to a
+/// single item — the parser preserves every instance verbatim so a
+/// caller wanting to enforce that policy can do so over the property
+/// list it walks.
+///
+/// The wire layout (§6.5.21.2) is two sequential null-terminated UTF-8
+/// strings inside a FullBox(`altt`, version=0, flags=0):
+///
+/// ```text
+/// utf8string alt_text;
+/// utf8string alt_lang;
+/// ```
+///
+/// Per §6.5.21.3:
+///
+/// * `alt_text` is the human-readable alternate text. The §6.5.21
+///   text does not promote an empty `alt_text` to "absent"; the
+///   parser nonetheless preserves an empty string verbatim and the
+///   [`Self::alt_text_opt`] helper offers a strongly typed `Option`
+///   shape for callers who want to skip an empty string.
+/// * `alt_lang` is an RFC 5646 compliant language tag string
+///   (e.g. `"en-US"`, `"fr-FR"`, `"zh-CN"`). When `alt_lang` is empty
+///   the language is **unknown/undefined**; [`Self::alt_lang_opt`]
+///   projects the empty form to `None`.
+///
+/// The wire layout matches §6.5.20 `udes` structurally (FullBox header
+/// followed by null-terminated UTF-8 strings) but carries only two
+/// fields rather than four, and reverses the documented field order
+/// (`udes` lists `lang` first; `altt` lists `alt_text` first followed
+/// by `alt_lang`). The parser surfaces the fields under their HEIF
+/// names so a caller cross-referencing with the spec sees the same
+/// identifiers.
+///
+/// Spec: ISO/IEC 23008-12 §6.5.21.2 — FullBox(`altt`, version=0,
+/// flags=0).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Altt {
+    /// Alternate text for the associated image (HTML-`alt`-style).
+    /// An empty string is the documented "no text" shape; the
+    /// [`Self::alt_text_opt`] helper projects that to `None`.
+    pub alt_text: String,
+    /// RFC 5646 language tag for [`Self::alt_text`]; empty = the
+    /// language is unknown/undefined (§6.5.21.3).
+    pub alt_lang: String,
+}
+
+impl Altt {
+    /// `alt_text` typed as `Option<&str>`: `None` when the field is
+    /// empty. §6.5.21.3 does not document an explicit "absent"
+    /// sentinel for `alt_text` — the property is informative — but
+    /// projecting the empty string to `None` lets a caller branch on
+    /// "no alternate text was carried" without re-checking
+    /// `is_empty()`.
+    pub fn alt_text_opt(&self) -> Option<&str> {
+        if self.alt_text.is_empty() {
+            None
+        } else {
+            Some(self.alt_text.as_str())
+        }
+    }
+
+    /// `alt_lang` typed as `Option<&str>`: `None` when the field is
+    /// empty (§6.5.21.3 "the language is unknown/undefined").
+    pub fn alt_lang_opt(&self) -> Option<&str> {
+        if self.alt_lang.is_empty() {
+            None
+        } else {
+            Some(self.alt_lang.as_str())
+        }
+    }
+}
+
 /// One property box, kept typed for the boxes AVIF cares about + a raw
 /// fallback so an unknown property still gets an index for association.
 #[derive(Clone, Debug)]
@@ -903,6 +989,8 @@ pub enum Property {
     Mdft(Mdft),
     /// User-description descriptive property (HEIF §6.5.20).
     Udes(Udes),
+    /// Accessibility-text descriptive property (HEIF §6.5.21).
+    Altt(Altt),
     Other(BoxType, Vec<u8>),
 }
 
@@ -930,6 +1018,7 @@ impl Property {
             Property::Crtt(_) => CRTT,
             Property::Mdft(_) => MDFT,
             Property::Udes(_) => UDES,
+            Property::Altt(_) => ALTT,
             Property::Other(t, _) => *t,
         }
     }
@@ -1098,8 +1187,8 @@ impl Meta {
     /// `a1lx` is treated as recognised even when its bytes are not acted
     /// upon, because the spec forbids marking it essential; a `clap`,
     /// `irot`, `imir`, `lsel`, `a1op`, `iscl`, `rref`, `crtt`, `mdft`,
-    /// `udes`, etc. that we parse counts as recognised regardless of
-    /// the essential bit.
+    /// `udes`, `altt`, etc. that we parse counts as recognised
+    /// regardless of the essential bit.
     pub fn unsupported_essential_properties(&self, item_id: u32) -> Vec<BoxType> {
         let Some(assoc) = self.assoc_by_id(item_id) else {
             return Vec::new();
@@ -1434,6 +1523,7 @@ fn parse_ipco(payload: &[u8]) -> Result<Vec<Property>> {
             x if x == &CRTT => Property::Crtt(parse_crtt(body)?),
             x if x == &MDFT => Property::Mdft(parse_mdft(body)?),
             x if x == &UDES => Property::Udes(parse_udes(body)?),
+            x if x == &ALTT => Property::Altt(parse_altt(body)?),
             other => Property::Other(*other, body.to_vec()),
         };
         out.push(prop);
@@ -1884,6 +1974,39 @@ fn parse_udes(body: &[u8]) -> Result<Udes> {
         description,
         tags,
     })
+}
+
+/// Parse `altt` (AccessibilityTextProperty — HEIF §6.5.21).
+/// FullBox(`altt`, version=0, flags=0) followed by two sequential
+/// null-terminated UTF-8 strings:
+///
+/// ```text
+/// utf8string alt_text;
+/// utf8string alt_lang;
+/// ```
+///
+/// Per §6.5.21.3 an empty `alt_lang` flags the language as
+/// unknown/undefined; the parser preserves the raw empty string and
+/// the [`Altt::alt_lang_opt`] / [`Altt::alt_text_opt`] helpers project
+/// the empty form to `None`. The parsed field order is
+/// `alt_text`-first to mirror the §6.5.21.2 syntax verbatim — this
+/// reverses the field ordering relative to `udes`, where the language
+/// tag comes first.
+///
+/// An unknown `version` is rejected so a future-version layout cannot
+/// be misread as v0. A body that runs out before both strings have
+/// been read is rejected by [`read_cstr`]. Trailing bytes past the
+/// second terminator are ignored, mirroring the §8.11.6 `infe`
+/// tail-field behaviour for forward compatibility with future spec
+/// revisions that append new fields under the same `version=0` slot.
+fn parse_altt(body: &[u8]) -> Result<Altt> {
+    let (version, _flags, rest) = parse_full_box(body)?;
+    if version != 0 {
+        return Err(Error::invalid(format!("avif: altt version {version} != 0")));
+    }
+    let (alt_text, after_text) = read_cstr(rest, 0)?;
+    let (alt_lang, _after_lang) = read_cstr(rest, after_text)?;
+    Ok(Altt { alt_text, alt_lang })
 }
 
 /// Parse an `iref` box: FullBox header followed by a sequence of typed
@@ -3465,5 +3588,203 @@ mod tests {
             })
             .collect();
         assert_eq!(langs, vec!["en-US", "fr-FR"]);
+    }
+
+    // -----------------------------------------------------------------
+    // HEIF §6.5.21 AccessibilityTextProperty (`altt`) — parse + helpers
+    // -----------------------------------------------------------------
+
+    /// Build an `altt` body — FullBox(v=0, f=0) followed by two
+    /// nul-terminated UTF-8 strings in the §6.5.21.2 declaration
+    /// order: `alt_text`, then `alt_lang`. The reversed pairing
+    /// relative to `udes` is intentional — `udes` lists `lang` first
+    /// and `altt` lists the text first.
+    fn altt_body(alt_text: &str, alt_lang: &str) -> Vec<u8> {
+        let mut buf = vec![0u8; 4];
+        for s in [alt_text, alt_lang] {
+            buf.extend_from_slice(s.as_bytes());
+            buf.push(0);
+        }
+        buf
+    }
+
+    #[test]
+    fn altt_round_trip_reads_text_then_lang() {
+        // Distinct values per field so a cross-wire between
+        // alt_text and alt_lang would surface immediately.
+        let a = parse_altt(&altt_body(
+            "Photo of the cabin's front porch at dusk",
+            "en-US",
+        ))
+        .unwrap();
+        assert_eq!(a.alt_text, "Photo of the cabin's front porch at dusk");
+        assert_eq!(a.alt_lang, "en-US");
+    }
+
+    /// §6.5.21.3 documents an empty `alt_lang` as the
+    /// "unknown/undefined" sentinel. The parser surfaces the raw
+    /// empty string verbatim; the `*_opt` helpers project to `None`.
+    /// `alt_text` is also tolerated as empty here even though the
+    /// spec text does not promote it explicitly — the parse still
+    /// preserves the raw shape and `alt_text_opt` is `None` for the
+    /// empty case.
+    #[test]
+    fn altt_empty_strings_are_preserved_and_projectable_to_none() {
+        let a = parse_altt(&altt_body("", "")).unwrap();
+        assert_eq!(a.alt_text, "");
+        assert_eq!(a.alt_lang, "");
+        assert_eq!(a.alt_text_opt(), None);
+        assert_eq!(a.alt_lang_opt(), None);
+    }
+
+    #[test]
+    fn altt_opt_helpers_round_trip_non_empty() {
+        let a = parse_altt(&altt_body("Vue de la mer", "fr-FR")).unwrap();
+        assert_eq!(a.alt_text_opt(), Some("Vue de la mer"));
+        assert_eq!(a.alt_lang_opt(), Some("fr-FR"));
+    }
+
+    /// UTF-8 multi-byte payloads (CJK + accented Latin) survive the
+    /// parser intact — `read_cstr` uses `from_utf8_lossy`, so the
+    /// round-trip is byte-equal for already-valid UTF-8 input.
+    #[test]
+    fn altt_preserves_utf8_multibyte() {
+        let a = parse_altt(&altt_body("夕暮れの海岸", "zh-CN")).unwrap();
+        assert_eq!(a.alt_text, "夕暮れの海岸");
+        assert_eq!(a.alt_lang, "zh-CN");
+    }
+
+    #[test]
+    fn altt_rejects_unknown_version() {
+        // version=1, flags=0; two empty strings would otherwise be a
+        // well-formed v0 body.
+        let mut buf = vec![1u8, 0, 0, 0];
+        buf.extend_from_slice(&[0, 0]);
+        assert!(parse_altt(&buf).is_err());
+    }
+
+    /// A body that runs out before the second nul is written must be
+    /// rejected — `read_cstr` bails on an unterminated string, which
+    /// is exactly the behaviour we want so a truncated `altt` cannot
+    /// be partially read.
+    #[test]
+    fn altt_rejects_truncated_body() {
+        // FullBox header + one empty string + start of the second
+        // without a terminator.
+        let mut buf = vec![0u8; 4];
+        // alt_text = ""
+        buf.push(0);
+        // alt_lang = "en" with no trailing nul.
+        buf.extend_from_slice(b"en");
+        assert!(parse_altt(&buf).is_err());
+    }
+
+    /// Trailing bytes past the second terminator are forward-compat
+    /// space — the parser ignores them (mirrors the §8.11.6 `infe`
+    /// tail behaviour). A v0 producer that pads the box with extra
+    /// reserved bytes is read cleanly.
+    #[test]
+    fn altt_tolerates_trailing_bytes() {
+        let mut body = altt_body("hi", "en");
+        body.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let a = parse_altt(&body).unwrap();
+        assert_eq!(a.alt_text, "hi");
+        assert_eq!(a.alt_lang, "en");
+    }
+
+    #[test]
+    fn altt_dispatched_through_parse_ipco() {
+        let body = altt_body("Cabin at dusk", "en-US");
+        let mut ipco = Vec::new();
+        let s = 8 + body.len() as u32;
+        ipco.extend_from_slice(&s.to_be_bytes());
+        ipco.extend_from_slice(b"altt");
+        ipco.extend_from_slice(&body);
+        let props = parse_ipco(&ipco).unwrap();
+        assert_eq!(props.len(), 1);
+        match &props[0] {
+            Property::Altt(a) => {
+                assert_eq!(a.alt_text, "Cabin at dusk");
+                assert_eq!(a.alt_lang, "en-US");
+            }
+            other => panic!("expected Altt, got {other:?}"),
+        }
+        assert_eq!(props[0].kind(), *b"altt");
+    }
+
+    /// A recognised `altt` property — even when flagged essential
+    /// (unusual for a descriptive property, but the parser does not
+    /// reject the bit) — does NOT trip
+    /// [`Meta::unsupported_essential_properties`].
+    #[test]
+    fn altt_essential_association_is_recognised() {
+        let m = Meta {
+            properties: vec![Property::Altt(Altt::default())],
+            associations: vec![ItemPropertyAssociation {
+                item_id: 1,
+                entries: vec![PropertyAssociation {
+                    index: 0,
+                    essential: true,
+                }],
+            }],
+            ..Meta::default()
+        };
+        assert!(!m.has_unsupported_essential_property(1));
+        assert!(m.unsupported_essential_properties(1).is_empty());
+    }
+
+    /// §6.5.21.1 allows zero-or-more `altt` instances per item with
+    /// each instance carrying a different `alt_lang` — the dispatch
+    /// returns every `altt` in insertion order so the caller can pick
+    /// the most appropriate language.
+    #[test]
+    fn altt_multiple_languages_coexist_on_same_item() {
+        let en = altt_body("Sunset over the bay", "en-US");
+        let fr = altt_body("Coucher de soleil sur la baie", "fr-FR");
+        let mut ipco = Vec::new();
+        let se = 8 + en.len() as u32;
+        ipco.extend_from_slice(&se.to_be_bytes());
+        ipco.extend_from_slice(b"altt");
+        ipco.extend_from_slice(&en);
+        let sf = 8 + fr.len() as u32;
+        ipco.extend_from_slice(&sf.to_be_bytes());
+        ipco.extend_from_slice(b"altt");
+        ipco.extend_from_slice(&fr);
+
+        let props = parse_ipco(&ipco).unwrap();
+        assert_eq!(props.len(), 2);
+        let langs: Vec<&str> = props
+            .iter()
+            .filter_map(|p| match p {
+                Property::Altt(a) => Some(a.alt_lang.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(langs, vec!["en-US", "fr-FR"]);
+    }
+
+    /// `altt` reverses the §6.5.20 `udes` field ordering — `altt`
+    /// puts the text first and the language second, while `udes`
+    /// puts the language first. A bit-rotted parser that copy-pasted
+    /// `udes`'s field order would surface immediately: an `altt`
+    /// whose `alt_text == "en-US"` and `alt_lang == "Sunset"` is a
+    /// red flag, not a valid payload. This test pins the documented
+    /// order against that regression.
+    #[test]
+    fn altt_field_order_is_text_then_lang_not_reversed() {
+        // The wire bytes are unambiguous about which string is
+        // `alt_text` and which is `alt_lang`. If the parser swapped
+        // the assignment, the assertions below would flip.
+        let a = parse_altt(&altt_body("Sunset", "en-US")).unwrap();
+        assert_eq!(a.alt_text, "Sunset");
+        assert_eq!(a.alt_lang, "en-US");
+        // And the inverse — if a writer accidentally put the
+        // language first, the parser MUST surface that wire-level
+        // mistake by carrying the language tag as `alt_text` and the
+        // English description as `alt_lang`, rather than silently
+        // re-ordering for the caller.
+        let mis = parse_altt(&altt_body("en-US", "Sunset")).unwrap();
+        assert_eq!(mis.alt_text, "en-US");
+        assert_eq!(mis.alt_lang, "Sunset");
     }
 }

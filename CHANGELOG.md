@@ -9,6 +9,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- ISO/IEC 23008-12 §6.5.21 AccessibilityTextProperty (`altt`) descriptive
+  item-property parser. The body shape is taken verbatim from §6.5.21.2 —
+  a FullBox(`altt`, version=0, flags=0) followed by two sequential
+  null-terminated UTF-8 strings: `alt_text` then `alt_lang`. The
+  field order is reversed relative to §6.5.20 `udes` (which puts
+  `lang` first), so the parser pins the §6.5.21.2 declaration order
+  explicitly. Per §6.5.21.3 an empty `alt_lang` is the
+  unknown/undefined sentinel; the parser preserves the raw empty
+  string and surfaces a strongly typed projection via two `*_opt`
+  helpers (`Altt::{alt_text_opt, alt_lang_opt}`) returning `None` for
+  the empty case. Lands as a new `Property::Altt(Altt)` variant
+  dispatched through `parse_ipco` alongside the other recognised
+  properties. The parser rejects unknown `version` values (per the
+  spec's `version = 0` declaration in the syntax block) so a
+  future-version layout cannot be misread as v0, rejects a body that
+  runs out before the second NUL terminator has been observed, and
+  tolerates trailing bytes past the second terminator for
+  forward-compatibility with future spec revisions that append new
+  fields under the same `version=0` slot (mirrors the §8.11.6 `infe`
+  tail-field behaviour). A recognised `altt` property — even when
+  flagged essential in the `ipma` association — does not trip
+  `Meta::unsupported_essential_properties`. Per §6.5.21.1
+  `Quantity: Zero or more`, multiple `altt` instances may coexist on
+  the same item carrying different language codes; the dispatch
+  returns every instance in insertion order so the caller can pick
+  the most appropriate. Coverage: +10 unit
+  (`altt_round_trip_reads_text_then_lang` with distinct values per
+  field that would catch a cross-wire,
+  `altt_empty_strings_are_preserved_and_projectable_to_none` covering
+  the §6.5.21.3 sentinel form, `altt_opt_helpers_round_trip_non_empty`,
+  `altt_preserves_utf8_multibyte` round-tripping CJK + accented Latin
+  payloads, `altt_rejects_unknown_version`,
+  `altt_rejects_truncated_body`, `altt_tolerates_trailing_bytes`
+  proving forward-compat tail behaviour,
+  `altt_dispatched_through_parse_ipco`,
+  `altt_essential_association_is_recognised`,
+  `altt_multiple_languages_coexist_on_same_item` proving the
+  §6.5.21.1 zero-or-more quantity round-trip, and
+  `altt_field_order_is_text_then_lang_not_reversed` pinning the
+  reversed-from-`udes` declaration order against a future copy-paste
+  regression). Default lib 375 (was 364); standalone lib 360 (was
+  349); integration 61 + 1 ignored unchanged. Re-exports add `Altt`.
+  Spec: ISO/IEC 23008-12:2025 §6.5.21.
+
 - ISO/IEC 23008-12 §6.5.20 UserDescriptionProperty (`udes`) descriptive
   item-property parser. The body shape is taken verbatim from
   §6.5.20.2 — a FullBox(`udes`, version=0, flags=0) followed by four
