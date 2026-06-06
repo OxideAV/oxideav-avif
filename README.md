@@ -26,7 +26,7 @@ still loses significant signal.
 |----------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `ftyp` brand check                     | accepts `avif` / `avis` / `mif1` / `msf1` / `miaf`                                                                                                         |
 | `meta` sub-boxes                       | `hdlr`, `pitm` (v0/v1), `iinf` (v0/v1) + `infe` (v2/v3), `iloc` (v0/v1/v2), `iref`, `iprp` / `ipco` / `ipma` (v0/v1, small + large property indices)       |
-| Item properties                        | `av1C`, `ispe`, `colr` (nclx + ICC), `pixi`, `pasp`, `irot`, `imir`, `clap`, `auxC`, `mdcv`, `clli`, `cclv`, `rloc`, `lsel`, `a1op`, `a1lx`, `iscl` (HEIF §6.5.13 image scaling — four u16 ratio fields + `Iscl::is_well_formed` + `Iscl::scaled_dims`), `rref` (HEIF §6.5.17 required reference types — typed `Vec<BoxType>` + `Rref::{count, requires}`), `crtt` (HEIF §6.5.18 creation time — u64 microseconds since 1904-01-01 UTC + `Crtt::{seconds_since_unix_epoch, subsecond_micros}`), `mdft` (HEIF §6.5.19 modification time — same 1904-epoch microsecond unit as `crtt`; `Mdft::{seconds_since_unix_epoch, subsecond_micros}` mirror the `crtt` helpers, and `mdft` may legally co-occur with `crtt` on a single item to surface a creation/modification pair); unknown boxes retained as `Property::Other` so indices stay valid |
+| Item properties                        | `av1C`, `ispe`, `colr` (nclx + ICC), `pixi`, `pasp`, `irot`, `imir`, `clap`, `auxC`, `mdcv`, `clli`, `cclv`, `rloc`, `lsel`, `a1op`, `a1lx`, `iscl` (HEIF §6.5.13 image scaling — four u16 ratio fields + `Iscl::is_well_formed` + `Iscl::scaled_dims`), `rref` (HEIF §6.5.17 required reference types — typed `Vec<BoxType>` + `Rref::{count, requires}`), `crtt` (HEIF §6.5.18 creation time — u64 microseconds since 1904-01-01 UTC + `Crtt::{seconds_since_unix_epoch, subsecond_micros}`), `mdft` (HEIF §6.5.19 modification time — same 1904-epoch microsecond unit as `crtt`; `Mdft::{seconds_since_unix_epoch, subsecond_micros}` mirror the `crtt` helpers, and `mdft` may legally co-occur with `crtt` on a single item to surface a creation/modification pair), `udes` (HEIF §6.5.20 user description — four UTF-8 strings `lang` / `name` / `description` / `tags` with the §6.5.20.3 empty-string "absent" sentinels projected via `Udes::{lang_opt, name_opt, description_opt, tags_opt}` and a `Udes::tag_list` view that splits on `','` and trims each segment; §6.5.20.1 quantity is zero-or-more so multiple language variants legally co-occur on a single item); unknown boxes retained as `Property::Other` so indices stay valid |
 | Sample Transform (`sato`)              | descriptor parser + per-sample evaluator for av1-avif §4.2.3 — full operator table (negation/abs/not/bsr unary + sum/difference/product/quotient/and/or/xor/pow/min/max binary), all 4 bit-depth widths (8/16/32/64-bit intermediate), every spec assertion enforced (`token_count >= 1`, sample index ≤ `reference_count`, postfix order, stack discipline, single-element terminal stack, reserved-token rejection); composition into a reconstructed image deferred until oxideav-av1 ships a decoder |
 | Tone Map (`tmap`)                      | item-type four-CC detection + `AvifInfo::tmap_item_ids` enumeration + av1-avif §4.2.2 `should`-level compliance audit (`audit_tone_map` / `ToneMapCompliance`): `altr` group pairs the tmap with its base item; gain-map inputs (`dimg to_ids[1..]`) flagged hidden via `infe` flags low bit; aggregate via `AvifInfo::tone_map_compliance` / `tone_map_strict_compliant()`. **`tmap` descriptor body parse** lands via `GainMapMetadata::parse` (ISO 21496-1:2025 Annex C.2): `GainMapVersion` + flags (`is_multichannel` → 1 or 3 R/G/B channels, `use_base_colour_space`), base/alternate HDR headroom, and per-channel `GainMapChannel` rationals (min/max/gamma/base+alternate offset). Enforces every §5.2 / Annex C.2.3 `shall` (non-zero denominators, non-zero `gamma_numerator`, `writer_version ≥ minimum_version`, per-channel `gain_map_max ≥ gain_map_min` per §5.2.5.3 — value-comparison via cross-multiplied i64 so `max == min` is permitted, `alternate_hdr_headroom ≠ base_hdr_headroom` per §5.2.7 — also value-comparison so e.g. `1/1` and `2/2` trip the check), returns `Unsupported` for an unknown `minimum_version`, and ignores trailing padding / future-optional bytes. One-call extractor `gain_map_metadata(file, tmap_item_id)` resolves a tmap item's `iloc` payload and runs the parse, mirroring the existing `item_payload_bytes` accessor pattern |
 | AV1 layered properties (`a1op`/`a1lx`) | `a1op` operating-point selector (u8 `op_index`) + `a1lx` layered-image index (`layer_size[3]`, 16/32-bit fields, `documented_layers()`) parsed per av1-avif §2.3.2; surfaced via `AvifInfo::{operating_point, layered_index}` |
@@ -84,6 +84,100 @@ still loses significant signal.
 
 See `examples/diag_decode.rs` for a drop-in report of exactly which
 stage each input reaches.
+
+### Round 241 — HEIF §6.5.20 `udes` user-description item property
+
+The descriptive item-property rollout continues with §6.5.20
+UserDescriptionProperty, which pairs the associated item or entity
+group with a human-readable name, description, and a comma-separated
+tag list, all carried in a single language. Per §6.5.20.1 the
+property is descriptive with `Quantity (per associated item_ID):
+Zero or more`, and multiple instances on the same item shall carry
+**different** language codes — they represent the same content
+translated for different audiences, from which a reader picks the
+most appropriate.
+
+The wire layout is taken verbatim from §6.5.20.2 — a
+FullBox(`udes`, version=0, flags=0) followed by four sequential
+NUL-terminated UTF-8 strings:
+
+```text
+utf8string lang;
+utf8string name;
+utf8string description;
+utf8string tags;
+```
+
+Each field's empty-string form (a single NUL byte) is the documented
+§6.5.20.3 "absent" sentinel: empty `lang` = unknown/undefined
+language, empty `name` = no name provided, empty `description` = no
+description provided, empty `tags` = no tags provided.
+
+The parser preserves every string verbatim — including the
+empty-string sentinel — and surfaces a strongly typed projection
+via four `*_opt` helpers and a derived tag view:
+
+```text
+Property::Udes(Udes {
+    lang: String,        // RFC 5646 language tag, empty = unknown
+    name: String,        // empty = absent
+    description: String, // empty = absent
+    tags: String,        // empty = absent
+})
+
+Udes::lang_opt()         -> Option<&str>     // None when empty
+Udes::name_opt()         -> Option<&str>     // None when empty
+Udes::description_opt()  -> Option<&str>     // None when empty
+Udes::tags_opt()         -> Option<&str>     // None when empty (raw form)
+Udes::tag_list()         -> Vec<&str>        // split on ',' + trim
+```
+
+`tag_list` realises the §6.5.20.3 "comma-separated user-defined
+tags" shape: it splits the `tags` field on `','`, trims whitespace
+per segment, and drops empty / whitespace-only segments so a caller
+iterating the result gets a clean tag list. The raw `tags` field is
+preserved untouched for callers that want the on-wire form.
+
+Forward-compatibility behaviour matches §8.11.6 `infe`: trailing
+bytes past the fourth NUL terminator are ignored at parse time, so a
+v0 producer that pads the box with reserved bytes for a future spec
+revision is read cleanly. An unknown `version` value is rejected so
+a future-version layout (which might re-shape the field order or
+widths) cannot be misread as v0, and a body that runs out before all
+four NUL terminators have been observed is rejected by `read_cstr`
+rather than producing a partially-populated `Udes`.
+
+A recognised `udes` property — even when unusually flagged essential
+in the `ipma` association — does not trip
+[`Meta::unsupported_essential_properties`], joining the previously
+recognised `clap` / `irot` / `imir` / `lsel` / `a1op` / `a1lx` /
+`iscl` / `rref` / `crtt` / `mdft` properties on the always-honoured
+list. (`udes` is descriptive per §6.5.20.1, so the §7
+grid-derivation audit is untouched — transformative-property scope
+only.)
+
+Test delta: +11 unit (`udes_round_trip_reads_all_four_fields`,
+`udes_empty_strings_are_preserved_and_projectable_to_none`,
+`udes_opt_helpers_round_trip_non_empty`,
+`udes_tag_list_splits_and_trims`, `udes_preserves_utf8_multibyte`,
+`udes_rejects_unknown_version`, `udes_rejects_truncated_body`,
+`udes_tolerates_trailing_bytes`,
+`udes_dispatched_through_parse_ipco`,
+`udes_essential_association_is_recognised`,
+`udes_multiple_languages_coexist_on_same_item`). Default lib 364
+(was 353); standalone lib 349 (was 338); integration 61 + 1 ignored
+unchanged. Re-exports: `oxideav_avif::Udes`.
+
+Followups: §6.5.21 AccessibilityTextProperty (`altt`) is the next
+property in the §6.5 sequence — a `Quantity: Zero or more`
+descriptive item property whose body is two sequential `utf8string`
+fields (`alt_text` + `alt_lang`), structurally a strict subset of
+`udes`. §6.5.22 / §6.5.23 / §6.5.24 (`aebr` / `wbbr` / `fobr`) are
+the capture-side numeric descriptive properties (exposure
+numerator/step, blue-amber / green-magenta white balance,
+focus-distance rational) — each a single fixed-width payload, so
+the parsers would be three sibling commits in the same shape as
+`crtt` / `mdft`.
 
 ### Round 238 — HEIF §6.5.19 `mdft` modification-time item property
 

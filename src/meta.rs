@@ -73,6 +73,8 @@ const RREF: BoxType = b(b"rref");
 const CRTT: BoxType = b(b"crtt");
 /// HEIF §6.5.19 — Modification Time Information descriptive property.
 const MDFT: BoxType = b(b"mdft");
+/// HEIF §6.5.20 — User Description descriptive property.
+const UDES: BoxType = b(b"udes");
 
 /// HEIF §6.6.2.2 — image overlay derived-image type.
 pub const ITEM_TYPE_IOVL: BoxType = b(b"iovl");
@@ -750,6 +752,120 @@ impl Mdft {
     }
 }
 
+/// User Description descriptive property (`udes`) — HEIF §6.5.20.
+///
+/// Pairs the associated item or entity group with a human-readable
+/// name, description, and a comma-separated tag list, all carried in a
+/// single language. Per §6.5.20.1 the property is a descriptive item
+/// property with `Quantity (per associated item_ID): Zero or more`,
+/// and multiple instances associated to the same item shall carry
+/// **different** language codes — they represent the same content in
+/// different languages, from which a reader picks the most
+/// appropriate.
+///
+/// The wire layout is four sequential null-terminated UTF-8 strings:
+///
+/// ```text
+/// utf8string lang;
+/// utf8string name;
+/// utf8string description;
+/// utf8string tags;
+/// ```
+///
+/// Per §6.5.20.3:
+///
+/// * `lang` is an RFC 5646 language tag (e.g. `"en-US"`, `"fr-FR"`,
+///   `"zh-CN"`); an empty string means the language is
+///   unknown/undefined.
+/// * `name` is a human-readable name for the associated item; an
+///   empty string means no name is provided.
+/// * `description` is a human-readable description; an empty string
+///   means no description is provided.
+/// * `tags` is a comma-separated user-defined tag list; an empty
+///   string means no tags are provided.
+///
+/// The parser preserves every string verbatim, including the
+/// `"absent"` empty-string sentinel — callers needing a strongly
+/// optional shape can convert with the [`Self::name_opt`],
+/// [`Self::description_opt`], [`Self::tags_opt`], and
+/// [`Self::lang_opt`] helpers which return `None` for the empty
+/// case.
+///
+/// Spec: ISO/IEC 23008-12 §6.5.20.2 — FullBox(`udes`, version=0,
+/// flags=0).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Udes {
+    /// RFC 5646 language tag (e.g. `"en-US"`); empty = unknown.
+    pub lang: String,
+    /// Human-readable name for the item or entity group; empty = absent.
+    pub name: String,
+    /// Human-readable description for the item or entity group;
+    /// empty = absent.
+    pub description: String,
+    /// Comma-separated user-defined tags; empty = absent.
+    pub tags: String,
+}
+
+impl Udes {
+    /// `lang` typed as `Option<&str>`: `None` when the field is empty
+    /// (§6.5.20.3 "unknown/undefined").
+    pub fn lang_opt(&self) -> Option<&str> {
+        if self.lang.is_empty() {
+            None
+        } else {
+            Some(self.lang.as_str())
+        }
+    }
+
+    /// `name` typed as `Option<&str>`: `None` when the field is empty
+    /// (§6.5.20.3 "no name is provided").
+    pub fn name_opt(&self) -> Option<&str> {
+        if self.name.is_empty() {
+            None
+        } else {
+            Some(self.name.as_str())
+        }
+    }
+
+    /// `description` typed as `Option<&str>`: `None` when the field is
+    /// empty (§6.5.20.3 "no description is provided").
+    pub fn description_opt(&self) -> Option<&str> {
+        if self.description.is_empty() {
+            None
+        } else {
+            Some(self.description.as_str())
+        }
+    }
+
+    /// `tags` split on `','` and trimmed, after the §6.5.20.3
+    /// "comma-separated" shape. Returns an empty vector when the
+    /// `tags` field is absent (empty string); blank-only segments
+    /// (`",,foo,"`) are filtered out so a caller iterating the
+    /// result gets a clean tag list.
+    pub fn tag_list(&self) -> Vec<&str> {
+        if self.tags.is_empty() {
+            return Vec::new();
+        }
+        self.tags
+            .split(',')
+            .map(|t| t.trim())
+            .filter(|t| !t.is_empty())
+            .collect()
+    }
+
+    /// `tags` typed as `Option<&str>`: `None` when the field is empty
+    /// (§6.5.20.3 "no tags is provided"). Unlike [`Self::tag_list`]
+    /// this preserves the raw comma-separated form including any
+    /// leading / trailing whitespace.
+    pub fn tags_opt(&self) -> Option<&str> {
+        if self.tags.is_empty() {
+            None
+        } else {
+            Some(self.tags.as_str())
+        }
+    }
+}
+
 /// One property box, kept typed for the boxes AVIF cares about + a raw
 /// fallback so an unknown property still gets an index for association.
 #[derive(Clone, Debug)]
@@ -785,6 +901,8 @@ pub enum Property {
     Crtt(Crtt),
     /// Modification-time descriptive property (HEIF §6.5.19).
     Mdft(Mdft),
+    /// User-description descriptive property (HEIF §6.5.20).
+    Udes(Udes),
     Other(BoxType, Vec<u8>),
 }
 
@@ -811,6 +929,7 @@ impl Property {
             Property::Rref(_) => RREF,
             Property::Crtt(_) => CRTT,
             Property::Mdft(_) => MDFT,
+            Property::Udes(_) => UDES,
             Property::Other(t, _) => *t,
         }
     }
@@ -979,8 +1098,8 @@ impl Meta {
     /// `a1lx` is treated as recognised even when its bytes are not acted
     /// upon, because the spec forbids marking it essential; a `clap`,
     /// `irot`, `imir`, `lsel`, `a1op`, `iscl`, `rref`, `crtt`, `mdft`,
-    /// etc. that we parse counts as recognised regardless of the
-    /// essential bit.
+    /// `udes`, etc. that we parse counts as recognised regardless of
+    /// the essential bit.
     pub fn unsupported_essential_properties(&self, item_id: u32) -> Vec<BoxType> {
         let Some(assoc) = self.assoc_by_id(item_id) else {
             return Vec::new();
@@ -1314,6 +1433,7 @@ fn parse_ipco(payload: &[u8]) -> Result<Vec<Property>> {
             x if x == &RREF => Property::Rref(parse_rref(body)?),
             x if x == &CRTT => Property::Crtt(parse_crtt(body)?),
             x if x == &MDFT => Property::Mdft(parse_mdft(body)?),
+            x if x == &UDES => Property::Udes(parse_udes(body)?),
             other => Property::Other(*other, body.to_vec()),
         };
         out.push(prop);
@@ -1722,6 +1842,47 @@ fn parse_mdft(body: &[u8]) -> Result<Mdft> {
     }
     Ok(Mdft {
         modification_time: read_u64(rest, 0)?,
+    })
+}
+
+/// Parse `udes` (UserDescriptionProperty — HEIF §6.5.20).
+/// FullBox(`udes`, version=0, flags=0) followed by four
+/// sequential null-terminated UTF-8 strings:
+///
+/// ```text
+/// utf8string lang;
+/// utf8string name;
+/// utf8string description;
+/// utf8string tags;
+/// ```
+///
+/// Per §6.5.20.3 each field's empty-string form (a single nul byte)
+/// is the documented "absent" sentinel; the parser preserves the raw
+/// string and leaves the `Option` projection to the
+/// [`Udes::lang_opt`] / [`Udes::name_opt`] / [`Udes::description_opt`]
+/// / [`Udes::tags_opt`] / [`Udes::tag_list`] helpers.
+///
+/// An unknown `version` is rejected so a future-version layout (which
+/// might re-shape the field order or widths) cannot be misread as v0.
+/// A body that runs out before all four strings have been read is
+/// rejected by [`read_cstr`]; trailing bytes past the fourth
+/// terminator are ignored, mirroring the §8.11.6 `infe` tail-field
+/// behaviour for forward compatibility with future spec revisions
+/// that append new fields under the same `version=0` slot.
+fn parse_udes(body: &[u8]) -> Result<Udes> {
+    let (version, _flags, rest) = parse_full_box(body)?;
+    if version != 0 {
+        return Err(Error::invalid(format!("avif: udes version {version} != 0")));
+    }
+    let (lang, after_lang) = read_cstr(rest, 0)?;
+    let (name, after_name) = read_cstr(rest, after_lang)?;
+    let (description, after_desc) = read_cstr(rest, after_name)?;
+    let (tags, _after_tags) = read_cstr(rest, after_desc)?;
+    Ok(Udes {
+        lang,
+        name,
+        description,
+        tags,
     })
 }
 
@@ -3086,5 +3247,223 @@ mod tests {
             Some(Property::Mdft(d)) => assert_eq!(d.modification_time, mdft_raw),
             other => panic!("expected Mdft, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // HEIF §6.5.20 UserDescriptionProperty (`udes`) — parse + helpers
+    // -----------------------------------------------------------------
+
+    /// Build a `udes` body — FullBox(v=0, f=0) followed by four
+    /// nul-terminated UTF-8 strings in the §6.5.20.2 declaration
+    /// order: `lang`, `name`, `description`, `tags`.
+    fn udes_body(lang: &str, name: &str, description: &str, tags: &str) -> Vec<u8> {
+        let mut buf = vec![0u8; 4];
+        for s in [lang, name, description, tags] {
+            buf.extend_from_slice(s.as_bytes());
+            buf.push(0);
+        }
+        buf
+    }
+
+    #[test]
+    fn udes_round_trip_reads_all_four_fields() {
+        // Distinct values per field so a cross-wire between lang /
+        // name / description / tags would surface immediately.
+        let u = parse_udes(&udes_body(
+            "en-US",
+            "Front porch",
+            "Photo of the cabin's front porch at dusk",
+            "outdoor,porch,dusk",
+        ))
+        .unwrap();
+        assert_eq!(u.lang, "en-US");
+        assert_eq!(u.name, "Front porch");
+        assert_eq!(u.description, "Photo of the cabin's front porch at dusk");
+        assert_eq!(u.tags, "outdoor,porch,dusk");
+    }
+
+    /// §6.5.20.3 documents an empty string for any of the four fields
+    /// as the "absent" sentinel. The parser surfaces the raw empty
+    /// string verbatim; the `*_opt` helpers project to `None`.
+    #[test]
+    fn udes_empty_strings_are_preserved_and_projectable_to_none() {
+        // All four fields empty (just nul terminators). This is the
+        // minimal-length §6.5.20.2 body — a FullBox header and four
+        // bytes of nul.
+        let u = parse_udes(&udes_body("", "", "", "")).unwrap();
+        assert_eq!(u.lang, "");
+        assert_eq!(u.name, "");
+        assert_eq!(u.description, "");
+        assert_eq!(u.tags, "");
+        assert_eq!(u.lang_opt(), None);
+        assert_eq!(u.name_opt(), None);
+        assert_eq!(u.description_opt(), None);
+        assert_eq!(u.tags_opt(), None);
+        assert!(u.tag_list().is_empty());
+    }
+
+    #[test]
+    fn udes_opt_helpers_round_trip_non_empty() {
+        let u = parse_udes(&udes_body("fr-FR", "Mer", "Vue de la mer", "mer,été")).unwrap();
+        assert_eq!(u.lang_opt(), Some("fr-FR"));
+        assert_eq!(u.name_opt(), Some("Mer"));
+        assert_eq!(u.description_opt(), Some("Vue de la mer"));
+        assert_eq!(u.tags_opt(), Some("mer,été"));
+    }
+
+    /// `tag_list` splits on `','`, trims whitespace per segment, and
+    /// drops empty / whitespace-only segments. The raw `tags` field
+    /// is preserved verbatim — `tag_list` is a derived view.
+    #[test]
+    fn udes_tag_list_splits_and_trims() {
+        let u = parse_udes(&udes_body(
+            "en",
+            "n",
+            "d",
+            "outdoor, sunset ,, beach,,, mountain",
+        ))
+        .unwrap();
+        assert_eq!(u.tag_list(), vec!["outdoor", "sunset", "beach", "mountain"]);
+        // raw field is untouched.
+        assert_eq!(u.tags, "outdoor, sunset ,, beach,,, mountain");
+    }
+
+    /// UTF-8 multi-byte payloads (CJK + accented Latin) survive the
+    /// parser intact — the underlying cstring reader uses
+    /// `from_utf8_lossy`, so the round-trip is byte-equal for any
+    /// already-valid UTF-8 input.
+    #[test]
+    fn udes_preserves_utf8_multibyte() {
+        let u = parse_udes(&udes_body(
+            "zh-CN",
+            "海岸",
+            "夕暮れの海岸",
+            "海, 夕暮れ, 風景",
+        ))
+        .unwrap();
+        assert_eq!(u.lang, "zh-CN");
+        assert_eq!(u.name, "海岸");
+        assert_eq!(u.description, "夕暮れの海岸");
+        assert_eq!(u.tag_list(), vec!["海", "夕暮れ", "風景"]);
+    }
+
+    #[test]
+    fn udes_rejects_unknown_version() {
+        // version=1, flags=0; four empty strings would otherwise be
+        // a well-formed v0 body.
+        let mut buf = vec![1u8, 0, 0, 0];
+        buf.extend_from_slice(&[0, 0, 0, 0]);
+        assert!(parse_udes(&buf).is_err());
+    }
+
+    /// A body that runs out before the fourth nul is written must be
+    /// rejected — the `read_cstr` helper bails on an unterminated
+    /// string, which is exactly what we want here so a truncated
+    /// `udes` cannot be partially read.
+    #[test]
+    fn udes_rejects_truncated_body() {
+        // FullBox header + three empty strings + start of the fourth
+        // without a terminator.
+        let mut buf = vec![0u8; 4];
+        // lang = ""
+        buf.push(0);
+        // name = ""
+        buf.push(0);
+        // description = ""
+        buf.push(0);
+        // tags = "abc" with no trailing nul.
+        buf.extend_from_slice(b"abc");
+        assert!(parse_udes(&buf).is_err());
+    }
+
+    /// Trailing bytes past the fourth terminator are forward-compat
+    /// space — the parser ignores them (mirrors the §8.11.6 `infe`
+    /// tail behaviour). A v0 producer that pads the box with extra
+    /// reserved bytes is read cleanly.
+    #[test]
+    fn udes_tolerates_trailing_bytes() {
+        let mut body = udes_body("en", "n", "d", "t");
+        body.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+        let u = parse_udes(&body).unwrap();
+        assert_eq!(u.lang, "en");
+        assert_eq!(u.tags, "t");
+    }
+
+    #[test]
+    fn udes_dispatched_through_parse_ipco() {
+        let body = udes_body("en-US", "Cabin", "Front porch", "outdoor,porch");
+        let mut ipco = Vec::new();
+        let s = 8 + body.len() as u32;
+        ipco.extend_from_slice(&s.to_be_bytes());
+        ipco.extend_from_slice(b"udes");
+        ipco.extend_from_slice(&body);
+        let props = parse_ipco(&ipco).unwrap();
+        assert_eq!(props.len(), 1);
+        match &props[0] {
+            Property::Udes(u) => {
+                assert_eq!(u.lang, "en-US");
+                assert_eq!(u.name, "Cabin");
+                assert_eq!(u.description, "Front porch");
+                assert_eq!(u.tags, "outdoor,porch");
+            }
+            other => panic!("expected Udes, got {other:?}"),
+        }
+        assert_eq!(props[0].kind(), *b"udes");
+    }
+
+    /// A recognised `udes` property — even when flagged essential
+    /// (unusual for a descriptive property, but the parser doesn't
+    /// reject the bit) — does NOT trip
+    /// [`Meta::unsupported_essential_properties`].
+    #[test]
+    fn udes_essential_association_is_recognised() {
+        let m = Meta {
+            properties: vec![Property::Udes(Udes::default())],
+            associations: vec![ItemPropertyAssociation {
+                item_id: 1,
+                entries: vec![PropertyAssociation {
+                    index: 0,
+                    essential: true,
+                }],
+            }],
+            ..Meta::default()
+        };
+        assert!(!m.has_unsupported_essential_property(1));
+        assert!(m.unsupported_essential_properties(1).is_empty());
+    }
+
+    /// §6.5.20.1 allows zero-or-more `udes` instances per item, with
+    /// each instance carrying a different `lang` — the dispatch
+    /// returns every `udes` in insertion order so the caller can pick
+    /// the most appropriate language.
+    #[test]
+    fn udes_multiple_languages_coexist_on_same_item() {
+        let en = udes_body("en-US", "Beach", "Sunset over the bay", "beach,sunset");
+        let fr = udes_body(
+            "fr-FR",
+            "Plage",
+            "Coucher de soleil sur la baie",
+            "plage,coucher",
+        );
+        let mut ipco = Vec::new();
+        let se = 8 + en.len() as u32;
+        ipco.extend_from_slice(&se.to_be_bytes());
+        ipco.extend_from_slice(b"udes");
+        ipco.extend_from_slice(&en);
+        let sf = 8 + fr.len() as u32;
+        ipco.extend_from_slice(&sf.to_be_bytes());
+        ipco.extend_from_slice(b"udes");
+        ipco.extend_from_slice(&fr);
+
+        let props = parse_ipco(&ipco).unwrap();
+        assert_eq!(props.len(), 2);
+        let langs: Vec<&str> = props
+            .iter()
+            .filter_map(|p| match p {
+                Property::Udes(u) => Some(u.lang.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(langs, vec!["en-US", "fr-FR"]);
     }
 }

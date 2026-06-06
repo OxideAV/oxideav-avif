@@ -9,6 +9,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- ISO/IEC 23008-12 §6.5.20 UserDescriptionProperty (`udes`) descriptive
+  item-property parser. The body shape is taken verbatim from
+  §6.5.20.2 — a FullBox(`udes`, version=0, flags=0) followed by four
+  sequential null-terminated UTF-8 strings: `lang`, `name`,
+  `description`, `tags`. Per §6.5.20.3 each field's empty-string form
+  is the documented "absent" sentinel; the parser preserves the raw
+  empty string and surfaces a strongly typed projection via four
+  `*_opt` helpers (`Udes::{lang_opt, name_opt, description_opt,
+  tags_opt}`) returning `None` for the empty case, plus a derived
+  `Udes::tag_list` view that splits the `tags` field on `','`, trims
+  whitespace per segment, and filters out blank-only segments so a
+  caller iterating the result gets a clean tag list. Lands as a new
+  `Property::Udes(Udes)` variant dispatched through `parse_ipco`
+  alongside the other recognised properties. The parser rejects
+  unknown `version` values (per the spec's `version = 0` declaration
+  in the syntax block) so a future-version layout cannot be misread
+  as v0, rejects a body that runs out before the fourth NUL
+  terminator has been observed, and tolerates trailing bytes past
+  the fourth terminator for forward-compatibility with future spec
+  revisions that append new fields under the same `version=0` slot
+  (mirrors the §8.11.6 `infe` tail-field behaviour). A recognised
+  `udes` property — even when unusually flagged essential in the
+  `ipma` association — does not trip
+  `Meta::unsupported_essential_properties`. Per §6.5.20.1
+  `Quantity: Zero or more`, multiple `udes` instances may coexist on
+  the same item carrying different language codes; the dispatch
+  returns every instance in insertion order so the caller can pick
+  the most appropriate. Coverage: +11 unit
+  (`udes_round_trip_reads_all_four_fields` with distinct values per
+  field that would catch a cross-wire,
+  `udes_empty_strings_are_preserved_and_projectable_to_none` covering
+  the §6.5.20.3 sentinel form, `udes_opt_helpers_round_trip_non_empty`,
+  `udes_tag_list_splits_and_trims` exercising blank-segment /
+  extra-whitespace handling, `udes_preserves_utf8_multibyte`
+  round-tripping CJK + accented Latin payloads,
+  `udes_rejects_unknown_version`, `udes_rejects_truncated_body`,
+  `udes_tolerates_trailing_bytes` proving forward-compat tail
+  behaviour, `udes_dispatched_through_parse_ipco`,
+  `udes_essential_association_is_recognised`, and
+  `udes_multiple_languages_coexist_on_same_item` proving the §6.5.20.1
+  zero-or-more quantity round-trip). Default lib 364 (was 353);
+  standalone lib 349 (was 338); integration 61 + 1 ignored unchanged.
+  Re-exports add `Udes`. Spec: ISO/IEC 23008-12:2025 §6.5.20.
+
 - ISO/IEC 23008-12 §6.5.19 ModificationTimeProperty (`mdft`) descriptive
   item-property parser. The body shape is taken verbatim from
   §6.5.19.2 — a FullBox(`mdft`, version=0, flags=0) carrying a single
