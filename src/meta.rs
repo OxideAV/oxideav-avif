@@ -77,6 +77,8 @@ const MDFT: BoxType = b(b"mdft");
 const UDES: BoxType = b(b"udes");
 /// HEIF §6.5.21 — Accessibility Text descriptive property.
 const ALTT: BoxType = b(b"altt");
+/// HEIF §6.5.22 — Auto Exposure Information descriptive property.
+const AEBR: BoxType = b(b"aebr");
 
 /// HEIF §6.6.2.2 — image overlay derived-image type.
 pub const ITEM_TYPE_IOVL: BoxType = b(b"iovl");
@@ -952,6 +954,98 @@ impl Altt {
     }
 }
 
+/// Auto Exposure Information descriptive property (`aebr`) —
+/// HEIF §6.5.22.
+///
+/// Carries the exposure variation of the associated image item
+/// relative to the camera settings (i.e. the offset, in number of
+/// stops, applied by an auto-exposure-bracketing routine). The
+/// property is associated with one image item out of an `aebr` entity
+/// group (§6.8.6) so a reader can identify the relative position of a
+/// frame inside an exposure-bracketed burst.
+///
+/// Per §6.5.22.1 the property is a descriptive item property with
+/// `Quantity (per item): At most one` — a single item carries zero or
+/// one `aebr` instance.
+///
+/// The wire layout (§6.5.22.2) is two signed bytes inside a
+/// FullBox(`aebr`, version=0, flags=0):
+///
+/// ```text
+/// int(8) exposure_step;
+/// int(8) exposure_numerator;
+/// ```
+///
+/// Per §6.5.22.3:
+///
+/// * `exposure_step` selects the bracketing increment. The spec
+///   enumerates four values explicitly: `1` = full-stop increment,
+///   `2` = half-stop, `3` = third-stop, `4` = quarter-stop. Other
+///   values are **reserved**; the parser preserves the raw value so a
+///   future-revision producer is round-tripped, and the
+///   [`Aebr::is_defined_step`] helper exposes the §6.5.22.3
+///   enumeration check.
+/// * `exposure_numerator` specifies the numerator used to compute the
+///   exposure offset, expressed as
+///   `exposure_numerator / exposure_step` stops.
+///
+/// Note: the spec text declares both fields as `int(8)` (signed). The
+/// numerator carries a signed direction (negative = darker than the
+/// camera setting, positive = brighter) so the signed interpretation
+/// is load-bearing for downstream consumers. The parser surfaces the
+/// raw bytes as `i8` and the [`Aebr::exposure_stops`] helper exposes
+/// the float-valued offset.
+///
+/// Spec: ISO/IEC 23008-12 §6.5.22.2 — FullBox(`aebr`, version=0,
+/// flags=0).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Aebr {
+    /// Bracketing increment selector. Defined values per §6.5.22.3
+    /// are `1` (full stop), `2` (half), `3` (third), `4` (quarter);
+    /// every other value is reserved. The parser preserves the raw
+    /// byte verbatim.
+    pub exposure_step: i8,
+    /// Exposure numerator. The exposure offset in stops is
+    /// `exposure_numerator / exposure_step` (§6.5.22.3).
+    pub exposure_numerator: i8,
+}
+
+impl Aebr {
+    /// Full-stop bracketing increment (§6.5.22.3 `exposure_step == 1`).
+    pub const STEP_FULL: i8 = 1;
+    /// Half-stop bracketing increment (§6.5.22.3 `exposure_step == 2`).
+    pub const STEP_HALF: i8 = 2;
+    /// Third-stop bracketing increment (§6.5.22.3 `exposure_step == 3`).
+    pub const STEP_THIRD: i8 = 3;
+    /// Quarter-stop bracketing increment (§6.5.22.3
+    /// `exposure_step == 4`).
+    pub const STEP_QUARTER: i8 = 4;
+
+    /// True when [`Self::exposure_step`] is one of the four defined
+    /// values from §6.5.22.3 (`1` / `2` / `3` / `4`). Other values
+    /// are reserved and a strict reader may surface a diagnostic.
+    pub fn is_defined_step(&self) -> bool {
+        matches!(
+            self.exposure_step,
+            Self::STEP_FULL | Self::STEP_HALF | Self::STEP_THIRD | Self::STEP_QUARTER
+        )
+    }
+
+    /// The exposure offset expressed in number of stops:
+    /// `exposure_numerator / exposure_step` (§6.5.22.3).
+    ///
+    /// Returns `None` when `exposure_step == 0` — the spec lists `0`
+    /// as a reserved value and dividing by it is undefined. Callers
+    /// that want to gate on the §6.5.22.3 enumeration explicitly
+    /// should consult [`Self::is_defined_step`] first.
+    pub fn exposure_stops(&self) -> Option<f64> {
+        if self.exposure_step == 0 {
+            return None;
+        }
+        Some(f64::from(self.exposure_numerator) / f64::from(self.exposure_step))
+    }
+}
+
 /// One property box, kept typed for the boxes AVIF cares about + a raw
 /// fallback so an unknown property still gets an index for association.
 #[derive(Clone, Debug)]
@@ -991,6 +1085,8 @@ pub enum Property {
     Udes(Udes),
     /// Accessibility-text descriptive property (HEIF §6.5.21).
     Altt(Altt),
+    /// Auto-exposure-information descriptive property (HEIF §6.5.22).
+    Aebr(Aebr),
     Other(BoxType, Vec<u8>),
 }
 
@@ -1019,6 +1115,7 @@ impl Property {
             Property::Mdft(_) => MDFT,
             Property::Udes(_) => UDES,
             Property::Altt(_) => ALTT,
+            Property::Aebr(_) => AEBR,
             Property::Other(t, _) => *t,
         }
     }
@@ -1187,7 +1284,7 @@ impl Meta {
     /// `a1lx` is treated as recognised even when its bytes are not acted
     /// upon, because the spec forbids marking it essential; a `clap`,
     /// `irot`, `imir`, `lsel`, `a1op`, `iscl`, `rref`, `crtt`, `mdft`,
-    /// `udes`, `altt`, etc. that we parse counts as recognised
+    /// `udes`, `altt`, `aebr`, etc. that we parse counts as recognised
     /// regardless of the essential bit.
     pub fn unsupported_essential_properties(&self, item_id: u32) -> Vec<BoxType> {
         let Some(assoc) = self.assoc_by_id(item_id) else {
@@ -1524,6 +1621,7 @@ fn parse_ipco(payload: &[u8]) -> Result<Vec<Property>> {
             x if x == &MDFT => Property::Mdft(parse_mdft(body)?),
             x if x == &UDES => Property::Udes(parse_udes(body)?),
             x if x == &ALTT => Property::Altt(parse_altt(body)?),
+            x if x == &AEBR => Property::Aebr(parse_aebr(body)?),
             other => Property::Other(*other, body.to_vec()),
         };
         out.push(prop);
@@ -2007,6 +2105,45 @@ fn parse_altt(body: &[u8]) -> Result<Altt> {
     let (alt_text, after_text) = read_cstr(rest, 0)?;
     let (alt_lang, _after_lang) = read_cstr(rest, after_text)?;
     Ok(Altt { alt_text, alt_lang })
+}
+
+/// Parse `aebr` (AutoExposureProperty — HEIF §6.5.22). FullBox(`aebr`,
+/// version=0, flags=0) followed by two `int(8)` fields:
+///
+/// ```text
+/// int(8) exposure_step;
+/// int(8) exposure_numerator;
+/// ```
+///
+/// The §6.5.22.3 enumeration for `exposure_step` (`1`/`2`/`3`/`4`)
+/// is not enforced at parse time — the parser surfaces the raw value
+/// and the [`Aebr::is_defined_step`] / [`Aebr::exposure_stops`]
+/// helpers expose the semantic checks separately. This keeps "did the
+/// bytes decode" and "did they satisfy the spec's enumeration" as
+/// distinct signals, matching the pattern used by the other HEIF
+/// property parsers in this module (notably `iscl` which factors out
+/// §6.5.13.3 `is_well_formed`).
+///
+/// An unknown `version` is rejected so a future-version layout cannot
+/// be misread as v0. Trailing bytes past the two fields are ignored,
+/// mirroring the forward-compatibility behaviour of the other
+/// FullBox-headed property parsers — a v0 producer that pads the box
+/// with reserved bytes is read cleanly.
+fn parse_aebr(body: &[u8]) -> Result<Aebr> {
+    let (version, _flags, rest) = parse_full_box(body)?;
+    if version != 0 {
+        return Err(Error::invalid(format!("avif: aebr version {version} != 0")));
+    }
+    if rest.len() < 2 {
+        return Err(Error::invalid(format!(
+            "avif: aebr too short ({} < 2)",
+            rest.len()
+        )));
+    }
+    Ok(Aebr {
+        exposure_step: rest[0] as i8,
+        exposure_numerator: rest[1] as i8,
+    })
 }
 
 /// Parse an `iref` box: FullBox header followed by a sequence of typed
@@ -3786,5 +3923,211 @@ mod tests {
         let mis = parse_altt(&altt_body("en-US", "Sunset")).unwrap();
         assert_eq!(mis.alt_text, "en-US");
         assert_eq!(mis.alt_lang, "Sunset");
+    }
+
+    // -----------------------------------------------------------------
+    // HEIF §6.5.22 AutoExposureProperty (`aebr`) — parse + helpers
+    // -----------------------------------------------------------------
+
+    /// Build an `aebr` body — FullBox(v=0, f=0) followed by two
+    /// `int(8)` fields in the §6.5.22.2 declaration order:
+    /// `exposure_step`, then `exposure_numerator`. The helper accepts
+    /// signed `i8` inputs and writes them as their two's-complement
+    /// byte form so a negative `exposure_numerator` (darker than the
+    /// camera setting) is exercised faithfully.
+    fn aebr_body(exposure_step: i8, exposure_numerator: i8) -> Vec<u8> {
+        let mut buf = vec![0u8; 4];
+        buf.push(exposure_step as u8);
+        buf.push(exposure_numerator as u8);
+        buf
+    }
+
+    #[test]
+    fn aebr_round_trip_reads_step_then_numerator() {
+        // Distinct values per field so a cross-wire between
+        // exposure_step and exposure_numerator would surface
+        // immediately.
+        let a = parse_aebr(&aebr_body(3, 5)).unwrap();
+        assert_eq!(a.exposure_step, 3);
+        assert_eq!(a.exposure_numerator, 5);
+    }
+
+    /// The §6.5.22.3 enumeration for `exposure_step` documents four
+    /// defined values; the `STEP_*` constants pin each one and the
+    /// `is_defined_step` helper rejects everything else (including
+    /// `0` and the negative range).
+    #[test]
+    fn aebr_defined_step_enumeration() {
+        for s in [
+            Aebr::STEP_FULL,
+            Aebr::STEP_HALF,
+            Aebr::STEP_THIRD,
+            Aebr::STEP_QUARTER,
+        ] {
+            let a = parse_aebr(&aebr_body(s, 1)).unwrap();
+            assert!(a.is_defined_step(), "step {s} should be defined");
+        }
+        for s in [-1, 0, 5, 7, i8::MIN, i8::MAX] {
+            let a = parse_aebr(&aebr_body(s, 1)).unwrap();
+            assert!(!a.is_defined_step(), "step {s} must NOT be defined");
+        }
+    }
+
+    /// The §6.5.22.3 stops formula is `exposure_numerator /
+    /// exposure_step`. The helper returns `Some(f)` for every
+    /// non-zero `exposure_step` (including reserved values, so a
+    /// strict reader can route through `is_defined_step` first to
+    /// gate the enumeration) and `None` for a zero step (the
+    /// reserved sentinel that would divide by zero).
+    #[test]
+    fn aebr_exposure_stops_matches_spec_ratio() {
+        // Full-stop: -2 numerator → -2.0 stops (two stops darker).
+        let a = parse_aebr(&aebr_body(1, -2)).unwrap();
+        assert_eq!(a.exposure_stops(), Some(-2.0));
+        // Half-stop: 3 numerator → +1.5 stops.
+        let a = parse_aebr(&aebr_body(2, 3)).unwrap();
+        assert_eq!(a.exposure_stops(), Some(1.5));
+        // Third-stop: 4 numerator → +4/3 stops.
+        let a = parse_aebr(&aebr_body(3, 4)).unwrap();
+        let v = a.exposure_stops().unwrap();
+        assert!((v - 4.0 / 3.0).abs() < 1e-12, "got {v}");
+        // Quarter-stop: -3 numerator → -0.75 stops.
+        let a = parse_aebr(&aebr_body(4, -3)).unwrap();
+        assert_eq!(a.exposure_stops(), Some(-0.75));
+        // Zero step (reserved): no float interpretation.
+        let a = parse_aebr(&aebr_body(0, 7)).unwrap();
+        assert_eq!(a.exposure_stops(), None);
+    }
+
+    /// Both fields are signed: the parser must read a negative
+    /// `exposure_numerator` as the two's-complement `i8` value, not
+    /// as an unsigned byte. A writer that produces `-1` (0xFF) for
+    /// "one stop darker" must round-trip to `-1`, not `255`.
+    #[test]
+    fn aebr_signed_byte_reinterpretation() {
+        let a = parse_aebr(&aebr_body(1, -1)).unwrap();
+        assert_eq!(a.exposure_numerator, -1);
+        assert_eq!(a.exposure_stops(), Some(-1.0));
+
+        let a = parse_aebr(&aebr_body(-1, 5)).unwrap();
+        assert_eq!(a.exposure_step, -1);
+        // Reserved-step value; the helper still computes a ratio so
+        // the caller can route through `is_defined_step` to gate the
+        // enumeration explicitly.
+        assert!(!a.is_defined_step());
+        assert_eq!(a.exposure_stops(), Some(-5.0));
+
+        let a = parse_aebr(&aebr_body(i8::MIN, i8::MAX)).unwrap();
+        assert_eq!(a.exposure_step, i8::MIN);
+        assert_eq!(a.exposure_numerator, i8::MAX);
+    }
+
+    #[test]
+    fn aebr_rejects_unknown_version() {
+        // version=1, flags=0; two zero bytes would otherwise be a
+        // well-formed v0 body.
+        let mut buf = vec![1u8, 0, 0, 0];
+        buf.extend_from_slice(&[0, 0]);
+        assert!(parse_aebr(&buf).is_err());
+    }
+
+    /// A body shorter than the two-byte fixed tail must be rejected
+    /// so a truncated `aebr` cannot be partially read.
+    #[test]
+    fn aebr_rejects_truncated_body() {
+        // FullBox header alone — no fields at all.
+        let buf = vec![0u8; 4];
+        assert!(parse_aebr(&buf).is_err());
+        // FullBox header + one field only.
+        let mut buf = vec![0u8; 4];
+        buf.push(2);
+        assert!(parse_aebr(&buf).is_err());
+    }
+
+    /// Trailing bytes past the two-byte tail are forward-compat
+    /// space — the parser ignores them, mirroring the behaviour of
+    /// every other FullBox-headed property parser in this module.
+    #[test]
+    fn aebr_tolerates_trailing_bytes() {
+        let mut body = aebr_body(2, 1);
+        body.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let a = parse_aebr(&body).unwrap();
+        assert_eq!(a.exposure_step, 2);
+        assert_eq!(a.exposure_numerator, 1);
+    }
+
+    #[test]
+    fn aebr_dispatched_through_parse_ipco() {
+        let body = aebr_body(3, -2);
+        let mut ipco = Vec::new();
+        let s = 8 + body.len() as u32;
+        ipco.extend_from_slice(&s.to_be_bytes());
+        ipco.extend_from_slice(b"aebr");
+        ipco.extend_from_slice(&body);
+        let props = parse_ipco(&ipco).unwrap();
+        assert_eq!(props.len(), 1);
+        match &props[0] {
+            Property::Aebr(a) => {
+                assert_eq!(a.exposure_step, 3);
+                assert_eq!(a.exposure_numerator, -2);
+            }
+            other => panic!("expected Aebr, got {other:?}"),
+        }
+        assert_eq!(props[0].kind(), *b"aebr");
+    }
+
+    /// A recognised `aebr` property — even when flagged essential
+    /// (unusual for a descriptive property, but the parser does not
+    /// reject the bit) — does NOT trip
+    /// [`Meta::unsupported_essential_properties`].
+    #[test]
+    fn aebr_essential_association_is_recognised() {
+        let m = Meta {
+            properties: vec![Property::Aebr(Aebr::default())],
+            associations: vec![ItemPropertyAssociation {
+                item_id: 1,
+                entries: vec![PropertyAssociation {
+                    index: 0,
+                    essential: true,
+                }],
+            }],
+            ..Meta::default()
+        };
+        assert!(!m.has_unsupported_essential_property(1));
+        assert!(m.unsupported_essential_properties(1).is_empty());
+    }
+
+    /// §6.5.22.1 caps `aebr` at one per item (`At most one`). A
+    /// `Meta::property_for(item_id, &AEBR)` lookup finds the
+    /// associated single instance via the standard `ipma` walk; the
+    /// dispatch returns the `Aebr` variant which the caller pattern
+    /// matches on. This test exercises the typical lookup shape end
+    /// to end.
+    #[test]
+    fn aebr_lookup_via_property_for() {
+        let m = Meta {
+            properties: vec![Property::Aebr(Aebr {
+                exposure_step: 2,
+                exposure_numerator: -1,
+            })],
+            associations: vec![ItemPropertyAssociation {
+                item_id: 9,
+                entries: vec![PropertyAssociation {
+                    index: 0,
+                    essential: false,
+                }],
+            }],
+            ..Meta::default()
+        };
+        match m.property_for(9, b"aebr") {
+            Some(Property::Aebr(a)) => {
+                assert_eq!(a.exposure_step, 2);
+                assert_eq!(a.exposure_numerator, -1);
+                assert_eq!(a.exposure_stops(), Some(-0.5));
+            }
+            other => panic!("expected Aebr, got {other:?}"),
+        }
+        // No `aebr` for an item that doesn't carry the association.
+        assert!(m.property_for(99, b"aebr").is_none());
     }
 }

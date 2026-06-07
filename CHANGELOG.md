@@ -9,6 +9,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- ISO/IEC 23008-12 §6.5.22 AutoExposureProperty (`aebr`) descriptive
+  item-property parser. The body shape is taken verbatim from
+  §6.5.22.2 — a FullBox(`aebr`, version=0, flags=0) followed by two
+  signed `int(8)` fields: `exposure_step` then `exposure_numerator`.
+  Per §6.5.22.1 the property is descriptive with `Quantity (per item):
+  At most one` and identifies the exposure variation, in number of
+  stops, applied by an auto-exposure-bracketing routine relative to
+  the camera settings. The bracketing increment is enumerated in
+  §6.5.22.3 (`1` = full stop, `2` = half, `3` = third, `4` = quarter);
+  every other value is reserved. The parser surfaces the raw byte and
+  exposes the enumeration check via four `Aebr::STEP_*` associated
+  constants plus an `Aebr::is_defined_step` predicate so a strict
+  reader can route on the §6.5.22.3 enumeration without re-deriving
+  the table at the call site. The exposure offset formula
+  (`exposure_numerator / exposure_step`) is exposed via
+  `Aebr::exposure_stops` returning `Option<f64>`: `Some(f)` for any
+  non-zero step (including reserved values, so a caller wanting the
+  defined-only path gates on `is_defined_step` first), and `None`
+  for the reserved zero step that would divide by zero. Both wire
+  fields are signed `int(8)`; the parser reinterprets the byte as
+  `i8` so a negative `exposure_numerator` (darker-than-camera bracket
+  position) round-trips correctly rather than wrapping to `255`.
+  Lands as a new `Property::Aebr(Aebr)` variant dispatched through
+  `parse_ipco` alongside the other recognised properties. The parser
+  rejects unknown `version` values (per the spec's `version = 0`
+  declaration in the syntax block) so a future-version layout cannot
+  be misread as v0, rejects a body shorter than the two-byte fixed
+  tail so a truncated `aebr` cannot be partially read, and tolerates
+  trailing bytes past the two fields for forward-compatibility with
+  future spec revisions that append new fields under the same
+  `version=0` slot (mirrors the behaviour of every other
+  FullBox-headed property parser in this module). A recognised
+  `aebr` property — even when unusually flagged essential in the
+  `ipma` association — does not trip
+  `Meta::unsupported_essential_properties`. Coverage: +10 unit
+  (`aebr_round_trip_reads_step_then_numerator` with distinct values
+  per field that would catch a cross-wire,
+  `aebr_defined_step_enumeration` exhaustively walking the four
+  defined values + a representative reserved set including the
+  signed-range endpoints, `aebr_exposure_stops_matches_spec_ratio`
+  exercising the four defined steps with negative and positive
+  numerators and pinning the zero-step `None` shape,
+  `aebr_signed_byte_reinterpretation` proving the i8 cast survives
+  the `-1` → `0xFF` round-trip on both fields plus the i8 min/max
+  endpoints, `aebr_rejects_unknown_version`,
+  `aebr_rejects_truncated_body` covering both a header-only buffer
+  and a header + one-byte-only shape, `aebr_tolerates_trailing_bytes`
+  proving forward-compat tail behaviour,
+  `aebr_dispatched_through_parse_ipco`,
+  `aebr_essential_association_is_recognised`, and
+  `aebr_lookup_via_property_for` proving the end-to-end
+  `Meta::property_for(item_id, &AEBR)` lookup including
+  `exposure_stops` evaluation on the found instance). Default lib
+  385 (was 375); standalone lib 370 (was 360); integration 61 + 1
+  ignored unchanged. Re-exports add `Aebr`. Spec: ISO/IEC
+  23008-12:2025 §6.5.22.
+
 - ISO/IEC 23008-12 §6.5.21 AccessibilityTextProperty (`altt`) descriptive
   item-property parser. The body shape is taken verbatim from §6.5.21.2 —
   a FullBox(`altt`, version=0, flags=0) followed by two sequential
