@@ -26,7 +26,7 @@ still loses significant signal.
 |----------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `ftyp` brand check                     | accepts `avif` / `avis` / `mif1` / `msf1` / `miaf`                                                                                                         |
 | `meta` sub-boxes                       | `hdlr`, `pitm` (v0/v1), `iinf` (v0/v1) + `infe` (v2/v3), `iloc` (v0/v1/v2), `iref`, `iprp` / `ipco` / `ipma` (v0/v1, small + large property indices)       |
-| Item properties                        | `av1C`, `ispe`, `colr` (nclx + ICC), `pixi`, `pasp`, `irot`, `imir`, `clap`, `auxC`, `mdcv`, `clli`, `cclv`, `rloc`, `lsel`, `a1op`, `a1lx`, `iscl` (HEIF §6.5.13 image scaling — four u16 ratio fields + `Iscl::is_well_formed` + `Iscl::scaled_dims`), `rref` (HEIF §6.5.17 required reference types — typed `Vec<BoxType>` + `Rref::{count, requires}`), `crtt` (HEIF §6.5.18 creation time — u64 microseconds since 1904-01-01 UTC + `Crtt::{seconds_since_unix_epoch, subsecond_micros}`), `mdft` (HEIF §6.5.19 modification time — same 1904-epoch microsecond unit as `crtt`; `Mdft::{seconds_since_unix_epoch, subsecond_micros}` mirror the `crtt` helpers, and `mdft` may legally co-occur with `crtt` on a single item to surface a creation/modification pair), `udes` (HEIF §6.5.20 user description — four UTF-8 strings `lang` / `name` / `description` / `tags` with the §6.5.20.3 empty-string "absent" sentinels projected via `Udes::{lang_opt, name_opt, description_opt, tags_opt}` and a `Udes::tag_list` view that splits on `','` and trims each segment; §6.5.20.1 quantity is zero-or-more so multiple language variants legally co-occur on a single item), `altt` (HEIF §6.5.21 accessibility text — FullBox + two UTF-8 strings `alt_text` then `alt_lang` in the §6.5.21.2 declaration order, reversed relative to `udes`; §6.5.21.3 empty `alt_lang` is the unknown/undefined sentinel projected via `Altt::{alt_text_opt, alt_lang_opt}`; §6.5.21.1 quantity is zero-or-more so multiple language variants of the alternate text legally co-occur on a single item), `aebr` (HEIF §6.5.22 auto-exposure information — FullBox + two `int(8)` fields `exposure_step` then `exposure_numerator` per §6.5.22.2; the §6.5.22.3 enumeration for `exposure_step` is exposed via `Aebr::{STEP_FULL, STEP_HALF, STEP_THIRD, STEP_QUARTER}` constants + `Aebr::is_defined_step`, and the stops offset (`exposure_numerator / exposure_step` per §6.5.22.3) via `Aebr::exposure_stops` returning `None` for the reserved zero step; both fields are signed so a negative numerator round-trips correctly as a darker-than-camera bracket position; §6.5.22.1 quantity is at-most-one); unknown boxes retained as `Property::Other` so indices stay valid |
+| Item properties                        | `av1C`, `ispe`, `colr` (nclx + ICC), `pixi`, `pasp`, `irot`, `imir`, `clap`, `auxC`, `mdcv`, `clli`, `cclv`, `rloc`, `lsel`, `a1op`, `a1lx`, `iscl` (HEIF §6.5.13 image scaling — four u16 ratio fields + `Iscl::is_well_formed` + `Iscl::scaled_dims`), `rref` (HEIF §6.5.17 required reference types — typed `Vec<BoxType>` + `Rref::{count, requires}`), `crtt` (HEIF §6.5.18 creation time — u64 microseconds since 1904-01-01 UTC + `Crtt::{seconds_since_unix_epoch, subsecond_micros}`), `mdft` (HEIF §6.5.19 modification time — same 1904-epoch microsecond unit as `crtt`; `Mdft::{seconds_since_unix_epoch, subsecond_micros}` mirror the `crtt` helpers, and `mdft` may legally co-occur with `crtt` on a single item to surface a creation/modification pair), `udes` (HEIF §6.5.20 user description — four UTF-8 strings `lang` / `name` / `description` / `tags` with the §6.5.20.3 empty-string "absent" sentinels projected via `Udes::{lang_opt, name_opt, description_opt, tags_opt}` and a `Udes::tag_list` view that splits on `','` and trims each segment; §6.5.20.1 quantity is zero-or-more so multiple language variants legally co-occur on a single item), `altt` (HEIF §6.5.21 accessibility text — FullBox + two UTF-8 strings `alt_text` then `alt_lang` in the §6.5.21.2 declaration order, reversed relative to `udes`; §6.5.21.3 empty `alt_lang` is the unknown/undefined sentinel projected via `Altt::{alt_text_opt, alt_lang_opt}`; §6.5.21.1 quantity is zero-or-more so multiple language variants of the alternate text legally co-occur on a single item), `aebr` (HEIF §6.5.22 auto-exposure information — FullBox + two `int(8)` fields `exposure_step` then `exposure_numerator` per §6.5.22.2; the §6.5.22.3 enumeration for `exposure_step` is exposed via `Aebr::{STEP_FULL, STEP_HALF, STEP_THIRD, STEP_QUARTER}` constants + `Aebr::is_defined_step`, and the stops offset (`exposure_numerator / exposure_step` per §6.5.22.3) via `Aebr::exposure_stops` returning `None` for the reserved zero step; both fields are signed so a negative numerator round-trips correctly as a darker-than-camera bracket position; §6.5.22.1 quantity is at-most-one), `wbbr` (HEIF §6.5.23 white-balance information — FullBox + `unsigned int(16)` `blue_amber` (colour-temperature component in Kelvin, big-endian per ISO/IEC 14496-12 §4.2) + signed `int(8)` `green_magenta` (colour-deviation component in 1/100 Duv) per §6.5.23.2; the §6.5.23.3 NOTE describes `green_magenta == 0` as the neutral sentinel, with negative = magenta shift and positive = green shift, surfaced via `Wbbr::NEUTRAL_GREEN_MAGENTA` + `Wbbr::is_green_magenta_neutral` + the `Wbbr::green_magenta_duv` projection that divides the wire field by 100.0 so callers don't re-derive the unit conversion; §6.5.23.1 quantity is at-most-one); unknown boxes retained as `Property::Other` so indices stay valid |
 | Sample Transform (`sato`)              | descriptor parser + per-sample evaluator for av1-avif §4.2.3 — full operator table (negation/abs/not/bsr unary + sum/difference/product/quotient/and/or/xor/pow/min/max binary), all 4 bit-depth widths (8/16/32/64-bit intermediate), every spec assertion enforced (`token_count >= 1`, sample index ≤ `reference_count`, postfix order, stack discipline, single-element terminal stack, reserved-token rejection); composition into a reconstructed image deferred until oxideav-av1 ships a decoder |
 | Tone Map (`tmap`)                      | item-type four-CC detection + `AvifInfo::tmap_item_ids` enumeration + av1-avif §4.2.2 `should`-level compliance audit (`audit_tone_map` / `ToneMapCompliance`): `altr` group pairs the tmap with its base item; gain-map inputs (`dimg to_ids[1..]`) flagged hidden via `infe` flags low bit; aggregate via `AvifInfo::tone_map_compliance` / `tone_map_strict_compliant()`. **`tmap` descriptor body parse** lands via `GainMapMetadata::parse` (ISO 21496-1:2025 Annex C.2): `GainMapVersion` + flags (`is_multichannel` → 1 or 3 R/G/B channels, `use_base_colour_space`), base/alternate HDR headroom, and per-channel `GainMapChannel` rationals (min/max/gamma/base+alternate offset). Enforces every §5.2 / Annex C.2.3 `shall` (non-zero denominators, non-zero `gamma_numerator`, `writer_version ≥ minimum_version`, per-channel `gain_map_max ≥ gain_map_min` per §5.2.5.3 — value-comparison via cross-multiplied i64 so `max == min` is permitted, `alternate_hdr_headroom ≠ base_hdr_headroom` per §5.2.7 — also value-comparison so e.g. `1/1` and `2/2` trip the check), returns `Unsupported` for an unknown `minimum_version`, and ignores trailing padding / future-optional bytes. One-call extractor `gain_map_metadata(file, tmap_item_id)` resolves a tmap item's `iloc` payload and runs the parse, mirroring the existing `item_payload_bytes` accessor pattern |
 | AV1 layered properties (`a1op`/`a1lx`) | `a1op` operating-point selector (u8 `op_index`) + `a1lx` layered-image index (`layer_size[3]`, 16/32-bit fields, `documented_layers()`) parsed per av1-avif §2.3.2; surfaced via `AvifInfo::{operating_point, layered_index}` |
@@ -84,6 +84,114 @@ still loses significant signal.
 
 See `examples/diag_decode.rs` for a drop-in report of exactly which
 stage each input reaches.
+
+### Round 253 — HEIF §6.5.23 `wbbr` white-balance item property
+
+The descriptive item-property rollout picks up §6.5.23
+WhiteBalanceProperty, the white-balance-bracketing sibling of `aebr`:
+it carries the white-balance compensation applied to the associated
+image item, relative to the camera settings, as a colour-temperature
+component on the blue/amber axis plus a colour-deviation component
+on the green/magenta axis. Per §6.5.23.1 the property is descriptive
+with `Quantity (per item): At most one`, mirroring `aebr` — a single
+item carries zero or one `wbbr` instance, and the property is used
+in conjunction with a `wbbr` entity group (§6.8.6) to identify the
+relative position of a frame inside a white-balance bracketed burst.
+
+The wire layout is taken verbatim from §6.5.23.2 — a
+FullBox(`wbbr`, version=0, flags=0) followed by two fields of
+asymmetric width:
+
+```text
+unsigned int(16) blue_amber;
+int(8)           green_magenta;
+```
+
+`blue_amber` is the colour-temperature component of the white
+balance in Kelvin (§6.5.23.3). The wire field is `unsigned int(16)`
+so the representable range is 0..=65535 K — wide enough for the
+practical photographic span (a candle is roughly 1850 K, midday
+daylight roughly 5600 K, a clear-sky blue cast roughly 10000 K).
+The big-endian byte order follows ISO/IEC 14496-12 §4.2 like every
+other multi-byte field in the box hierarchy; a
+`wbbr_blue_amber_is_big_endian` unit test pins this against a
+little-endian regression (which would surface `0x15B0` = 5552 K as
+`0xB015` = 45077 K, well outside any realistic camera setting).
+
+`green_magenta` is the colour-deviation component in units of 1/100
+Duv (the §6.5.23.3 distance-to-blackbody-locus measure). The field
+is `int(8)` — signed — and the §6.5.23.3 NOTE makes the sign
+load-bearing: a negative value indicates a magenta colour shift, a
+positive value indicates a green colour shift, and zero indicates a
+neutral light source (no green/magenta compensation relative to the
+camera setting). The parser surfaces the raw `i8` and exposes the
+Duv-unit projection via `Wbbr::green_magenta_duv` (`green_magenta /
+100.0` — a `-50` round-trips to `-0.5` Duv magenta, a `+50` to
+`+0.5` Duv green, `0` to `0.0`). The neutral sentinel is exposed
+via the `Wbbr::NEUTRAL_GREEN_MAGENTA` associated constant + a
+`Wbbr::is_green_magenta_neutral` predicate that flips on exactly
+that value regardless of the `blue_amber` reading (the two
+components are independent per §6.5.23.3).
+
+```text
+Property::Wbbr(Wbbr {
+    blue_amber:    u16,  // Kelvin (§6.5.23.3)
+    green_magenta: i8,   // 1/100 Duv, signed
+})
+
+Wbbr::NEUTRAL_GREEN_MAGENTA            = 0i8
+Wbbr::green_magenta_duv()  -> f64       // wire / 100.0
+Wbbr::is_green_magenta_neutral() -> bool
+```
+
+Forward-compatibility behaviour matches every other FullBox-headed
+property parser in this module: an unknown `version` is rejected so
+a future-version layout (which might re-shape the field widths)
+cannot be misread as v0, a body shorter than the three-byte fixed
+tail is rejected (the truncation check covers a header-only buffer,
+a header + one byte of `blue_amber` only, and a header + a complete
+`blue_amber` but missing `green_magenta`), and trailing bytes past
+the three-byte tail are ignored so a v0 producer that pads the box
+with reserved bytes for a future spec revision is read cleanly.
+
+A recognised `wbbr` property — even when flagged essential in the
+`ipma` association — does not trip
+[`Meta::unsupported_essential_properties`], joining the previously
+recognised `clap` / `irot` / `imir` / `lsel` / `a1op` / `a1lx` /
+`iscl` / `rref` / `crtt` / `mdft` / `udes` / `altt` / `aebr`
+properties on the always-honoured list. (`wbbr` is descriptive per
+§6.5.23.1, so the §7 grid-derivation audit is untouched —
+transformative-property scope only.)
+
+Test delta: +11 unit (`wbbr_round_trip_reads_blue_amber_then_green_magenta`,
+`wbbr_blue_amber_is_big_endian` pinning byte order on `0x15B0` plus
+the `u16::MAX` / `0` endpoints, `wbbr_signed_green_magenta_reinterpretation`
+proving the `i8` cast survives the `-1` → `0xFF` round-trip plus the
+i8 min/max endpoints, `wbbr_green_magenta_duv_projection` exercising
+the `±0.5` Duv / neutral / `i8::MIN` shapes,
+`wbbr_green_magenta_neutral_predicate` walking the zero sentinel
+across multiple `blue_amber` readings + every non-zero value
+including the i8 endpoints, `wbbr_rejects_unknown_version`,
+`wbbr_rejects_truncated_body` covering all three truncation shapes
+(header-only, header + 1-byte, header + 2-byte),
+`wbbr_tolerates_trailing_bytes`,
+`wbbr_dispatched_through_parse_ipco`,
+`wbbr_essential_association_is_recognised`, and
+`wbbr_lookup_via_property_for` proving the end-to-end
+`Meta::property_for(item_id, &WBBR)` lookup including the
+`green_magenta_duv` evaluation on the found instance). Default lib
+396 (was 385); standalone lib 381 (was 370); integration 61 + 1
+ignored unchanged. Re-exports: `oxideav_avif::Wbbr`.
+
+Followups: §6.5.24 `fobr` (FocusProperty — focus distance in
+metres expressed as a `unsigned int(16)` numerator / `unsigned
+int(16)` denominator rational, with focus-at-infinity carried as
+the divide-by-zero sentinel `denominator == 0`) and §6.5.25 `afbr`
+(FlashExposureProperty — same capture-side numeric descriptive
+family). §6.5.36 `amve`
+(AmbientViewingEnvironmentProperty) is the HDR-rendering hint
+pulling from CTA-861.3 and would slot in alongside the
+`mdcv` / `clli` family.
 
 ### Round 244 — HEIF §6.5.21 `altt` accessibility-text item property
 

@@ -79,6 +79,8 @@ const UDES: BoxType = b(b"udes");
 const ALTT: BoxType = b(b"altt");
 /// HEIF §6.5.22 — Auto Exposure Information descriptive property.
 const AEBR: BoxType = b(b"aebr");
+/// HEIF §6.5.23 — White Balance Information descriptive property.
+const WBBR: BoxType = b(b"wbbr");
 
 /// HEIF §6.6.2.2 — image overlay derived-image type.
 pub const ITEM_TYPE_IOVL: BoxType = b(b"iovl");
@@ -1046,6 +1048,96 @@ impl Aebr {
     }
 }
 
+/// White Balance Information descriptive property (`wbbr`) —
+/// HEIF §6.5.23.
+///
+/// Carries the white-balance compensation applied to the associated
+/// image item relative to the camera settings: a blue/amber bias
+/// expressed as a colour-temperature component in Kelvin, plus a
+/// green/magenta bias expressed as a colour-deviation component in
+/// units of 1/100 Duv (distance to the blackbody locus). The
+/// property is associated with one image item out of a `wbbr` entity
+/// group (§6.8.6) so a reader can identify the relative position of
+/// a frame inside a white-balance bracketed burst.
+///
+/// Per §6.5.23.1 the property is a descriptive item property with
+/// `Quantity (per item): At most one` — a single item carries zero
+/// or one `wbbr` instance.
+///
+/// The wire layout (§6.5.23.2) is a 16-bit unsigned colour
+/// temperature followed by an 8-bit signed colour deviation, inside
+/// a FullBox(`wbbr`, version=0, flags=0):
+///
+/// ```text
+/// unsigned int(16) blue_amber;
+/// int(8)           green_magenta;
+/// ```
+///
+/// Per §6.5.23.3:
+///
+/// * `blue_amber` is an unsigned integer indicating the colour
+///   temperature component of the white balance, in Kelvin.
+/// * `green_magenta` is a signed integer indicating the colour
+///   deviation component of the white balance, in units of 1/100
+///   Duv (distance to the blackbody locus). The §6.5.23.3 NOTE
+///   states that a Duv of 0 indicates a light source that is
+///   neutral, a negative Duv indicates a magenta colour shift, and
+///   a positive Duv indicates a green colour shift. The
+///   [`Wbbr::green_magenta_duv`] helper exposes the Duv value
+///   itself (`green_magenta / 100.0`) so callers don't re-derive
+///   the unit conversion.
+///
+/// Note: the spec text declares `green_magenta` as `int(8)` (signed).
+/// A negative value carries a signed direction (magenta shift), so
+/// the signed interpretation is load-bearing for downstream
+/// consumers. The parser surfaces the raw byte as `i8`.
+///
+/// Spec: ISO/IEC 23008-12 §6.5.23.2 — FullBox(`wbbr`, version=0,
+/// flags=0).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Wbbr {
+    /// Colour-temperature component of the white balance in Kelvin
+    /// (§6.5.23.3). The wire field is `unsigned int(16)` so the
+    /// representable range is 0..=65535 K — wide enough for the
+    /// practical photographic span (a candle is ≈ 1850 K, midday
+    /// daylight ≈ 5600 K, a clear-sky blue cast ≈ 10000 K).
+    pub blue_amber: u16,
+    /// Colour-deviation component of the white balance in units of
+    /// 1/100 Duv (§6.5.23.3). Signed so a negative value carries
+    /// the magenta direction and a positive value the green
+    /// direction; the parser preserves the raw signed byte
+    /// verbatim. See [`Wbbr::green_magenta_duv`] for the Duv-unit
+    /// projection.
+    pub green_magenta: i8,
+}
+
+impl Wbbr {
+    /// The §6.5.23.3 NOTE sentinel for a neutral light source:
+    /// `green_magenta == 0` carries a Duv of zero, i.e. the
+    /// associated image item was captured without any green/magenta
+    /// compensation relative to the camera-set white balance. The
+    /// `blue_amber` field is not bound by this sentinel.
+    pub const NEUTRAL_GREEN_MAGENTA: i8 = 0;
+
+    /// The §6.5.23.3 colour-deviation expressed in Duv (the
+    /// distance from the blackbody locus). The wire field is in
+    /// units of 1/100 Duv, so the projection is
+    /// `green_magenta / 100.0`. A negative value indicates a
+    /// magenta colour shift and a positive value indicates a green
+    /// colour shift, per the §6.5.23.3 NOTE.
+    pub fn green_magenta_duv(&self) -> f64 {
+        f64::from(self.green_magenta) / 100.0
+    }
+
+    /// True when `green_magenta == 0` — the §6.5.23.3 NOTE neutral
+    /// sentinel, i.e. no green/magenta compensation relative to the
+    /// camera-set white balance. The `blue_amber` (colour
+    /// temperature) component is independent and is not consulted.
+    pub fn is_green_magenta_neutral(&self) -> bool {
+        self.green_magenta == Self::NEUTRAL_GREEN_MAGENTA
+    }
+}
+
 /// One property box, kept typed for the boxes AVIF cares about + a raw
 /// fallback so an unknown property still gets an index for association.
 #[derive(Clone, Debug)]
@@ -1087,6 +1179,8 @@ pub enum Property {
     Altt(Altt),
     /// Auto-exposure-information descriptive property (HEIF §6.5.22).
     Aebr(Aebr),
+    /// White-balance-information descriptive property (HEIF §6.5.23).
+    Wbbr(Wbbr),
     Other(BoxType, Vec<u8>),
 }
 
@@ -1116,6 +1210,7 @@ impl Property {
             Property::Udes(_) => UDES,
             Property::Altt(_) => ALTT,
             Property::Aebr(_) => AEBR,
+            Property::Wbbr(_) => WBBR,
             Property::Other(t, _) => *t,
         }
     }
@@ -1284,8 +1379,8 @@ impl Meta {
     /// `a1lx` is treated as recognised even when its bytes are not acted
     /// upon, because the spec forbids marking it essential; a `clap`,
     /// `irot`, `imir`, `lsel`, `a1op`, `iscl`, `rref`, `crtt`, `mdft`,
-    /// `udes`, `altt`, `aebr`, etc. that we parse counts as recognised
-    /// regardless of the essential bit.
+    /// `udes`, `altt`, `aebr`, `wbbr`, etc. that we parse counts as
+    /// recognised regardless of the essential bit.
     pub fn unsupported_essential_properties(&self, item_id: u32) -> Vec<BoxType> {
         let Some(assoc) = self.assoc_by_id(item_id) else {
             return Vec::new();
@@ -1622,6 +1717,7 @@ fn parse_ipco(payload: &[u8]) -> Result<Vec<Property>> {
             x if x == &UDES => Property::Udes(parse_udes(body)?),
             x if x == &ALTT => Property::Altt(parse_altt(body)?),
             x if x == &AEBR => Property::Aebr(parse_aebr(body)?),
+            x if x == &WBBR => Property::Wbbr(parse_wbbr(body)?),
             other => Property::Other(*other, body.to_vec()),
         };
         out.push(prop);
@@ -2143,6 +2239,48 @@ fn parse_aebr(body: &[u8]) -> Result<Aebr> {
     Ok(Aebr {
         exposure_step: rest[0] as i8,
         exposure_numerator: rest[1] as i8,
+    })
+}
+
+/// Parse `wbbr` (WhiteBalanceProperty — HEIF §6.5.23).
+/// FullBox(`wbbr`, version=0, flags=0) followed by:
+///
+/// ```text
+/// unsigned int(16) blue_amber;
+/// int(8)           green_magenta;
+/// ```
+///
+/// per §6.5.23.2. `blue_amber` is the colour-temperature component
+/// in Kelvin (so a 16-bit unsigned range is comfortable for every
+/// practical photographic temperature). `green_magenta` is the
+/// colour-deviation component in 1/100 Duv (signed: negative =
+/// magenta shift, positive = green shift per the §6.5.23.3 NOTE).
+///
+/// An unknown `version` is rejected so a future-version layout
+/// cannot be misread as v0. Trailing bytes past the three fields
+/// are ignored, mirroring the forward-compatibility behaviour of
+/// the other FullBox-headed property parsers in this module — a v0
+/// producer that pads the box with reserved bytes is read cleanly.
+///
+/// The §6.5.23.3 NOTE sentinel (`green_magenta == 0` = neutral
+/// light source) is not enforced at parse time — the
+/// [`Wbbr::is_green_magenta_neutral`] predicate exposes the check
+/// separately, mirroring how `aebr`'s §6.5.22.3 enumeration is
+/// surfaced via [`Aebr::is_defined_step`].
+fn parse_wbbr(body: &[u8]) -> Result<Wbbr> {
+    let (version, _flags, rest) = parse_full_box(body)?;
+    if version != 0 {
+        return Err(Error::invalid(format!("avif: wbbr version {version} != 0")));
+    }
+    if rest.len() < 3 {
+        return Err(Error::invalid(format!(
+            "avif: wbbr too short ({} < 3)",
+            rest.len()
+        )));
+    }
+    Ok(Wbbr {
+        blue_amber: read_u16(rest, 0)?,
+        green_magenta: rest[2] as i8,
     })
 }
 
@@ -4129,5 +4267,231 @@ mod tests {
         }
         // No `aebr` for an item that doesn't carry the association.
         assert!(m.property_for(99, b"aebr").is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // HEIF §6.5.23 WhiteBalanceProperty (`wbbr`) — parse + helpers
+    // -----------------------------------------------------------------
+
+    /// Build a `wbbr` body — FullBox(v=0, f=0) followed by an
+    /// `unsigned int(16)` `blue_amber` (big-endian per ISO/IEC
+    /// 14496-12 §4.2) and a signed `int(8)` `green_magenta`, in the
+    /// §6.5.23.2 declaration order. The helper accepts an `i8` for
+    /// the second field and writes its two's-complement byte form
+    /// so a negative `green_magenta` (magenta colour shift) is
+    /// exercised faithfully.
+    fn wbbr_body(blue_amber: u16, green_magenta: i8) -> Vec<u8> {
+        let mut buf = vec![0u8; 4];
+        buf.extend_from_slice(&blue_amber.to_be_bytes());
+        buf.push(green_magenta as u8);
+        buf
+    }
+
+    #[test]
+    fn wbbr_round_trip_reads_blue_amber_then_green_magenta() {
+        // Distinct, asymmetric values per field so a cross-wire
+        // between `blue_amber` and `green_magenta` would surface
+        // immediately. 5600 K is a midday-daylight Kelvin value
+        // wide enough to require both bytes of the 16-bit field.
+        let w = parse_wbbr(&wbbr_body(5600, 7)).unwrap();
+        assert_eq!(w.blue_amber, 5600);
+        assert_eq!(w.green_magenta, 7);
+    }
+
+    /// `blue_amber` is `unsigned int(16)` and is read big-endian
+    /// per ISO/IEC 14496-12 §4.2. A value that requires the high
+    /// byte to be non-zero (`0x15B0` = 5552) pins the byte order
+    /// against a little-endian regression that would surface as
+    /// `0xB015` = 45077 K — well outside the photographic span and
+    /// easy to catch.
+    #[test]
+    fn wbbr_blue_amber_is_big_endian() {
+        let w = parse_wbbr(&wbbr_body(0x15B0, 0)).unwrap();
+        assert_eq!(w.blue_amber, 0x15B0);
+        // Endpoint coverage: u16::MAX exercises the high bit.
+        let w = parse_wbbr(&wbbr_body(u16::MAX, 0)).unwrap();
+        assert_eq!(w.blue_amber, u16::MAX);
+        // 0 K is the spec's lower bound — the wire field is
+        // unsigned so no sign extension is in play.
+        let w = parse_wbbr(&wbbr_body(0, 0)).unwrap();
+        assert_eq!(w.blue_amber, 0);
+    }
+
+    /// The §6.5.23.3 NOTE describes `green_magenta` as a signed
+    /// 1/100 Duv value: negative = magenta shift, positive = green
+    /// shift, zero = neutral. The parser must read the byte as
+    /// two's-complement `i8`, not as an unsigned byte. A writer
+    /// that produces `-1` (`0xFF`) for "0.01 Duv magenta shift"
+    /// must round-trip to `-1`, not `255`.
+    #[test]
+    fn wbbr_signed_green_magenta_reinterpretation() {
+        let w = parse_wbbr(&wbbr_body(5600, -1)).unwrap();
+        assert_eq!(w.green_magenta, -1);
+        // Endpoint coverage: i8 min/max round-trip.
+        let w = parse_wbbr(&wbbr_body(5600, i8::MIN)).unwrap();
+        assert_eq!(w.green_magenta, i8::MIN);
+        let w = parse_wbbr(&wbbr_body(5600, i8::MAX)).unwrap();
+        assert_eq!(w.green_magenta, i8::MAX);
+    }
+
+    /// The §6.5.23.3 NOTE projection: the wire field is in 1/100
+    /// Duv, so `green_magenta_duv()` returns `green_magenta /
+    /// 100.0` — `-50` is `-0.5` Duv (magenta), `+50` is `+0.5` Duv
+    /// (green), `0` is the neutral sentinel.
+    #[test]
+    fn wbbr_green_magenta_duv_projection() {
+        let w = parse_wbbr(&wbbr_body(5600, -50)).unwrap();
+        assert_eq!(w.green_magenta_duv(), -0.5);
+        let w = parse_wbbr(&wbbr_body(5600, 50)).unwrap();
+        assert_eq!(w.green_magenta_duv(), 0.5);
+        let w = parse_wbbr(&wbbr_body(5600, 0)).unwrap();
+        assert_eq!(w.green_magenta_duv(), 0.0);
+        // Endpoint: i8::MIN as 1/100 Duv is -1.28 Duv (well past
+        // any realistic camera adjustment, so this exercises the
+        // projection arithmetic at the wire-format extreme).
+        let w = parse_wbbr(&wbbr_body(5600, i8::MIN)).unwrap();
+        assert!((w.green_magenta_duv() - (-1.28)).abs() < 1e-12);
+    }
+
+    /// §6.5.23.3 NOTE: `green_magenta == 0` is the documented
+    /// neutral sentinel. The predicate flips on exactly that value
+    /// regardless of the `blue_amber` colour-temperature reading
+    /// (the two components are independent per §6.5.23.3).
+    #[test]
+    fn wbbr_green_magenta_neutral_predicate() {
+        let w = parse_wbbr(&wbbr_body(5600, 0)).unwrap();
+        assert!(w.is_green_magenta_neutral());
+        // `blue_amber` is independent: a non-default colour
+        // temperature with a zero deviation is still neutral on
+        // the green/magenta axis.
+        let w = parse_wbbr(&wbbr_body(2700, 0)).unwrap();
+        assert!(w.is_green_magenta_neutral());
+        let w = parse_wbbr(&wbbr_body(0, 0)).unwrap();
+        assert!(w.is_green_magenta_neutral());
+        // Any non-zero deviation flips off the predicate.
+        for gm in [-1, 1, -50, 50, i8::MIN, i8::MAX] {
+            let w = parse_wbbr(&wbbr_body(5600, gm)).unwrap();
+            assert!(
+                !w.is_green_magenta_neutral(),
+                "green_magenta {gm} must NOT be neutral"
+            );
+        }
+        assert_eq!(Wbbr::NEUTRAL_GREEN_MAGENTA, 0);
+    }
+
+    #[test]
+    fn wbbr_rejects_unknown_version() {
+        // version=1, flags=0; three zero bytes would otherwise be
+        // a well-formed v0 body.
+        let mut buf = vec![1u8, 0, 0, 0];
+        buf.extend_from_slice(&[0, 0, 0]);
+        assert!(parse_wbbr(&buf).is_err());
+    }
+
+    /// A body shorter than the three-byte fixed tail must be
+    /// rejected so a truncated `wbbr` cannot be partially read.
+    #[test]
+    fn wbbr_rejects_truncated_body() {
+        // FullBox header alone — no fields at all.
+        let buf = vec![0u8; 4];
+        assert!(parse_wbbr(&buf).is_err());
+        // FullBox header + `blue_amber` only (missing
+        // `green_magenta`).
+        let mut buf = vec![0u8; 4];
+        buf.extend_from_slice(&[0x15, 0xB0]);
+        assert!(parse_wbbr(&buf).is_err());
+        // FullBox header + one byte of `blue_amber` only
+        // (missing the second byte plus `green_magenta`).
+        let mut buf = vec![0u8; 4];
+        buf.push(0x15);
+        assert!(parse_wbbr(&buf).is_err());
+    }
+
+    /// Trailing bytes past the three-byte tail are forward-compat
+    /// space — the parser ignores them, mirroring the behaviour of
+    /// every other FullBox-headed property parser in this module.
+    #[test]
+    fn wbbr_tolerates_trailing_bytes() {
+        let mut body = wbbr_body(5600, -3);
+        body.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let w = parse_wbbr(&body).unwrap();
+        assert_eq!(w.blue_amber, 5600);
+        assert_eq!(w.green_magenta, -3);
+    }
+
+    #[test]
+    fn wbbr_dispatched_through_parse_ipco() {
+        let body = wbbr_body(6500, -7);
+        let mut ipco = Vec::new();
+        let s = 8 + body.len() as u32;
+        ipco.extend_from_slice(&s.to_be_bytes());
+        ipco.extend_from_slice(b"wbbr");
+        ipco.extend_from_slice(&body);
+        let props = parse_ipco(&ipco).unwrap();
+        assert_eq!(props.len(), 1);
+        match &props[0] {
+            Property::Wbbr(w) => {
+                assert_eq!(w.blue_amber, 6500);
+                assert_eq!(w.green_magenta, -7);
+            }
+            other => panic!("expected Wbbr, got {other:?}"),
+        }
+        assert_eq!(props[0].kind(), *b"wbbr");
+    }
+
+    /// A recognised `wbbr` property — even when flagged essential
+    /// (unusual for a descriptive property, but the parser does
+    /// not reject the bit) — does NOT trip
+    /// [`Meta::unsupported_essential_properties`].
+    #[test]
+    fn wbbr_essential_association_is_recognised() {
+        let m = Meta {
+            properties: vec![Property::Wbbr(Wbbr::default())],
+            associations: vec![ItemPropertyAssociation {
+                item_id: 1,
+                entries: vec![PropertyAssociation {
+                    index: 0,
+                    essential: true,
+                }],
+            }],
+            ..Meta::default()
+        };
+        assert!(!m.has_unsupported_essential_property(1));
+        assert!(m.unsupported_essential_properties(1).is_empty());
+    }
+
+    /// §6.5.23.1 caps `wbbr` at one per item (`At most one`). A
+    /// `Meta::property_for(item_id, &WBBR)` lookup finds the
+    /// associated single instance via the standard `ipma` walk;
+    /// the dispatch returns the `Wbbr` variant which the caller
+    /// pattern matches on. This test exercises the typical lookup
+    /// shape end to end.
+    #[test]
+    fn wbbr_lookup_via_property_for() {
+        let m = Meta {
+            properties: vec![Property::Wbbr(Wbbr {
+                blue_amber: 4800,
+                green_magenta: 25,
+            })],
+            associations: vec![ItemPropertyAssociation {
+                item_id: 9,
+                entries: vec![PropertyAssociation {
+                    index: 0,
+                    essential: false,
+                }],
+            }],
+            ..Meta::default()
+        };
+        match m.property_for(9, b"wbbr") {
+            Some(Property::Wbbr(w)) => {
+                assert_eq!(w.blue_amber, 4800);
+                assert_eq!(w.green_magenta, 25);
+                assert_eq!(w.green_magenta_duv(), 0.25);
+                assert!(!w.is_green_magenta_neutral());
+            }
+            other => panic!("expected Wbbr, got {other:?}"),
+        }
+        // No `wbbr` for an item that doesn't carry the association.
+        assert!(m.property_for(99, b"wbbr").is_none());
     }
 }

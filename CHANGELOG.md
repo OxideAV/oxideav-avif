@@ -9,6 +9,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- ISO/IEC 23008-12 §6.5.23 WhiteBalanceProperty (`wbbr`) descriptive
+  item-property parser. The body shape is taken verbatim from
+  §6.5.23.2 — a FullBox(`wbbr`, version=0, flags=0) followed by an
+  `unsigned int(16) blue_amber` (colour-temperature component in
+  Kelvin, big-endian per ISO/IEC 14496-12 §4.2) and a signed
+  `int(8) green_magenta` (colour-deviation component in 1/100 Duv).
+  Per §6.5.23.1 the property is descriptive with `Quantity (per
+  item): At most one` and identifies the white-balance compensation
+  applied to the associated image item relative to the camera
+  settings. The §6.5.23.3 NOTE describes `green_magenta == 0` as a
+  neutral light source, with negative values carrying a magenta
+  colour shift and positive values carrying a green colour shift.
+  The parser surfaces the raw fields and exposes the neutral
+  sentinel via the `Wbbr::NEUTRAL_GREEN_MAGENTA` associated
+  constant plus a `Wbbr::is_green_magenta_neutral` predicate, and
+  the Duv-unit projection via `Wbbr::green_magenta_duv` returning
+  `green_magenta / 100.0` (a `-50` round-trips to `-0.5` Duv
+  magenta, a `+50` to `+0.5` Duv green) so callers don't re-derive
+  the unit conversion. The `green_magenta` byte is reinterpreted as
+  `i8` so a writer that produces `-1` (`0xFF`) for the smallest
+  magenta shift round-trips to `-1`, not `255`. Lands as a new
+  `Property::Wbbr(Wbbr)` variant dispatched through `parse_ipco`
+  alongside the other recognised properties. The parser rejects
+  unknown `version` values (per the spec's `version = 0`
+  declaration in the syntax block) so a future-version layout
+  cannot be misread as v0, rejects a body shorter than the
+  three-byte fixed tail so a truncated `wbbr` cannot be partially
+  read (the truncation check covers a header-only buffer, a header
+  + a single byte of `blue_amber`, and a header + a complete
+  `blue_amber` but missing `green_magenta`), and tolerates
+  trailing bytes past the three fields for forward-compatibility
+  with future spec revisions that append new fields under the same
+  `version=0` slot (mirrors the behaviour of every other
+  FullBox-headed property parser in this module). A recognised
+  `wbbr` property — even when unusually flagged essential in the
+  `ipma` association — does not trip
+  `Meta::unsupported_essential_properties`. Coverage: +11 unit
+  (`wbbr_round_trip_reads_blue_amber_then_green_magenta` with
+  distinct values per field that would catch a cross-wire,
+  `wbbr_blue_amber_is_big_endian` pinning the ISO/IEC 14496-12 §4.2
+  byte order on `0x15B0` plus the `u16::MAX` / `0` endpoints,
+  `wbbr_signed_green_magenta_reinterpretation` proving the `i8`
+  cast survives the `-1` → `0xFF` round-trip plus the `i8::MIN` /
+  `i8::MAX` endpoints, `wbbr_green_magenta_duv_projection`
+  exercising the `±0.5` Duv shapes plus the neutral sentinel plus
+  the `i8::MIN` wire-extreme, `wbbr_green_magenta_neutral_predicate`
+  walking the zero sentinel across multiple `blue_amber` readings +
+  every non-zero value including the `i8` endpoints,
+  `wbbr_rejects_unknown_version`, `wbbr_rejects_truncated_body`
+  covering all three truncation shapes (header-only, header +
+  1-byte, header + 2-byte), `wbbr_tolerates_trailing_bytes`
+  proving forward-compat tail behaviour,
+  `wbbr_dispatched_through_parse_ipco`,
+  `wbbr_essential_association_is_recognised`, and
+  `wbbr_lookup_via_property_for` proving the end-to-end
+  `Meta::property_for(item_id, &WBBR)` lookup including
+  `green_magenta_duv` evaluation on the found instance). Default
+  lib 396 (was 385); standalone lib 381 (was 370); integration 61
+  + 1 ignored unchanged. Re-exports add `Wbbr`. Spec: ISO/IEC
+  23008-12:2025 §6.5.23.
+
 - ISO/IEC 23008-12 §6.5.22 AutoExposureProperty (`aebr`) descriptive
   item-property parser. The body shape is taken verbatim from
   §6.5.22.2 — a FullBox(`aebr`, version=0, flags=0) followed by two
