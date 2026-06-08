@@ -26,7 +26,7 @@ still loses significant signal.
 |----------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `ftyp` brand check                     | accepts `avif` / `avis` / `mif1` / `msf1` / `miaf`                                                                                                         |
 | `meta` sub-boxes                       | `hdlr`, `pitm` (v0/v1), `iinf` (v0/v1) + `infe` (v2/v3), `iloc` (v0/v1/v2), `iref`, `iprp` / `ipco` / `ipma` (v0/v1, small + large property indices)       |
-| Item properties                        | `av1C`, `ispe`, `colr` (nclx + ICC), `pixi`, `pasp`, `irot`, `imir`, `clap`, `auxC`, `mdcv`, `clli`, `cclv`, `rloc`, `lsel`, `a1op`, `a1lx`, `iscl` (HEIF §6.5.13 image scaling — four u16 ratio fields + `Iscl::is_well_formed` + `Iscl::scaled_dims`), `rref` (HEIF §6.5.17 required reference types — typed `Vec<BoxType>` + `Rref::{count, requires}`), `crtt` (HEIF §6.5.18 creation time — u64 microseconds since 1904-01-01 UTC + `Crtt::{seconds_since_unix_epoch, subsecond_micros}`), `mdft` (HEIF §6.5.19 modification time — same 1904-epoch microsecond unit as `crtt`; `Mdft::{seconds_since_unix_epoch, subsecond_micros}` mirror the `crtt` helpers, and `mdft` may legally co-occur with `crtt` on a single item to surface a creation/modification pair), `udes` (HEIF §6.5.20 user description — four UTF-8 strings `lang` / `name` / `description` / `tags` with the §6.5.20.3 empty-string "absent" sentinels projected via `Udes::{lang_opt, name_opt, description_opt, tags_opt}` and a `Udes::tag_list` view that splits on `','` and trims each segment; §6.5.20.1 quantity is zero-or-more so multiple language variants legally co-occur on a single item), `altt` (HEIF §6.5.21 accessibility text — FullBox + two UTF-8 strings `alt_text` then `alt_lang` in the §6.5.21.2 declaration order, reversed relative to `udes`; §6.5.21.3 empty `alt_lang` is the unknown/undefined sentinel projected via `Altt::{alt_text_opt, alt_lang_opt}`; §6.5.21.1 quantity is zero-or-more so multiple language variants of the alternate text legally co-occur on a single item), `aebr` (HEIF §6.5.22 auto-exposure information — FullBox + two `int(8)` fields `exposure_step` then `exposure_numerator` per §6.5.22.2; the §6.5.22.3 enumeration for `exposure_step` is exposed via `Aebr::{STEP_FULL, STEP_HALF, STEP_THIRD, STEP_QUARTER}` constants + `Aebr::is_defined_step`, and the stops offset (`exposure_numerator / exposure_step` per §6.5.22.3) via `Aebr::exposure_stops` returning `None` for the reserved zero step; both fields are signed so a negative numerator round-trips correctly as a darker-than-camera bracket position; §6.5.22.1 quantity is at-most-one), `wbbr` (HEIF §6.5.23 white-balance information — FullBox + `unsigned int(16)` `blue_amber` (colour-temperature component in Kelvin, big-endian per ISO/IEC 14496-12 §4.2) + signed `int(8)` `green_magenta` (colour-deviation component in 1/100 Duv) per §6.5.23.2; the §6.5.23.3 NOTE describes `green_magenta == 0` as the neutral sentinel, with negative = magenta shift and positive = green shift, surfaced via `Wbbr::NEUTRAL_GREEN_MAGENTA` + `Wbbr::is_green_magenta_neutral` + the `Wbbr::green_magenta_duv` projection that divides the wire field by 100.0 so callers don't re-derive the unit conversion; §6.5.23.1 quantity is at-most-one); unknown boxes retained as `Property::Other` so indices stay valid |
+| Item properties                        | `av1C`, `ispe`, `colr` (nclx + ICC), `pixi`, `pasp`, `irot`, `imir`, `clap`, `auxC`, `mdcv`, `clli`, `cclv`, `rloc`, `lsel`, `a1op`, `a1lx`, `iscl` (HEIF §6.5.13 image scaling — four u16 ratio fields + `Iscl::is_well_formed` + `Iscl::scaled_dims`), `rref` (HEIF §6.5.17 required reference types — typed `Vec<BoxType>` + `Rref::{count, requires}`), `crtt` (HEIF §6.5.18 creation time — u64 microseconds since 1904-01-01 UTC + `Crtt::{seconds_since_unix_epoch, subsecond_micros}`), `mdft` (HEIF §6.5.19 modification time — same 1904-epoch microsecond unit as `crtt`; `Mdft::{seconds_since_unix_epoch, subsecond_micros}` mirror the `crtt` helpers, and `mdft` may legally co-occur with `crtt` on a single item to surface a creation/modification pair), `udes` (HEIF §6.5.20 user description — four UTF-8 strings `lang` / `name` / `description` / `tags` with the §6.5.20.3 empty-string "absent" sentinels projected via `Udes::{lang_opt, name_opt, description_opt, tags_opt}` and a `Udes::tag_list` view that splits on `','` and trims each segment; §6.5.20.1 quantity is zero-or-more so multiple language variants legally co-occur on a single item), `altt` (HEIF §6.5.21 accessibility text — FullBox + two UTF-8 strings `alt_text` then `alt_lang` in the §6.5.21.2 declaration order, reversed relative to `udes`; §6.5.21.3 empty `alt_lang` is the unknown/undefined sentinel projected via `Altt::{alt_text_opt, alt_lang_opt}`; §6.5.21.1 quantity is zero-or-more so multiple language variants of the alternate text legally co-occur on a single item), `aebr` (HEIF §6.5.22 auto-exposure information — FullBox + two `int(8)` fields `exposure_step` then `exposure_numerator` per §6.5.22.2; the §6.5.22.3 enumeration for `exposure_step` is exposed via `Aebr::{STEP_FULL, STEP_HALF, STEP_THIRD, STEP_QUARTER}` constants + `Aebr::is_defined_step`, and the stops offset (`exposure_numerator / exposure_step` per §6.5.22.3) via `Aebr::exposure_stops` returning `None` for the reserved zero step; both fields are signed so a negative numerator round-trips correctly as a darker-than-camera bracket position; §6.5.22.1 quantity is at-most-one), `wbbr` (HEIF §6.5.23 white-balance information — FullBox + `unsigned int(16)` `blue_amber` (colour-temperature component in Kelvin, big-endian per ISO/IEC 14496-12 §4.2) + signed `int(8)` `green_magenta` (colour-deviation component in 1/100 Duv) per §6.5.23.2; the §6.5.23.3 NOTE describes `green_magenta == 0` as the neutral sentinel, with negative = magenta shift and positive = green shift, surfaced via `Wbbr::NEUTRAL_GREEN_MAGENTA` + `Wbbr::is_green_magenta_neutral` + the `Wbbr::green_magenta_duv` projection that divides the wire field by 100.0 so callers don't re-derive the unit conversion; §6.5.23.1 quantity is at-most-one), `fobr` (HEIF §6.5.24 focus information — FullBox + `unsigned int(16)` `focus_distance_numerator` + `unsigned int(16)` `focus_distance_denominator` per §6.5.24.2; focus distance in metres is the ratio of the two fields per §6.5.24.3, with **focus at infinity** signalled by the divide-by-zero sentinel `focus_distance_denominator == 0` (and the numerator `should` also be zero per the same paragraph); surfaced via `Fobr::INFINITY_DENOMINATOR` constant + `Fobr::focus_distance_metres` returning `Option<f64>` (`None` on infinity), `Fobr::is_focus_at_infinity` (permissive — denominator zero alone, matching the spec `i.e.` clause), and `Fobr::has_well_formed_infinity_sentinel` (strict — both fields zero, distinguishing writers that honour the `should`); §6.5.24.1 quantity is at-most-one); unknown boxes retained as `Property::Other` so indices stay valid |
 | Sample Transform (`sato`)              | descriptor parser + per-sample evaluator for av1-avif §4.2.3 — full operator table (negation/abs/not/bsr unary + sum/difference/product/quotient/and/or/xor/pow/min/max binary), all 4 bit-depth widths (8/16/32/64-bit intermediate), every spec assertion enforced (`token_count >= 1`, sample index ≤ `reference_count`, postfix order, stack discipline, single-element terminal stack, reserved-token rejection); composition into a reconstructed image deferred until oxideav-av1 ships a decoder |
 | Tone Map (`tmap`)                      | item-type four-CC detection + `AvifInfo::tmap_item_ids` enumeration + av1-avif §4.2.2 `should`-level compliance audit (`audit_tone_map` / `ToneMapCompliance`): `altr` group pairs the tmap with its base item; gain-map inputs (`dimg to_ids[1..]`) flagged hidden via `infe` flags low bit; aggregate via `AvifInfo::tone_map_compliance` / `tone_map_strict_compliant()`. **`tmap` descriptor body parse** lands via `GainMapMetadata::parse` (ISO 21496-1:2025 Annex C.2): `GainMapVersion` + flags (`is_multichannel` → 1 or 3 R/G/B channels, `use_base_colour_space`), base/alternate HDR headroom, and per-channel `GainMapChannel` rationals (min/max/gamma/base+alternate offset). Enforces every §5.2 / Annex C.2.3 `shall` (non-zero denominators, non-zero `gamma_numerator`, `writer_version ≥ minimum_version`, per-channel `gain_map_max ≥ gain_map_min` per §5.2.5.3 — value-comparison via cross-multiplied i64 so `max == min` is permitted, `alternate_hdr_headroom ≠ base_hdr_headroom` per §5.2.7 — also value-comparison so e.g. `1/1` and `2/2` trip the check), returns `Unsupported` for an unknown `minimum_version`, and ignores trailing padding / future-optional bytes. One-call extractor `gain_map_metadata(file, tmap_item_id)` resolves a tmap item's `iloc` payload and runs the parse, mirroring the existing `item_payload_bytes` accessor pattern |
 | AV1 layered properties (`a1op`/`a1lx`) | `a1op` operating-point selector (u8 `op_index`) + `a1lx` layered-image index (`layer_size[3]`, 16/32-bit fields, `documented_layers()`) parsed per av1-avif §2.3.2; surfaced via `AvifInfo::{operating_point, layered_index}` |
@@ -84,6 +84,122 @@ still loses significant signal.
 
 See `examples/diag_decode.rs` for a drop-in report of exactly which
 stage each input reaches.
+
+### Round 256 — HEIF §6.5.24 `fobr` focus-information item property
+
+The descriptive item-property rollout picks up §6.5.24
+FocusProperty, the focus-bracketing sibling of `aebr` / `wbbr`: it
+carries the focus variation applied to the associated image item,
+relative to the camera settings, as a focus-distance rational in
+metres. Per §6.5.24.1 the property is descriptive with
+`Quantity (per item): At most one`, mirroring `aebr` and `wbbr` —
+a single item carries zero or one `fobr` instance, and the
+property is used in conjunction with a `fobr` entity group
+(§6.8.6) to identify the relative position of a frame inside a
+focus-bracketed burst.
+
+The wire layout is taken verbatim from §6.5.24.2 — a
+FullBox(`fobr`, version=0, flags=0) followed by two equal-width
+unsigned 16-bit fields:
+
+```text
+unsigned int(16) focus_distance_numerator;
+unsigned int(16) focus_distance_denominator;
+```
+
+Per §6.5.24.3 the focus distance is expressed in metres as the
+ratio `focus_distance_numerator / focus_distance_denominator`.
+Both fields are big-endian per ISO/IEC 14496-12 §4.2 like every
+other multi-byte field in the box hierarchy; a
+`fobr_fields_are_big_endian` unit test pins this against a
+little-endian regression (which would mis-read `0x0125` = 293 as
+`0x2501` = 9473, an order of magnitude away from any realistic
+setting).
+
+The §6.5.24.3 NOTE carves out a sentinel for **focus at
+infinity**: it is signalled by **division by zero**, i.e.
+`focus_distance_denominator == 0`, with the `focus_distance_numerator`
+`should` also be zero in that case. The `i.e.` clause is the
+load-bearing part (denominator zero = infinity); the `should`
+clause is a writer recommendation. The parser surfaces both
+shapes and exposes a strict predicate via
+`Fobr::has_well_formed_infinity_sentinel` (both fields zero — the
+writer honoured the `should`) and a permissive predicate via
+`Fobr::is_focus_at_infinity` (denominator zero alone — still
+infinity per the `i.e.` clause even when the numerator is
+non-zero). The `Fobr::focus_distance_metres` projection returns
+`Some(num / den)` for well-formed denominators and `None` for the
+infinity sentinel so callers don't re-derive the division-by-zero
+check.
+
+```text
+Property::Fobr(Fobr {
+    focus_distance_numerator:   u16,  // §6.5.24.2
+    focus_distance_denominator: u16,  // §6.5.24.2 (0 == infinity)
+})
+
+Fobr::INFINITY_DENOMINATOR             = 0u16
+Fobr::focus_distance_metres() -> Option<f64>   // None on infinity
+Fobr::is_focus_at_infinity() -> bool           // den == 0
+Fobr::has_well_formed_infinity_sentinel() -> bool  // num == 0 && den == 0
+```
+
+Forward-compatibility behaviour matches every other FullBox-headed
+property parser in this module: an unknown `version` is rejected
+so a future-version layout (which might re-shape the field widths
+or add fields) cannot be misread as v0, a body shorter than the
+four-byte fixed tail is rejected (the truncation check covers a
+header-only buffer, a header + the numerator alone, and a header +
+numerator + only one byte of the denominator), and trailing bytes
+past the four-byte tail are ignored so a v0 producer that pads the
+box with reserved bytes for a future spec revision is read cleanly.
+
+A recognised `fobr` property — even when flagged essential in the
+`ipma` association — does not trip
+[`Meta::unsupported_essential_properties`], joining the previously
+recognised `clap` / `irot` / `imir` / `lsel` / `a1op` / `a1lx` /
+`iscl` / `rref` / `crtt` / `mdft` / `udes` / `altt` / `aebr` /
+`wbbr` properties on the always-honoured list. (`fobr` is
+descriptive per §6.5.24.1, so the §7 grid-derivation audit is
+untouched — transformative-property scope only.)
+
+Test delta: +11 unit
+(`fobr_round_trip_reads_numerator_then_denominator`,
+`fobr_fields_are_big_endian` pinning byte order on `0x0125` /
+`0x0008` plus the `u16::MAX` / `0` endpoints,
+`fobr_focus_distance_metres_projection` walking 1.7 m portrait,
+1.0 m unit, 0.05 m macro, the `u16::MAX / 1` extreme, and both
+strict and lenient infinity sentinels,
+`fobr_is_focus_at_infinity_predicate` covering both sentinel
+shapes plus a wide non-infinity sweep,
+`fobr_well_formed_infinity_sentinel_predicate` separating the
+strict (`0/0`) and lenient (`42/0`) infinity readings plus the
+`0/N` (zero metres, not infinity) edge, `fobr_rejects_unknown_version`,
+`fobr_rejects_truncated_body` covering all three truncation shapes
+(header-only, header + numerator only, header + numerator + 1
+byte of denominator), `fobr_tolerates_trailing_bytes`,
+`fobr_dispatched_through_parse_ipco`,
+`fobr_essential_association_is_recognised`, and
+`fobr_lookup_via_property_for` proving the end-to-end
+`Meta::property_for(item_id, &FOBR)` lookup for both a well-formed
+1.7 m reading and the strict infinity sentinel). Default lib 407
+(was 396); standalone lib 392 (was 381); integration 61 + 1
+ignored unchanged. Re-exports: `oxideav_avif::Fobr`.
+
+This brings the §6.5.x typed-property coverage to every
+descriptive property from §6.5.4 (`pasp`) through §6.5.24
+(`fobr`), with the entire camera-side bracketing family (`aebr`
+exposure, `wbbr` white balance, `fobr` focus) now parsed.
+
+Followups: §6.5.25 `afbr` (FlashExposureProperty — flash-exposure
+variation as two signed `int(8)` fields `flash_exposure_numerator`
+/ `flash_exposure_denominator`, expressing a number of f-stops as
+their ratio) and §6.5.26 `dobr` (DepthOfFieldProperty — same
+signed `int(8)` ratio shape but expressing the depth-of-field
+aperture change in stops). §6.5.36 `amve`
+(AmbientViewingEnvironmentProperty) is the HDR-rendering hint
+pulling from CTA-861.3 and would slot in alongside the
+`mdcv` / `clli` family.
 
 ### Round 253 — HEIF §6.5.23 `wbbr` white-balance item property
 

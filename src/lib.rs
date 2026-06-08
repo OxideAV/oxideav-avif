@@ -9,7 +9,7 @@
 //!   properties `av1C`, `ispe`, `colr` (nclx + ICC), `pixi`, `pasp`,
 //!   `irot`, `imir`, `clap`, `auxC`, `mdcv`, `clli`, `cclv`,
 //!   `a1op`, `a1lx`, `iscl`, `rref`, `crtt`, `mdft`, `udes`, `altt`,
-//!   `aebr`, `wbbr`.
+//!   `aebr`, `wbbr`, `fobr`.
 //!   Derived-image
 //!   carriers: `iovl` / `iden` /
 //!   `grid` / `sato` (Sample Transform — av1-avif v1.2.0 §4.2.3) /
@@ -127,11 +127,11 @@ pub use grid::{composite_grid, ImageGrid};
 pub use image::{AvifFrame, AvifPixelFormat, AvifPlane};
 pub use inspect::{gain_map_metadata, inspect, item_payload_bytes, transforms_for, AvifInfo};
 pub use meta::{
-    A1lx, A1op, Aebr, Altt, AuxC, AuxKind, Cclv, Clap, Clli, Colr, Crtt, Imir, IrefEntry, Irot,
-    Iscl, Ispe, ItemInfo, ItemLocation, Lsel, Mdcv, Mdft, Meta, Pasp, Pixi, Property, Rloc, Rref,
-    Udes, Wbbr, AUX_URN_ALPHA_HEVC, AUX_URN_ALPHA_MPEG, AUX_URN_DEPTH_HEVC, AUX_URN_DEPTH_MPEG,
-    AUX_URN_HDR_GAINMAP, ITEM_TYPE_EXIF, ITEM_TYPE_IDEN, ITEM_TYPE_IOVL, ITEM_TYPE_MIME,
-    ITEM_TYPE_SATO, ITEM_TYPE_TMAP, ITEM_TYPE_URI,
+    A1lx, A1op, Aebr, Altt, AuxC, AuxKind, Cclv, Clap, Clli, Colr, Crtt, Fobr, Imir, IrefEntry,
+    Irot, Iscl, Ispe, ItemInfo, ItemLocation, Lsel, Mdcv, Mdft, Meta, Pasp, Pixi, Property, Rloc,
+    Rref, Udes, Wbbr, AUX_URN_ALPHA_HEVC, AUX_URN_ALPHA_MPEG, AUX_URN_DEPTH_HEVC,
+    AUX_URN_DEPTH_MPEG, AUX_URN_HDR_GAINMAP, ITEM_TYPE_EXIF, ITEM_TYPE_IDEN, ITEM_TYPE_IOVL,
+    ITEM_TYPE_MIME, ITEM_TYPE_SATO, ITEM_TYPE_TMAP, ITEM_TYPE_URI,
 };
 pub use parser::{
     audit_mif1, classify_brands, item_bytes_owned, parse, parse_header, AvifHeader, AvifImage,

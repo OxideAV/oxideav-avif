@@ -81,6 +81,8 @@ const ALTT: BoxType = b(b"altt");
 const AEBR: BoxType = b(b"aebr");
 /// HEIF §6.5.23 — White Balance Information descriptive property.
 const WBBR: BoxType = b(b"wbbr");
+/// HEIF §6.5.24 — Focus Information descriptive property.
+const FOBR: BoxType = b(b"fobr");
 
 /// HEIF §6.6.2.2 — image overlay derived-image type.
 pub const ITEM_TYPE_IOVL: BoxType = b(b"iovl");
@@ -1138,6 +1140,105 @@ impl Wbbr {
     }
 }
 
+/// Focus Information descriptive property (`fobr`) — HEIF §6.5.24.
+///
+/// Carries the focus variation of the associated image item relative
+/// to the camera settings. The focus distance is expressed in metres
+/// as the ratio of [`Self::focus_distance_numerator`] over
+/// [`Self::focus_distance_denominator`]. Per the §6.5.24.3 sentinel,
+/// **focus at infinity is signalled by division by zero** — i.e.
+/// `focus_distance_denominator == 0` AND
+/// `focus_distance_numerator should be 0`. The property identifies
+/// one image item out of a `fobr` entity group (§6.8.6) so a reader
+/// can place a frame inside a focus-bracketed burst.
+///
+/// Per §6.5.24.1 the property is a descriptive item property with
+/// `Quantity (per item): At most one` — a single item carries zero
+/// or one `fobr` instance.
+///
+/// The wire layout (§6.5.24.2) is two consecutive 16-bit unsigned
+/// integers inside a FullBox(`fobr`, version=0, flags=0):
+///
+/// ```text
+/// unsigned int(16) focus_distance_numerator;
+/// unsigned int(16) focus_distance_denominator;
+/// ```
+///
+/// Per §6.5.24.3 the focus distance in metres is the ratio
+/// `focus_distance_numerator / focus_distance_denominator`. A
+/// denominator of zero is the §6.5.24.3 infinity sentinel: focus at
+/// infinity, with the numerator also `should` be zero. The
+/// [`Fobr::focus_distance_metres`] helper returns `None` for the
+/// infinity sentinel and `Some(metres)` otherwise so callers don't
+/// re-derive the ratio. The [`Fobr::is_focus_at_infinity`]
+/// predicate exposes the sentinel check itself.
+///
+/// Spec: ISO/IEC 23008-12 §6.5.24.2 — FullBox(`fobr`, version=0,
+/// flags=0).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Fobr {
+    /// Numerator of the focus-distance ratio (§6.5.24.3). Unsigned
+    /// 16-bit; combined with [`Self::focus_distance_denominator`]
+    /// gives the focus distance in metres. The infinity sentinel
+    /// pairs a zero denominator with a zero numerator per the
+    /// §6.5.24.3 `should`.
+    pub focus_distance_numerator: u16,
+    /// Denominator of the focus-distance ratio (§6.5.24.3).
+    /// Unsigned 16-bit. A value of zero is the §6.5.24.3
+    /// "focus at infinity" sentinel; otherwise the focus distance
+    /// in metres is `focus_distance_numerator /
+    /// focus_distance_denominator`.
+    pub focus_distance_denominator: u16,
+}
+
+impl Fobr {
+    /// The §6.5.24.3 "focus at infinity" sentinel value for the
+    /// denominator: `focus_distance_denominator == 0` signals
+    /// focus at infinity (and the numerator `should` also be zero
+    /// per the spec NOTE).
+    pub const INFINITY_DENOMINATOR: u16 = 0;
+
+    /// The focus distance in metres per §6.5.24.3
+    /// (`focus_distance_numerator / focus_distance_denominator`),
+    /// or `None` when the denominator is the §6.5.24.3 infinity
+    /// sentinel (zero). The numerator is intentionally NOT
+    /// validated against the `should be equal to 0` part of the
+    /// sentinel because §6.5.24.3 expresses it as a writer
+    /// recommendation; the predicate is purely on the denominator
+    /// per the `i.e.` clause.
+    pub fn focus_distance_metres(&self) -> Option<f64> {
+        if self.focus_distance_denominator == Self::INFINITY_DENOMINATOR {
+            None
+        } else {
+            Some(
+                f64::from(self.focus_distance_numerator)
+                    / f64::from(self.focus_distance_denominator),
+            )
+        }
+    }
+
+    /// True when the denominator is the §6.5.24.3 infinity sentinel
+    /// (zero). The numerator's `should be equal to 0` is not
+    /// consulted here — see [`Self::has_well_formed_infinity_sentinel`]
+    /// for the stricter combined check.
+    pub fn is_focus_at_infinity(&self) -> bool {
+        self.focus_distance_denominator == Self::INFINITY_DENOMINATOR
+    }
+
+    /// True when the property carries the §6.5.24.3 infinity
+    /// sentinel in its strict shape: BOTH numerator AND denominator
+    /// are zero, matching the spec's "`focus_distance_denominator`
+    /// is equal to 0 and `focus_distance_numerator` should be equal
+    /// to 0" clause. Returns `false` for a denominator-only zero
+    /// (which is still infinity per
+    /// [`Self::is_focus_at_infinity`] but violates the writer
+    /// `should`) and for any non-infinity reading.
+    pub fn has_well_formed_infinity_sentinel(&self) -> bool {
+        self.focus_distance_denominator == Self::INFINITY_DENOMINATOR
+            && self.focus_distance_numerator == 0
+    }
+}
+
 /// One property box, kept typed for the boxes AVIF cares about + a raw
 /// fallback so an unknown property still gets an index for association.
 #[derive(Clone, Debug)]
@@ -1181,6 +1282,8 @@ pub enum Property {
     Aebr(Aebr),
     /// White-balance-information descriptive property (HEIF §6.5.23).
     Wbbr(Wbbr),
+    /// Focus-information descriptive property (HEIF §6.5.24).
+    Fobr(Fobr),
     Other(BoxType, Vec<u8>),
 }
 
@@ -1211,6 +1314,7 @@ impl Property {
             Property::Altt(_) => ALTT,
             Property::Aebr(_) => AEBR,
             Property::Wbbr(_) => WBBR,
+            Property::Fobr(_) => FOBR,
             Property::Other(t, _) => *t,
         }
     }
@@ -1379,8 +1483,8 @@ impl Meta {
     /// `a1lx` is treated as recognised even when its bytes are not acted
     /// upon, because the spec forbids marking it essential; a `clap`,
     /// `irot`, `imir`, `lsel`, `a1op`, `iscl`, `rref`, `crtt`, `mdft`,
-    /// `udes`, `altt`, `aebr`, `wbbr`, etc. that we parse counts as
-    /// recognised regardless of the essential bit.
+    /// `udes`, `altt`, `aebr`, `wbbr`, `fobr`, etc. that we parse
+    /// counts as recognised regardless of the essential bit.
     pub fn unsupported_essential_properties(&self, item_id: u32) -> Vec<BoxType> {
         let Some(assoc) = self.assoc_by_id(item_id) else {
             return Vec::new();
@@ -1718,6 +1822,7 @@ fn parse_ipco(payload: &[u8]) -> Result<Vec<Property>> {
             x if x == &ALTT => Property::Altt(parse_altt(body)?),
             x if x == &AEBR => Property::Aebr(parse_aebr(body)?),
             x if x == &WBBR => Property::Wbbr(parse_wbbr(body)?),
+            x if x == &FOBR => Property::Fobr(parse_fobr(body)?),
             other => Property::Other(*other, body.to_vec()),
         };
         out.push(prop);
@@ -2281,6 +2386,46 @@ fn parse_wbbr(body: &[u8]) -> Result<Wbbr> {
     Ok(Wbbr {
         blue_amber: read_u16(rest, 0)?,
         green_magenta: rest[2] as i8,
+    })
+}
+
+/// Parse `fobr` (FocusProperty — HEIF §6.5.24).
+/// FullBox(`fobr`, version=0, flags=0) followed by:
+///
+/// ```text
+/// unsigned int(16) focus_distance_numerator;
+/// unsigned int(16) focus_distance_denominator;
+/// ```
+///
+/// per §6.5.24.2. The focus distance is expressed in metres as
+/// `focus_distance_numerator / focus_distance_denominator`
+/// (§6.5.24.3). Both fields are big-endian unsigned per ISO/IEC
+/// 14496-12 §4.2. A denominator of zero is the §6.5.24.3 infinity
+/// sentinel and the numerator `should` also be zero in that case;
+/// neither field is validated against that sentinel here so a
+/// well-formed but unusual reading (denominator-only zero) survives
+/// to the typed value where [`Fobr::has_well_formed_infinity_sentinel`]
+/// can distinguish it.
+///
+/// An unknown `version` is rejected so a future-version layout
+/// cannot be misread as v0. Trailing bytes past the four fixed
+/// bytes are ignored, mirroring the forward-compatibility behaviour
+/// of the other FullBox-headed property parsers in this module — a
+/// v0 producer that pads the box with reserved bytes is read cleanly.
+fn parse_fobr(body: &[u8]) -> Result<Fobr> {
+    let (version, _flags, rest) = parse_full_box(body)?;
+    if version != 0 {
+        return Err(Error::invalid(format!("avif: fobr version {version} != 0")));
+    }
+    if rest.len() < 4 {
+        return Err(Error::invalid(format!(
+            "avif: fobr too short ({} < 4)",
+            rest.len()
+        )));
+    }
+    Ok(Fobr {
+        focus_distance_numerator: read_u16(rest, 0)?,
+        focus_distance_denominator: read_u16(rest, 2)?,
     })
 }
 
@@ -4493,5 +4638,272 @@ mod tests {
         }
         // No `wbbr` for an item that doesn't carry the association.
         assert!(m.property_for(99, b"wbbr").is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // HEIF §6.5.24 FocusProperty (`fobr`) — parse + helpers
+    // -----------------------------------------------------------------
+
+    /// Build a `fobr` body — FullBox(v=0, f=0) followed by two
+    /// `unsigned int(16)` fields (big-endian per ISO/IEC 14496-12
+    /// §4.2) in the §6.5.24.2 declaration order:
+    /// `focus_distance_numerator` then `focus_distance_denominator`.
+    fn fobr_body(num: u16, den: u16) -> Vec<u8> {
+        let mut buf = vec![0u8; 4];
+        buf.extend_from_slice(&num.to_be_bytes());
+        buf.extend_from_slice(&den.to_be_bytes());
+        buf
+    }
+
+    #[test]
+    fn fobr_round_trip_reads_numerator_then_denominator() {
+        // Distinct, asymmetric values per field so a cross-wire
+        // between numerator and denominator would surface
+        // immediately. 17 / 10 expresses 1.7 m, a realistic
+        // mid-range portrait focus distance.
+        let f = parse_fobr(&fobr_body(17, 10)).unwrap();
+        assert_eq!(f.focus_distance_numerator, 17);
+        assert_eq!(f.focus_distance_denominator, 10);
+    }
+
+    /// Both fields are `unsigned int(16)` and are read big-endian
+    /// per ISO/IEC 14496-12 §4.2. A value that requires the high
+    /// byte to be non-zero (`0x0125` = 293) pins the byte order
+    /// against a little-endian regression that would surface as
+    /// `0x2501` = 9473 — easily distinguished from the intended
+    /// reading.
+    #[test]
+    fn fobr_fields_are_big_endian() {
+        let f = parse_fobr(&fobr_body(0x0125, 0x0008)).unwrap();
+        assert_eq!(f.focus_distance_numerator, 0x0125);
+        assert_eq!(f.focus_distance_denominator, 0x0008);
+        // Endpoint coverage: u16::MAX exercises both high bits.
+        let f = parse_fobr(&fobr_body(u16::MAX, u16::MAX)).unwrap();
+        assert_eq!(f.focus_distance_numerator, u16::MAX);
+        assert_eq!(f.focus_distance_denominator, u16::MAX);
+        // Strict-infinity sentinel: both fields zero.
+        let f = parse_fobr(&fobr_body(0, 0)).unwrap();
+        assert_eq!(f.focus_distance_numerator, 0);
+        assert_eq!(f.focus_distance_denominator, 0);
+    }
+
+    /// §6.5.24.3 projection: focus distance in metres is
+    /// `focus_distance_numerator / focus_distance_denominator`.
+    /// The helper returns `Some(metres)` for a well-formed
+    /// denominator and `None` for the infinity sentinel
+    /// (denominator zero).
+    #[test]
+    fn fobr_focus_distance_metres_projection() {
+        // 17 / 10 = 1.7 m (portrait range).
+        let f = parse_fobr(&fobr_body(17, 10)).unwrap();
+        assert_eq!(f.focus_distance_metres(), Some(1.7));
+        // 1 / 1 = 1.0 m.
+        let f = parse_fobr(&fobr_body(1, 1)).unwrap();
+        assert_eq!(f.focus_distance_metres(), Some(1.0));
+        // 5 / 100 = 0.05 m (macro range).
+        let f = parse_fobr(&fobr_body(5, 100)).unwrap();
+        assert_eq!(f.focus_distance_metres(), Some(0.05));
+        // u16::MAX / 1 — extreme but representable on the wire.
+        let f = parse_fobr(&fobr_body(u16::MAX, 1)).unwrap();
+        assert_eq!(f.focus_distance_metres(), Some(f64::from(u16::MAX)));
+        // §6.5.24.3 infinity sentinel: denominator zero.
+        let f = parse_fobr(&fobr_body(0, 0)).unwrap();
+        assert_eq!(f.focus_distance_metres(), None);
+        // §6.5.24.3 NOTE: the writer `should` zero the numerator
+        // too, but the helper returns `None` whenever the
+        // denominator is zero (the `i.e.` clause is the
+        // load-bearing predicate).
+        let f = parse_fobr(&fobr_body(42, 0)).unwrap();
+        assert_eq!(f.focus_distance_metres(), None);
+    }
+
+    /// §6.5.24.3 infinity sentinel: `focus_distance_denominator ==
+    /// 0` signals focus at infinity. The predicate flips on
+    /// exactly that condition regardless of the numerator.
+    #[test]
+    fn fobr_is_focus_at_infinity_predicate() {
+        let f = parse_fobr(&fobr_body(0, 0)).unwrap();
+        assert!(f.is_focus_at_infinity());
+        // Spec NOTE: numerator `should` be zero, but a non-zero
+        // numerator still reads as infinity per the `i.e.` clause.
+        let f = parse_fobr(&fobr_body(42, 0)).unwrap();
+        assert!(f.is_focus_at_infinity());
+        // Any non-zero denominator flips off the predicate.
+        for den in [1u16, 10, 100, 1000, u16::MAX] {
+            let f = parse_fobr(&fobr_body(17, den)).unwrap();
+            assert!(
+                !f.is_focus_at_infinity(),
+                "denominator {den} must NOT be infinity"
+            );
+        }
+        assert_eq!(Fobr::INFINITY_DENOMINATOR, 0);
+    }
+
+    /// §6.5.24.3 strict-infinity sentinel: BOTH numerator AND
+    /// denominator zero. The stricter predicate distinguishes a
+    /// "well-formed" infinity (writer honoured the `should`) from
+    /// a denominator-only zero (still infinity per the `i.e.` but
+    /// violates the `should`).
+    #[test]
+    fn fobr_well_formed_infinity_sentinel_predicate() {
+        // Strict infinity: both zero.
+        let f = parse_fobr(&fobr_body(0, 0)).unwrap();
+        assert!(f.has_well_formed_infinity_sentinel());
+        // Denominator-only zero: still infinity, but the writer
+        // violated the §6.5.24.3 `should`.
+        let f = parse_fobr(&fobr_body(1, 0)).unwrap();
+        assert!(!f.has_well_formed_infinity_sentinel());
+        let f = parse_fobr(&fobr_body(u16::MAX, 0)).unwrap();
+        assert!(!f.has_well_formed_infinity_sentinel());
+        // Numerator zero with a non-zero denominator: 0 / N = 0 m
+        // (focus at the front element); not the infinity sentinel.
+        let f = parse_fobr(&fobr_body(0, 1)).unwrap();
+        assert!(!f.has_well_formed_infinity_sentinel());
+        assert_eq!(f.focus_distance_metres(), Some(0.0));
+        // Generic non-infinity.
+        let f = parse_fobr(&fobr_body(17, 10)).unwrap();
+        assert!(!f.has_well_formed_infinity_sentinel());
+    }
+
+    #[test]
+    fn fobr_rejects_unknown_version() {
+        // version=1, flags=0; four zero bytes would otherwise be a
+        // well-formed v0 body.
+        let mut buf = vec![1u8, 0, 0, 0];
+        buf.extend_from_slice(&[0, 0, 0, 0]);
+        assert!(parse_fobr(&buf).is_err());
+    }
+
+    /// A body shorter than the four-byte fixed tail must be
+    /// rejected so a truncated `fobr` cannot be partially read.
+    #[test]
+    fn fobr_rejects_truncated_body() {
+        // FullBox header alone — no fields at all.
+        let buf = vec![0u8; 4];
+        assert!(parse_fobr(&buf).is_err());
+        // FullBox header + `focus_distance_numerator` only
+        // (missing the denominator).
+        let mut buf = vec![0u8; 4];
+        buf.extend_from_slice(&[0x00, 0x11]);
+        assert!(parse_fobr(&buf).is_err());
+        // FullBox header + numerator + one byte of denominator
+        // (missing the second byte of the denominator).
+        let mut buf = vec![0u8; 4];
+        buf.extend_from_slice(&[0x00, 0x11, 0x00]);
+        assert!(parse_fobr(&buf).is_err());
+    }
+
+    /// Trailing bytes past the four-byte tail are forward-compat
+    /// space — the parser ignores them, mirroring the behaviour of
+    /// every other FullBox-headed property parser in this module.
+    #[test]
+    fn fobr_tolerates_trailing_bytes() {
+        let mut body = fobr_body(17, 10);
+        body.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let f = parse_fobr(&body).unwrap();
+        assert_eq!(f.focus_distance_numerator, 17);
+        assert_eq!(f.focus_distance_denominator, 10);
+        assert_eq!(f.focus_distance_metres(), Some(1.7));
+    }
+
+    #[test]
+    fn fobr_dispatched_through_parse_ipco() {
+        let body = fobr_body(7, 2);
+        let mut ipco = Vec::new();
+        let s = 8 + body.len() as u32;
+        ipco.extend_from_slice(&s.to_be_bytes());
+        ipco.extend_from_slice(b"fobr");
+        ipco.extend_from_slice(&body);
+        let props = parse_ipco(&ipco).unwrap();
+        assert_eq!(props.len(), 1);
+        match &props[0] {
+            Property::Fobr(f) => {
+                assert_eq!(f.focus_distance_numerator, 7);
+                assert_eq!(f.focus_distance_denominator, 2);
+                assert_eq!(f.focus_distance_metres(), Some(3.5));
+            }
+            other => panic!("expected Fobr, got {other:?}"),
+        }
+        assert_eq!(props[0].kind(), *b"fobr");
+    }
+
+    /// A recognised `fobr` property — even when flagged essential
+    /// (unusual for a descriptive property, but the parser does
+    /// not reject the bit) — does NOT trip
+    /// [`Meta::unsupported_essential_properties`].
+    #[test]
+    fn fobr_essential_association_is_recognised() {
+        let m = Meta {
+            properties: vec![Property::Fobr(Fobr::default())],
+            associations: vec![ItemPropertyAssociation {
+                item_id: 1,
+                entries: vec![PropertyAssociation {
+                    index: 0,
+                    essential: true,
+                }],
+            }],
+            ..Meta::default()
+        };
+        assert!(!m.has_unsupported_essential_property(1));
+        assert!(m.unsupported_essential_properties(1).is_empty());
+    }
+
+    /// §6.5.24.1 caps `fobr` at one per item (`At most one`). A
+    /// `Meta::property_for(item_id, &FOBR)` lookup finds the
+    /// associated single instance via the standard `ipma` walk;
+    /// the dispatch returns the `Fobr` variant which the caller
+    /// pattern matches on. This test exercises the typical lookup
+    /// shape end to end.
+    #[test]
+    fn fobr_lookup_via_property_for() {
+        let m = Meta {
+            properties: vec![Property::Fobr(Fobr {
+                focus_distance_numerator: 17,
+                focus_distance_denominator: 10,
+            })],
+            associations: vec![ItemPropertyAssociation {
+                item_id: 9,
+                entries: vec![PropertyAssociation {
+                    index: 0,
+                    essential: false,
+                }],
+            }],
+            ..Meta::default()
+        };
+        match m.property_for(9, b"fobr") {
+            Some(Property::Fobr(f)) => {
+                assert_eq!(f.focus_distance_numerator, 17);
+                assert_eq!(f.focus_distance_denominator, 10);
+                assert_eq!(f.focus_distance_metres(), Some(1.7));
+                assert!(!f.is_focus_at_infinity());
+            }
+            other => panic!("expected Fobr, got {other:?}"),
+        }
+        // No `fobr` for an item that doesn't carry the association.
+        assert!(m.property_for(99, b"fobr").is_none());
+
+        // Infinity sentinel via `property_for`.
+        let m = Meta {
+            properties: vec![Property::Fobr(Fobr {
+                focus_distance_numerator: 0,
+                focus_distance_denominator: 0,
+            })],
+            associations: vec![ItemPropertyAssociation {
+                item_id: 5,
+                entries: vec![PropertyAssociation {
+                    index: 0,
+                    essential: false,
+                }],
+            }],
+            ..Meta::default()
+        };
+        match m.property_for(5, b"fobr") {
+            Some(Property::Fobr(f)) => {
+                assert!(f.is_focus_at_infinity());
+                assert!(f.has_well_formed_infinity_sentinel());
+                assert_eq!(f.focus_distance_metres(), None);
+            }
+            other => panic!("expected Fobr, got {other:?}"),
+        }
     }
 }

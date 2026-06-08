@@ -9,6 +9,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- ISO/IEC 23008-12 §6.5.24 FocusProperty (`fobr`) descriptive
+  item-property parser. The body shape is taken verbatim from
+  §6.5.24.2 — a FullBox(`fobr`, version=0, flags=0) followed by an
+  `unsigned int(16) focus_distance_numerator` and an
+  `unsigned int(16) focus_distance_denominator`, both big-endian per
+  ISO/IEC 14496-12 §4.2. Per §6.5.24.1 the property is descriptive
+  with `Quantity (per item): At most one` and identifies the focus
+  variation applied to the associated image item relative to the
+  camera settings — used to place a frame inside a focus-bracketed
+  burst via the §6.8.6 `'fobr'` entity group. Per §6.5.24.3 the
+  focus distance in metres is the ratio
+  `focus_distance_numerator / focus_distance_denominator`; the spec
+  carves out a sentinel for **focus at infinity** that is signalled
+  by **division by zero** (`focus_distance_denominator == 0`, with
+  the numerator `should` also be zero per the same paragraph). The
+  parser surfaces the raw fields and exposes
+  `Fobr::INFINITY_DENOMINATOR` (associated constant set to `0`),
+  `Fobr::is_focus_at_infinity` (predicate on the denominator,
+  matching the spec's `i.e.` clause), and
+  `Fobr::has_well_formed_infinity_sentinel` (stricter predicate
+  requiring BOTH fields zero, distinguishing a writer that
+  honoured the §6.5.24.3 `should` from a denominator-only zero that
+  still reads as infinity but violates the writer recommendation).
+  The `Fobr::focus_distance_metres` projection returns
+  `Some(num / den)` for well-formed denominators and `None` for the
+  infinity sentinel, so callers don't re-derive the division-by-zero
+  check. Lands as a new `Property::Fobr(Fobr)` variant dispatched
+  through `parse_ipco` alongside the other recognised properties.
+  The parser rejects unknown `version` values (per the spec's
+  `version = 0` declaration in the syntax block) so a future-version
+  layout cannot be misread as v0, rejects a body shorter than the
+  four-byte fixed tail so a truncated `fobr` cannot be partially
+  read (the truncation check covers a header-only buffer, a header +
+  the numerator alone, and a header + numerator + only one byte of
+  the denominator), and tolerates trailing bytes past the four
+  fields for forward-compatibility with future spec revisions that
+  append new fields under the same `version=0` slot (mirrors the
+  behaviour of every other FullBox-headed property parser in this
+  module). A recognised `fobr` property — even when unusually
+  flagged essential in the `ipma` association — does not trip
+  `Meta::unsupported_essential_properties`. Coverage: +11 unit
+  (`fobr_round_trip_reads_numerator_then_denominator` with distinct
+  values per field that would catch a cross-wire,
+  `fobr_fields_are_big_endian` pinning the ISO/IEC 14496-12 §4.2
+  byte order on `0x0125`/`0x0008` plus the `u16::MAX` / `0`
+  endpoints, `fobr_focus_distance_metres_projection` walking the
+  1.7 m portrait reading, the 1.0 m unit reading, the 0.05 m macro
+  reading, the `u16::MAX / 1` representable extreme, and both the
+  strict (`0/0`) and lenient (`42/0`) infinity sentinels,
+  `fobr_is_focus_at_infinity_predicate` covering both spec sentinel
+  shapes plus a wide non-infinity sweep,
+  `fobr_well_formed_infinity_sentinel_predicate` separating the
+  strict and lenient infinity readings plus the `0/N` (zero metres,
+  not infinity) edge, `fobr_rejects_unknown_version`,
+  `fobr_rejects_truncated_body` walking all three truncation
+  offsets, `fobr_tolerates_trailing_bytes` exercising the
+  forward-compat slack, `fobr_dispatched_through_parse_ipco`
+  proving the wbbr/aebr/etc. dispatch table also routes `fobr`,
+  `fobr_essential_association_is_recognised` proving the essential
+  bit does not surface as unsupported, and
+  `fobr_lookup_via_property_for` exercising the typical end-to-end
+  `Meta::property_for` shape for both a well-formed reading and the
+  strict infinity sentinel). Re-exports `Fobr` from the crate root
+  next to `Wbbr`. Brings the §6.5.x typed-property coverage to
+  every descriptive property from §6.5.4 through §6.5.24; §6.5.25
+  (`afbr`) / §6.5.26 (`dobr`) / §6.5.27+ remain.
+
 - ISO/IEC 23008-12 §6.5.23 WhiteBalanceProperty (`wbbr`) descriptive
   item-property parser. The body shape is taken verbatim from
   §6.5.23.2 — a FullBox(`wbbr`, version=0, flags=0) followed by an
