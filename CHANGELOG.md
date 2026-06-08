@@ -9,6 +9,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- ISO/IEC 23008-12 §6.5.25 FlashExposureProperty (`afbr`) descriptive
+  item-property parser. The body shape is taken verbatim from
+  §6.5.25.2 — a FullBox(`afbr`, version=0, flags=0) followed by an
+  `int(8) flash_exposure_numerator` and an `int(8)
+  flash_exposure_denominator`, both **signed** per the spec text.
+  Per §6.5.25.1 the property is descriptive with `Quantity (per
+  item): At most one` and identifies the flash exposure variation
+  applied to the associated image item relative to the camera
+  settings — used to place a frame inside a flash-bracketed burst
+  via the §6.8.6 `'afbr'` entity group. Per §6.5.25.3 the flash
+  exposure value of the sample is expressed in **number of
+  f-stops** as the ratio `flash_exposure_numerator /
+  flash_exposure_denominator`. Unlike `fobr`'s §6.5.24.3
+  divide-by-zero infinity sentinel, §6.5.25 does NOT carve out a
+  dedicated sentinel for a zero denominator — a zero denominator
+  is mathematically undefined and the `Afbr::flash_exposure_stops`
+  projection returns `None` in that case (mirroring `aebr` /
+  `Aebr::exposure_stops` on the reserved zero step). The
+  `i8::MIN / -1` corner — which would overflow an integer-only
+  divide — round-trips as `128.0` via the explicit `f64::from`
+  widening so an arithmetic panic is impossible. Both bytes are
+  reinterpreted as `i8` so a writer that produces `-1` (`0xFF`)
+  for the smallest dark direction round-trips to `-1`, not `255`.
+  Lands as a new `Property::Afbr(Afbr)` variant dispatched through
+  `parse_ipco` alongside the other recognised properties. The
+  parser rejects unknown `version` values (per the spec's
+  `version = 0` declaration in the syntax block) so a future-version
+  layout cannot be misread as v0, rejects a body shorter than the
+  two-byte fixed tail so a truncated `afbr` cannot be partially
+  read (the truncation check covers a header-only buffer and a
+  header + the numerator alone), and tolerates trailing bytes past
+  the two fields for forward-compatibility with future spec
+  revisions that append new fields under the same `version=0` slot
+  (mirrors the behaviour of every other FullBox-headed property
+  parser in this module). A recognised `afbr` property — even when
+  unusually flagged essential in the `ipma` association — does not
+  trip `Meta::unsupported_essential_properties`. Coverage: +9 unit
+  (`afbr_round_trip_reads_numerator_then_denominator` with
+  distinct values per field that would catch a cross-wire,
+  `afbr_fields_are_signed` walking single-sign-negative
+  (`-1/2` and `1/-2`), double-sign-negative (`-1/-2`), the
+  `i8::MIN` / `i8::MAX` endpoints, and a raw `0xFF` byte that
+  must read as `-1`, `afbr_flash_exposure_stops_projection`
+  walking the `+0.5` half-stop over, `-0.5` half-stop under,
+  `+1.0` full-stop over, `-2/3` two-third-stop under,
+  `i8::MIN / -1 = +128` widening endpoint, zero-denominator
+  undefined reading, zero-numerator `0/N` zero-stops reading, and
+  `0/0` undefined reading, `afbr_rejects_unknown_version`,
+  `afbr_rejects_truncated_body` walking both truncation offsets
+  (header-only and header + numerator only),
+  `afbr_tolerates_trailing_bytes` exercising the forward-compat
+  slack, `afbr_dispatched_through_parse_ipco` proving the
+  wbbr/aebr/etc. dispatch table also routes `afbr`,
+  `afbr_essential_association_is_recognised` proving the essential
+  bit does not surface as unsupported, and
+  `afbr_lookup_via_property_for` exercising the typical end-to-end
+  `Meta::property_for` shape for a well-formed `+0.5`-stop
+  reading, a `-0.75`-stop negative-bracket reading, and the
+  zero-denominator undefined reading). Re-exports `Afbr` from the
+  crate root next to `Fobr`. Brings the §6.5.x typed-property
+  coverage to every descriptive property from §6.5.4 through
+  §6.5.25; §6.5.26 (`dobr`) / §6.5.27+ remain.
+
 - ISO/IEC 23008-12 §6.5.24 FocusProperty (`fobr`) descriptive
   item-property parser. The body shape is taken verbatim from
   §6.5.24.2 — a FullBox(`fobr`, version=0, flags=0) followed by an

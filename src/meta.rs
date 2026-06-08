@@ -83,6 +83,8 @@ const AEBR: BoxType = b(b"aebr");
 const WBBR: BoxType = b(b"wbbr");
 /// HEIF §6.5.24 — Focus Information descriptive property.
 const FOBR: BoxType = b(b"fobr");
+/// HEIF §6.5.25 — Flash Exposure Information descriptive property.
+const AFBR: BoxType = b(b"afbr");
 
 /// HEIF §6.6.2.2 — image overlay derived-image type.
 pub const ITEM_TYPE_IOVL: BoxType = b(b"iovl");
@@ -1239,6 +1241,84 @@ impl Fobr {
     }
 }
 
+/// Flash Exposure Information descriptive property (`afbr`) —
+/// HEIF §6.5.25.
+///
+/// Carries the flash exposure variation of the associated image item
+/// relative to the camera settings, expressed in **number of f-stops**
+/// as the ratio of [`Self::flash_exposure_numerator`] over
+/// [`Self::flash_exposure_denominator`]. The property identifies one
+/// image item out of an `afbr` entity group (§6.8.6) so a reader can
+/// place a frame inside a flash-bracketed burst.
+///
+/// Per §6.5.25.1 the property is a descriptive item property with
+/// `Quantity (per item): At most one` — a single item carries zero
+/// or one `afbr` instance.
+///
+/// The wire layout (§6.5.25.2) is two consecutive **signed** bytes
+/// inside a FullBox(`afbr`, version=0, flags=0):
+///
+/// ```text
+/// int(8) flash_exposure_numerator;
+/// int(8) flash_exposure_denominator;
+/// ```
+///
+/// Per §6.5.25.3 the flash-exposure value of the sample is expressed
+/// in number of f-stops as `flash_exposure_numerator /
+/// flash_exposure_denominator`. The fields are signed so a negative
+/// numerator carries an under-exposed (darker) flash setting and a
+/// positive numerator an over-exposed (brighter) flash setting
+/// relative to the camera-set flash exposure.
+///
+/// The spec does NOT carve out a dedicated infinity sentinel for
+/// `afbr` (unlike the §6.5.24 `fobr` divide-by-zero infinity
+/// reading). A denominator of zero is therefore mathematically
+/// undefined; the [`Afbr::flash_exposure_stops`] helper returns
+/// `None` in that case so callers don't trip a division-by-zero
+/// panic on a malformed reading, mirroring the `aebr` /
+/// `Aebr::exposure_stops` and `fobr` / `Fobr::focus_distance_metres`
+/// patterns on the sibling parsers.
+///
+/// Note: the spec text declares both fields as `int(8)` (signed). The
+/// signed interpretation is load-bearing for downstream consumers
+/// because a flash-bracketed burst routinely carries both signs. The
+/// parser surfaces the raw bytes as `i8`.
+///
+/// Spec: ISO/IEC 23008-12 §6.5.25.2 — FullBox(`afbr`, version=0,
+/// flags=0).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Afbr {
+    /// Numerator of the flash-exposure ratio (§6.5.25.3). Signed
+    /// 8-bit; combined with [`Self::flash_exposure_denominator`]
+    /// gives the flash exposure in number of f-stops. A negative
+    /// value carries an under-exposed (darker) flash position
+    /// relative to the camera-set flash exposure.
+    pub flash_exposure_numerator: i8,
+    /// Denominator of the flash-exposure ratio (§6.5.25.3). Signed
+    /// 8-bit. The spec does not carve out a dedicated sentinel for
+    /// a zero denominator — a zero is mathematically undefined and
+    /// is surfaced as `None` by [`Self::flash_exposure_stops`].
+    pub flash_exposure_denominator: i8,
+}
+
+impl Afbr {
+    /// The flash exposure value in number of f-stops per §6.5.25.3
+    /// (`flash_exposure_numerator / flash_exposure_denominator`),
+    /// or `None` when the denominator is zero (mathematically
+    /// undefined; the spec does not carve out a dedicated sentinel
+    /// for this case). The signed-i8 numerator and denominator are
+    /// widened to `f64` so the ratio carries the full
+    /// `i8::MIN / 1` … `i8::MAX / 1` span without saturation, and
+    /// the `i8::MIN / -1` case (which would overflow an
+    /// integer-only divide) round-trips as `128.0`.
+    pub fn flash_exposure_stops(&self) -> Option<f64> {
+        if self.flash_exposure_denominator == 0 {
+            return None;
+        }
+        Some(f64::from(self.flash_exposure_numerator) / f64::from(self.flash_exposure_denominator))
+    }
+}
+
 /// One property box, kept typed for the boxes AVIF cares about + a raw
 /// fallback so an unknown property still gets an index for association.
 #[derive(Clone, Debug)]
@@ -1284,6 +1364,8 @@ pub enum Property {
     Wbbr(Wbbr),
     /// Focus-information descriptive property (HEIF §6.5.24).
     Fobr(Fobr),
+    /// Flash-exposure-information descriptive property (HEIF §6.5.25).
+    Afbr(Afbr),
     Other(BoxType, Vec<u8>),
 }
 
@@ -1315,6 +1397,7 @@ impl Property {
             Property::Aebr(_) => AEBR,
             Property::Wbbr(_) => WBBR,
             Property::Fobr(_) => FOBR,
+            Property::Afbr(_) => AFBR,
             Property::Other(t, _) => *t,
         }
     }
@@ -1483,8 +1566,8 @@ impl Meta {
     /// `a1lx` is treated as recognised even when its bytes are not acted
     /// upon, because the spec forbids marking it essential; a `clap`,
     /// `irot`, `imir`, `lsel`, `a1op`, `iscl`, `rref`, `crtt`, `mdft`,
-    /// `udes`, `altt`, `aebr`, `wbbr`, `fobr`, etc. that we parse
-    /// counts as recognised regardless of the essential bit.
+    /// `udes`, `altt`, `aebr`, `wbbr`, `fobr`, `afbr`, etc. that we
+    /// parse counts as recognised regardless of the essential bit.
     pub fn unsupported_essential_properties(&self, item_id: u32) -> Vec<BoxType> {
         let Some(assoc) = self.assoc_by_id(item_id) else {
             return Vec::new();
@@ -1823,6 +1906,7 @@ fn parse_ipco(payload: &[u8]) -> Result<Vec<Property>> {
             x if x == &AEBR => Property::Aebr(parse_aebr(body)?),
             x if x == &WBBR => Property::Wbbr(parse_wbbr(body)?),
             x if x == &FOBR => Property::Fobr(parse_fobr(body)?),
+            x if x == &AFBR => Property::Afbr(parse_afbr(body)?),
             other => Property::Other(*other, body.to_vec()),
         };
         out.push(prop);
@@ -2426,6 +2510,43 @@ fn parse_fobr(body: &[u8]) -> Result<Fobr> {
     Ok(Fobr {
         focus_distance_numerator: read_u16(rest, 0)?,
         focus_distance_denominator: read_u16(rest, 2)?,
+    })
+}
+
+/// Parse `afbr` (FlashExposureProperty — HEIF §6.5.25).
+/// FullBox(`afbr`, version=0, flags=0) followed by:
+///
+/// ```text
+/// int(8) flash_exposure_numerator;
+/// int(8) flash_exposure_denominator;
+/// ```
+///
+/// per §6.5.25.2. The flash exposure value of the sample is expressed
+/// in number of f-stops as `flash_exposure_numerator /
+/// flash_exposure_denominator` per §6.5.25.3. Both fields are signed
+/// per the spec text; the bytes are reinterpreted as `i8` so a writer
+/// that produces `-1` (`0xFF`) for the smallest dark direction
+/// round-trips to `-1`, not `255`.
+///
+/// An unknown `version` is rejected so a future-version layout cannot
+/// be misread as v0. Trailing bytes past the two fixed bytes are
+/// ignored, mirroring the forward-compatibility behaviour of the
+/// other FullBox-headed property parsers in this module — a v0
+/// producer that pads the box with reserved bytes is read cleanly.
+fn parse_afbr(body: &[u8]) -> Result<Afbr> {
+    let (version, _flags, rest) = parse_full_box(body)?;
+    if version != 0 {
+        return Err(Error::invalid(format!("avif: afbr version {version} != 0")));
+    }
+    if rest.len() < 2 {
+        return Err(Error::invalid(format!(
+            "avif: afbr too short ({} < 2)",
+            rest.len()
+        )));
+    }
+    Ok(Afbr {
+        flash_exposure_numerator: rest[0] as i8,
+        flash_exposure_denominator: rest[1] as i8,
     })
 }
 
@@ -4904,6 +5025,264 @@ mod tests {
                 assert_eq!(f.focus_distance_metres(), None);
             }
             other => panic!("expected Fobr, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // HEIF §6.5.25 FlashExposureProperty (`afbr`) — parse + helpers
+    // -----------------------------------------------------------------
+
+    /// Build an `afbr` body — FullBox(v=0, f=0) followed by two
+    /// `int(8)` fields in the §6.5.25.2 declaration order:
+    /// `flash_exposure_numerator` then `flash_exposure_denominator`.
+    /// Accepts `i8` so the test call sites read in spec-text units
+    /// (negative values for the dark direction of the bracket).
+    fn afbr_body(num: i8, den: i8) -> Vec<u8> {
+        let mut buf = vec![0u8; 4];
+        buf.push(num as u8);
+        buf.push(den as u8);
+        buf
+    }
+
+    #[test]
+    fn afbr_round_trip_reads_numerator_then_denominator() {
+        // Distinct, asymmetric values per field so a cross-wire
+        // between numerator and denominator would surface
+        // immediately. 1 / 2 expresses +0.5 stops of flash, a
+        // realistic mid-bracket position.
+        let a = parse_afbr(&afbr_body(1, 2)).unwrap();
+        assert_eq!(a.flash_exposure_numerator, 1);
+        assert_eq!(a.flash_exposure_denominator, 2);
+    }
+
+    /// Both fields are `int(8)` (signed). A writer that emits `0xFF`
+    /// for the smallest dark direction must round-trip to `-1`, not
+    /// `255` — i.e. the parser must interpret the byte as `i8`.
+    #[test]
+    fn afbr_fields_are_signed() {
+        // Lone negative numerator: -1 / +2 = -0.5 stops (under).
+        let a = parse_afbr(&afbr_body(-1, 2)).unwrap();
+        assert_eq!(a.flash_exposure_numerator, -1);
+        assert_eq!(a.flash_exposure_denominator, 2);
+        // Lone negative denominator: +1 / -2 = -0.5 stops (under,
+        // expressed via the sign of the denominator).
+        let a = parse_afbr(&afbr_body(1, -2)).unwrap();
+        assert_eq!(a.flash_exposure_numerator, 1);
+        assert_eq!(a.flash_exposure_denominator, -2);
+        // Both negative: -1 / -2 = +0.5 stops (over).
+        let a = parse_afbr(&afbr_body(-1, -2)).unwrap();
+        assert_eq!(a.flash_exposure_numerator, -1);
+        assert_eq!(a.flash_exposure_denominator, -2);
+        // Signed endpoints: i8::MIN / i8::MAX = -128 / 127.
+        let a = parse_afbr(&afbr_body(i8::MIN, i8::MAX)).unwrap();
+        assert_eq!(a.flash_exposure_numerator, i8::MIN);
+        assert_eq!(a.flash_exposure_denominator, i8::MAX);
+        // The raw `0xFF` byte must read as `-1`, NOT `255` —
+        // pins the `as i8` cast against a stray `as u8` regression.
+        let mut buf = vec![0u8; 4];
+        buf.extend_from_slice(&[0xFF, 0x02]);
+        let a = parse_afbr(&buf).unwrap();
+        assert_eq!(a.flash_exposure_numerator, -1);
+        assert_eq!(a.flash_exposure_denominator, 2);
+    }
+
+    /// §6.5.25.3 projection: flash exposure in number of f-stops is
+    /// `flash_exposure_numerator / flash_exposure_denominator`.
+    /// The helper returns `Some(stops)` for a well-formed denominator
+    /// and `None` for the (spec-undefined) zero denominator.
+    #[test]
+    fn afbr_flash_exposure_stops_projection() {
+        // 1 / 2 = +0.5 stops (half-stop over).
+        let a = parse_afbr(&afbr_body(1, 2)).unwrap();
+        assert_eq!(a.flash_exposure_stops(), Some(0.5));
+        // -1 / 2 = -0.5 stops (half-stop under).
+        let a = parse_afbr(&afbr_body(-1, 2)).unwrap();
+        assert_eq!(a.flash_exposure_stops(), Some(-0.5));
+        // 1 / 1 = +1.0 stop (full-stop over).
+        let a = parse_afbr(&afbr_body(1, 1)).unwrap();
+        assert_eq!(a.flash_exposure_stops(), Some(1.0));
+        // -2 / 3 = -0.6667 stops (two-third-stop under).
+        let a = parse_afbr(&afbr_body(-2, 3)).unwrap();
+        let v = a.flash_exposure_stops().unwrap();
+        assert!((v - (-2.0 / 3.0)).abs() < 1e-12, "got {v}");
+        // i8::MIN / -1 must NOT integer-overflow — the f64 widening
+        // gives 128.0 cleanly. This pins the `f64::from` widening
+        // against a hypothetical `i8 / i8` integer-only divide
+        // regression that would panic.
+        let a = parse_afbr(&afbr_body(i8::MIN, -1)).unwrap();
+        assert_eq!(a.flash_exposure_stops(), Some(128.0));
+        // Zero denominator — mathematically undefined per the spec's
+        // silence (no §6.5.25.3 sentinel carve-out unlike `fobr`'s
+        // infinity reading); the helper returns `None`.
+        let a = parse_afbr(&afbr_body(1, 0)).unwrap();
+        assert_eq!(a.flash_exposure_stops(), None);
+        // Zero numerator, non-zero denominator: 0 / N = 0.0 stops
+        // (no flash variation relative to the camera setting).
+        let a = parse_afbr(&afbr_body(0, 1)).unwrap();
+        assert_eq!(a.flash_exposure_stops(), Some(0.0));
+        // Zero / zero: still undefined (denominator-zero path).
+        let a = parse_afbr(&afbr_body(0, 0)).unwrap();
+        assert_eq!(a.flash_exposure_stops(), None);
+    }
+
+    #[test]
+    fn afbr_rejects_unknown_version() {
+        // version=1, flags=0; two zero bytes would otherwise be a
+        // well-formed v0 body.
+        let mut buf = vec![1u8, 0, 0, 0];
+        buf.extend_from_slice(&[0, 0]);
+        assert!(parse_afbr(&buf).is_err());
+    }
+
+    /// A body shorter than the two-byte fixed tail must be rejected
+    /// so a truncated `afbr` cannot be partially read.
+    #[test]
+    fn afbr_rejects_truncated_body() {
+        // FullBox header alone — no fields at all.
+        let buf = vec![0u8; 4];
+        assert!(parse_afbr(&buf).is_err());
+        // FullBox header + `flash_exposure_numerator` only
+        // (missing the denominator).
+        let mut buf = vec![0u8; 4];
+        buf.push(0x01);
+        assert!(parse_afbr(&buf).is_err());
+    }
+
+    /// Trailing bytes past the two-byte tail are forward-compat
+    /// space — the parser ignores them, mirroring the behaviour of
+    /// every other FullBox-headed property parser in this module.
+    #[test]
+    fn afbr_tolerates_trailing_bytes() {
+        let mut body = afbr_body(1, 2);
+        body.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let a = parse_afbr(&body).unwrap();
+        assert_eq!(a.flash_exposure_numerator, 1);
+        assert_eq!(a.flash_exposure_denominator, 2);
+        assert_eq!(a.flash_exposure_stops(), Some(0.5));
+    }
+
+    #[test]
+    fn afbr_dispatched_through_parse_ipco() {
+        let body = afbr_body(-3, 4);
+        let mut ipco = Vec::new();
+        let s = 8 + body.len() as u32;
+        ipco.extend_from_slice(&s.to_be_bytes());
+        ipco.extend_from_slice(b"afbr");
+        ipco.extend_from_slice(&body);
+        let props = parse_ipco(&ipco).unwrap();
+        assert_eq!(props.len(), 1);
+        match &props[0] {
+            Property::Afbr(a) => {
+                assert_eq!(a.flash_exposure_numerator, -3);
+                assert_eq!(a.flash_exposure_denominator, 4);
+                assert_eq!(a.flash_exposure_stops(), Some(-0.75));
+            }
+            other => panic!("expected Afbr, got {other:?}"),
+        }
+        assert_eq!(props[0].kind(), *b"afbr");
+    }
+
+    /// A recognised `afbr` property — even when flagged essential
+    /// (unusual for a descriptive property, but the parser does
+    /// not reject the bit) — does NOT trip
+    /// [`Meta::unsupported_essential_properties`].
+    #[test]
+    fn afbr_essential_association_is_recognised() {
+        let m = Meta {
+            properties: vec![Property::Afbr(Afbr::default())],
+            associations: vec![ItemPropertyAssociation {
+                item_id: 1,
+                entries: vec![PropertyAssociation {
+                    index: 0,
+                    essential: true,
+                }],
+            }],
+            ..Meta::default()
+        };
+        assert!(!m.has_unsupported_essential_property(1));
+        assert!(m.unsupported_essential_properties(1).is_empty());
+    }
+
+    /// §6.5.25.1 caps `afbr` at one per item (`At most one`). A
+    /// `Meta::property_for(item_id, &AFBR)` lookup finds the
+    /// associated single instance via the standard `ipma` walk;
+    /// the dispatch returns the `Afbr` variant which the caller
+    /// pattern matches on. This test exercises the typical lookup
+    /// shape end to end.
+    #[test]
+    fn afbr_lookup_via_property_for() {
+        let m = Meta {
+            properties: vec![Property::Afbr(Afbr {
+                flash_exposure_numerator: 1,
+                flash_exposure_denominator: 2,
+            })],
+            associations: vec![ItemPropertyAssociation {
+                item_id: 9,
+                entries: vec![PropertyAssociation {
+                    index: 0,
+                    essential: false,
+                }],
+            }],
+            ..Meta::default()
+        };
+        match m.property_for(9, b"afbr") {
+            Some(Property::Afbr(a)) => {
+                assert_eq!(a.flash_exposure_numerator, 1);
+                assert_eq!(a.flash_exposure_denominator, 2);
+                assert_eq!(a.flash_exposure_stops(), Some(0.5));
+            }
+            other => panic!("expected Afbr, got {other:?}"),
+        }
+        // No `afbr` for an item that doesn't carry the association.
+        assert!(m.property_for(99, b"afbr").is_none());
+
+        // Negative bracket position via `property_for`.
+        let m = Meta {
+            properties: vec![Property::Afbr(Afbr {
+                flash_exposure_numerator: -3,
+                flash_exposure_denominator: 4,
+            })],
+            associations: vec![ItemPropertyAssociation {
+                item_id: 5,
+                entries: vec![PropertyAssociation {
+                    index: 0,
+                    essential: false,
+                }],
+            }],
+            ..Meta::default()
+        };
+        match m.property_for(5, b"afbr") {
+            Some(Property::Afbr(a)) => {
+                assert_eq!(a.flash_exposure_numerator, -3);
+                assert_eq!(a.flash_exposure_denominator, 4);
+                assert_eq!(a.flash_exposure_stops(), Some(-0.75));
+            }
+            other => panic!("expected Afbr, got {other:?}"),
+        }
+
+        // Zero-denominator "undefined" reading: still typed as Afbr,
+        // just with `flash_exposure_stops() == None`.
+        let m = Meta {
+            properties: vec![Property::Afbr(Afbr {
+                flash_exposure_numerator: 1,
+                flash_exposure_denominator: 0,
+            })],
+            associations: vec![ItemPropertyAssociation {
+                item_id: 7,
+                entries: vec![PropertyAssociation {
+                    index: 0,
+                    essential: false,
+                }],
+            }],
+            ..Meta::default()
+        };
+        match m.property_for(7, b"afbr") {
+            Some(Property::Afbr(a)) => {
+                assert_eq!(a.flash_exposure_numerator, 1);
+                assert_eq!(a.flash_exposure_denominator, 0);
+                assert_eq!(a.flash_exposure_stops(), None);
+            }
+            other => panic!("expected Afbr, got {other:?}"),
         }
     }
 }
