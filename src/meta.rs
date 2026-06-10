@@ -85,6 +85,8 @@ const WBBR: BoxType = b(b"wbbr");
 const FOBR: BoxType = b(b"fobr");
 /// HEIF §6.5.25 — Flash Exposure Information descriptive property.
 const AFBR: BoxType = b(b"afbr");
+/// HEIF §6.5.26 — Depth of Field Information descriptive property.
+const DOBR: BoxType = b(b"dobr");
 
 /// HEIF §6.6.2.2 — image overlay derived-image type.
 pub const ITEM_TYPE_IOVL: BoxType = b(b"iovl");
@@ -1319,6 +1321,84 @@ impl Afbr {
     }
 }
 
+/// Depth of Field Information descriptive property (`dobr`) —
+/// HEIF §6.5.26.
+///
+/// Carries the depth-of-field variation of the associated image item
+/// relative to the camera settings, expressed as an **aperture change**
+/// in a number of stops, as the ratio of [`Self::f_stop_numerator`]
+/// over [`Self::f_stop_denominator`]. The property identifies one
+/// image item out of a `dobr` entity group (§6.8.6) so a reader can
+/// place a frame inside a depth-of-field-bracketed burst.
+///
+/// Per §6.5.26.1 the property is a descriptive item property with
+/// `Quantity (per item): At most one` — a single item carries zero
+/// or one `dobr` instance.
+///
+/// The wire layout (§6.5.26.2) is two consecutive **signed** bytes
+/// inside a FullBox(`dobr`, version=0, flags=0):
+///
+/// ```text
+/// int(8) f_stop_numerator;
+/// int(8) f_stop_denominator;
+/// ```
+///
+/// Per §6.5.26.3 the depth-of-field variation is expressed as an
+/// aperture change in a number of stops, computed as `f_stop_numerator
+/// / f_stop_denominator`. The fields are signed so a negative
+/// numerator carries an aperture change toward a smaller f-number
+/// (shallower depth of field) and a positive numerator toward a larger
+/// f-number (deeper depth of field) relative to the camera-set
+/// aperture.
+///
+/// The spec does NOT carve out a dedicated infinity sentinel for
+/// `dobr` (unlike the §6.5.24 `fobr` divide-by-zero infinity
+/// reading). A denominator of zero is therefore mathematically
+/// undefined; the [`Dobr::aperture_stops`] helper returns `None` in
+/// that case so callers don't trip a division-by-zero panic on a
+/// malformed reading, mirroring the `afbr` / [`Afbr::flash_exposure_stops`]
+/// pattern on the structurally identical sibling parser.
+///
+/// Note: the spec text declares both fields as `int(8)` (signed). The
+/// signed interpretation is load-bearing for downstream consumers
+/// because a depth-of-field-bracketed burst routinely carries both
+/// signs. The parser surfaces the raw bytes as `i8`.
+///
+/// Spec: ISO/IEC 23008-12 §6.5.26.2 — FullBox(`dobr`, version=0,
+/// flags=0).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Dobr {
+    /// Numerator of the aperture-change ratio (§6.5.26.3). Signed
+    /// 8-bit; combined with [`Self::f_stop_denominator`] gives the
+    /// depth-of-field variation in number of stops. A negative value
+    /// carries an aperture change toward a shallower depth of field
+    /// relative to the camera-set aperture.
+    pub f_stop_numerator: i8,
+    /// Denominator of the aperture-change ratio (§6.5.26.3). Signed
+    /// 8-bit. The spec does not carve out a dedicated sentinel for a
+    /// zero denominator — a zero is mathematically undefined and is
+    /// surfaced as `None` by [`Self::aperture_stops`].
+    pub f_stop_denominator: i8,
+}
+
+impl Dobr {
+    /// The depth-of-field variation expressed as an aperture change in
+    /// a number of stops per §6.5.26.3 (`f_stop_numerator /
+    /// f_stop_denominator`), or `None` when the denominator is zero
+    /// (mathematically undefined; the spec does not carve out a
+    /// dedicated sentinel for this case). The signed-i8 numerator and
+    /// denominator are widened to `f64` so the ratio carries the full
+    /// `i8::MIN / 1` … `i8::MAX / 1` span without saturation, and the
+    /// `i8::MIN / -1` case (which would overflow an integer-only
+    /// divide) round-trips as `128.0`.
+    pub fn aperture_stops(&self) -> Option<f64> {
+        if self.f_stop_denominator == 0 {
+            return None;
+        }
+        Some(f64::from(self.f_stop_numerator) / f64::from(self.f_stop_denominator))
+    }
+}
+
 /// One property box, kept typed for the boxes AVIF cares about + a raw
 /// fallback so an unknown property still gets an index for association.
 #[derive(Clone, Debug)]
@@ -1366,6 +1446,8 @@ pub enum Property {
     Fobr(Fobr),
     /// Flash-exposure-information descriptive property (HEIF §6.5.25).
     Afbr(Afbr),
+    /// Depth-of-field-information descriptive property (HEIF §6.5.26).
+    Dobr(Dobr),
     Other(BoxType, Vec<u8>),
 }
 
@@ -1398,6 +1480,7 @@ impl Property {
             Property::Wbbr(_) => WBBR,
             Property::Fobr(_) => FOBR,
             Property::Afbr(_) => AFBR,
+            Property::Dobr(_) => DOBR,
             Property::Other(t, _) => *t,
         }
     }
@@ -1566,8 +1649,9 @@ impl Meta {
     /// `a1lx` is treated as recognised even when its bytes are not acted
     /// upon, because the spec forbids marking it essential; a `clap`,
     /// `irot`, `imir`, `lsel`, `a1op`, `iscl`, `rref`, `crtt`, `mdft`,
-    /// `udes`, `altt`, `aebr`, `wbbr`, `fobr`, `afbr`, etc. that we
-    /// parse counts as recognised regardless of the essential bit.
+    /// `udes`, `altt`, `aebr`, `wbbr`, `fobr`, `afbr`, `dobr`, etc.
+    /// that we parse counts as recognised regardless of the essential
+    /// bit.
     pub fn unsupported_essential_properties(&self, item_id: u32) -> Vec<BoxType> {
         let Some(assoc) = self.assoc_by_id(item_id) else {
             return Vec::new();
@@ -1907,6 +1991,7 @@ fn parse_ipco(payload: &[u8]) -> Result<Vec<Property>> {
             x if x == &WBBR => Property::Wbbr(parse_wbbr(body)?),
             x if x == &FOBR => Property::Fobr(parse_fobr(body)?),
             x if x == &AFBR => Property::Afbr(parse_afbr(body)?),
+            x if x == &DOBR => Property::Dobr(parse_dobr(body)?),
             other => Property::Other(*other, body.to_vec()),
         };
         out.push(prop);
@@ -2547,6 +2632,43 @@ fn parse_afbr(body: &[u8]) -> Result<Afbr> {
     Ok(Afbr {
         flash_exposure_numerator: rest[0] as i8,
         flash_exposure_denominator: rest[1] as i8,
+    })
+}
+
+/// Parse `dobr` (DepthOfFieldProperty — HEIF §6.5.26).
+/// FullBox(`dobr`, version=0, flags=0) followed by:
+///
+/// ```text
+/// int(8) f_stop_numerator;
+/// int(8) f_stop_denominator;
+/// ```
+///
+/// per §6.5.26.2. The depth-of-field variation is expressed as an
+/// aperture change in a number of stops, computed as `f_stop_numerator
+/// / f_stop_denominator` per §6.5.26.3. Both fields are signed per the
+/// spec text; the bytes are reinterpreted as `i8` so a writer that
+/// produces `-1` (`0xFF`) for the shallow direction round-trips to
+/// `-1`, not `255`.
+///
+/// An unknown `version` is rejected so a future-version layout cannot
+/// be misread as v0. Trailing bytes past the two fixed bytes are
+/// ignored, mirroring the forward-compatibility behaviour of the
+/// other FullBox-headed property parsers in this module — a v0
+/// producer that pads the box with reserved bytes is read cleanly.
+fn parse_dobr(body: &[u8]) -> Result<Dobr> {
+    let (version, _flags, rest) = parse_full_box(body)?;
+    if version != 0 {
+        return Err(Error::invalid(format!("avif: dobr version {version} != 0")));
+    }
+    if rest.len() < 2 {
+        return Err(Error::invalid(format!(
+            "avif: dobr too short ({} < 2)",
+            rest.len()
+        )));
+    }
+    Ok(Dobr {
+        f_stop_numerator: rest[0] as i8,
+        f_stop_denominator: rest[1] as i8,
     })
 }
 
@@ -5282,6 +5404,302 @@ mod tests {
                 assert_eq!(a.flash_exposure_denominator, 0);
                 assert_eq!(a.flash_exposure_stops(), None);
             }
+            other => panic!("expected Afbr, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // HEIF §6.5.26 DepthOfFieldProperty (`dobr`) — parse + helpers
+    // -----------------------------------------------------------------
+
+    /// Build a `dobr` body — FullBox(v=0, f=0) followed by two
+    /// `int(8)` fields in the §6.5.26.2 declaration order:
+    /// `f_stop_numerator` then `f_stop_denominator`. Accepts `i8` so
+    /// the test call sites read in spec-text units (negative values
+    /// for the shallow direction of the bracket).
+    fn dobr_body(num: i8, den: i8) -> Vec<u8> {
+        let mut buf = vec![0u8; 4];
+        buf.push(num as u8);
+        buf.push(den as u8);
+        buf
+    }
+
+    #[test]
+    fn dobr_round_trip_reads_numerator_then_denominator() {
+        // Distinct, asymmetric values per field so a cross-wire
+        // between numerator and denominator would surface
+        // immediately. 1 / 2 expresses +0.5 stops of aperture change,
+        // a realistic mid-bracket position.
+        let d = parse_dobr(&dobr_body(1, 2)).unwrap();
+        assert_eq!(d.f_stop_numerator, 1);
+        assert_eq!(d.f_stop_denominator, 2);
+    }
+
+    /// Both fields are `int(8)` (signed). A writer that emits `0xFF`
+    /// for the smallest shallow direction must round-trip to `-1`, not
+    /// `255` — i.e. the parser must interpret the byte as `i8`.
+    #[test]
+    fn dobr_fields_are_signed() {
+        // Lone negative numerator: -1 / +2 = -0.5 stops (shallower).
+        let d = parse_dobr(&dobr_body(-1, 2)).unwrap();
+        assert_eq!(d.f_stop_numerator, -1);
+        assert_eq!(d.f_stop_denominator, 2);
+        // Lone negative denominator: +1 / -2 = -0.5 stops (shallower,
+        // expressed via the sign of the denominator).
+        let d = parse_dobr(&dobr_body(1, -2)).unwrap();
+        assert_eq!(d.f_stop_numerator, 1);
+        assert_eq!(d.f_stop_denominator, -2);
+        // Both negative: -1 / -2 = +0.5 stops (deeper).
+        let d = parse_dobr(&dobr_body(-1, -2)).unwrap();
+        assert_eq!(d.f_stop_numerator, -1);
+        assert_eq!(d.f_stop_denominator, -2);
+        // Signed endpoints: i8::MIN / i8::MAX = -128 / 127.
+        let d = parse_dobr(&dobr_body(i8::MIN, i8::MAX)).unwrap();
+        assert_eq!(d.f_stop_numerator, i8::MIN);
+        assert_eq!(d.f_stop_denominator, i8::MAX);
+        // The raw `0xFF` byte must read as `-1`, NOT `255` —
+        // pins the `as i8` cast against a stray `as u8` regression.
+        let mut buf = vec![0u8; 4];
+        buf.extend_from_slice(&[0xFF, 0x02]);
+        let d = parse_dobr(&buf).unwrap();
+        assert_eq!(d.f_stop_numerator, -1);
+        assert_eq!(d.f_stop_denominator, 2);
+    }
+
+    /// §6.5.26.3 projection: the depth-of-field variation as an
+    /// aperture change in number of stops is `f_stop_numerator /
+    /// f_stop_denominator`. The helper returns `Some(stops)` for a
+    /// well-formed denominator and `None` for the (spec-undefined)
+    /// zero denominator.
+    #[test]
+    fn dobr_aperture_stops_projection() {
+        // 1 / 2 = +0.5 stops (half-stop deeper).
+        let d = parse_dobr(&dobr_body(1, 2)).unwrap();
+        assert_eq!(d.aperture_stops(), Some(0.5));
+        // -1 / 2 = -0.5 stops (half-stop shallower).
+        let d = parse_dobr(&dobr_body(-1, 2)).unwrap();
+        assert_eq!(d.aperture_stops(), Some(-0.5));
+        // 1 / 1 = +1.0 stop (full-stop deeper).
+        let d = parse_dobr(&dobr_body(1, 1)).unwrap();
+        assert_eq!(d.aperture_stops(), Some(1.0));
+        // -2 / 3 = -0.6667 stops (two-third-stop shallower).
+        let d = parse_dobr(&dobr_body(-2, 3)).unwrap();
+        let v = d.aperture_stops().unwrap();
+        assert!((v - (-2.0 / 3.0)).abs() < 1e-12, "got {v}");
+        // i8::MIN / -1 must NOT integer-overflow — the f64 widening
+        // gives 128.0 cleanly. This pins the `f64::from` widening
+        // against a hypothetical `i8 / i8` integer-only divide
+        // regression that would panic.
+        let d = parse_dobr(&dobr_body(i8::MIN, -1)).unwrap();
+        assert_eq!(d.aperture_stops(), Some(128.0));
+        // Zero denominator — mathematically undefined per the spec's
+        // silence (no §6.5.26.3 sentinel carve-out unlike `fobr`'s
+        // infinity reading); the helper returns `None`.
+        let d = parse_dobr(&dobr_body(1, 0)).unwrap();
+        assert_eq!(d.aperture_stops(), None);
+        // Zero numerator, non-zero denominator: 0 / N = 0.0 stops
+        // (no aperture variation relative to the camera setting).
+        let d = parse_dobr(&dobr_body(0, 1)).unwrap();
+        assert_eq!(d.aperture_stops(), Some(0.0));
+        // Zero / zero: still undefined (denominator-zero path).
+        let d = parse_dobr(&dobr_body(0, 0)).unwrap();
+        assert_eq!(d.aperture_stops(), None);
+    }
+
+    #[test]
+    fn dobr_rejects_unknown_version() {
+        // version=1, flags=0; two zero bytes would otherwise be a
+        // well-formed v0 body.
+        let mut buf = vec![1u8, 0, 0, 0];
+        buf.extend_from_slice(&[0, 0]);
+        assert!(parse_dobr(&buf).is_err());
+    }
+
+    /// A body shorter than the two-byte fixed tail must be rejected
+    /// so a truncated `dobr` cannot be partially read.
+    #[test]
+    fn dobr_rejects_truncated_body() {
+        // FullBox header alone — no fields at all.
+        let buf = vec![0u8; 4];
+        assert!(parse_dobr(&buf).is_err());
+        // FullBox header + `f_stop_numerator` only
+        // (missing the denominator).
+        let mut buf = vec![0u8; 4];
+        buf.push(0x01);
+        assert!(parse_dobr(&buf).is_err());
+    }
+
+    /// Trailing bytes past the two-byte tail are forward-compat
+    /// space — the parser ignores them, mirroring the behaviour of
+    /// every other FullBox-headed property parser in this module.
+    #[test]
+    fn dobr_tolerates_trailing_bytes() {
+        let mut body = dobr_body(1, 2);
+        body.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let d = parse_dobr(&body).unwrap();
+        assert_eq!(d.f_stop_numerator, 1);
+        assert_eq!(d.f_stop_denominator, 2);
+        assert_eq!(d.aperture_stops(), Some(0.5));
+    }
+
+    #[test]
+    fn dobr_dispatched_through_parse_ipco() {
+        let body = dobr_body(-3, 4);
+        let mut ipco = Vec::new();
+        let s = 8 + body.len() as u32;
+        ipco.extend_from_slice(&s.to_be_bytes());
+        ipco.extend_from_slice(b"dobr");
+        ipco.extend_from_slice(&body);
+        let props = parse_ipco(&ipco).unwrap();
+        assert_eq!(props.len(), 1);
+        match &props[0] {
+            Property::Dobr(d) => {
+                assert_eq!(d.f_stop_numerator, -3);
+                assert_eq!(d.f_stop_denominator, 4);
+                assert_eq!(d.aperture_stops(), Some(-0.75));
+            }
+            other => panic!("expected Dobr, got {other:?}"),
+        }
+        assert_eq!(props[0].kind(), *b"dobr");
+    }
+
+    /// A recognised `dobr` property — even when flagged essential
+    /// (unusual for a descriptive property, but the parser does
+    /// not reject the bit) — does NOT trip
+    /// [`Meta::unsupported_essential_properties`].
+    #[test]
+    fn dobr_essential_association_is_recognised() {
+        let m = Meta {
+            properties: vec![Property::Dobr(Dobr::default())],
+            associations: vec![ItemPropertyAssociation {
+                item_id: 1,
+                entries: vec![PropertyAssociation {
+                    index: 0,
+                    essential: true,
+                }],
+            }],
+            ..Meta::default()
+        };
+        assert!(!m.has_unsupported_essential_property(1));
+        assert!(m.unsupported_essential_properties(1).is_empty());
+    }
+
+    /// §6.5.26.1 caps `dobr` at one per item (`At most one`). A
+    /// `Meta::property_for(item_id, &DOBR)` lookup finds the
+    /// associated single instance via the standard `ipma` walk;
+    /// the dispatch returns the `Dobr` variant which the caller
+    /// pattern matches on. This test exercises the typical lookup
+    /// shape end to end.
+    #[test]
+    fn dobr_lookup_via_property_for() {
+        let m = Meta {
+            properties: vec![Property::Dobr(Dobr {
+                f_stop_numerator: 1,
+                f_stop_denominator: 2,
+            })],
+            associations: vec![ItemPropertyAssociation {
+                item_id: 9,
+                entries: vec![PropertyAssociation {
+                    index: 0,
+                    essential: false,
+                }],
+            }],
+            ..Meta::default()
+        };
+        match m.property_for(9, b"dobr") {
+            Some(Property::Dobr(d)) => {
+                assert_eq!(d.f_stop_numerator, 1);
+                assert_eq!(d.f_stop_denominator, 2);
+                assert_eq!(d.aperture_stops(), Some(0.5));
+            }
+            other => panic!("expected Dobr, got {other:?}"),
+        }
+        // No `dobr` for an item that doesn't carry the association.
+        assert!(m.property_for(99, b"dobr").is_none());
+
+        // Negative bracket position via `property_for`.
+        let m = Meta {
+            properties: vec![Property::Dobr(Dobr {
+                f_stop_numerator: -3,
+                f_stop_denominator: 4,
+            })],
+            associations: vec![ItemPropertyAssociation {
+                item_id: 5,
+                entries: vec![PropertyAssociation {
+                    index: 0,
+                    essential: false,
+                }],
+            }],
+            ..Meta::default()
+        };
+        match m.property_for(5, b"dobr") {
+            Some(Property::Dobr(d)) => {
+                assert_eq!(d.f_stop_numerator, -3);
+                assert_eq!(d.f_stop_denominator, 4);
+                assert_eq!(d.aperture_stops(), Some(-0.75));
+            }
+            other => panic!("expected Dobr, got {other:?}"),
+        }
+
+        // Zero-denominator "undefined" reading: still typed as Dobr,
+        // just with `aperture_stops() == None`.
+        let m = Meta {
+            properties: vec![Property::Dobr(Dobr {
+                f_stop_numerator: 1,
+                f_stop_denominator: 0,
+            })],
+            associations: vec![ItemPropertyAssociation {
+                item_id: 7,
+                entries: vec![PropertyAssociation {
+                    index: 0,
+                    essential: false,
+                }],
+            }],
+            ..Meta::default()
+        };
+        match m.property_for(7, b"dobr") {
+            Some(Property::Dobr(d)) => {
+                assert_eq!(d.f_stop_numerator, 1);
+                assert_eq!(d.f_stop_denominator, 0);
+                assert_eq!(d.aperture_stops(), None);
+            }
+            other => panic!("expected Dobr, got {other:?}"),
+        }
+
+        // `dobr` may legally co-occur with `afbr` on the same item
+        // (different §6.5 properties); both resolve independently.
+        let m = Meta {
+            properties: vec![
+                Property::Dobr(Dobr {
+                    f_stop_numerator: 1,
+                    f_stop_denominator: 2,
+                }),
+                Property::Afbr(Afbr {
+                    flash_exposure_numerator: -1,
+                    flash_exposure_denominator: 2,
+                }),
+            ],
+            associations: vec![ItemPropertyAssociation {
+                item_id: 3,
+                entries: vec![
+                    PropertyAssociation {
+                        index: 0,
+                        essential: false,
+                    },
+                    PropertyAssociation {
+                        index: 1,
+                        essential: false,
+                    },
+                ],
+            }],
+            ..Meta::default()
+        };
+        match m.property_for(3, b"dobr") {
+            Some(Property::Dobr(d)) => assert_eq!(d.aperture_stops(), Some(0.5)),
+            other => panic!("expected Dobr, got {other:?}"),
+        }
+        match m.property_for(3, b"afbr") {
+            Some(Property::Afbr(a)) => assert_eq!(a.flash_exposure_stops(), Some(-0.5)),
             other => panic!("expected Afbr, got {other:?}"),
         }
     }

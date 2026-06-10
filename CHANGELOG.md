@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- ISO/IEC 23008-12 §6.5.26 DepthOfFieldProperty (`dobr`) descriptive
+  item-property parser. The body shape is taken verbatim from
+  §6.5.26.2 — a FullBox(`dobr`, version=0, flags=0) followed by an
+  `int(8) f_stop_numerator` and an `int(8) f_stop_denominator`, both
+  **signed** per the spec text. Per §6.5.26.1 the property is
+  descriptive with `Quantity (per item): At most one` and identifies
+  the depth-of-field variation applied to the associated image item
+  relative to the camera settings — used to place a frame inside a
+  depth-of-field-bracketed burst via the §6.8.6 `'dobr'` entity
+  group. Per §6.5.26.3 the variation is expressed as an aperture
+  change in a number of stops, computed as `f_stop_numerator /
+  f_stop_denominator`. The wire layout is structurally identical to
+  the §6.5.25 `afbr` flash-exposure sibling (two signed `int(8)`
+  ratio fields); like `afbr`, §6.5.26 does NOT carve out a dedicated
+  sentinel for a zero denominator — a zero denominator is
+  mathematically undefined and the `Dobr::aperture_stops` projection
+  returns `None` in that case. The `i8::MIN / -1` corner — which
+  would overflow an integer-only divide — round-trips as `128.0` via
+  the explicit `f64::from` widening, ruling out an arithmetic panic.
+  A recognised `dobr` property does not trip
+  `Meta::unsupported_essential_properties` even when flagged
+  essential, joining the always-honoured list. New re-export:
+  `oxideav_avif::Dobr`.
+
 - ISO/IEC 23008-12 §6.5.25 FlashExposureProperty (`afbr`) descriptive
   item-property parser. The body shape is taken verbatim from
   §6.5.25.2 — a FullBox(`afbr`, version=0, flags=0) followed by an
