@@ -172,6 +172,15 @@ impl EntityGroup {
     pub fn is_equivalence(&self) -> bool {
         &self.grouping_type == b"eqiv"
     }
+
+    /// True when the grouping type signals a set of images captured in
+    /// order to create a panorama (HEIF §6.8.8.1), listed in
+    /// increasing panorama order. The §6.5.27 `pano` item property
+    /// describing the panorama direction `should` only be associated
+    /// with an entity group of this type (§6.5.27.1).
+    pub fn is_panorama(&self) -> bool {
+        &self.grouping_type == b"pano"
+    }
 }
 
 /// Parse a `GroupsListBox` (`grpl`) payload into its set of entity
@@ -2259,8 +2268,34 @@ mod tests {
         assert!(g.is_alternates());
         assert!(!g.is_stereo_pair());
         assert!(!g.is_equivalence());
+        assert!(!g.is_panorama());
         assert_eq!(g.group_id, 42);
         assert_eq!(g.entity_ids, vec![1, 2, 3]);
+    }
+
+    /// `pano` group (HEIF §6.8.8.1): entities listed in increasing
+    /// panorama order; the helper classifies the grouping type.
+    #[test]
+    fn grpl_parses_pano_group() {
+        let mut buf = Vec::new();
+        let mut child = vec![0u8; 4]; // FullBox
+        child.extend_from_slice(&5u32.to_be_bytes()); // group_id
+        child.extend_from_slice(&3u32.to_be_bytes()); // num_entities
+        child.extend_from_slice(&21u32.to_be_bytes()); // first in panorama order
+        child.extend_from_slice(&22u32.to_be_bytes());
+        child.extend_from_slice(&23u32.to_be_bytes());
+        let size = (8 + child.len()) as u32;
+        buf.extend_from_slice(&size.to_be_bytes());
+        buf.extend_from_slice(b"pano");
+        buf.extend_from_slice(&child);
+        let groups = parse_grpl(&buf).unwrap();
+        assert_eq!(groups.len(), 1);
+        let g = &groups[0];
+        assert!(g.is_panorama());
+        assert!(!g.is_alternates());
+        assert!(!g.is_stereo_pair());
+        assert!(!g.is_equivalence());
+        assert_eq!(g.entity_ids, vec![21, 22, 23]);
     }
 
     /// `ster` group convention: two entities, first is left view.

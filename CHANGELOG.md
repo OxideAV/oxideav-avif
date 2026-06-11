@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- ISO/IEC 23008-12 §6.5.27 PanoramaProperty (`pano`) descriptive
+  item-property parser. The body shape is taken verbatim from
+  §6.5.27.2 — a FullBox(`pano`, version=0, flags=0) followed by an
+  `unsigned int(8) panorama_direction` and, **only** when the
+  direction signals one of the two grid panorama types (`4` raster
+  scan / `5` continuous order), an `unsigned int(8) rows_minus_one` +
+  `unsigned int(8) columns_minus_one` pair — i.e. the first
+  conditionally-sized property body in the §6.5.x rollout, surfaced
+  as `Pano::grid: Option<PanoGrid>` being `Some` exactly for the two
+  grid directions. Per §6.5.27.1 the property is descriptive with
+  `Quantity (per item): At most one` and `should` only be associated
+  with a `'pano'` entity group (§6.8.8.1), whose entities are listed
+  in increasing panorama order — the new
+  `EntityGroup::is_panorama()` helper classifies that grouping type
+  alongside the existing `altr` / `ster` / `eqiv` recognisers. The
+  six §6.5.27.3 direction values are exposed as `Pano::DIRECTION_*`
+  constants plus `is_defined_direction()` / `is_grid()` projections;
+  an undefined direction (`>= 6`, "other values are undefined") is
+  preserved verbatim rather than rejected so readers can skip the
+  panorama reconstruction without losing the rest of the file. The
+  `PanoGrid::{rows, columns}` projections add the §6.5.27.3
+  minus-one back with a `u16` widening so the `255` wire endpoint
+  reads as `256` instead of wrapping. A recognised `pano` property
+  does not trip `Meta::unsupported_essential_properties` even when
+  flagged essential, joining the always-honoured list. New
+  re-exports: `oxideav_avif::{Pano, PanoGrid}`.
+
 - ISO/IEC 23008-12 §6.5.26 DepthOfFieldProperty (`dobr`) descriptive
   item-property parser. The body shape is taken verbatim from
   §6.5.26.2 — a FullBox(`dobr`, version=0, flags=0) followed by an

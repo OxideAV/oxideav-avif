@@ -87,6 +87,8 @@ const FOBR: BoxType = b(b"fobr");
 const AFBR: BoxType = b(b"afbr");
 /// HEIF §6.5.26 — Depth of Field Information descriptive property.
 const DOBR: BoxType = b(b"dobr");
+/// HEIF §6.5.27 — Panorama Information descriptive property.
+const PANO: BoxType = b(b"pano");
 
 /// HEIF §6.6.2.2 — image overlay derived-image type.
 pub const ITEM_TYPE_IOVL: BoxType = b(b"iovl");
@@ -1399,6 +1401,138 @@ impl Dobr {
     }
 }
 
+/// Grid-shape tail of a Panorama Information property (`pano`) —
+/// HEIF §6.5.27.2.
+///
+/// Present on the wire **only** when `panorama_direction` signals one
+/// of the two grid panorama types (`4` raster scan, `5` continuous
+/// order); for the four linear directions (`0..=3`) the property body
+/// ends after the direction byte and this struct is absent
+/// ([`Pano::grid`] is `None`).
+///
+/// Both fields are stored minus-one per §6.5.27.3, so the wire value
+/// `0` means one row / one column. The [`Self::rows`] / [`Self::columns`]
+/// projections add the one back, widening to `u16` so the `255 + 1`
+/// endpoint doesn't wrap.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PanoGrid {
+    /// Number of rows in the grid **minus one** (§6.5.27.3).
+    pub rows_minus_one: u8,
+    /// Number of columns in the grid **minus one** (§6.5.27.3).
+    pub columns_minus_one: u8,
+}
+
+impl PanoGrid {
+    /// Number of rows in the grid (§6.5.27.3 `rows_minus_one + 1`),
+    /// widened to `u16` so the `255` wire endpoint reads as `256`
+    /// instead of wrapping to `0`.
+    pub fn rows(&self) -> u16 {
+        u16::from(self.rows_minus_one) + 1
+    }
+
+    /// Number of columns in the grid (§6.5.27.3
+    /// `columns_minus_one + 1`), widened to `u16` so the `255` wire
+    /// endpoint reads as `256` instead of wrapping to `0`.
+    pub fn columns(&self) -> u16 {
+        u16::from(self.columns_minus_one) + 1
+    }
+}
+
+/// Panorama Information descriptive property (`pano`) — HEIF §6.5.27.
+///
+/// Defines the characteristics associated with a panorama declared by
+/// a `'pano'` entity group (§6.8.8.1): the type of panorama and the
+/// scanning order of the input images composing it. Per §6.5.27.1 the
+/// property `should` only be associated with an entity group whose
+/// `grouping_type` is `'pano'` (see
+/// [`EntityGroup::is_panorama`](crate::derived::EntityGroup::is_panorama)),
+/// and the quantity per associated item is at most one.
+///
+/// The wire layout (§6.5.27.2) is a FullBox(`pano`, version=0,
+/// flags=0) followed by:
+///
+/// ```text
+/// unsigned int(8) panorama_direction;
+/// if (panorama_direction >= 4 && panorama_direction <= 5) { // grid
+///     unsigned int(8) rows_minus_one;
+///     unsigned int(8) columns_minus_one;
+/// }
+/// ```
+///
+/// i.e. the two grid-shape bytes are **conditionally present** — they
+/// exist only for the two grid directions, surfaced here as
+/// [`Self::grid`] being `Some` exactly when
+/// `panorama_direction ∈ {4, 5}`.
+///
+/// Per §6.5.27.3 the direction values are:
+///
+/// | value | meaning |
+/// |-------|---------|
+/// | 0     | left-to-right horizontal panorama |
+/// | 1     | right-to-left horizontal panorama |
+/// | 2     | bottom-to-top vertical panorama |
+/// | 3     | top-to-bottom vertical panorama |
+/// | 4     | grid panorama in raster scan order (rows left-to-right, top-to-bottom from the top-left corner) |
+/// | 5     | grid panorama in continuous order (boustrophedon: first row left-to-right, second right-to-left, …) |
+/// | other | undefined |
+///
+/// An undefined direction (`>= 6`) is **not** a parse error — the raw
+/// value is preserved and [`Self::is_defined_direction`] reports
+/// `false`, so a reader can skip the panorama reconstruction while
+/// still walking the rest of the file.
+///
+/// Spec: ISO/IEC 23008-12 §6.5.27.2 — FullBox(`pano`, version=0,
+/// flags=0).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Pano {
+    /// Type of panorama + scanning order of the input images
+    /// (§6.5.27.3). See the direction table on [`Pano`]; values `>= 6`
+    /// are undefined and preserved verbatim.
+    pub panorama_direction: u8,
+    /// Grid shape — present on the wire only when
+    /// [`Self::panorama_direction`] is one of the two grid types
+    /// ([`Self::DIRECTION_GRID_RASTER`] /
+    /// [`Self::DIRECTION_GRID_CONTINUOUS`]); `None` for the four
+    /// linear directions and for undefined direction values.
+    pub grid: Option<PanoGrid>,
+}
+
+impl Pano {
+    /// §6.5.27.3 value 0 — left-to-right horizontal panorama.
+    pub const DIRECTION_LEFT_TO_RIGHT: u8 = 0;
+    /// §6.5.27.3 value 1 — right-to-left horizontal panorama.
+    pub const DIRECTION_RIGHT_TO_LEFT: u8 = 1;
+    /// §6.5.27.3 value 2 — bottom-to-top vertical panorama.
+    pub const DIRECTION_BOTTOM_TO_TOP: u8 = 2;
+    /// §6.5.27.3 value 3 — top-to-bottom vertical panorama.
+    pub const DIRECTION_TOP_TO_BOTTOM: u8 = 3;
+    /// §6.5.27.3 value 4 — grid panorama in raster scan order (rows
+    /// and columns organised left-to-right and top-to-bottom starting
+    /// from the top-left corner).
+    pub const DIRECTION_GRID_RASTER: u8 = 4;
+    /// §6.5.27.3 value 5 — grid panorama in continuous order
+    /// (starting from the top-left corner the first row is organised
+    /// left-to-right, the second right-to-left, the third
+    /// left-to-right, and so on).
+    pub const DIRECTION_GRID_CONTINUOUS: u8 = 5;
+
+    /// True when [`Self::panorama_direction`] is one of the six
+    /// §6.5.27.3 defined values (`0..=5`); `false` for the
+    /// spec-undefined remainder.
+    pub fn is_defined_direction(&self) -> bool {
+        self.panorama_direction <= Self::DIRECTION_GRID_CONTINUOUS
+    }
+
+    /// True when the direction signals one of the two grid panorama
+    /// types (§6.5.27.2 syntax condition `panorama_direction >= 4 &&
+    /// panorama_direction <= 5`) — exactly the case where
+    /// [`Self::grid`] carries the grid shape.
+    pub fn is_grid(&self) -> bool {
+        self.panorama_direction >= Self::DIRECTION_GRID_RASTER
+            && self.panorama_direction <= Self::DIRECTION_GRID_CONTINUOUS
+    }
+}
+
 /// One property box, kept typed for the boxes AVIF cares about + a raw
 /// fallback so an unknown property still gets an index for association.
 #[derive(Clone, Debug)]
@@ -1448,6 +1582,8 @@ pub enum Property {
     Afbr(Afbr),
     /// Depth-of-field-information descriptive property (HEIF §6.5.26).
     Dobr(Dobr),
+    /// Panorama-information descriptive property (HEIF §6.5.27).
+    Pano(Pano),
     Other(BoxType, Vec<u8>),
 }
 
@@ -1481,6 +1617,7 @@ impl Property {
             Property::Fobr(_) => FOBR,
             Property::Afbr(_) => AFBR,
             Property::Dobr(_) => DOBR,
+            Property::Pano(_) => PANO,
             Property::Other(t, _) => *t,
         }
     }
@@ -1649,7 +1786,8 @@ impl Meta {
     /// `a1lx` is treated as recognised even when its bytes are not acted
     /// upon, because the spec forbids marking it essential; a `clap`,
     /// `irot`, `imir`, `lsel`, `a1op`, `iscl`, `rref`, `crtt`, `mdft`,
-    /// `udes`, `altt`, `aebr`, `wbbr`, `fobr`, `afbr`, `dobr`, etc.
+    /// `udes`, `altt`, `aebr`, `wbbr`, `fobr`, `afbr`, `dobr`,
+    /// `pano`, etc.
     /// that we parse counts as recognised regardless of the essential
     /// bit.
     pub fn unsupported_essential_properties(&self, item_id: u32) -> Vec<BoxType> {
@@ -1992,6 +2130,7 @@ fn parse_ipco(payload: &[u8]) -> Result<Vec<Property>> {
             x if x == &FOBR => Property::Fobr(parse_fobr(body)?),
             x if x == &AFBR => Property::Afbr(parse_afbr(body)?),
             x if x == &DOBR => Property::Dobr(parse_dobr(body)?),
+            x if x == &PANO => Property::Pano(parse_pano(body)?),
             other => Property::Other(*other, body.to_vec()),
         };
         out.push(prop);
@@ -2669,6 +2808,62 @@ fn parse_dobr(body: &[u8]) -> Result<Dobr> {
     Ok(Dobr {
         f_stop_numerator: rest[0] as i8,
         f_stop_denominator: rest[1] as i8,
+    })
+}
+
+/// Parse `pano` (PanoramaProperty — HEIF §6.5.27).
+/// FullBox(`pano`, version=0, flags=0) followed by:
+///
+/// ```text
+/// unsigned int(8) panorama_direction;
+/// if (panorama_direction >= 4 && panorama_direction <= 5) { // grid
+///     unsigned int(8) rows_minus_one;
+///     unsigned int(8) columns_minus_one;
+/// }
+/// ```
+///
+/// per §6.5.27.2. The two grid-shape bytes are conditionally present —
+/// the syntax guards them behind the two grid direction values, so a
+/// linear-direction body is one byte long and a grid-direction body is
+/// three bytes long. A grid direction whose body is missing the shape
+/// bytes is rejected (truncated); a linear or undefined direction
+/// ignores any trailing bytes, mirroring the forward-compatibility
+/// behaviour of the other FullBox-headed property parsers in this
+/// module.
+///
+/// An undefined `panorama_direction` (`>= 6`, §6.5.27.3 "other values
+/// are undefined") is NOT a parse error — the raw value is preserved
+/// so a reader can skip the panorama reconstruction without losing the
+/// rest of the file. An unknown `version` is rejected so a
+/// future-version layout cannot be misread as v0.
+fn parse_pano(body: &[u8]) -> Result<Pano> {
+    let (version, _flags, rest) = parse_full_box(body)?;
+    if version != 0 {
+        return Err(Error::invalid(format!("avif: pano version {version} != 0")));
+    }
+    if rest.is_empty() {
+        return Err(Error::invalid("avif: pano too short (0 < 1)"));
+    }
+    let panorama_direction = rest[0];
+    let grid = if (Pano::DIRECTION_GRID_RASTER..=Pano::DIRECTION_GRID_CONTINUOUS)
+        .contains(&panorama_direction)
+    {
+        if rest.len() < 3 {
+            return Err(Error::invalid(format!(
+                "avif: pano grid direction {panorama_direction} but body too short ({} < 3)",
+                rest.len()
+            )));
+        }
+        Some(PanoGrid {
+            rows_minus_one: rest[1],
+            columns_minus_one: rest[2],
+        })
+    } else {
+        None
+    };
+    Ok(Pano {
+        panorama_direction,
+        grid,
     })
 }
 
@@ -5702,5 +5897,216 @@ mod tests {
             Some(Property::Afbr(a)) => assert_eq!(a.flash_exposure_stops(), Some(-0.5)),
             other => panic!("expected Afbr, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // HEIF §6.5.27 PanoramaProperty (`pano`) — parse + helpers
+    // -----------------------------------------------------------------
+
+    /// Build a linear-direction `pano` body — FullBox(v=0, f=0)
+    /// followed by the lone `unsigned int(8) panorama_direction` per
+    /// the §6.5.27.2 syntax (the grid-shape bytes are conditionally
+    /// absent for directions outside `4..=5`).
+    fn pano_body_linear(direction: u8) -> Vec<u8> {
+        let mut buf = vec![0u8; 4];
+        buf.push(direction);
+        buf
+    }
+
+    /// Build a grid-direction `pano` body — FullBox(v=0, f=0)
+    /// followed by the three §6.5.27.2 bytes `panorama_direction`,
+    /// `rows_minus_one`, `columns_minus_one`.
+    fn pano_body_grid(direction: u8, rows_minus_one: u8, columns_minus_one: u8) -> Vec<u8> {
+        let mut buf = pano_body_linear(direction);
+        buf.push(rows_minus_one);
+        buf.push(columns_minus_one);
+        buf
+    }
+
+    /// The four linear directions (§6.5.27.3 values 0..=3) parse from
+    /// a one-byte body with no grid shape attached.
+    #[test]
+    fn pano_linear_directions_have_no_grid() {
+        for direction in [
+            Pano::DIRECTION_LEFT_TO_RIGHT,
+            Pano::DIRECTION_RIGHT_TO_LEFT,
+            Pano::DIRECTION_BOTTOM_TO_TOP,
+            Pano::DIRECTION_TOP_TO_BOTTOM,
+        ] {
+            let p = parse_pano(&pano_body_linear(direction)).unwrap();
+            assert_eq!(p.panorama_direction, direction);
+            assert_eq!(p.grid, None);
+            assert!(p.is_defined_direction());
+            assert!(!p.is_grid());
+        }
+    }
+
+    /// The two grid directions (§6.5.27.3 values 4..=5) carry the
+    /// conditional `rows_minus_one` / `columns_minus_one` pair, in
+    /// that declaration order. Distinct asymmetric values per field so
+    /// a rows/columns cross-wire would surface immediately.
+    #[test]
+    fn pano_grid_directions_carry_shape() {
+        for direction in [Pano::DIRECTION_GRID_RASTER, Pano::DIRECTION_GRID_CONTINUOUS] {
+            let p = parse_pano(&pano_body_grid(direction, 1, 2)).unwrap();
+            assert_eq!(p.panorama_direction, direction);
+            assert!(p.is_defined_direction());
+            assert!(p.is_grid());
+            let g = p.grid.expect("grid direction must carry shape");
+            assert_eq!(g.rows_minus_one, 1);
+            assert_eq!(g.columns_minus_one, 2);
+            // §6.5.27.3 minus-one storage: wire 1/2 → 2 rows, 3 cols.
+            assert_eq!(g.rows(), 2);
+            assert_eq!(g.columns(), 3);
+        }
+    }
+
+    /// §6.5.27.3 stores both grid extents minus one, so the `0xFF`
+    /// wire endpoint means 256 — the projections must widen to `u16`
+    /// rather than wrap a `u8` add to zero.
+    #[test]
+    fn pano_grid_dims_widen_past_u8() {
+        let p = parse_pano(&pano_body_grid(Pano::DIRECTION_GRID_RASTER, 0xFF, 0xFF)).unwrap();
+        let g = p.grid.unwrap();
+        assert_eq!(g.rows(), 256);
+        assert_eq!(g.columns(), 256);
+        // And the all-zero floor reads as a 1×1 grid, not 0×0.
+        let p = parse_pano(&pano_body_grid(Pano::DIRECTION_GRID_CONTINUOUS, 0, 0)).unwrap();
+        let g = p.grid.unwrap();
+        assert_eq!(g.rows(), 1);
+        assert_eq!(g.columns(), 1);
+    }
+
+    /// §6.5.27.3 "other values are undefined" — an undefined
+    /// direction is preserved verbatim (NOT a parse error) and reads
+    /// as neither defined nor grid, so the §6.5.27.2 conditional
+    /// grid-shape bytes are not consumed.
+    #[test]
+    fn pano_undefined_direction_is_preserved_not_rejected() {
+        for direction in [6u8, 7, 0x7F, 0xFF] {
+            let p = parse_pano(&pano_body_linear(direction)).unwrap();
+            assert_eq!(p.panorama_direction, direction);
+            assert_eq!(p.grid, None);
+            assert!(!p.is_defined_direction());
+            assert!(!p.is_grid());
+        }
+    }
+
+    #[test]
+    fn pano_rejects_unknown_version() {
+        // version=1, flags=0; a direction byte that would otherwise
+        // be a well-formed v0 linear body.
+        let mut buf = vec![1u8, 0, 0, 0];
+        buf.push(Pano::DIRECTION_LEFT_TO_RIGHT);
+        assert!(parse_pano(&buf).is_err());
+    }
+
+    /// A body without even the direction byte is rejected, and a grid
+    /// direction whose conditional shape bytes are missing (in whole
+    /// or in part) is rejected as truncated.
+    #[test]
+    fn pano_rejects_truncated_body() {
+        // FullBox header alone — no direction byte at all.
+        let buf = vec![0u8; 4];
+        assert!(parse_pano(&buf).is_err());
+        // Grid direction with no shape bytes.
+        assert!(parse_pano(&pano_body_linear(Pano::DIRECTION_GRID_RASTER)).is_err());
+        // Grid direction with only `rows_minus_one`
+        // (missing `columns_minus_one`).
+        let mut buf = pano_body_linear(Pano::DIRECTION_GRID_CONTINUOUS);
+        buf.push(2);
+        assert!(parse_pano(&buf).is_err());
+    }
+
+    /// Trailing bytes past the syntax-mandated tail are forward-compat
+    /// space — the parser ignores them on both the linear (one-byte)
+    /// and grid (three-byte) shapes, mirroring the behaviour of every
+    /// other FullBox-headed property parser in this module.
+    #[test]
+    fn pano_tolerates_trailing_bytes() {
+        let mut body = pano_body_linear(Pano::DIRECTION_TOP_TO_BOTTOM);
+        body.extend_from_slice(&[0xDE, 0xAD]);
+        let p = parse_pano(&body).unwrap();
+        assert_eq!(p.panorama_direction, Pano::DIRECTION_TOP_TO_BOTTOM);
+        assert_eq!(p.grid, None);
+
+        let mut body = pano_body_grid(Pano::DIRECTION_GRID_RASTER, 3, 4);
+        body.extend_from_slice(&[0xBE, 0xEF]);
+        let p = parse_pano(&body).unwrap();
+        let g = p.grid.unwrap();
+        assert_eq!((g.rows(), g.columns()), (4, 5));
+    }
+
+    #[test]
+    fn pano_dispatched_through_parse_ipco() {
+        let body = pano_body_grid(Pano::DIRECTION_GRID_CONTINUOUS, 2, 3);
+        let mut ipco = Vec::new();
+        let s = 8 + body.len() as u32;
+        ipco.extend_from_slice(&s.to_be_bytes());
+        ipco.extend_from_slice(b"pano");
+        ipco.extend_from_slice(&body);
+        let props = parse_ipco(&ipco).unwrap();
+        assert_eq!(props.len(), 1);
+        match &props[0] {
+            Property::Pano(p) => {
+                assert_eq!(p.panorama_direction, Pano::DIRECTION_GRID_CONTINUOUS);
+                let g = p.grid.unwrap();
+                assert_eq!((g.rows(), g.columns()), (3, 4));
+            }
+            other => panic!("expected Pano, got {other:?}"),
+        }
+        assert_eq!(props[0].kind(), *b"pano");
+    }
+
+    /// A recognised `pano` property — even when flagged essential
+    /// (unusual for a descriptive property, but the parser does not
+    /// reject the bit) — does NOT trip
+    /// [`Meta::unsupported_essential_properties`].
+    #[test]
+    fn pano_essential_association_is_recognised() {
+        let m = Meta {
+            properties: vec![Property::Pano(Pano::default())],
+            associations: vec![ItemPropertyAssociation {
+                item_id: 1,
+                entries: vec![PropertyAssociation {
+                    index: 0,
+                    essential: true,
+                }],
+            }],
+            ..Meta::default()
+        };
+        assert!(!m.has_unsupported_essential_property(1));
+        assert!(m.unsupported_essential_properties(1).is_empty());
+    }
+
+    /// §6.5.27.1 caps `pano` at one per associated item (`At most
+    /// one`). A `Meta::property_for(item_id, b"pano")` lookup finds
+    /// the associated single instance via the standard `ipma` walk.
+    #[test]
+    fn pano_lookup_via_property_for() {
+        let m = Meta {
+            properties: vec![Property::Pano(Pano {
+                panorama_direction: Pano::DIRECTION_RIGHT_TO_LEFT,
+                grid: None,
+            })],
+            associations: vec![ItemPropertyAssociation {
+                item_id: 9,
+                entries: vec![PropertyAssociation {
+                    index: 0,
+                    essential: false,
+                }],
+            }],
+            ..Meta::default()
+        };
+        match m.property_for(9, b"pano") {
+            Some(Property::Pano(p)) => {
+                assert_eq!(p.panorama_direction, Pano::DIRECTION_RIGHT_TO_LEFT);
+                assert!(p.is_defined_direction());
+                assert!(!p.is_grid());
+            }
+            other => panic!("expected Pano, got {other:?}"),
+        }
+        // No `pano` for an item that doesn't carry the association.
+        assert!(m.property_for(99, b"pano").is_none());
     }
 }
