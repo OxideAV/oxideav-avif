@@ -129,9 +129,10 @@ pub use inspect::{gain_map_metadata, inspect, item_payload_bytes, transforms_for
 pub use meta::{
     A1lx, A1op, Aebr, Afbr, Altt, AuxC, AuxKind, Cclv, Clap, Clli, Colr, Crtt, Dobr, Fobr, Imir,
     IrefEntry, Irot, Iscl, Ispe, ItemInfo, ItemLocation, Lsel, Mdcv, Mdft, Meta, Pano, PanoGrid,
-    Pasp, Pixi, Property, Rloc, Rref, Tols, Udes, Wbbr, AUX_URN_ALPHA_HEVC, AUX_URN_ALPHA_MPEG,
-    AUX_URN_DEPTH_HEVC, AUX_URN_DEPTH_MPEG, AUX_URN_HDR_GAINMAP, ITEM_TYPE_EXIF, ITEM_TYPE_IDEN,
-    ITEM_TYPE_IOVL, ITEM_TYPE_MIME, ITEM_TYPE_SATO, ITEM_TYPE_TMAP, ITEM_TYPE_URI,
+    Pasp, Pixi, Property, Rloc, Rref, Subs, SubsEntry, Tols, Udes, Wbbr, AUX_URN_ALPHA_HEVC,
+    AUX_URN_ALPHA_MPEG, AUX_URN_DEPTH_HEVC, AUX_URN_DEPTH_MPEG, AUX_URN_HDR_GAINMAP,
+    ITEM_TYPE_EXIF, ITEM_TYPE_IDEN, ITEM_TYPE_IOVL, ITEM_TYPE_MIME, ITEM_TYPE_SATO, ITEM_TYPE_TMAP,
+    ITEM_TYPE_URI,
 };
 pub use parser::{
     audit_mif1, classify_brands, item_bytes_owned, parse, parse_header, AvifHeader, AvifImage,

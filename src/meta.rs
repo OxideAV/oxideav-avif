@@ -89,6 +89,8 @@ const AFBR: BoxType = b(b"afbr");
 const DOBR: BoxType = b(b"dobr");
 /// HEIF §6.5.27 — Panorama Information descriptive property.
 const PANO: BoxType = b(b"pano");
+/// HEIF §6.5.28 — Sub-Sample Information descriptive property.
+const SUBS: BoxType = b(b"subs");
 /// HEIF §6.5.29 — Target Output Layer Set descriptive property.
 const TOLS: BoxType = b(b"tols");
 
@@ -1535,6 +1537,68 @@ impl Pano {
     }
 }
 
+/// One sub-sample of a `subs` Sub-Sample Information descriptive property
+/// (HEIF §6.5.28). Each entry mirrors the inner loop body of the
+/// `SubSampleInformationBox` (ISO/IEC 14496-12 §8.7.7.2).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SubsEntry {
+    /// Size, in bytes, of this sub-sample (ISO/IEC 14496-12 §8.7.7.3).
+    /// Carried on the wire as 32-bit when the box `version == 1` and
+    /// 16-bit when `version == 0`; surfaced here widened to `u32` so the
+    /// caller need not branch on the box version.
+    pub subsample_size: u32,
+    /// Degradation priority — higher values mark sub-samples with greater
+    /// impact on decoded quality (§8.7.7.3).
+    pub subsample_priority: u8,
+    /// `0` — required to decode the sample; `1` — not required but may
+    /// carry enhancement data such as SEI messages (§8.7.7.3).
+    pub discardable: u8,
+    /// Codec-defined parameter block; `0` when the coding format gives no
+    /// definition (§8.7.7.3).
+    pub codec_specific_parameters: u32,
+}
+
+/// Sub-Sample Information descriptive property (`subs`) — HEIF §6.5.28.
+///
+/// For coded image items, sub-sample information is given using an
+/// associated item property whose body is exactly a
+/// `SubSampleInformationBox` as defined in ISO/IEC 14496-12 §8.7.7 for
+/// the coding format of the associated coded image item (§6.5.28).
+///
+/// HEIF §6.5.28 constrains the box when used as an item property: the
+/// `entry_count` field shall be `1` and the single entry's `sample_delta`
+/// shall be `0`. The parser enforces both and surfaces only the
+/// resulting list of sub-samples — the lone entry's `subsample_count`
+/// loop body — since the spec fixes the surrounding table to a single
+/// degenerate row.
+///
+/// The wire layout (ISO/IEC 14496-12 §8.7.7.2) is a
+/// `FullBox('subs', version, flags)` followed by `entry_count`, then per
+/// entry a `sample_delta`, a `subsample_count`, and that many
+/// `(subsample_size, subsample_priority, discardable,
+/// codec_specific_parameters)` tuples. `subsample_size` is 32-bit when
+/// `version == 1`, else 16-bit. Zero or more `subs` may be associated
+/// with the same item; when more than one is present their `flags` shall
+/// differ, so the property surfaces [`Self::flags`] verbatim to let a
+/// caller key the codec-specific meaning of each box.
+///
+/// The property is descriptive (`Quantity (per item): Zero or more for a
+/// coded image item`); a `subs` association is therefore never essential
+/// in a way this crate cannot honour, and surfacing the typed entries
+/// keeps it off [`Meta::unsupported_essential_properties`].
+///
+/// Spec: ISO/IEC 23008-12 §6.5.28; ISO/IEC 14496-12 §8.7.7.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Subs {
+    /// `flags` from the `FullBox` header. The semantics, if any, are
+    /// supplied by the coding format; when more than one `subs` is
+    /// associated with an item their `flags` differ (§6.5.28).
+    pub flags: u32,
+    /// The single entry's sub-samples, in wire order (§8.7.7.2 inner
+    /// loop). Empty when the entry's `subsample_count` is `0`.
+    pub entries: Vec<SubsEntry>,
+}
+
 /// Target Output Layer Set descriptive property (`tols`) — HEIF
 /// §6.5.29.
 ///
@@ -1627,6 +1691,8 @@ pub enum Property {
     Dobr(Dobr),
     /// Panorama-information descriptive property (HEIF §6.5.27).
     Pano(Pano),
+    /// Sub-sample-information descriptive property (HEIF §6.5.28).
+    Subs(Subs),
     /// Target-output-layer-set descriptive property (HEIF §6.5.29).
     Tols(Tols),
     Other(BoxType, Vec<u8>),
@@ -1663,6 +1729,7 @@ impl Property {
             Property::Afbr(_) => AFBR,
             Property::Dobr(_) => DOBR,
             Property::Pano(_) => PANO,
+            Property::Subs(_) => SUBS,
             Property::Tols(_) => TOLS,
             Property::Other(t, _) => *t,
         }
@@ -1833,7 +1900,7 @@ impl Meta {
     /// upon, because the spec forbids marking it essential; a `clap`,
     /// `irot`, `imir`, `lsel`, `a1op`, `iscl`, `rref`, `crtt`, `mdft`,
     /// `udes`, `altt`, `aebr`, `wbbr`, `fobr`, `afbr`, `dobr`,
-    /// `pano`, `tols`, etc.
+    /// `pano`, `subs`, `tols`, etc.
     /// that we parse counts as recognised regardless of the essential
     /// bit. `tols` (§6.5.29) is the one descriptive property the spec
     /// *requires* to be essential (`essential shall be equal to 1`), so
@@ -2180,6 +2247,7 @@ fn parse_ipco(payload: &[u8]) -> Result<Vec<Property>> {
             x if x == &AFBR => Property::Afbr(parse_afbr(body)?),
             x if x == &DOBR => Property::Dobr(parse_dobr(body)?),
             x if x == &PANO => Property::Pano(parse_pano(body)?),
+            x if x == &SUBS => Property::Subs(parse_subs(body)?),
             x if x == &TOLS => Property::Tols(parse_tols(body)?),
             other => Property::Other(*other, body.to_vec()),
         };
@@ -2915,6 +2983,70 @@ fn parse_pano(body: &[u8]) -> Result<Pano> {
         panorama_direction,
         grid,
     })
+}
+
+/// Parse `subs` (SubSampleInformationBox as item property — HEIF §6.5.28,
+/// ISO/IEC 14496-12 §8.7.7.2).
+///
+/// `FullBox('subs', version, flags)` followed by `entry_count` and, per
+/// entry, `sample_delta`, `subsample_count`, and that many sub-sample
+/// tuples. When used as an item property HEIF §6.5.28 fixes
+/// `entry_count == 1` and the single entry's `sample_delta == 0`; both
+/// are enforced. `version` selects the `subsample_size` width: 32-bit for
+/// v1, 16-bit for v0; any other version is rejected so a future layout is
+/// not misread. Trailing bytes past the declared sub-samples are ignored
+/// for forward compatibility.
+fn parse_subs(body: &[u8]) -> Result<Subs> {
+    let (version, flags, rest) = parse_full_box(body)?;
+    if version != 0 && version != 1 {
+        return Err(Error::invalid(format!(
+            "avif: subs version {version} unsupported (expected 0 or 1)"
+        )));
+    }
+    let entry_count = read_u32(rest, 0)?;
+    if entry_count != 1 {
+        return Err(Error::invalid(format!(
+            "avif: subs entry_count {entry_count} != 1 (HEIF §6.5.28)"
+        )));
+    }
+    let sample_delta = read_u32(rest, 4)?;
+    if sample_delta != 0 {
+        return Err(Error::invalid(format!(
+            "avif: subs sample_delta {sample_delta} != 0 (HEIF §6.5.28)"
+        )));
+    }
+    let subsample_count = read_u16(rest, 8)?;
+    let mut entries = Vec::with_capacity(subsample_count as usize);
+    let mut off = 10usize;
+    for _ in 0..subsample_count {
+        let subsample_size = if version == 1 {
+            let v = read_u32(rest, off)?;
+            off += 4;
+            v
+        } else {
+            let v = read_u16(rest, off)? as u32;
+            off += 2;
+            v
+        };
+        let priority_off = off
+            .checked_add(2)
+            .ok_or_else(|| Error::invalid("avif: subs entry offset overflow"))?;
+        if priority_off > rest.len() {
+            return Err(Error::invalid("avif: subs truncated sub-sample entry"));
+        }
+        let subsample_priority = rest[off];
+        let discardable = rest[off + 1];
+        off += 2;
+        let codec_specific_parameters = read_u32(rest, off)?;
+        off += 4;
+        entries.push(SubsEntry {
+            subsample_size,
+            subsample_priority,
+            discardable,
+            codec_specific_parameters,
+        });
+    }
+    Ok(Subs { flags, entries })
 }
 
 /// Parse `tols` (TargetOlsProperty — HEIF §6.5.29).
@@ -6183,6 +6315,199 @@ mod tests {
         }
         // No `pano` for an item that doesn't carry the association.
         assert!(m.property_for(99, b"pano").is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // HEIF §6.5.28 SubSampleInformationBox (`subs`) — parse + helpers
+    // -----------------------------------------------------------------
+
+    /// Build a `subs` body — FullBox('subs', version, flags), then the
+    /// HEIF §6.5.28-fixed `entry_count = 1`, `sample_delta = 0`, the
+    /// single entry's `subsample_count`, and that many tuples. Each tuple
+    /// is `(size, priority, discardable, codec_specific_parameters)`;
+    /// `size` is written 32-bit when `version == 1`, else 16-bit.
+    fn subs_body(version: u8, flags: u32, samples: &[(u32, u8, u8, u32)]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.push(version);
+        buf.extend_from_slice(&[(flags >> 16) as u8, (flags >> 8) as u8, flags as u8]);
+        buf.extend_from_slice(&1u32.to_be_bytes()); // entry_count
+        buf.extend_from_slice(&0u32.to_be_bytes()); // sample_delta
+        buf.extend_from_slice(&(samples.len() as u16).to_be_bytes());
+        for &(size, prio, disc, csp) in samples {
+            if version == 1 {
+                buf.extend_from_slice(&size.to_be_bytes());
+            } else {
+                buf.extend_from_slice(&(size as u16).to_be_bytes());
+            }
+            buf.push(prio);
+            buf.push(disc);
+            buf.extend_from_slice(&csp.to_be_bytes());
+        }
+        buf
+    }
+
+    #[test]
+    fn subs_v0_round_trips_entries() {
+        let samples = [(0x0102u32, 7u8, 1u8, 0xDEAD_BEEFu32), (0x0003, 0, 0, 0)];
+        let s = parse_subs(&subs_body(0, 0, &samples)).unwrap();
+        assert_eq!(s.flags, 0);
+        assert_eq!(s.entries.len(), 2);
+        assert_eq!(s.entries[0].subsample_size, 0x0102);
+        assert_eq!(s.entries[0].subsample_priority, 7);
+        assert_eq!(s.entries[0].discardable, 1);
+        assert_eq!(s.entries[0].codec_specific_parameters, 0xDEAD_BEEF);
+        assert_eq!(s.entries[1].subsample_size, 3);
+    }
+
+    /// v1 widens `subsample_size` to 32-bit (§8.7.7.2). A value past the
+    /// 16-bit range only survives the v1 path.
+    #[test]
+    fn subs_v1_uses_32bit_size() {
+        let samples = [(0x0001_0002u32, 0u8, 0u8, 0u32)];
+        let s = parse_subs(&subs_body(1, 0, &samples)).unwrap();
+        assert_eq!(s.entries[0].subsample_size, 0x0001_0002);
+    }
+
+    /// HEIF §6.5.28: `flags` distinguishes multiple `subs` on one item;
+    /// the parser surfaces it from the FullBox header verbatim.
+    #[test]
+    fn subs_surfaces_flags() {
+        let s = parse_subs(&subs_body(0, 0x00AB_CDEF & 0x00FF_FFFF, &[])).unwrap();
+        assert_eq!(s.flags, 0x00AB_CDEF & 0x00FF_FFFF);
+        assert!(s.entries.is_empty());
+    }
+
+    /// Zero sub-samples (`subsample_count == 0`) is well-formed: the entry
+    /// exists but carries no tuples (§8.7.7.3).
+    #[test]
+    fn subs_empty_subsample_count_ok() {
+        let s = parse_subs(&subs_body(1, 0, &[])).unwrap();
+        assert!(s.entries.is_empty());
+    }
+
+    /// HEIF §6.5.28 fixes `entry_count == 1` for item-property use.
+    #[test]
+    fn subs_rejects_entry_count_not_one() {
+        let mut buf = vec![0u8, 0, 0, 0];
+        buf.extend_from_slice(&2u32.to_be_bytes()); // entry_count = 2
+        assert!(parse_subs(&buf).is_err());
+    }
+
+    /// HEIF §6.5.28 fixes the single entry's `sample_delta == 0`.
+    #[test]
+    fn subs_rejects_nonzero_sample_delta() {
+        let mut buf = vec![0u8, 0, 0, 0];
+        buf.extend_from_slice(&1u32.to_be_bytes()); // entry_count = 1
+        buf.extend_from_slice(&5u32.to_be_bytes()); // sample_delta = 5
+        buf.extend_from_slice(&0u16.to_be_bytes()); // subsample_count = 0
+        assert!(parse_subs(&buf).is_err());
+    }
+
+    #[test]
+    fn subs_rejects_unknown_version() {
+        let mut buf = vec![2u8, 0, 0, 0]; // version = 2
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&0u16.to_be_bytes());
+        assert!(parse_subs(&buf).is_err());
+    }
+
+    #[test]
+    fn subs_rejects_truncated_tuple() {
+        // Declares one sub-sample but the tuple bytes are short.
+        let mut buf = vec![0u8, 0, 0, 0];
+        buf.extend_from_slice(&1u32.to_be_bytes()); // entry_count
+        buf.extend_from_slice(&0u32.to_be_bytes()); // sample_delta
+        buf.extend_from_slice(&1u16.to_be_bytes()); // subsample_count = 1
+        buf.extend_from_slice(&0x0010u16.to_be_bytes()); // size only
+        assert!(parse_subs(&buf).is_err());
+    }
+
+    /// Trailing bytes past the declared sub-samples are forward-compat
+    /// space and are ignored.
+    #[test]
+    fn subs_tolerates_trailing_bytes() {
+        let mut body = subs_body(0, 0, &[(4, 0, 0, 0)]);
+        body.extend_from_slice(&[0xFF, 0xFF]);
+        let s = parse_subs(&body).unwrap();
+        assert_eq!(s.entries.len(), 1);
+        assert_eq!(s.entries[0].subsample_size, 4);
+    }
+
+    #[test]
+    fn subs_dispatched_through_parse_ipco() {
+        let body = subs_body(1, 0, &[(0x0000_0009, 3, 0, 0x0000_0001)]);
+        let mut ipco = Vec::new();
+        let s = 8 + body.len() as u32;
+        ipco.extend_from_slice(&s.to_be_bytes());
+        ipco.extend_from_slice(b"subs");
+        ipco.extend_from_slice(&body);
+        let props = parse_ipco(&ipco).unwrap();
+        assert_eq!(props.len(), 1);
+        match &props[0] {
+            Property::Subs(sub) => {
+                assert_eq!(sub.entries.len(), 1);
+                assert_eq!(sub.entries[0].subsample_size, 9);
+                assert_eq!(sub.entries[0].subsample_priority, 3);
+                assert_eq!(sub.entries[0].codec_specific_parameters, 1);
+            }
+            other => panic!("expected Subs, got {other:?}"),
+        }
+        assert_eq!(props[0].kind(), *b"subs");
+    }
+
+    /// `subs` is descriptive (`Zero or more`); a recognised association —
+    /// even if flagged essential — does NOT trip
+    /// [`Meta::unsupported_essential_properties`].
+    #[test]
+    fn subs_essential_association_is_recognised() {
+        let m = Meta {
+            properties: vec![Property::Subs(Subs::default())],
+            associations: vec![ItemPropertyAssociation {
+                item_id: 1,
+                entries: vec![PropertyAssociation {
+                    index: 0,
+                    essential: true,
+                }],
+            }],
+            ..Meta::default()
+        };
+        assert!(!m.has_unsupported_essential_property(1));
+        assert!(m.unsupported_essential_properties(1).is_empty());
+    }
+
+    /// HEIF §6.5.28 allows `Zero or more` `subs` per item; a
+    /// `Meta::property_for(item_id, b"subs")` lookup finds an associated
+    /// instance via the standard `ipma` walk.
+    #[test]
+    fn subs_lookup_via_property_for() {
+        let m = Meta {
+            properties: vec![Property::Subs(Subs {
+                flags: 1,
+                entries: vec![SubsEntry {
+                    subsample_size: 12,
+                    subsample_priority: 2,
+                    discardable: 0,
+                    codec_specific_parameters: 0,
+                }],
+            })],
+            associations: vec![ItemPropertyAssociation {
+                item_id: 4,
+                entries: vec![PropertyAssociation {
+                    index: 0,
+                    essential: false,
+                }],
+            }],
+            ..Meta::default()
+        };
+        match m.property_for(4, b"subs") {
+            Some(Property::Subs(sub)) => {
+                assert_eq!(sub.flags, 1);
+                assert_eq!(sub.entries[0].subsample_size, 12);
+            }
+            other => panic!("expected Subs, got {other:?}"),
+        }
+        assert!(m.property_for(99, b"subs").is_none());
     }
 
     // -----------------------------------------------------------------

@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- ISO/IEC 23008-12 §6.5.28 SubSampleInformationBox (`subs`) descriptive
+  item-property parser — the one §6.5.x property defined by reference to
+  ISO/IEC 14496-12's `SubSampleInformationBox` (§8.7.7.2) rather than
+  self-contained in the HEIF spec, backfilling the gap the §6.5.29
+  rollout flagged. HEIF §6.5.28 fixes the outer table to a single
+  degenerate row (`entry_count == 1`, that entry's `sample_delta == 0`,
+  both enforced), so the parser surfaces only the inner sub-sample list
+  as `Property::Subs(Subs { flags, entries })` (re-exported as
+  `oxideav_avif::{Subs, SubsEntry}`). Each `SubsEntry` carries
+  `subsample_size` / `subsample_priority` / `discardable` /
+  `codec_specific_parameters`; `subsample_size` is 32-bit on the wire
+  for box `version == 1` and 16-bit for v0, widened to `u32` so callers
+  need not branch on the width. Box `flags` are surfaced because §6.5.28
+  permits zero-or-more `subs` per item and requires their `flags` to
+  differ when more than one is present. `subsample_count == 0` is
+  well-formed (empty `entries`); v0/v1 accepted, other versions
+  rejected; truncated tuples and a non-degenerate outer table rejected;
+  trailing bytes ignored. `subs` is descriptive so a recognised
+  association does not trip `Meta::unsupported_essential_properties`.
+  +14 unit tests.
 - ISO/IEC 23008-12 §6.5.29 TargetOlsProperty (`tols`) descriptive
   item-property parser. The body shape is taken verbatim from
   §6.5.29.2 — an `ItemFullProperty('tols', version=0, flags=0)`
