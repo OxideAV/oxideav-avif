@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- ISO/IEC 23008-12 §6.5.29 TargetOlsProperty (`tols`) descriptive
+  item-property parser. The body shape is taken verbatim from
+  §6.5.29.2 — an `ItemFullProperty('tols', version=0, flags=0)`
+  followed by a single big-endian `unsigned int(16) target_ols_idx`,
+  surfaced as `Property::Tols(Tols { target_ols_idx })` (re-exported as
+  `oxideav_avif::Tols`). The field is the output layer set index to be
+  provided to the decoding process of the associated coded image item;
+  per §6.5.29.3 its precise interpretation is coding-format specific,
+  so it is surfaced verbatim. `tols` is the one descriptive §6.5.x
+  property the spec *requires* to be essential (§6.5.29.1 `essential
+  shall be equal to 1`); because the parser surfaces a typed value, a
+  `tols` association does not trip
+  `Meta::unsupported_essential_properties`. Forward-compat behaviour
+  matches the rest of the FullBox-headed property parsers — unknown
+  `version` rejected, body shorter than the two-byte field rejected,
+  trailing bytes ignored. +8 unit tests (lib 444, standalone 429).
 - ISO/IEC 23008-12 §6.5.27 PanoramaProperty (`pano`) descriptive
   item-property parser. The body shape is taken verbatim from
   §6.5.27.2 — a FullBox(`pano`, version=0, flags=0) followed by an

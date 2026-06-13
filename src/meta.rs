@@ -89,6 +89,8 @@ const AFBR: BoxType = b(b"afbr");
 const DOBR: BoxType = b(b"dobr");
 /// HEIF §6.5.27 — Panorama Information descriptive property.
 const PANO: BoxType = b(b"pano");
+/// HEIF §6.5.29 — Target Output Layer Set descriptive property.
+const TOLS: BoxType = b(b"tols");
 
 /// HEIF §6.6.2.2 — image overlay derived-image type.
 pub const ITEM_TYPE_IOVL: BoxType = b(b"iovl");
@@ -1533,6 +1535,47 @@ impl Pano {
     }
 }
 
+/// Target Output Layer Set descriptive property (`tols`) — HEIF
+/// §6.5.29.
+///
+/// Provides the output layer set index to be used as input for the
+/// decoding process of the associated coded image item (§6.5.29.1). For
+/// a layered coding format that carries several output layer sets, this
+/// property pins which set the decoder must select before reconstructing
+/// the image item.
+///
+/// The wire layout (§6.5.29.2) is an `ItemFullProperty('tols',
+/// version=0, flags=0)` followed by a single big-endian
+/// `unsigned int(16) target_ols_idx`:
+///
+/// ```text
+/// unsigned int(16) target_ols_idx;
+/// ```
+///
+/// Per §6.5.29.1 the property is descriptive, `Quantity (per item): Zero
+/// or one for a coded image item`, and — unlike the rest of the
+/// descriptive §6.5.x family — `essential shall be equal to 1`: a reader
+/// that cannot honour the requested output layer set must not process
+/// the item. Because the parser recognises and surfaces the field, a
+/// `tols` association does not trip
+/// [`Meta::unsupported_essential_properties`]; a caller that lacks the
+/// layered-decode path consults [`Self::target_ols_idx`] and routes
+/// accordingly.
+///
+/// Per §6.5.29.3 the precise meaning of `target_ols_idx` is specific to
+/// the coding format of the image item and is defined by each coding
+/// format that requires the property, so the value is surfaced verbatim
+/// without further interpretation here.
+///
+/// Spec: ISO/IEC 23008-12 §6.5.29.2 — ItemFullProperty(`tols`,
+/// version=0, flags=0).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Tols {
+    /// Output layer set index to be provided to the decoding process
+    /// (§6.5.29.3). Interpretation is coding-format specific.
+    pub target_ols_idx: u16,
+}
+
 /// One property box, kept typed for the boxes AVIF cares about + a raw
 /// fallback so an unknown property still gets an index for association.
 #[derive(Clone, Debug)]
@@ -1584,6 +1627,8 @@ pub enum Property {
     Dobr(Dobr),
     /// Panorama-information descriptive property (HEIF §6.5.27).
     Pano(Pano),
+    /// Target-output-layer-set descriptive property (HEIF §6.5.29).
+    Tols(Tols),
     Other(BoxType, Vec<u8>),
 }
 
@@ -1618,6 +1663,7 @@ impl Property {
             Property::Afbr(_) => AFBR,
             Property::Dobr(_) => DOBR,
             Property::Pano(_) => PANO,
+            Property::Tols(_) => TOLS,
             Property::Other(t, _) => *t,
         }
     }
@@ -1787,9 +1833,12 @@ impl Meta {
     /// upon, because the spec forbids marking it essential; a `clap`,
     /// `irot`, `imir`, `lsel`, `a1op`, `iscl`, `rref`, `crtt`, `mdft`,
     /// `udes`, `altt`, `aebr`, `wbbr`, `fobr`, `afbr`, `dobr`,
-    /// `pano`, etc.
+    /// `pano`, `tols`, etc.
     /// that we parse counts as recognised regardless of the essential
-    /// bit.
+    /// bit. `tols` (§6.5.29) is the one descriptive property the spec
+    /// *requires* to be essential (`essential shall be equal to 1`), so
+    /// surfacing its typed value is what keeps a `tols`-carrying item
+    /// off this list.
     pub fn unsupported_essential_properties(&self, item_id: u32) -> Vec<BoxType> {
         let Some(assoc) = self.assoc_by_id(item_id) else {
             return Vec::new();
@@ -2131,6 +2180,7 @@ fn parse_ipco(payload: &[u8]) -> Result<Vec<Property>> {
             x if x == &AFBR => Property::Afbr(parse_afbr(body)?),
             x if x == &DOBR => Property::Dobr(parse_dobr(body)?),
             x if x == &PANO => Property::Pano(parse_pano(body)?),
+            x if x == &TOLS => Property::Tols(parse_tols(body)?),
             other => Property::Other(*other, body.to_vec()),
         };
         out.push(prop);
@@ -2864,6 +2914,31 @@ fn parse_pano(body: &[u8]) -> Result<Pano> {
     Ok(Pano {
         panorama_direction,
         grid,
+    })
+}
+
+/// Parse `tols` (TargetOlsProperty — HEIF §6.5.29).
+/// ItemFullProperty(`tols`, version=0, flags=0) followed by a single
+/// big-endian `unsigned int(16) target_ols_idx` (§6.5.29.2).
+///
+/// An unknown `version` is rejected so a future-version layout (which
+/// might re-shape the field width or add fields) cannot be misread as
+/// v0; a body shorter than the two-byte field is rejected; trailing
+/// bytes past the field are ignored for forward compatibility, matching
+/// every other FullBox-headed property parser in this module.
+fn parse_tols(body: &[u8]) -> Result<Tols> {
+    let (version, _flags, rest) = parse_full_box(body)?;
+    if version != 0 {
+        return Err(Error::invalid(format!("avif: tols version {version} != 0")));
+    }
+    if rest.len() < 2 {
+        return Err(Error::invalid(format!(
+            "avif: tols too short ({} < 2)",
+            rest.len()
+        )));
+    }
+    Ok(Tols {
+        target_ols_idx: read_u16(rest, 0)?,
     })
 }
 
@@ -6108,5 +6183,133 @@ mod tests {
         }
         // No `pano` for an item that doesn't carry the association.
         assert!(m.property_for(99, b"pano").is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // HEIF §6.5.29 TargetOlsProperty (`tols`) — parse + helpers
+    // -----------------------------------------------------------------
+
+    /// Build a `tols` body — ItemFullProperty(v=0, f=0) followed by the
+    /// big-endian `unsigned int(16) target_ols_idx` per §6.5.29.2.
+    fn tols_body(target_ols_idx: u16) -> Vec<u8> {
+        let mut buf = vec![0u8; 4];
+        buf.extend_from_slice(&target_ols_idx.to_be_bytes());
+        buf
+    }
+
+    #[test]
+    fn tols_round_trip_reads_target_ols_idx() {
+        for raw in [0u16, 1, 7, 0x0102, u16::MAX] {
+            let t = parse_tols(&tols_body(raw)).unwrap();
+            assert_eq!(t.target_ols_idx, raw);
+        }
+    }
+
+    /// §6.5.29.2 declares `target_ols_idx` as big-endian per ISO/IEC
+    /// 14496-12 §4.2. A little-endian regression would surface `0x0102`
+    /// = 258 as `0x0201` = 513.
+    #[test]
+    fn tols_target_ols_idx_is_big_endian() {
+        let t = parse_tols(&tols_body(0x0102)).unwrap();
+        assert_eq!(t.target_ols_idx, 0x0102);
+        // Manually assemble the wire bytes high-then-low to pin order.
+        let mut buf = vec![0u8; 4];
+        buf.push(0x01);
+        buf.push(0x02);
+        assert_eq!(parse_tols(&buf).unwrap().target_ols_idx, 0x0102);
+    }
+
+    #[test]
+    fn tols_rejects_unknown_version() {
+        // version=1, flags=0 with an otherwise well-formed v0 payload.
+        let mut buf = vec![1u8, 0, 0, 0];
+        buf.extend_from_slice(&3u16.to_be_bytes());
+        assert!(parse_tols(&buf).is_err());
+    }
+
+    #[test]
+    fn tols_rejects_truncated_body() {
+        // FullBox header alone — no field at all.
+        let buf = vec![0u8; 4];
+        assert!(parse_tols(&buf).is_err());
+        // Header + only one of the two field bytes.
+        let mut buf = vec![0u8; 4];
+        buf.push(0x12);
+        assert!(parse_tols(&buf).is_err());
+    }
+
+    /// Trailing bytes past the two-byte field are forward-compat space —
+    /// the parser ignores them, matching every other FullBox-headed
+    /// property parser in this module.
+    #[test]
+    fn tols_tolerates_trailing_bytes() {
+        let mut body = tols_body(42);
+        body.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let t = parse_tols(&body).unwrap();
+        assert_eq!(t.target_ols_idx, 42);
+    }
+
+    #[test]
+    fn tols_dispatched_through_parse_ipco() {
+        let body = tols_body(0xBEEF);
+        let mut ipco = Vec::new();
+        let s = 8 + body.len() as u32;
+        ipco.extend_from_slice(&s.to_be_bytes());
+        ipco.extend_from_slice(b"tols");
+        ipco.extend_from_slice(&body);
+        let props = parse_ipco(&ipco).unwrap();
+        assert_eq!(props.len(), 1);
+        match &props[0] {
+            Property::Tols(t) => assert_eq!(t.target_ols_idx, 0xBEEF),
+            other => panic!("expected Tols, got {other:?}"),
+        }
+        assert_eq!(props[0].kind(), *b"tols");
+    }
+
+    /// §6.5.29.1 mandates `essential shall be equal to 1` for `tols` —
+    /// it is the one descriptive §6.5.x property required to be
+    /// essential. Because the parser surfaces a typed value, the item is
+    /// recognised and does NOT trip
+    /// [`Meta::unsupported_essential_properties`].
+    #[test]
+    fn tols_essential_association_is_recognised() {
+        let m = Meta {
+            properties: vec![Property::Tols(Tols { target_ols_idx: 2 })],
+            associations: vec![ItemPropertyAssociation {
+                item_id: 1,
+                entries: vec![PropertyAssociation {
+                    index: 0,
+                    essential: true,
+                }],
+            }],
+            ..Meta::default()
+        };
+        assert!(!m.has_unsupported_essential_property(1));
+        assert!(m.unsupported_essential_properties(1).is_empty());
+    }
+
+    /// §6.5.29.1 caps `tols` at one per associated coded image item
+    /// (`Zero or one`). A `Meta::property_for(item_id, b"tols")` lookup
+    /// finds the associated instance via the standard `ipma` walk.
+    #[test]
+    fn tols_lookup_via_property_for() {
+        let m = Meta {
+            properties: vec![Property::Tols(Tols {
+                target_ols_idx: 0x0304,
+            })],
+            associations: vec![ItemPropertyAssociation {
+                item_id: 7,
+                entries: vec![PropertyAssociation {
+                    index: 0,
+                    essential: true,
+                }],
+            }],
+            ..Meta::default()
+        };
+        match m.property_for(7, b"tols") {
+            Some(Property::Tols(t)) => assert_eq!(t.target_ols_idx, 0x0304),
+            other => panic!("expected Tols, got {other:?}"),
+        }
+        assert!(m.property_for(99, b"tols").is_none());
     }
 }
