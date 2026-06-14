@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- ISO/IEC 23008-12 §6.5.37 ProgressiveDerivedImageItemInformationProperty
+  (`prdi`) descriptive item-property parser — describes the progressive
+  rendering steps of a **derived** image item, surfaced as
+  `Property::Prdi(Prdi { flags, step_count, item_counts })` (re-exported
+  as `oxideav_avif::Prdi`). The first §6.5.x property whose body is
+  entirely gated by the box `flags` (§6.5.37.2): `step_count` is read iff
+  `one_item_per_step` is clear or `alternative_is_candidate` is set, and
+  the per-step `item_count[]` array iff `one_item_per_step` is clear.
+  Both `step_count` and `item_counts` are `Option`, `Some` exactly when
+  present on the wire; the §6.5.37.3 inference rule (infer `step_count`
+  from the `'dimg'` input count, `item_count == 1` per step) is applied
+  by `Prdi::{step_count_or_inferred, item_count_for_step}`. The three
+  §6.5.37.1 flag bits are exposed via
+  `Prdi::{FLAG_ITEM_REFERENCE_ORDER, FLAG_ONE_ITEM_PER_STEP,
+  FLAG_ALTERNATIVE_IS_CANDIDATE}` + `is_*` projections with the whole
+  24-bit field preserved. Unknown `version` rejected, truncated body
+  rejected, trailing bytes ignored; descriptive so a recognised `prdi`
+  never trips `Meta::unsupported_essential_properties`. +11 unit tests.
+
 - ISO/IEC 23008-12 §6.5.28 SubSampleInformationBox (`subs`) descriptive
   item-property parser — the one §6.5.x property defined by reference to
   ISO/IEC 14496-12's `SubSampleInformationBox` (§8.7.7.2) rather than

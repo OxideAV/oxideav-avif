@@ -93,6 +93,8 @@ const PANO: BoxType = b(b"pano");
 const SUBS: BoxType = b(b"subs");
 /// HEIF §6.5.29 — Target Output Layer Set descriptive property.
 const TOLS: BoxType = b(b"tols");
+/// HEIF §6.5.37 — Progressive Derived Image Item Information descriptive property.
+const PRDI: BoxType = b(b"prdi");
 
 /// HEIF §6.6.2.2 — image overlay derived-image type.
 pub const ITEM_TYPE_IOVL: BoxType = b(b"iovl");
@@ -1640,6 +1642,133 @@ pub struct Tols {
     pub target_ols_idx: u16,
 }
 
+/// Progressive Derived Image Item Information descriptive property
+/// (`prdi`) — HEIF §6.5.37.
+///
+/// Describes the progressive rendering steps associated with a derived
+/// image item (§6.5.37.1). Each progressive rendering step specifies the
+/// number of candidate input image items to use for the reconstruction
+/// of the derived image item, described as a difference from the previous
+/// step. Quantity per item is zero-or-one for a derived image item.
+///
+/// Uniquely among the §6.5.x descriptive family parsed so far, the body
+/// is **gated by the box `flags`** — there is no payload byte that is
+/// unconditionally present. The wire layout (§6.5.37.2) is an
+/// `ItemFullProperty('prdi', version=0, flags)` followed by:
+///
+/// ```text
+/// if ((flags & one_item_per_step) == 0 ||
+///     (flags & alternative_is_candidate))
+///    unsigned int(16) step_count;
+/// if ((flags & one_item_per_step) == 0) {
+///    for (i = 0; i < step_count; i++)
+///       unsigned int(16) item_count;
+/// }
+/// ```
+///
+/// Three `flags` bits are defined (§6.5.37.1):
+///
+/// | bit | name | meaning when set |
+/// |-----|------|------------------|
+/// | `0x000001` | [`Self::FLAG_ITEM_REFERENCE_ORDER`] | candidate input image items follow the `'dimg'` reference declaration order; when not set they follow the file order of appearance of the items' data |
+/// | `0x000002` | [`Self::FLAG_ONE_ITEM_PER_STEP`] | each progressive rendering step consumes exactly one candidate input image item; when not set the per-step counts are listed explicitly |
+/// | `0x000004` | [`Self::FLAG_ALTERNATIVE_IS_CANDIDATE`] | an alternative (`'prgr'`/`'altr'` group member or thumbnail) to an input image item is also a candidate input image item |
+///
+/// The conditional shape follows directly:
+///
+/// * `one_item_per_step` clear → every step consumes a per-step
+///   `item_count`, so `step_count` is present and the `item_count[]`
+///   array follows.
+/// * `one_item_per_step` set + `alternative_is_candidate` set →
+///   `step_count` is present (the step count is no longer derivable from
+///   `'dimg'` because alternatives extend the candidate list) but the
+///   per-step `item_count` array is **not** (each step consumes one item).
+/// * `one_item_per_step` set + `alternative_is_candidate` clear →
+///   neither field is present; per §6.5.37.3 `step_count` is then
+///   inferred to be the number of input image items listed in `'dimg'`
+///   and each `item_count` is inferred to be `1`.
+///
+/// [`Self::step_count`] / [`Self::item_counts`] are therefore `Option`,
+/// carrying `Some` exactly when the field was present on the wire. A
+/// reader resolves the inferred values against the derived item's
+/// `'dimg'` reference; [`Self::step_count_or_inferred`] applies the
+/// §6.5.37.3 inference rule given that input count.
+///
+/// `step_count` semantics (§6.5.37.3): `> 1` is the number of
+/// progressive rendering steps; `== 1` indicates progressive rendering is
+/// not desired; `== 0` is reserved for future use by ISO/IEC.
+///
+/// Spec: ISO/IEC 23008-12 §6.5.37.2 — ItemFullProperty(`prdi`,
+/// version=0, flags).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Prdi {
+    /// The full 24-bit `flags` field of the `ItemFullProperty` header.
+    /// The three defined bits (`item_reference_order`,
+    /// `one_item_per_step`, `alternative_is_candidate`) are surfaced via
+    /// the `is_*` projections; the field is kept whole so an unknown
+    /// future flag bit round-trips.
+    pub flags: u32,
+    /// `step_count` (§6.5.37.3) when present on the wire — `Some` exactly
+    /// when `one_item_per_step` is clear **or**
+    /// `alternative_is_candidate` is set. `None` means the count is
+    /// inferred to be the number of `'dimg'` input image items (see
+    /// [`Self::step_count_or_inferred`]).
+    pub step_count: Option<u16>,
+    /// Per-step `item_count` array (§6.5.37.3) when present — `Some`
+    /// exactly when `one_item_per_step` is clear, in which case it has
+    /// exactly `step_count` entries. `None` means each step consumes one
+    /// candidate input image item (the inferred `item_count == 1`).
+    pub item_counts: Option<Vec<u16>>,
+}
+
+impl Prdi {
+    /// §6.5.37.1 flag `0x000001` — candidate input image items follow
+    /// the `'dimg'` item-reference declaration order.
+    pub const FLAG_ITEM_REFERENCE_ORDER: u32 = 0x0000_0001;
+    /// §6.5.37.1 flag `0x000002` — each progressive rendering step
+    /// consumes exactly one candidate input image item.
+    pub const FLAG_ONE_ITEM_PER_STEP: u32 = 0x0000_0002;
+    /// §6.5.37.1 flag `0x000004` — an alternative to an input image item
+    /// is also a candidate input image item.
+    pub const FLAG_ALTERNATIVE_IS_CANDIDATE: u32 = 0x0000_0004;
+
+    /// True when the `item_reference_order` flag (`0x000001`) is set.
+    pub fn is_item_reference_order(&self) -> bool {
+        self.flags & Self::FLAG_ITEM_REFERENCE_ORDER != 0
+    }
+
+    /// True when the `one_item_per_step` flag (`0x000002`) is set.
+    pub fn is_one_item_per_step(&self) -> bool {
+        self.flags & Self::FLAG_ONE_ITEM_PER_STEP != 0
+    }
+
+    /// True when the `alternative_is_candidate` flag (`0x000004`) is set.
+    pub fn is_alternative_is_candidate(&self) -> bool {
+        self.flags & Self::FLAG_ALTERNATIVE_IS_CANDIDATE != 0
+    }
+
+    /// The effective number of progressive rendering steps, applying the
+    /// §6.5.37.3 inference rule: when [`Self::step_count`] was present on
+    /// the wire it is returned verbatim; otherwise it is inferred to be
+    /// `dimg_input_count`, the number of input image items listed in the
+    /// derived item's `'dimg'` reference.
+    pub fn step_count_or_inferred(&self, dimg_input_count: u16) -> u16 {
+        self.step_count.unwrap_or(dimg_input_count)
+    }
+
+    /// The effective `item_count` for the `i`-th progressive rendering
+    /// step, applying the §6.5.37.3 inference rule: when
+    /// [`Self::item_counts`] is present it is indexed directly (returning
+    /// `None` for an out-of-range step); otherwise each step is inferred
+    /// to consume `1` candidate input image item.
+    pub fn item_count_for_step(&self, i: usize) -> Option<u16> {
+        match &self.item_counts {
+            Some(counts) => counts.get(i).copied(),
+            None => Some(1),
+        }
+    }
+}
+
 /// One property box, kept typed for the boxes AVIF cares about + a raw
 /// fallback so an unknown property still gets an index for association.
 #[derive(Clone, Debug)]
@@ -1695,6 +1824,9 @@ pub enum Property {
     Subs(Subs),
     /// Target-output-layer-set descriptive property (HEIF §6.5.29).
     Tols(Tols),
+    /// Progressive-derived-image-item-information descriptive property
+    /// (HEIF §6.5.37).
+    Prdi(Prdi),
     Other(BoxType, Vec<u8>),
 }
 
@@ -1731,6 +1863,7 @@ impl Property {
             Property::Pano(_) => PANO,
             Property::Subs(_) => SUBS,
             Property::Tols(_) => TOLS,
+            Property::Prdi(_) => PRDI,
             Property::Other(t, _) => *t,
         }
     }
@@ -2249,6 +2382,7 @@ fn parse_ipco(payload: &[u8]) -> Result<Vec<Property>> {
             x if x == &PANO => Property::Pano(parse_pano(body)?),
             x if x == &SUBS => Property::Subs(parse_subs(body)?),
             x if x == &TOLS => Property::Tols(parse_tols(body)?),
+            x if x == &PRDI => Property::Prdi(parse_prdi(body)?),
             other => Property::Other(*other, body.to_vec()),
         };
         out.push(prop);
@@ -3071,6 +3205,72 @@ fn parse_tols(body: &[u8]) -> Result<Tols> {
     }
     Ok(Tols {
         target_ols_idx: read_u16(rest, 0)?,
+    })
+}
+
+/// Parse `prdi` (ProgressiveDerivedImageItemInformationProperty — HEIF
+/// §6.5.37).
+///
+/// `ItemFullProperty('prdi', version=0, flags)` whose body is entirely
+/// `flags`-gated (§6.5.37.2):
+///
+/// ```text
+/// if ((flags & one_item_per_step) == 0 ||
+///     (flags & alternative_is_candidate))
+///    unsigned int(16) step_count;
+/// if ((flags & one_item_per_step) == 0) {
+///    for (i = 0; i < step_count; i++)
+///       unsigned int(16) item_count;
+/// }
+/// ```
+///
+/// `step_count` is present iff `one_item_per_step` is clear or
+/// `alternative_is_candidate` is set; the `item_count[]` array is present
+/// iff `one_item_per_step` is clear (in which case `step_count` is also
+/// present, so the array length is well-defined). When neither field is
+/// present (`one_item_per_step` set, `alternative_is_candidate` clear) the
+/// body is empty and both values are inferred per §6.5.37.3.
+///
+/// An unknown `version` is rejected so a future-version layout cannot be
+/// misread as v0; a truncated `step_count` or `item_count` array is
+/// rejected; trailing bytes past the declared array are ignored for
+/// forward compatibility, matching every other FullBox-headed property
+/// parser in this module.
+fn parse_prdi(body: &[u8]) -> Result<Prdi> {
+    let (version, flags, rest) = parse_full_box(body)?;
+    if version != 0 {
+        return Err(Error::invalid(format!("avif: prdi version {version} != 0")));
+    }
+    let one_item_per_step = flags & Prdi::FLAG_ONE_ITEM_PER_STEP != 0;
+    let alternative_is_candidate = flags & Prdi::FLAG_ALTERNATIVE_IS_CANDIDATE != 0;
+
+    let mut off = 0usize;
+    let step_count = if !one_item_per_step || alternative_is_candidate {
+        let v = read_u16(rest, off)?;
+        off += 2;
+        Some(v)
+    } else {
+        None
+    };
+
+    let item_counts = if !one_item_per_step {
+        // `step_count` is guaranteed present here (the condition that
+        // gates `step_count` is a superset of `!one_item_per_step`).
+        let n = step_count.expect("prdi: step_count present when one_item_per_step is clear");
+        let mut counts = Vec::with_capacity(n as usize);
+        for _ in 0..n {
+            counts.push(read_u16(rest, off)?);
+            off += 2;
+        }
+        Some(counts)
+    } else {
+        None
+    };
+
+    Ok(Prdi {
+        flags,
+        step_count,
+        item_counts,
     })
 }
 
@@ -6636,5 +6836,225 @@ mod tests {
             other => panic!("expected Tols, got {other:?}"),
         }
         assert!(m.property_for(99, b"tols").is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // HEIF §6.5.37 ProgressiveDerivedImageItemInformationProperty
+    // (`prdi`) — parse + helpers
+    // -----------------------------------------------------------------
+
+    /// Build a `prdi` body — FullBox('prdi', version=0, flags), then the
+    /// §6.5.37.2 conditionally-present `step_count` and `item_count[]`
+    /// fields, written exactly as the syntax guards prescribe given
+    /// `flags`. `item_counts` is the per-step array a writer would emit
+    /// (ignored when the `one_item_per_step` flag is set).
+    fn prdi_body(version: u8, flags: u32, item_counts: &[u16]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.push(version);
+        buf.extend_from_slice(&[(flags >> 16) as u8, (flags >> 8) as u8, flags as u8]);
+        let one_item_per_step = flags & Prdi::FLAG_ONE_ITEM_PER_STEP != 0;
+        let alt_is_candidate = flags & Prdi::FLAG_ALTERNATIVE_IS_CANDIDATE != 0;
+        if !one_item_per_step || alt_is_candidate {
+            buf.extend_from_slice(&(item_counts.len() as u16).to_be_bytes());
+        }
+        if !one_item_per_step {
+            for &c in item_counts {
+                buf.extend_from_slice(&c.to_be_bytes());
+            }
+        }
+        buf
+    }
+
+    /// `one_item_per_step` clear → `step_count` and the per-step
+    /// `item_count[]` array are both present (§6.5.37.2). The array is
+    /// read with exactly `step_count` entries and surfaced verbatim.
+    #[test]
+    fn prdi_full_form_reads_step_count_and_item_counts() {
+        let p = parse_prdi(&prdi_body(0, 0, &[3, 1, 2])).unwrap();
+        assert_eq!(p.flags, 0);
+        assert_eq!(p.step_count, Some(3));
+        assert_eq!(p.item_counts.as_deref(), Some(&[3u16, 1, 2][..]));
+        assert!(!p.is_one_item_per_step());
+        assert!(!p.is_alternative_is_candidate());
+        assert!(!p.is_item_reference_order());
+        // Inference helpers return the present values unchanged.
+        assert_eq!(p.step_count_or_inferred(99), 3);
+        assert_eq!(p.item_count_for_step(0), Some(3));
+        assert_eq!(p.item_count_for_step(2), Some(2));
+        assert_eq!(p.item_count_for_step(3), None);
+    }
+
+    /// `one_item_per_step` set + `alternative_is_candidate` set →
+    /// `step_count` is present (the count is no longer derivable from
+    /// `'dimg'`) but the `item_count[]` array is absent (each step
+    /// consumes one item). `item_count_for_step` infers `1`.
+    #[test]
+    fn prdi_one_item_per_step_with_alternatives_keeps_step_count_only() {
+        let flags = Prdi::FLAG_ONE_ITEM_PER_STEP | Prdi::FLAG_ALTERNATIVE_IS_CANDIDATE;
+        // `item_counts` carries the step count but no array bytes are
+        // written for it in this flag combination.
+        let p = parse_prdi(&prdi_body(0, flags, &[0, 0, 0, 0])).unwrap();
+        assert_eq!(p.step_count, Some(4));
+        assert_eq!(p.item_counts, None);
+        assert!(p.is_one_item_per_step());
+        assert!(p.is_alternative_is_candidate());
+        // Every step consumes exactly one candidate input image item.
+        for i in 0..4 {
+            assert_eq!(p.item_count_for_step(i), Some(1));
+        }
+        assert_eq!(p.step_count_or_inferred(99), 4);
+    }
+
+    /// `one_item_per_step` set + `alternative_is_candidate` clear →
+    /// the body is empty; both `step_count` and the `item_count[]` array
+    /// are inferred per §6.5.37.3.
+    #[test]
+    fn prdi_one_item_per_step_no_alternatives_has_empty_body() {
+        let flags = Prdi::FLAG_ONE_ITEM_PER_STEP;
+        let body = prdi_body(0, flags, &[]);
+        // FullBox header only — no payload bytes.
+        assert_eq!(body.len(), 4);
+        let p = parse_prdi(&body).unwrap();
+        assert_eq!(p.step_count, None);
+        assert_eq!(p.item_counts, None);
+        // `step_count` is inferred to be the number of `'dimg'` inputs.
+        assert_eq!(p.step_count_or_inferred(5), 5);
+        // Each step consumes one candidate input image item.
+        assert_eq!(p.item_count_for_step(0), Some(1));
+        assert_eq!(p.item_count_for_step(42), Some(1));
+    }
+
+    /// The `item_reference_order` flag is orthogonal to the body shape —
+    /// it does not gate any field, but it must round-trip through
+    /// [`Prdi::flags`] and be reported by the projection. Combined here
+    /// with the full form so the body is still read.
+    #[test]
+    fn prdi_item_reference_order_flag_round_trips() {
+        let flags = Prdi::FLAG_ITEM_REFERENCE_ORDER;
+        let p = parse_prdi(&prdi_body(0, flags, &[2, 2])).unwrap();
+        assert!(p.is_item_reference_order());
+        assert!(!p.is_one_item_per_step());
+        assert_eq!(p.step_count, Some(2));
+        assert_eq!(p.item_counts.as_deref(), Some(&[2u16, 2][..]));
+        // The whole flags field is preserved, including the set bit.
+        assert_eq!(p.flags, Prdi::FLAG_ITEM_REFERENCE_ORDER);
+    }
+
+    /// A zero `step_count` (reserved for future use per §6.5.37.3) reads
+    /// as an empty `item_count[]` array — well-formed at the wire level,
+    /// surfaced verbatim so a reader can apply the reserved-value policy.
+    #[test]
+    fn prdi_zero_step_count_yields_empty_item_counts() {
+        let p = parse_prdi(&prdi_body(0, 0, &[])).unwrap();
+        assert_eq!(p.step_count, Some(0));
+        assert_eq!(p.item_counts.as_deref(), Some(&[][..]));
+        assert_eq!(p.item_count_for_step(0), None);
+    }
+
+    #[test]
+    fn prdi_rejects_unknown_version() {
+        // version=1, flags=0; otherwise a well-formed v0 full-form body.
+        let mut buf = prdi_body(0, 0, &[1]);
+        buf[0] = 1;
+        assert!(parse_prdi(&buf).is_err());
+    }
+
+    /// A truncated `step_count` or a short `item_count[]` array is
+    /// rejected. The full form needs 2 bytes for `step_count` plus
+    /// 2×`step_count` for the array; cutting either short fails.
+    #[test]
+    fn prdi_rejects_truncated_body() {
+        // step_count present (flags=0) but body has only the header.
+        assert!(parse_prdi(&[0u8, 0, 0, 0]).is_err());
+        // step_count says 2 entries but only one is present.
+        let mut buf = vec![0u8, 0, 0, 0];
+        buf.extend_from_slice(&2u16.to_be_bytes()); // step_count = 2
+        buf.extend_from_slice(&7u16.to_be_bytes()); // only one item_count
+        assert!(parse_prdi(&buf).is_err());
+        // one_item_per_step+alt: step_count required but missing.
+        let flags = Prdi::FLAG_ONE_ITEM_PER_STEP | Prdi::FLAG_ALTERNATIVE_IS_CANDIDATE;
+        let hdr = [0u8, (flags >> 16) as u8, (flags >> 8) as u8, flags as u8];
+        assert!(parse_prdi(&hdr).is_err());
+    }
+
+    /// Trailing bytes past the declared array are forward-compat space —
+    /// the parser reads exactly `step_count` entries and ignores the
+    /// rest, mirroring every other FullBox-headed property parser.
+    #[test]
+    fn prdi_tolerates_trailing_bytes() {
+        let mut body = prdi_body(0, 0, &[1, 2]);
+        body.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let p = parse_prdi(&body).unwrap();
+        assert_eq!(p.step_count, Some(2));
+        assert_eq!(p.item_counts.as_deref(), Some(&[1u16, 2][..]));
+    }
+
+    #[test]
+    fn prdi_dispatched_through_parse_ipco() {
+        let body = prdi_body(0, 0, &[3, 1]);
+        let mut ipco = Vec::new();
+        let s = 8 + body.len() as u32;
+        ipco.extend_from_slice(&s.to_be_bytes());
+        ipco.extend_from_slice(b"prdi");
+        ipco.extend_from_slice(&body);
+        let props = parse_ipco(&ipco).unwrap();
+        assert_eq!(props.len(), 1);
+        match &props[0] {
+            Property::Prdi(p) => {
+                assert_eq!(p.step_count, Some(2));
+                assert_eq!(p.item_counts.as_deref(), Some(&[3u16, 1][..]));
+            }
+            other => panic!("expected Prdi, got {other:?}"),
+        }
+        assert_eq!(props[0].kind(), *b"prdi");
+    }
+
+    /// A recognised `prdi` property — even when flagged essential — does
+    /// NOT trip [`Meta::unsupported_essential_properties`].
+    #[test]
+    fn prdi_essential_association_is_recognised() {
+        let m = Meta {
+            properties: vec![Property::Prdi(Prdi::default())],
+            associations: vec![ItemPropertyAssociation {
+                item_id: 1,
+                entries: vec![PropertyAssociation {
+                    index: 0,
+                    essential: true,
+                }],
+            }],
+            ..Meta::default()
+        };
+        assert!(!m.has_unsupported_essential_property(1));
+        assert!(m.unsupported_essential_properties(1).is_empty());
+    }
+
+    /// §6.5.37.1 caps `prdi` at zero-or-one per derived image item. A
+    /// `Meta::property_for(item_id, b"prdi")` lookup finds the associated
+    /// single instance via the standard `ipma` walk.
+    #[test]
+    fn prdi_lookup_via_property_for() {
+        let m = Meta {
+            properties: vec![Property::Prdi(Prdi {
+                flags: Prdi::FLAG_ITEM_REFERENCE_ORDER,
+                step_count: Some(2),
+                item_counts: Some(vec![1, 1]),
+            })],
+            associations: vec![ItemPropertyAssociation {
+                item_id: 9,
+                entries: vec![PropertyAssociation {
+                    index: 0,
+                    essential: false,
+                }],
+            }],
+            ..Meta::default()
+        };
+        match m.property_for(9, b"prdi") {
+            Some(Property::Prdi(p)) => {
+                assert!(p.is_item_reference_order());
+                assert_eq!(p.step_count, Some(2));
+            }
+            other => panic!("expected Prdi, got {other:?}"),
+        }
+        assert!(m.property_for(99, b"prdi").is_none());
     }
 }
