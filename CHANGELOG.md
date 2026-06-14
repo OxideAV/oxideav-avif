@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- ISO/IEC 23008-12 §6.5.30–§6.5.35 slideshow transition-effect item-property
+  family — six new descriptive/transformative properties that document
+  suggested transitions and timing between consecutive items of a slideshow
+  entity group, each associated with the **first** of the two items
+  involved:
+  - §6.5.30 `wipe` (WipeTransitionEffectProperty) →
+    `Property::Wipe(Wipe { transition_direction })`, with the eight
+    §6.5.30.3 direction constants (`FROM_LEFT` … `FROM_RIGHT_BOTTOM`) and
+    an `is_known_direction` projection.
+  - §6.5.31 `zoom` (ZoomTransitionEffectProperty) →
+    `Property::Zoom(Zoom { transition_direction, transition_shape })`,
+    unpacking the §6.5.31.2 single octet (`unsigned int(1)` direction in
+    the top bit, `unsigned int(7)` shape in the low seven), with
+    `DIRECTION_{IN,OUT}` / `SHAPE_{RECTANGULAR,CIRCLE,STAR}` constants and
+    `is_known_shape`.
+  - §6.5.32 `fade` (FadeTransitionEffectProperty) →
+    `Property::Fade(Fade)` with `THROUGH_WHITE` / `THROUGH_BLACK` /
+    `DISSOLVE`.
+  - §6.5.33 `splt` (SplitTransitionEffectProperty) →
+    `Property::Splt(Splt)` with `VERTICAL_{IN,OUT}` /
+    `HORIZONTAL_{IN,OUT}`.
+  - §6.5.34 `stpe` (SuggestedTransitionPeriodProperty) →
+    `Property::Stpe(Stpe { transition_period })` plus a `seconds()`
+    helper applying the §6.5.34.3 unit (1/16 s).
+  - §6.5.35 `ssld` (SuggestedTimeDisplayDurationProperty) →
+    `Property::Ssld(Ssld { duration })` plus `seconds()` and an
+    `is_reserved()` check for the §6.5.35.3 reserved `duration == 0`
+    sentinel.
+  All six are re-exported as `oxideav_avif::{Wipe, Zoom, Fade, Splt,
+  Stpe, Ssld}`. Each parser rejects an unknown `version`; reserved
+  enumerant values are surfaced verbatim (the `is_known_*` predicates
+  distinguish them); trailing bytes are ignored for forward
+  compatibility. Although §6.5.30–§6.5.33 list the effects as
+  *transformative*, they are slideshow-presentation hints rather than
+  pixel transforms, so a recognised association never trips
+  `Meta::unsupported_essential_properties`. +19 unit tests.
+
 - ISO/IEC 23008-12 §6.5.37 ProgressiveDerivedImageItemInformationProperty
   (`prdi`) descriptive item-property parser — describes the progressive
   rendering steps of a **derived** image item, surfaced as

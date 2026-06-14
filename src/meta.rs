@@ -93,6 +93,18 @@ const PANO: BoxType = b(b"pano");
 const SUBS: BoxType = b(b"subs");
 /// HEIF §6.5.29 — Target Output Layer Set descriptive property.
 const TOLS: BoxType = b(b"tols");
+/// HEIF §6.5.30 — Wipe Transition Effect transformative property.
+const WIPE: BoxType = b(b"wipe");
+/// HEIF §6.5.31 — Zoom Transition Effect transformative property.
+const ZOOM: BoxType = b(b"zoom");
+/// HEIF §6.5.32 — Fade Transition Effect transformative property.
+const FADE: BoxType = b(b"fade");
+/// HEIF §6.5.33 — Split Transition Effect transformative property.
+const SPLT: BoxType = b(b"splt");
+/// HEIF §6.5.34 — Suggested Transition Period descriptive property.
+const STPE: BoxType = b(b"stpe");
+/// HEIF §6.5.35 — Suggested Time Display Duration descriptive property.
+const SSLD: BoxType = b(b"ssld");
 /// HEIF §6.5.37 — Progressive Derived Image Item Information descriptive property.
 const PRDI: BoxType = b(b"prdi");
 
@@ -1769,6 +1781,255 @@ impl Prdi {
     }
 }
 
+/// Wipe Transition Effect transformative property (`wipe`) — HEIF
+/// §6.5.30.
+///
+/// Documents a suggested wipe transition effect to apply between the
+/// display of two consecutive items of a slideshow entity group: an
+/// image that gradually replaces another from one side to another
+/// following a moving boundary. The property is associated with the
+/// **first** of the two consecutive items involved in the transition
+/// (§6.5.30.1), and the precise rendering process is deliberately left
+/// to the player.
+///
+/// Although §6.5.30.1 lists the property type as *transformative*, it
+/// does not transform the pixels of the associated image item itself;
+/// it is a slideshow-presentation hint. A reader that does not perform
+/// slideshow transitions safely ignores it, so a recognised `wipe`
+/// never trips [`Meta::unsupported_essential_properties`].
+///
+/// Spec: ISO/IEC 23008-12 §6.5.30.2 — ItemFullProperty(`wipe`,
+/// version=0, flags=0).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Wipe {
+    /// `transition_direction` (§6.5.30.3) — see the direction constants
+    /// on [`Wipe`]. Values `>= 8` are reserved; surfaced verbatim.
+    pub transition_direction: u8,
+}
+
+impl Wipe {
+    /// §6.5.30.3 — from the left, following a vertical moving boundary.
+    pub const FROM_LEFT: u8 = 0;
+    /// §6.5.30.3 — from the right, following a vertical moving boundary.
+    pub const FROM_RIGHT: u8 = 1;
+    /// §6.5.30.3 — from the top, following a horizontal moving boundary.
+    pub const FROM_TOP: u8 = 2;
+    /// §6.5.30.3 — from the bottom, following a horizontal moving boundary.
+    pub const FROM_BOTTOM: u8 = 3;
+    /// §6.5.30.3 — from the left-top corner, following a 45° boundary.
+    pub const FROM_LEFT_TOP: u8 = 4;
+    /// §6.5.30.3 — from the right-top corner, following a -45° boundary.
+    pub const FROM_RIGHT_TOP: u8 = 5;
+    /// §6.5.30.3 — from the left-bottom corner, following a -45° boundary.
+    pub const FROM_LEFT_BOTTOM: u8 = 6;
+    /// §6.5.30.3 — from the right-bottom corner, following a 45° boundary.
+    pub const FROM_RIGHT_BOTTOM: u8 = 7;
+
+    /// True when `transition_direction` is one of the eight defined
+    /// values (`0..=7`); values `>= 8` are reserved (§6.5.30.3).
+    pub fn is_known_direction(&self) -> bool {
+        self.transition_direction <= Self::FROM_RIGHT_BOTTOM
+    }
+}
+
+/// Zoom Transition Effect transformative property (`zoom`) — HEIF
+/// §6.5.31.
+///
+/// Documents a suggested zoom transition effect between two consecutive
+/// slideshow items: a new image replaces another by zoom-in or
+/// zoom-out from the middle of the preceding image, using a shape
+/// (`transition_shape`). Associated with the **first** of the two
+/// items (§6.5.31.1); rendering is left to the player.
+///
+/// The §6.5.31.2 body packs both fields into a single octet:
+/// `unsigned int(1) transition_direction` followed by
+/// `unsigned int(7) transition_shape`. The direction is the most
+/// significant bit; the shape occupies the low 7 bits.
+///
+/// Like the other transition effects, a reader that does not perform
+/// slideshow transitions safely ignores this property, so a recognised
+/// `zoom` never trips [`Meta::unsupported_essential_properties`].
+///
+/// Spec: ISO/IEC 23008-12 §6.5.31.2 — ItemFullProperty(`zoom`,
+/// version=0, flags=0).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Zoom {
+    /// `transition_direction` (§6.5.31.3) — `0` = zoom-in, `1` =
+    /// zoom-out. Decoded from the top bit of the §6.5.31.2 octet.
+    pub transition_direction: u8,
+    /// `transition_shape` (§6.5.31.3) — see the shape constants on
+    /// [`Zoom`]. Decoded from the low 7 bits; values not enumerated are
+    /// reserved and surfaced verbatim.
+    pub transition_shape: u8,
+}
+
+impl Zoom {
+    /// §6.5.31.3 — zoom-in using the shape defined by `transition_shape`.
+    pub const DIRECTION_IN: u8 = 0;
+    /// §6.5.31.3 — zoom-out using the shape defined by `transition_shape`.
+    pub const DIRECTION_OUT: u8 = 1;
+    /// §6.5.31.3 — rectangular transition shape.
+    pub const SHAPE_RECTANGULAR: u8 = 0;
+    /// §6.5.31.3 — circle transition shape.
+    pub const SHAPE_CIRCLE: u8 = 1;
+    /// §6.5.31.3 — star transition shape.
+    pub const SHAPE_STAR: u8 = 2;
+
+    /// True when `transition_shape` is one of the three defined values
+    /// (`0..=2`); other values are reserved (§6.5.31.3).
+    pub fn is_known_shape(&self) -> bool {
+        self.transition_shape <= Self::SHAPE_STAR
+    }
+}
+
+/// Fade Transition Effect transformative property (`fade`) — HEIF
+/// §6.5.32.
+///
+/// Documents a suggested fade transition effect between two consecutive
+/// slideshow items: an image replaces another either by transitioning
+/// through a white or black image, or by mutually fading in and out.
+/// Associated with the **first** of the two items (§6.5.32.1);
+/// rendering is left to the player.
+///
+/// A reader that does not perform slideshow transitions safely ignores
+/// this property, so a recognised `fade` never trips
+/// [`Meta::unsupported_essential_properties`].
+///
+/// Spec: ISO/IEC 23008-12 §6.5.32.2 — ItemFullProperty(`fade`,
+/// version=0, flags=0).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Fade {
+    /// `transition_direction` (§6.5.32.3) — see the constants on
+    /// [`Fade`]. Values `>= 3` are reserved; surfaced verbatim.
+    pub transition_direction: u8,
+}
+
+impl Fade {
+    /// §6.5.32.3 — the transition is through a white image.
+    pub const THROUGH_WHITE: u8 = 0;
+    /// §6.5.32.3 — the transition is through a black image.
+    pub const THROUGH_BLACK: u8 = 1;
+    /// §6.5.32.3 — the transition is a mutual fading in and out.
+    pub const DISSOLVE: u8 = 2;
+
+    /// True when `transition_direction` is one of the three defined
+    /// values (`0..=2`); other values are reserved (§6.5.32.3).
+    pub fn is_known_direction(&self) -> bool {
+        self.transition_direction <= Self::DISSOLVE
+    }
+}
+
+/// Split Transition Effect transformative property (`splt`) — HEIF
+/// §6.5.33.
+///
+/// Documents a suggested split transition effect between two
+/// consecutive slideshow items: one of the two images is split into
+/// two equal parts (vertically or horizontally) and the parts move to
+/// reveal or cover, depending on `transition_direction`. Associated
+/// with the **first** of the two items (§6.5.33.1); rendering is left
+/// to the player.
+///
+/// A reader that does not perform slideshow transitions safely ignores
+/// this property, so a recognised `splt` never trips
+/// [`Meta::unsupported_essential_properties`].
+///
+/// Spec: ISO/IEC 23008-12 §6.5.33.2 — ItemFullProperty(`splt`,
+/// version=0, flags=0).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Splt {
+    /// `transition_direction` (§6.5.33.3) — see the constants on
+    /// [`Splt`]. Values `>= 4` are reserved; surfaced verbatim.
+    pub transition_direction: u8,
+}
+
+impl Splt {
+    /// §6.5.33.3 — vertical-in: the second image is split vertically
+    /// and its parts move inward over the first image.
+    pub const VERTICAL_IN: u8 = 0;
+    /// §6.5.33.3 — vertical-out: the first image is split vertically
+    /// and its parts move outward revealing the second image.
+    pub const VERTICAL_OUT: u8 = 1;
+    /// §6.5.33.3 — horizontal-in: the second image is split
+    /// horizontally and its parts move inward over the first image.
+    pub const HORIZONTAL_IN: u8 = 2;
+    /// §6.5.33.3 — horizontal-out: the first image is split
+    /// horizontally and its parts move outward revealing the second.
+    pub const HORIZONTAL_OUT: u8 = 3;
+
+    /// True when `transition_direction` is one of the four defined
+    /// values (`0..=3`); other values are reserved (§6.5.33.3).
+    pub fn is_known_direction(&self) -> bool {
+        self.transition_direction <= Self::HORIZONTAL_OUT
+    }
+}
+
+/// Suggested Transition Period descriptive property (`stpe`) — HEIF
+/// §6.5.34.
+///
+/// Documents the suggested transition effect duration (from the start
+/// to the end of the transition) to apply between the display of two
+/// consecutive slideshow items. Associated with the **first** of the
+/// two items (§6.5.34.1).
+///
+/// Descriptive, so a recognised `stpe` never trips
+/// [`Meta::unsupported_essential_properties`].
+///
+/// Spec: ISO/IEC 23008-12 §6.5.34.2 — ItemFullProperty(`stpe`,
+/// version=0, flags=0).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stpe {
+    /// `transition_period` (§6.5.34.3) — the recommended transition
+    /// period in units of 1/16 second. Surfaced verbatim; see
+    /// [`Self::seconds`] for the converted value.
+    pub transition_period: u8,
+}
+
+impl Stpe {
+    /// The recommended transition period in seconds, applying the
+    /// §6.5.34.3 unit (`transition_period / 16`).
+    pub fn seconds(&self) -> f64 {
+        f64::from(self.transition_period) / 16.0
+    }
+}
+
+/// Suggested Time Display Duration descriptive property (`ssld`) —
+/// HEIF §6.5.35.
+///
+/// Documents the suggested display duration to apply to an image item
+/// (or, when associated with a slideshow entity group, the default for
+/// items in that group) of a slideshow (§6.5.35.1). When a transition
+/// effect applies at the start or end of an item's display, the
+/// duration is the time between the end of the incoming transition and
+/// the start of the outgoing one; otherwise it is the full display
+/// time (§6.5.35.1).
+///
+/// Descriptive, so a recognised `ssld` never trips
+/// [`Meta::unsupported_essential_properties`].
+///
+/// Spec: ISO/IEC 23008-12 §6.5.35.2 — ItemFullProperty(`ssld`,
+/// version=0, flags=0).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Ssld {
+    /// `duration` (§6.5.35.3) — the recommended display duration in
+    /// units of 1/16 second. The value `0` is reserved; surfaced
+    /// verbatim. See [`Self::seconds`] for the converted value and
+    /// [`Self::is_reserved`] for the reserved-sentinel check.
+    pub duration: u16,
+}
+
+impl Ssld {
+    /// The recommended display duration in seconds, applying the
+    /// §6.5.35.3 unit (`duration / 16`).
+    pub fn seconds(&self) -> f64 {
+        f64::from(self.duration) / 16.0
+    }
+
+    /// True when `duration == 0`, the §6.5.35.3 reserved sentinel.
+    pub fn is_reserved(&self) -> bool {
+        self.duration == 0
+    }
+}
+
 /// One property box, kept typed for the boxes AVIF cares about + a raw
 /// fallback so an unknown property still gets an index for association.
 #[derive(Clone, Debug)]
@@ -1824,6 +2085,18 @@ pub enum Property {
     Subs(Subs),
     /// Target-output-layer-set descriptive property (HEIF §6.5.29).
     Tols(Tols),
+    /// Wipe-transition-effect transformative property (HEIF §6.5.30).
+    Wipe(Wipe),
+    /// Zoom-transition-effect transformative property (HEIF §6.5.31).
+    Zoom(Zoom),
+    /// Fade-transition-effect transformative property (HEIF §6.5.32).
+    Fade(Fade),
+    /// Split-transition-effect transformative property (HEIF §6.5.33).
+    Splt(Splt),
+    /// Suggested-transition-period descriptive property (HEIF §6.5.34).
+    Stpe(Stpe),
+    /// Suggested-time-display-duration descriptive property (HEIF §6.5.35).
+    Ssld(Ssld),
     /// Progressive-derived-image-item-information descriptive property
     /// (HEIF §6.5.37).
     Prdi(Prdi),
@@ -1863,6 +2136,12 @@ impl Property {
             Property::Pano(_) => PANO,
             Property::Subs(_) => SUBS,
             Property::Tols(_) => TOLS,
+            Property::Wipe(_) => WIPE,
+            Property::Zoom(_) => ZOOM,
+            Property::Fade(_) => FADE,
+            Property::Splt(_) => SPLT,
+            Property::Stpe(_) => STPE,
+            Property::Ssld(_) => SSLD,
             Property::Prdi(_) => PRDI,
             Property::Other(t, _) => *t,
         }
@@ -2382,6 +2661,12 @@ fn parse_ipco(payload: &[u8]) -> Result<Vec<Property>> {
             x if x == &PANO => Property::Pano(parse_pano(body)?),
             x if x == &SUBS => Property::Subs(parse_subs(body)?),
             x if x == &TOLS => Property::Tols(parse_tols(body)?),
+            x if x == &WIPE => Property::Wipe(parse_wipe(body)?),
+            x if x == &ZOOM => Property::Zoom(parse_zoom(body)?),
+            x if x == &FADE => Property::Fade(parse_fade(body)?),
+            x if x == &SPLT => Property::Splt(parse_splt(body)?),
+            x if x == &STPE => Property::Stpe(parse_stpe(body)?),
+            x if x == &SSLD => Property::Ssld(parse_ssld(body)?),
             x if x == &PRDI => Property::Prdi(parse_prdi(body)?),
             other => Property::Other(*other, body.to_vec()),
         };
@@ -3205,6 +3490,120 @@ fn parse_tols(body: &[u8]) -> Result<Tols> {
     }
     Ok(Tols {
         target_ols_idx: read_u16(rest, 0)?,
+    })
+}
+
+/// Parse `wipe` (WipeTransitionEffectProperty — HEIF §6.5.30).
+/// FullBox(`wipe`, version=0, flags=0) followed by a single
+/// `unsigned int(8) transition_direction` (§6.5.30.2). An unknown
+/// `version` is rejected so a future-version layout cannot be misread
+/// as v0; trailing bytes are ignored for forward compatibility.
+fn parse_wipe(body: &[u8]) -> Result<Wipe> {
+    let (version, _flags, rest) = parse_full_box(body)?;
+    if version != 0 {
+        return Err(Error::invalid(format!("avif: wipe version {version} != 0")));
+    }
+    if rest.is_empty() {
+        return Err(Error::invalid("avif: wipe too short (0 < 1)"));
+    }
+    Ok(Wipe {
+        transition_direction: rest[0],
+    })
+}
+
+/// Parse `zoom` (ZoomTransitionEffectProperty — HEIF §6.5.31).
+/// FullBox(`zoom`, version=0, flags=0) followed by a single octet that
+/// packs `unsigned int(1) transition_direction` (top bit) and
+/// `unsigned int(7) transition_shape` (low 7 bits) per §6.5.31.2. An
+/// unknown `version` is rejected; trailing bytes are ignored for
+/// forward compatibility.
+fn parse_zoom(body: &[u8]) -> Result<Zoom> {
+    let (version, _flags, rest) = parse_full_box(body)?;
+    if version != 0 {
+        return Err(Error::invalid(format!("avif: zoom version {version} != 0")));
+    }
+    if rest.is_empty() {
+        return Err(Error::invalid("avif: zoom too short (0 < 1)"));
+    }
+    let packed = rest[0];
+    Ok(Zoom {
+        transition_direction: packed >> 7,
+        transition_shape: packed & 0x7f,
+    })
+}
+
+/// Parse `fade` (FadeTransitionEffectProperty — HEIF §6.5.32).
+/// FullBox(`fade`, version=0, flags=0) followed by a single
+/// `unsigned int(8) transition_direction` (§6.5.32.2). An unknown
+/// `version` is rejected; trailing bytes are ignored for forward
+/// compatibility.
+fn parse_fade(body: &[u8]) -> Result<Fade> {
+    let (version, _flags, rest) = parse_full_box(body)?;
+    if version != 0 {
+        return Err(Error::invalid(format!("avif: fade version {version} != 0")));
+    }
+    if rest.is_empty() {
+        return Err(Error::invalid("avif: fade too short (0 < 1)"));
+    }
+    Ok(Fade {
+        transition_direction: rest[0],
+    })
+}
+
+/// Parse `splt` (SplitTransitionEffectProperty — HEIF §6.5.33).
+/// FullBox(`splt`, version=0, flags=0) followed by a single
+/// `unsigned int(8) transition_direction` (§6.5.33.2). An unknown
+/// `version` is rejected; trailing bytes are ignored for forward
+/// compatibility.
+fn parse_splt(body: &[u8]) -> Result<Splt> {
+    let (version, _flags, rest) = parse_full_box(body)?;
+    if version != 0 {
+        return Err(Error::invalid(format!("avif: splt version {version} != 0")));
+    }
+    if rest.is_empty() {
+        return Err(Error::invalid("avif: splt too short (0 < 1)"));
+    }
+    Ok(Splt {
+        transition_direction: rest[0],
+    })
+}
+
+/// Parse `stpe` (SuggestedTransitionPeriodProperty — HEIF §6.5.34).
+/// FullBox(`stpe`, version=0, flags=0) followed by a single
+/// `unsigned int(8) transition_period` in units of 1/16 s (§6.5.34.2).
+/// An unknown `version` is rejected; trailing bytes are ignored for
+/// forward compatibility.
+fn parse_stpe(body: &[u8]) -> Result<Stpe> {
+    let (version, _flags, rest) = parse_full_box(body)?;
+    if version != 0 {
+        return Err(Error::invalid(format!("avif: stpe version {version} != 0")));
+    }
+    if rest.is_empty() {
+        return Err(Error::invalid("avif: stpe too short (0 < 1)"));
+    }
+    Ok(Stpe {
+        transition_period: rest[0],
+    })
+}
+
+/// Parse `ssld` (SuggestedTimeDisplayDurationProperty — HEIF §6.5.35).
+/// FullBox(`ssld`, version=0, flags=0) followed by a single
+/// `unsigned int(16) duration` in units of 1/16 s (§6.5.35.2). An
+/// unknown `version` is rejected; a truncated `duration` is rejected;
+/// trailing bytes are ignored for forward compatibility.
+fn parse_ssld(body: &[u8]) -> Result<Ssld> {
+    let (version, _flags, rest) = parse_full_box(body)?;
+    if version != 0 {
+        return Err(Error::invalid(format!("avif: ssld version {version} != 0")));
+    }
+    if rest.len() < 2 {
+        return Err(Error::invalid(format!(
+            "avif: ssld too short ({} < 2)",
+            rest.len()
+        )));
+    }
+    Ok(Ssld {
+        duration: read_u16(rest, 0)?,
     })
 }
 
@@ -7056,5 +7455,285 @@ mod tests {
             other => panic!("expected Prdi, got {other:?}"),
         }
         assert!(m.property_for(99, b"prdi").is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // HEIF §6.5.30-6.5.35 slideshow transition-effect properties
+    // (`wipe` / `zoom` / `fade` / `splt` / `stpe` / `ssld`)
+    // -----------------------------------------------------------------
+
+    /// Wrap a property body in an `ipco` so the dispatch path is
+    /// exercised end-to-end. `fourcc` is the four-CC; `body` already
+    /// includes the FullBox header bytes.
+    fn ipco_one(fourcc: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut ipco = Vec::new();
+        let s = 8 + body.len() as u32;
+        ipco.extend_from_slice(&s.to_be_bytes());
+        ipco.extend_from_slice(fourcc);
+        ipco.extend_from_slice(body);
+        ipco
+    }
+
+    /// FullBox(version=0, flags=0) header followed by the given payload.
+    fn full_box_v0(payload: &[u8]) -> Vec<u8> {
+        let mut buf = vec![0u8; 4];
+        buf.extend_from_slice(payload);
+        buf
+    }
+
+    #[test]
+    fn wipe_parses_every_defined_direction() {
+        for dir in 0u8..=7 {
+            let w = parse_wipe(&full_box_v0(&[dir])).unwrap();
+            assert_eq!(w.transition_direction, dir);
+            assert!(w.is_known_direction());
+        }
+        // Named constants line up with the spec values.
+        assert_eq!(Wipe::FROM_LEFT, 0);
+        assert_eq!(Wipe::FROM_RIGHT, 1);
+        assert_eq!(Wipe::FROM_TOP, 2);
+        assert_eq!(Wipe::FROM_BOTTOM, 3);
+        assert_eq!(Wipe::FROM_RIGHT_BOTTOM, 7);
+    }
+
+    #[test]
+    fn wipe_reserved_direction_surfaced_not_known() {
+        let w = parse_wipe(&full_box_v0(&[8])).unwrap();
+        assert_eq!(w.transition_direction, 8);
+        assert!(!w.is_known_direction());
+    }
+
+    #[test]
+    fn wipe_rejects_short_and_unknown_version() {
+        assert!(parse_wipe(&full_box_v0(&[])).is_err());
+        // version = 1
+        assert!(parse_wipe(&[1u8, 0, 0, 0, 0]).is_err());
+    }
+
+    #[test]
+    fn wipe_tolerates_trailing_bytes_and_dispatches() {
+        let body = full_box_v0(&[Wipe::FROM_LEFT_TOP, 0xAA, 0xBB]);
+        let props = parse_ipco(&ipco_one(b"wipe", &body)).unwrap();
+        assert_eq!(props.len(), 1);
+        match &props[0] {
+            Property::Wipe(w) => assert_eq!(w.transition_direction, Wipe::FROM_LEFT_TOP),
+            other => panic!("expected Wipe, got {other:?}"),
+        }
+        assert_eq!(props[0].kind(), *b"wipe");
+    }
+
+    #[test]
+    fn zoom_unpacks_direction_and_shape() {
+        // direction = 1 (top bit), shape = 2 (star)
+        let packed = (Zoom::DIRECTION_OUT << 7) | Zoom::SHAPE_STAR;
+        let z = parse_zoom(&full_box_v0(&[packed])).unwrap();
+        assert_eq!(z.transition_direction, Zoom::DIRECTION_OUT);
+        assert_eq!(z.transition_shape, Zoom::SHAPE_STAR);
+        assert!(z.is_known_shape());
+
+        // direction = 0, shape = 0 (rectangular)
+        let z = parse_zoom(&full_box_v0(&[0])).unwrap();
+        assert_eq!(z.transition_direction, Zoom::DIRECTION_IN);
+        assert_eq!(z.transition_shape, Zoom::SHAPE_RECTANGULAR);
+
+        // direction = 0, shape = 1 (circle)
+        let z = parse_zoom(&full_box_v0(&[Zoom::SHAPE_CIRCLE])).unwrap();
+        assert_eq!(z.transition_direction, Zoom::DIRECTION_IN);
+        assert_eq!(z.transition_shape, Zoom::SHAPE_CIRCLE);
+    }
+
+    #[test]
+    fn zoom_reserved_shape_surfaced_not_known() {
+        // direction = 1, shape = 0x7f (max 7-bit, reserved)
+        let z = parse_zoom(&full_box_v0(&[0xFF])).unwrap();
+        assert_eq!(z.transition_direction, Zoom::DIRECTION_OUT);
+        assert_eq!(z.transition_shape, 0x7f);
+        assert!(!z.is_known_shape());
+    }
+
+    #[test]
+    fn zoom_rejects_short_and_unknown_version() {
+        assert!(parse_zoom(&full_box_v0(&[])).is_err());
+        assert!(parse_zoom(&[3u8, 0, 0, 0, 0]).is_err());
+    }
+
+    #[test]
+    fn zoom_dispatches_through_ipco() {
+        let z = (Zoom::DIRECTION_IN << 7) | Zoom::SHAPE_CIRCLE;
+        let props = parse_ipco(&ipco_one(b"zoom", &full_box_v0(&[z]))).unwrap();
+        match &props[0] {
+            Property::Zoom(z) => {
+                assert_eq!(z.transition_direction, Zoom::DIRECTION_IN);
+                assert_eq!(z.transition_shape, Zoom::SHAPE_CIRCLE);
+            }
+            other => panic!("expected Zoom, got {other:?}"),
+        }
+        assert_eq!(props[0].kind(), *b"zoom");
+    }
+
+    #[test]
+    fn fade_parses_every_defined_direction() {
+        for dir in 0u8..=2 {
+            let f = parse_fade(&full_box_v0(&[dir])).unwrap();
+            assert_eq!(f.transition_direction, dir);
+            assert!(f.is_known_direction());
+        }
+        assert_eq!(Fade::THROUGH_WHITE, 0);
+        assert_eq!(Fade::THROUGH_BLACK, 1);
+        assert_eq!(Fade::DISSOLVE, 2);
+        let f = parse_fade(&full_box_v0(&[3])).unwrap();
+        assert!(!f.is_known_direction());
+    }
+
+    #[test]
+    fn fade_rejects_short_and_unknown_version() {
+        assert!(parse_fade(&full_box_v0(&[])).is_err());
+        assert!(parse_fade(&[2u8, 0, 0, 0, 1]).is_err());
+    }
+
+    #[test]
+    fn splt_parses_every_defined_direction_and_dispatches() {
+        for dir in 0u8..=3 {
+            let s = parse_splt(&full_box_v0(&[dir])).unwrap();
+            assert_eq!(s.transition_direction, dir);
+            assert!(s.is_known_direction());
+        }
+        assert_eq!(Splt::VERTICAL_IN, 0);
+        assert_eq!(Splt::VERTICAL_OUT, 1);
+        assert_eq!(Splt::HORIZONTAL_IN, 2);
+        assert_eq!(Splt::HORIZONTAL_OUT, 3);
+        let s = parse_splt(&full_box_v0(&[4])).unwrap();
+        assert!(!s.is_known_direction());
+
+        let props = parse_ipco(&ipco_one(b"splt", &full_box_v0(&[Splt::HORIZONTAL_IN]))).unwrap();
+        match &props[0] {
+            Property::Splt(s) => assert_eq!(s.transition_direction, Splt::HORIZONTAL_IN),
+            other => panic!("expected Splt, got {other:?}"),
+        }
+        assert_eq!(props[0].kind(), *b"splt");
+    }
+
+    #[test]
+    fn splt_rejects_short_and_unknown_version() {
+        assert!(parse_splt(&full_box_v0(&[])).is_err());
+        assert!(parse_splt(&[1u8, 0, 0, 0, 0]).is_err());
+    }
+
+    #[test]
+    fn stpe_parses_and_converts_period() {
+        // 32 units of 1/16 s == 2.0 s
+        let p = parse_stpe(&full_box_v0(&[32])).unwrap();
+        assert_eq!(p.transition_period, 32);
+        assert!((p.seconds() - 2.0).abs() < 1e-9);
+        let p = parse_stpe(&full_box_v0(&[8])).unwrap();
+        assert!((p.seconds() - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn stpe_rejects_short_and_unknown_version() {
+        assert!(parse_stpe(&full_box_v0(&[])).is_err());
+        assert!(parse_stpe(&[1u8, 0, 0, 0, 5]).is_err());
+    }
+
+    #[test]
+    fn ssld_parses_converts_and_flags_reserved() {
+        // 48 units of 1/16 s == 3.0 s
+        let d = parse_ssld(&full_box_v0(&64u16.to_be_bytes())).unwrap();
+        assert_eq!(d.duration, 64);
+        assert!((d.seconds() - 4.0).abs() < 1e-9);
+        assert!(!d.is_reserved());
+
+        // duration == 0 is the §6.5.35.3 reserved sentinel
+        let d = parse_ssld(&full_box_v0(&0u16.to_be_bytes())).unwrap();
+        assert!(d.is_reserved());
+        assert_eq!(d.seconds(), 0.0);
+    }
+
+    #[test]
+    fn ssld_rejects_short_and_unknown_version() {
+        // one byte short of the u16 duration
+        assert!(parse_ssld(&full_box_v0(&[0])).is_err());
+        assert!(parse_ssld(&full_box_v0(&[])).is_err());
+        assert!(parse_ssld(&[1u8, 0, 0, 0, 0, 16]).is_err());
+    }
+
+    #[test]
+    fn ssld_dispatches_and_tolerates_trailing() {
+        let mut body = full_box_v0(&80u16.to_be_bytes());
+        body.extend_from_slice(&[0xDE, 0xAD]);
+        let props = parse_ipco(&ipco_one(b"ssld", &body)).unwrap();
+        match &props[0] {
+            Property::Ssld(d) => assert_eq!(d.duration, 80),
+            other => panic!("expected Ssld, got {other:?}"),
+        }
+        assert_eq!(props[0].kind(), *b"ssld");
+    }
+
+    /// The transition effects are listed as *transformative* in
+    /// §6.5.30-6.5.33 but are slideshow-presentation hints, not pixel
+    /// transforms: a recognised association — even when flagged
+    /// essential — does NOT trip
+    /// [`Meta::unsupported_essential_properties`].
+    #[test]
+    fn transition_effects_essential_association_recognised() {
+        let m = Meta {
+            properties: vec![
+                Property::Wipe(Wipe::default()),
+                Property::Zoom(Zoom::default()),
+                Property::Fade(Fade::default()),
+                Property::Splt(Splt::default()),
+                Property::Stpe(Stpe::default()),
+                Property::Ssld(Ssld::default()),
+            ],
+            associations: vec![ItemPropertyAssociation {
+                item_id: 1,
+                entries: (0..6)
+                    .map(|i| PropertyAssociation {
+                        index: i,
+                        essential: true,
+                    })
+                    .collect(),
+            }],
+            ..Meta::default()
+        };
+        assert!(!m.has_unsupported_essential_property(1));
+        assert!(m.unsupported_essential_properties(1).is_empty());
+    }
+
+    /// Each transition property is reachable via the standard
+    /// `property_for` (`ipma`) lookup.
+    #[test]
+    fn transition_effects_lookup_via_property_for() {
+        let m = Meta {
+            properties: vec![
+                Property::Wipe(Wipe {
+                    transition_direction: Wipe::FROM_TOP,
+                }),
+                Property::Ssld(Ssld { duration: 96 }),
+            ],
+            associations: vec![ItemPropertyAssociation {
+                item_id: 7,
+                entries: vec![
+                    PropertyAssociation {
+                        index: 0,
+                        essential: false,
+                    },
+                    PropertyAssociation {
+                        index: 1,
+                        essential: false,
+                    },
+                ],
+            }],
+            ..Meta::default()
+        };
+        match m.property_for(7, b"wipe") {
+            Some(Property::Wipe(w)) => assert_eq!(w.transition_direction, Wipe::FROM_TOP),
+            other => panic!("expected Wipe, got {other:?}"),
+        }
+        match m.property_for(7, b"ssld") {
+            Some(Property::Ssld(d)) => assert_eq!(d.duration, 96),
+            other => panic!("expected Ssld, got {other:?}"),
+        }
+        assert!(m.property_for(99, b"wipe").is_none());
     }
 }
