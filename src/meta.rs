@@ -107,6 +107,8 @@ const STPE: BoxType = b(b"stpe");
 const SSLD: BoxType = b(b"ssld");
 /// HEIF §6.5.37 — Progressive Derived Image Item Information descriptive property.
 const PRDI: BoxType = b(b"prdi");
+/// HEIF §6.5.39 — Camera Extrinsic Matrix descriptive property.
+const CMEX: BoxType = b(b"cmex");
 /// HEIF §6.5.40 — Camera Intrinsic Matrix descriptive property.
 const CMIN: BoxType = b(b"cmin");
 
@@ -1783,6 +1785,228 @@ impl Prdi {
     }
 }
 
+/// Camera Extrinsic Matrix descriptive property (`cmex`) — HEIF
+/// §6.5.39.
+///
+/// Describes the spatial setup of the camera(s): a position in the
+/// cartesian representation and an orientation of an orthogonal
+/// right-handed camera coordinate system within an orthogonal
+/// right-handed cartesian 3D world coordinate system (§6.5.39.1). The
+/// z-axis of the camera coordinate system faces outward from the lens.
+///
+/// The `flags` field selects which sub-set of the extrinsic fields is
+/// signalled (§6.5.39.1):
+///
+/// ```text
+/// 0x000001  pos_x_present        — position signalled along the x axis
+/// 0x000002  pos_y_present        — position signalled along the y axis
+/// 0x000004  pos_z_present        — position signalled along the z axis
+/// 0x000008  orientation_present  — orientation is signalled
+/// 0x000010  rot_large_field_size — quaternion elements are 32-bit
+///                                  (else 16-bit)
+/// 0x000020  id_present           — world coordinate-system id signalled
+/// ```
+///
+/// The wire layout (§6.5.39.2) is an ItemFullProperty(`cmex`, version,
+/// flags) followed by the present fields in order: `pos_x`, `pos_y`,
+/// `pos_z` (each `signed int(32)`, µm), then — when
+/// `orientation_present` — for `version == 0` a quaternion triplet
+/// `quat_x` / `quat_y` / `quat_z` (each a `signed int` of 32 or 16 bits
+/// per `rot_large_field_size`), and finally — when `id_present` — an
+/// `unsigned int(32) id`.
+///
+/// A field that is not present is inferred to be `0` (§6.5.39.3) — this
+/// type stores each as an [`Option`] so a caller can distinguish
+/// "explicitly 0" from "absent / inferred 0".
+///
+/// For `version == 0` the quaternion is decoded per §6.5.39.1:
+///
+/// ```text
+/// orientationPrecision = (flags & rot_large_field_size) ? 16 : 0
+/// qX = quat_x / 2^(14 + orientationPrecision)
+/// qY = quat_y / 2^(14 + orientationPrecision)
+/// qZ = quat_z / 2^(14 + orientationPrecision)
+/// qW = abs(sqrt(1 - (qX^2 + qY^2 + qZ^2)))      // always positive
+/// ```
+///
+/// surfaced via [`Self::orientation_precision`], [`Self::quaternion`]
+/// (the four `(qX, qY, qZ, qW)` floats), and [`Self::rotation_matrix`]
+/// (the §6.5.39.1 `RC` 3×3 row-major rotation matrix). The µm positions
+/// are surfaced verbatim via [`Self::position`].
+///
+/// `version == 1` signals orientation via a
+/// `ViewpointGlobalCoordinateSysRotationStruct` defined in
+/// ISO/IEC 23090-7, whose byte layout is **not** in this crate's
+/// clean-room allow-list. For `version == 1` with `orientation_present`,
+/// the orientation tail (and any subsequent `id`) cannot be parsed; the
+/// parser surfaces the positions and rejects the unparseable
+/// orientation rather than guessing. See [`parse_cmex`] for the exact
+/// handling.
+///
+/// Per §6.5.39.1 quantity per item is zero or more; instances sharing an
+/// `id` indicate items captured in the same world coordinate system, and
+/// when more than one `cmex` is associated with an item the `id` shall be
+/// present.
+///
+/// Spec: ISO/IEC 23008-12 §6.5.39 — ItemFullProperty(`cmex`, version,
+/// flags).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Cmex {
+    /// The full 24-bit `flags` field of the FullBox header, preserved
+    /// whole so the presence bits and an unknown future flag round-trip.
+    /// See the `FLAG_*` constants and the presence accessors.
+    pub flags: u32,
+    /// FullBox `version` (§6.5.39.2). `0` selects the quaternion
+    /// orientation form; `1` selects the ISO/IEC 23090-7
+    /// `ViewpointGlobalCoordinateSysRotationStruct` form.
+    pub version: u8,
+    /// `pos_x` — the x-coordinate of the camera location in µm
+    /// (§6.5.39.3). `Some` exactly when `pos_x_present`; absent values
+    /// are inferred to be `0`.
+    pub pos_x: Option<i32>,
+    /// `pos_y` — the y-coordinate of the camera location in µm
+    /// (§6.5.39.3). `Some` exactly when `pos_y_present`.
+    pub pos_y: Option<i32>,
+    /// `pos_z` — the z-coordinate of the camera location in µm
+    /// (§6.5.39.3). `Some` exactly when `pos_z_present`.
+    pub pos_z: Option<i32>,
+    /// `quat_x` — the raw x component of the orientation quaternion
+    /// (§6.5.39.3). `Some` exactly when `orientation_present` **and**
+    /// `version == 0`; normalise via [`Self::quaternion`].
+    pub quat_x: Option<i32>,
+    /// `quat_y` — the raw y component of the orientation quaternion
+    /// (§6.5.39.3). Present under the same conditions as [`Self::quat_x`].
+    pub quat_y: Option<i32>,
+    /// `quat_z` — the raw z component of the orientation quaternion
+    /// (§6.5.39.3). Present under the same conditions as [`Self::quat_x`].
+    pub quat_z: Option<i32>,
+    /// `id` — the world coordinate-system identifier (§6.5.39.3). `Some`
+    /// exactly when `id_present`; absent values are inferred to be `0`.
+    pub id: Option<u32>,
+}
+
+impl Cmex {
+    /// §6.5.39.1 `pos_x_present` — position signalled along the x axis.
+    pub const FLAG_POS_X_PRESENT: u32 = 0x00_0001;
+    /// §6.5.39.1 `pos_y_present` — position signalled along the y axis.
+    pub const FLAG_POS_Y_PRESENT: u32 = 0x00_0002;
+    /// §6.5.39.1 `pos_z_present` — position signalled along the z axis.
+    pub const FLAG_POS_Z_PRESENT: u32 = 0x00_0004;
+    /// §6.5.39.1 `orientation_present` — orientation is signalled.
+    pub const FLAG_ORIENTATION_PRESENT: u32 = 0x00_0008;
+    /// §6.5.39.1 `rot_large_field_size` — quaternion elements are 32-bit
+    /// integers (otherwise 16-bit integers).
+    pub const FLAG_ROT_LARGE_FIELD_SIZE: u32 = 0x00_0010;
+    /// §6.5.39.1 `id_present` — the world coordinate-system id is
+    /// signalled.
+    pub const FLAG_ID_PRESENT: u32 = 0x00_0020;
+
+    /// True when `pos_x_present` (§6.5.39.1).
+    pub fn pos_x_present(&self) -> bool {
+        self.flags & Self::FLAG_POS_X_PRESENT != 0
+    }
+
+    /// True when `pos_y_present` (§6.5.39.1).
+    pub fn pos_y_present(&self) -> bool {
+        self.flags & Self::FLAG_POS_Y_PRESENT != 0
+    }
+
+    /// True when `pos_z_present` (§6.5.39.1).
+    pub fn pos_z_present(&self) -> bool {
+        self.flags & Self::FLAG_POS_Z_PRESENT != 0
+    }
+
+    /// True when `orientation_present` (§6.5.39.1).
+    pub fn orientation_present(&self) -> bool {
+        self.flags & Self::FLAG_ORIENTATION_PRESENT != 0
+    }
+
+    /// True when `rot_large_field_size` (§6.5.39.1) — quaternion elements
+    /// are 32-bit rather than 16-bit.
+    pub fn rot_large_field_size(&self) -> bool {
+        self.flags & Self::FLAG_ROT_LARGE_FIELD_SIZE != 0
+    }
+
+    /// True when `id_present` (§6.5.39.1).
+    pub fn id_present(&self) -> bool {
+        self.flags & Self::FLAG_ID_PRESENT != 0
+    }
+
+    /// `orientationPrecision = (flags & rot_large_field_size) ? 16 : 0`
+    /// per §6.5.39.1 — the extra bits of fractional quaternion precision
+    /// signalled by `rot_large_field_size`.
+    pub fn orientation_precision(&self) -> u32 {
+        if self.rot_large_field_size() {
+            16
+        } else {
+            0
+        }
+    }
+
+    /// The camera position vector `(pos_x, pos_y, pos_z)` in µm
+    /// (§6.5.39.1 / §6.5.39.3). Each axis not present in `flags` is
+    /// inferred to be `0`.
+    pub fn position(&self) -> [i32; 3] {
+        [
+            self.pos_x.unwrap_or(0),
+            self.pos_y.unwrap_or(0),
+            self.pos_z.unwrap_or(0),
+        ]
+    }
+
+    /// The orientation unit quaternion `(qX, qY, qZ, qW)` per §6.5.39.1,
+    /// computed only for `version == 0`. The three signalled components
+    /// are divided by `2^(14 + orientationPrecision)` (a floating-point
+    /// division, NOTE 2), and the fourth component is recovered as
+    /// `qW = abs(sqrt(1 - (qX^2 + qY^2 + qZ^2)))` (always positive,
+    /// NOTE 3). Returns `None` when orientation is absent or
+    /// `version != 0` (the `version == 1` form is an
+    /// ISO/IEC 23090-7 struct that this crate does not decode).
+    pub fn quaternion(&self) -> Option<[f64; 4]> {
+        if self.version != 0 {
+            return None;
+        }
+        let (qx, qy, qz) = (self.quat_x?, self.quat_y?, self.quat_z?);
+        let scale = f64::from(1u32 << (14 + self.orientation_precision()));
+        let qx = f64::from(qx) / scale;
+        let qy = f64::from(qy) / scale;
+        let qz = f64::from(qz) / scale;
+        let qw = (1.0 - (qx * qx + qy * qy + qz * qz)).max(0.0).sqrt().abs();
+        Some([qx, qy, qz, qw])
+    }
+
+    /// The §6.5.39.1 rotation matrix `RC` (row-major 3×3) built from the
+    /// unit quaternion, describing the transformation of the camera
+    /// coordinate system relative to the world coordinate system. Returns
+    /// `None` under the same conditions as [`Self::quaternion`].
+    pub fn rotation_matrix(&self) -> Option<[[f64; 3]; 3]> {
+        let [qx, qy, qz, qw] = self.quaternion()?;
+        Some([
+            [
+                1.0 - 2.0 * (qy * qy + qz * qz),
+                2.0 * (qx * qy - qz * qw),
+                2.0 * (qx * qz + qy * qw),
+            ],
+            [
+                2.0 * (qx * qy + qz * qw),
+                1.0 - 2.0 * (qx * qx + qz * qz),
+                2.0 * (qy * qz - qx * qw),
+            ],
+            [
+                2.0 * (qx * qz - qy * qw),
+                2.0 * (qy * qz + qx * qw),
+                1.0 - 2.0 * (qx * qx + qy * qy),
+            ],
+        ])
+    }
+
+    /// The world coordinate-system identifier per §6.5.39.3, inferred to
+    /// be `0` when `id_present` is clear.
+    pub fn coordinate_system_id(&self) -> u32 {
+        self.id.unwrap_or(0)
+    }
+}
+
 /// Camera Intrinsic Matrix descriptive property (`cmin`) — HEIF
 /// §6.5.40.
 ///
@@ -2277,6 +2501,8 @@ pub enum Property {
     /// Progressive-derived-image-item-information descriptive property
     /// (HEIF §6.5.37).
     Prdi(Prdi),
+    /// Camera-extrinsic-matrix descriptive property (HEIF §6.5.39).
+    Cmex(Cmex),
     /// Camera-intrinsic-matrix descriptive property (HEIF §6.5.40).
     Cmin(Cmin),
     Other(BoxType, Vec<u8>),
@@ -2322,6 +2548,7 @@ impl Property {
             Property::Stpe(_) => STPE,
             Property::Ssld(_) => SSLD,
             Property::Prdi(_) => PRDI,
+            Property::Cmex(_) => CMEX,
             Property::Cmin(_) => CMIN,
             Property::Other(t, _) => *t,
         }
@@ -2848,6 +3075,7 @@ fn parse_ipco(payload: &[u8]) -> Result<Vec<Property>> {
             x if x == &STPE => Property::Stpe(parse_stpe(body)?),
             x if x == &SSLD => Property::Ssld(parse_ssld(body)?),
             x if x == &PRDI => Property::Prdi(parse_prdi(body)?),
+            x if x == &CMEX => Property::Cmex(parse_cmex(body)?),
             x if x == &CMIN => Property::Cmin(parse_cmin(body)?),
             other => Property::Other(*other, body.to_vec()),
         };
@@ -3852,6 +4080,108 @@ fn parse_prdi(body: &[u8]) -> Result<Prdi> {
         step_count,
         item_counts,
     })
+}
+
+/// Parse `cmex` (CameraExtrinsicMatrixProperty — HEIF §6.5.39).
+/// ItemFullProperty(`cmex`, version, flags) followed by the present
+/// fields in `flags`-selected order (§6.5.39.2):
+///
+/// ```text
+/// if (flags & pos_x_present)       signed int(32) pos_x;
+/// if (flags & pos_y_present)       signed int(32) pos_y;
+/// if (flags & pos_z_present)       signed int(32) pos_z;
+/// if (flags & orientation_present) {
+///     if (version == 0) {
+///         signed int((flags & rot_large_field_size) ? 32 : 16) quat_x;
+///         signed int((flags & rot_large_field_size) ? 32 : 16) quat_y;
+///         signed int((flags & rot_large_field_size) ? 32 : 16) quat_z;
+///     } else if (version == 1) {
+///         ViewpointGlobalCoordinateSysRotationStruct rot;
+///     }
+/// }
+/// if (flags & id_present)          unsigned int(32) id;
+/// ```
+///
+/// The three position fields are µm coordinates (§6.5.39.3). For
+/// `version == 0` the orientation is a quaternion triplet whose element
+/// width is 16 or 32 bits per `rot_large_field_size`; this parser reads
+/// the signalled width and stores the raw signed values (the
+/// floating-point quaternion / rotation matrix is derived by
+/// [`Cmex::quaternion`] / [`Cmex::rotation_matrix`]).
+///
+/// For `version == 1` the orientation is a
+/// `ViewpointGlobalCoordinateSysRotationStruct` from ISO/IEC 23090-7,
+/// which is outside this crate's clean-room allow-list. When
+/// `version == 1` has `orientation_present`, the variable-length
+/// orientation struct (and therefore the byte position of any subsequent
+/// `id`) cannot be parsed; the parser returns an error rather than
+/// guessing the struct's length. A `version == 1` `cmex` **without**
+/// orientation (positions and/or `id` only) parses fine.
+///
+/// Any field whose presence flag is clear stays `None` (inferred to be
+/// `0` per §6.5.39.3). An unknown `version > 1` is rejected. Trailing
+/// bytes past the parsed fields are ignored, mirroring the other
+/// FullBox-headed property parsers in this module.
+fn parse_cmex(body: &[u8]) -> Result<Cmex> {
+    let (version, flags, rest) = parse_full_box(body)?;
+    if version > 1 {
+        return Err(Error::invalid(format!("avif: cmex version {version} > 1")));
+    }
+    let mut off = 0usize;
+    let read_i32_at = |rest: &[u8], off: &mut usize| -> Result<i32> {
+        let v = read_u32(rest, *off)? as i32;
+        *off += 4;
+        Ok(v)
+    };
+
+    let mut cmex = Cmex {
+        flags,
+        version,
+        ..Cmex::default()
+    };
+
+    if flags & Cmex::FLAG_POS_X_PRESENT != 0 {
+        cmex.pos_x = Some(read_i32_at(rest, &mut off)?);
+    }
+    if flags & Cmex::FLAG_POS_Y_PRESENT != 0 {
+        cmex.pos_y = Some(read_i32_at(rest, &mut off)?);
+    }
+    if flags & Cmex::FLAG_POS_Z_PRESENT != 0 {
+        cmex.pos_z = Some(read_i32_at(rest, &mut off)?);
+    }
+    if flags & Cmex::FLAG_ORIENTATION_PRESENT != 0 {
+        match version {
+            0 => {
+                if flags & Cmex::FLAG_ROT_LARGE_FIELD_SIZE != 0 {
+                    cmex.quat_x = Some(read_i32_at(rest, &mut off)?);
+                    cmex.quat_y = Some(read_i32_at(rest, &mut off)?);
+                    cmex.quat_z = Some(read_i32_at(rest, &mut off)?);
+                } else {
+                    cmex.quat_x = Some(i32::from(read_u16(rest, off)? as i16));
+                    off += 2;
+                    cmex.quat_y = Some(i32::from(read_u16(rest, off)? as i16));
+                    off += 2;
+                    cmex.quat_z = Some(i32::from(read_u16(rest, off)? as i16));
+                    off += 2;
+                }
+            }
+            // version == 1: the orientation is a
+            // ViewpointGlobalCoordinateSysRotationStruct (ISO/IEC
+            // 23090-7), whose byte layout is not in this crate's
+            // allow-list. Refuse rather than guess its length.
+            _ => {
+                return Err(Error::unsupported(
+                    "avif: cmex version 1 orientation \
+                     (ViewpointGlobalCoordinateSysRotationStruct, \
+                     ISO/IEC 23090-7) is not supported",
+                ));
+            }
+        }
+    }
+    if flags & Cmex::FLAG_ID_PRESENT != 0 {
+        cmex.id = Some(read_u32(rest, off)?);
+    }
+    Ok(cmex)
 }
 
 /// Parse `cmin` (CameraIntrinsicMatrixProperty — HEIF §6.5.40).
@@ -7212,6 +7542,318 @@ mod tests {
             other => panic!("expected Cmin, got {other:?}"),
         }
         assert!(m.property_for(99, b"cmin").is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // HEIF §6.5.39 CameraExtrinsicMatrixProperty (`cmex`) — parse +
+    // helpers
+    // -----------------------------------------------------------------
+
+    /// Build a `cmex` body — FullBox(version, flags) followed by the
+    /// present fields in §6.5.39.2 order. Positions are `signed
+    /// int(32)`; the quaternion triplet is `signed int(16)` unless
+    /// `rot_large_field_size` (bit 4) is set, in which case it is
+    /// `signed int(32)`. `id` is `unsigned int(32)`.
+    fn cmex_body(
+        version: u8,
+        flags: u32,
+        pos: [Option<i32>; 3],
+        quat: Option<[i32; 3]>,
+        id: Option<u32>,
+    ) -> Vec<u8> {
+        let mut buf = vec![version];
+        buf.extend_from_slice(&flags.to_be_bytes()[1..]); // 24-bit flags
+        for p in pos.into_iter().flatten() {
+            buf.extend_from_slice(&(p as u32).to_be_bytes());
+        }
+        if let Some(q) = quat {
+            let large = flags & Cmex::FLAG_ROT_LARGE_FIELD_SIZE != 0;
+            for c in q {
+                if large {
+                    buf.extend_from_slice(&(c as u32).to_be_bytes());
+                } else {
+                    buf.extend_from_slice(&(c as i16).to_be_bytes());
+                }
+            }
+        }
+        if let Some(i) = id {
+            buf.extend_from_slice(&i.to_be_bytes());
+        }
+        buf
+    }
+
+    /// Stereo-pair use-case (§6.5.39.1): only `pos_x_present`. Reads the
+    /// one position field, leaves all other fields absent (inferred 0).
+    #[test]
+    fn cmex_position_x_only() {
+        let flags = Cmex::FLAG_POS_X_PRESENT;
+        let c = parse_cmex(&cmex_body(0, flags, [Some(65_000), None, None], None, None)).unwrap();
+        assert_eq!(c.pos_x, Some(65_000));
+        assert_eq!(c.pos_y, None);
+        assert_eq!(c.pos_z, None);
+        assert_eq!(c.position(), [65_000, 0, 0]);
+        assert!(c.pos_x_present());
+        assert!(!c.orientation_present());
+        assert_eq!(c.quaternion(), None);
+    }
+
+    /// All three positions present read in x, y, z order (§6.5.39.2),
+    /// each `signed int(32)` in µm; negatives round-trip.
+    #[test]
+    fn cmex_positions_signed_in_order() {
+        let flags = Cmex::FLAG_POS_X_PRESENT | Cmex::FLAG_POS_Y_PRESENT | Cmex::FLAG_POS_Z_PRESENT;
+        let c = parse_cmex(&cmex_body(
+            0,
+            flags,
+            [Some(-1), Some(2), Some(i32::MIN)],
+            None,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(c.position(), [-1, 2, i32::MIN]);
+    }
+
+    /// 16-bit quaternion (default field size): `quat_x/y/z` are signed
+    /// 16-bit, scaled by `2^14`. Verify the §6.5.39.1 normalisation and
+    /// the derived `qW = sqrt(1 - (qX^2+qY^2+qZ^2))`.
+    #[test]
+    fn cmex_quaternion_16bit_identity() {
+        // Identity orientation: quat_x=quat_y=quat_z=0 → qW = 1.
+        let flags = Cmex::FLAG_ORIENTATION_PRESENT;
+        let c = parse_cmex(&cmex_body(0, flags, [None; 3], Some([0, 0, 0]), None)).unwrap();
+        assert_eq!(c.orientation_precision(), 0);
+        let q = c.quaternion().unwrap();
+        assert!((q[0]).abs() < 1e-12);
+        assert!((q[3] - 1.0).abs() < 1e-12);
+    }
+
+    /// A 90° rotation about z is `qZ = sin(45°) ≈ 0.7071`, `qW ≈
+    /// 0.7071`. With the 2^14 scale, `quat_z = round(0.70710678 * 16384)
+    /// = 11585`. Verify the quaternion and the §6.5.39.1 `RC` rotation
+    /// matrix (which should swap x/y axes with a sign).
+    #[test]
+    fn cmex_quaternion_rotation_matrix_z_90deg() {
+        let flags = Cmex::FLAG_ORIENTATION_PRESENT;
+        let qz = 11585; // round(sin(45°) * 2^14)
+        let c = parse_cmex(&cmex_body(0, flags, [None; 3], Some([0, 0, qz]), None)).unwrap();
+        let q = c.quaternion().unwrap();
+        let inv_sqrt2 = std::f64::consts::FRAC_1_SQRT_2;
+        assert!((q[2] - inv_sqrt2).abs() < 1e-3);
+        assert!((q[3] - inv_sqrt2).abs() < 1e-3);
+        let r = c.rotation_matrix().unwrap();
+        // RC for a +90° rotation about z: [[0,-1,0],[1,0,0],[0,0,1]].
+        assert!((r[0][0]).abs() < 1e-3);
+        assert!((r[0][1] - (-1.0)).abs() < 1e-3);
+        assert!((r[1][0] - 1.0).abs() < 1e-3);
+        assert!((r[2][2] - 1.0).abs() < 1e-3);
+    }
+
+    /// `rot_large_field_size` selects 32-bit quaternion elements and
+    /// raises `orientationPrecision` to 16, so the scale is `2^30`.
+    #[test]
+    fn cmex_quaternion_32bit_large_field() {
+        let flags = Cmex::FLAG_ORIENTATION_PRESENT | Cmex::FLAG_ROT_LARGE_FIELD_SIZE;
+        // qZ = 0.5 → quat_z = round(0.5 * 2^30) = 536870912.
+        let qz = 536_870_912;
+        let c = parse_cmex(&cmex_body(0, flags, [None; 3], Some([0, 0, qz]), None)).unwrap();
+        assert_eq!(c.orientation_precision(), 16);
+        assert!(c.rot_large_field_size());
+        let q = c.quaternion().unwrap();
+        assert!((q[2] - 0.5).abs() < 1e-9);
+        // qW = sqrt(1 - 0.25) = sqrt(0.75).
+        assert!((q[3] - 0.75_f64.sqrt()).abs() < 1e-9);
+    }
+
+    /// Full 3D-mapping use-case: all three positions + orientation + id,
+    /// read in §6.5.39.2 order. Confirms the `id` lands after the
+    /// quaternion (byte-offset bookkeeping is correct).
+    #[test]
+    fn cmex_all_fields_with_id() {
+        let flags = Cmex::FLAG_POS_X_PRESENT
+            | Cmex::FLAG_POS_Y_PRESENT
+            | Cmex::FLAG_POS_Z_PRESENT
+            | Cmex::FLAG_ORIENTATION_PRESENT
+            | Cmex::FLAG_ID_PRESENT;
+        let c = parse_cmex(&cmex_body(
+            0,
+            flags,
+            [Some(10), Some(20), Some(30)],
+            Some([0, 0, 0]),
+            Some(7),
+        ))
+        .unwrap();
+        assert_eq!(c.position(), [10, 20, 30]);
+        assert_eq!(c.id, Some(7));
+        assert_eq!(c.coordinate_system_id(), 7);
+        assert!((c.quaternion().unwrap()[3] - 1.0).abs() < 1e-12);
+    }
+
+    /// `id_present` without orientation reads the `id` immediately after
+    /// the positions (no quaternion bytes in between).
+    #[test]
+    fn cmex_id_after_positions_no_orientation() {
+        let flags = Cmex::FLAG_POS_X_PRESENT | Cmex::FLAG_ID_PRESENT;
+        let c = parse_cmex(&cmex_body(0, flags, [Some(42), None, None], None, Some(99))).unwrap();
+        assert_eq!(c.pos_x, Some(42));
+        assert_eq!(c.id, Some(99));
+    }
+
+    /// `qW` is clamped to a non-negative radicand: a quaternion whose
+    /// signalled components slightly exceed the unit sphere (allowed by
+    /// rounding) yields `qW = 0`, never a NaN.
+    #[test]
+    fn cmex_quaternion_qw_non_negative() {
+        let flags = Cmex::FLAG_ORIENTATION_PRESENT;
+        // qX = qY = qZ = 1.0 (quat = 2^14 each) → radicand 1-3 < 0.
+        let c = parse_cmex(&cmex_body(
+            0,
+            flags,
+            [None; 3],
+            Some([16_384, 16_384, 16_384]),
+            None,
+        ))
+        .unwrap();
+        let q = c.quaternion().unwrap();
+        assert!(q[3].is_finite());
+        assert_eq!(q[3], 0.0);
+    }
+
+    /// version 1 with orientation signals a
+    /// ViewpointGlobalCoordinateSysRotationStruct (ISO/IEC 23090-7,
+    /// outside the allow-list); the parser refuses rather than guess the
+    /// struct length.
+    #[test]
+    fn cmex_v1_orientation_unsupported() {
+        let flags = Cmex::FLAG_ORIENTATION_PRESENT;
+        let body = cmex_body(1, flags, [None; 3], Some([0, 0, 0]), None);
+        assert!(matches!(parse_cmex(&body), Err(Error::Unsupported(_))));
+    }
+
+    /// version 1 WITHOUT orientation (positions + id only) parses fine —
+    /// none of those fields depend on the unparseable rotation struct.
+    #[test]
+    fn cmex_v1_positions_only_ok() {
+        let flags = Cmex::FLAG_POS_X_PRESENT | Cmex::FLAG_ID_PRESENT;
+        let c = parse_cmex(&cmex_body(1, flags, [Some(5), None, None], None, Some(3))).unwrap();
+        assert_eq!(c.version, 1);
+        assert_eq!(c.pos_x, Some(5));
+        assert_eq!(c.id, Some(3));
+        // No quaternion for version != 0.
+        assert_eq!(c.quaternion(), None);
+    }
+
+    #[test]
+    fn cmex_rejects_unknown_version() {
+        let body = cmex_body(
+            0,
+            Cmex::FLAG_POS_X_PRESENT,
+            [Some(1), None, None],
+            None,
+            None,
+        );
+        let mut buf = body;
+        buf[0] = 2;
+        assert!(parse_cmex(&buf).is_err());
+    }
+
+    /// A body that runs out before a flagged field is rejected (truncated
+    /// reads never partially populate a field).
+    #[test]
+    fn cmex_rejects_truncated_body() {
+        // pos_x flagged but no payload bytes.
+        let buf = vec![0u8, 0, 0, Cmex::FLAG_POS_X_PRESENT as u8];
+        assert!(parse_cmex(&buf).is_err());
+        // 16-bit orientation flagged but only 4 of the 6 bytes present.
+        let mut buf = vec![0u8, 0, 0, Cmex::FLAG_ORIENTATION_PRESENT as u8];
+        buf.extend_from_slice(&[0u8; 4]);
+        assert!(parse_cmex(&buf).is_err());
+    }
+
+    /// Trailing bytes past the parsed fields are ignored (forward-compat
+    /// space), like the other FullBox-headed property parsers.
+    #[test]
+    fn cmex_tolerates_trailing_bytes() {
+        let mut body = cmex_body(
+            0,
+            Cmex::FLAG_POS_X_PRESENT,
+            [Some(7), None, None],
+            None,
+            None,
+        );
+        body.extend_from_slice(&[0xDE, 0xAD]);
+        let c = parse_cmex(&body).unwrap();
+        assert_eq!(c.pos_x, Some(7));
+    }
+
+    #[test]
+    fn cmex_dispatched_through_parse_ipco() {
+        let flags = Cmex::FLAG_POS_X_PRESENT | Cmex::FLAG_ORIENTATION_PRESENT;
+        let body = cmex_body(0, flags, [Some(1234), None, None], Some([0, 0, 0]), None);
+        let mut ipco = Vec::new();
+        let s = 8 + body.len() as u32;
+        ipco.extend_from_slice(&s.to_be_bytes());
+        ipco.extend_from_slice(b"cmex");
+        ipco.extend_from_slice(&body);
+        let props = parse_ipco(&ipco).unwrap();
+        assert_eq!(props.len(), 1);
+        match &props[0] {
+            Property::Cmex(c) => {
+                assert_eq!(c.pos_x, Some(1234));
+                assert!((c.quaternion().unwrap()[3] - 1.0).abs() < 1e-12);
+            }
+            other => panic!("expected Cmex, got {other:?}"),
+        }
+        assert_eq!(props[0].kind(), *b"cmex");
+    }
+
+    /// A recognised `cmex` property — even when flagged essential — does
+    /// NOT trip [`Meta::unsupported_essential_properties`].
+    #[test]
+    fn cmex_essential_association_is_recognised() {
+        let m = Meta {
+            properties: vec![Property::Cmex(Cmex::default())],
+            associations: vec![ItemPropertyAssociation {
+                item_id: 1,
+                entries: vec![PropertyAssociation {
+                    index: 0,
+                    essential: true,
+                }],
+            }],
+            ..Meta::default()
+        };
+        assert!(!m.has_unsupported_essential_property(1));
+        assert!(m.unsupported_essential_properties(1).is_empty());
+    }
+
+    /// §6.5.39.1 allows zero-or-more `cmex` per item; `property_for`
+    /// resolves an associated instance via the standard `ipma` walk.
+    #[test]
+    fn cmex_lookup_via_property_for() {
+        let m = Meta {
+            properties: vec![Property::Cmex(Cmex {
+                flags: Cmex::FLAG_POS_X_PRESENT | Cmex::FLAG_ID_PRESENT,
+                version: 0,
+                pos_x: Some(500),
+                id: Some(4),
+                ..Cmex::default()
+            })],
+            associations: vec![ItemPropertyAssociation {
+                item_id: 9,
+                entries: vec![PropertyAssociation {
+                    index: 0,
+                    essential: false,
+                }],
+            }],
+            ..Meta::default()
+        };
+        match m.property_for(9, b"cmex") {
+            Some(Property::Cmex(c)) => {
+                assert_eq!(c.position(), [500, 0, 0]);
+                assert_eq!(c.coordinate_system_id(), 4);
+            }
+            other => panic!("expected Cmex, got {other:?}"),
+        }
+        assert!(m.property_for(99, b"cmex").is_none());
     }
 
     // -----------------------------------------------------------------

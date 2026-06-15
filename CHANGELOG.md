@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- ISO/IEC 23008-12 §6.5.39 CameraExtrinsicMatrixProperty (`cmex`)
+  descriptive item-property parser — describes the spatial setup of the
+  camera(s): a cartesian position (µm) and an orientation of the camera
+  coordinate system within a right-handed 3D world coordinate system,
+  surfaced as `Property::Cmex(Cmex { flags, version, pos_x, pos_y,
+  pos_z, quat_x, quat_y, quat_z, id })` (re-exported as
+  `oxideav_avif::Cmex`). The wire shape follows §6.5.39.2 — an
+  ItemFullProperty(`cmex`, version, flags) whose six presence flags
+  (`pos_x_present` … `id_present`, plus `rot_large_field_size`) select
+  which fields are present; each absent field is stored as `None`
+  (inferred 0 per §6.5.39.3). For `version == 0` the orientation is a
+  quaternion triplet whose element width is 16 or 32 bits per
+  `rot_large_field_size`; helpers compute the §6.5.39.1 normalised unit
+  quaternion `(qX, qY, qZ, qW)` via `Cmex::quaternion` (with
+  `orientationPrecision = rot_large_field_size ? 16 : 0`,
+  `qW = abs(sqrt(1 - (qX²+qY²+qZ²)))` clamped non-negative) and the
+  `RC` 3×3 row-major rotation matrix via `Cmex::rotation_matrix`. The µm
+  position vector is surfaced by `Cmex::position` and the world
+  coordinate-system id by `Cmex::coordinate_system_id`; the presence
+  accessors `pos_x_present` … `id_present` and the `FLAG_*` constants
+  expose the §6.5.39.1 flag semantics. The `version == 1` orientation is
+  a `ViewpointGlobalCoordinateSysRotationStruct` defined in
+  ISO/IEC 23090-7 (outside this crate's clean-room documentation set);
+  a `version == 1` `cmex` carrying `orientation_present` is rejected with
+  `Unsupported` rather than guessing the struct's length, while a
+  `version == 1` `cmex` carrying only positions and/or `id` parses
+  normally.
+
 ## [0.0.9](https://github.com/OxideAV/oxideav-avif/compare/v0.0.8...v0.0.9) - 2026-06-15
 
 ### Other
