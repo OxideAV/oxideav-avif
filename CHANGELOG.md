@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/OxideAV/oxideav-avif/compare/v0.0.9...v0.0.10) - 2026-06-15
+
+### Other
+
+- HEIF §6.5.39 cmex CameraExtrinsicMatrixProperty parser
+- refresh to current status, drop per-round changelog cruft
+
 ### Added
 
 - ISO/IEC 23008-12 §6.5.39 CameraExtrinsicMatrixProperty (`cmex`)
