@@ -107,6 +107,8 @@ const STPE: BoxType = b(b"stpe");
 const SSLD: BoxType = b(b"ssld");
 /// HEIF §6.5.37 — Progressive Derived Image Item Information descriptive property.
 const PRDI: BoxType = b(b"prdi");
+/// HEIF §6.5.40 — Camera Intrinsic Matrix descriptive property.
+const CMIN: BoxType = b(b"cmin");
 
 /// HEIF §6.6.2.2 — image overlay derived-image type.
 pub const ITEM_TYPE_IOVL: BoxType = b(b"iovl");
@@ -1781,6 +1783,181 @@ impl Prdi {
     }
 }
 
+/// Camera Intrinsic Matrix descriptive property (`cmin`) — HEIF
+/// §6.5.40.
+///
+/// Describes the characteristics of the camera that captured the
+/// associated image item via a pinhole-camera intrinsic matrix
+///
+/// ```text
+/// | fx  s  cx |
+/// |  0 fy  cy |
+/// |  0  0   1 |
+/// ```
+///
+/// where `fx` / `fy` are the horizontal / vertical focal lengths, `s`
+/// is the skew factor, and `(cx, cy)` is the principal point
+/// (§6.5.40.1). Per §6.5.40.1 quantity per item is at most one.
+///
+/// The wire layout (§6.5.40.2) is an ItemFullProperty(`cmin`,
+/// version=0, flags) followed by:
+///
+/// ```text
+/// signed int(32) focal_length_x;
+/// signed int(32) principal_point_x;
+/// signed int(32) principal_point_y;
+/// if (flags & 1) {            // full intrinsics
+///     signed int(32) focal_length_y;
+///     signed int(32) skew_factor;
+/// }
+/// ```
+///
+/// Per §6.5.40.3 `(flags & 1) == 0` signals **simplified** intrinsics
+/// (no skew, square pixels: `focal_length_y` and `skew_factor` are
+/// absent, `fy` is inferred equal to `fx` and `s` is inferred to be
+/// `0`); `(flags & 1) == 1` signals **full** intrinsics with both
+/// extra fields present. [`Self::skew`] is `Some` exactly when the
+/// full-intrinsics tail is present.
+///
+/// The on-wire values are integers normalised by the image dimensions
+/// and a pair of flag-derived power-of-two denominators (§6.5.40.1):
+///
+/// ```text
+/// denominator     = 1 << ((flags & 0x001F00) >> 8)
+/// skewDenominator = 1 << ((flags & 0x1F0000) >> 16)
+/// ```
+///
+/// surfaced verbatim via [`Self::denominator_shift`] /
+/// [`Self::skew_denominator_shift`] (the raw shift operands) and
+/// [`Self::denominator`] / [`Self::skew_denominator`] (the
+/// `1 << shift` values). The §6.5.40.1 focal-length / principal-point
+/// formulas (which fold in the `image_width` / `image_height` from the
+/// associated [`Ispe`]) are applied by
+/// [`Self::focal_length_x_value`] / [`Self::focal_length_y_value`] /
+/// [`Self::principal_point_x_value`] / [`Self::principal_point_y_value`]
+/// / [`Self::skew_value`], each taking the spatial extents and
+/// returning the floating-point matrix entry (a floating-point, not an
+/// integer, division per §6.5.40.1 NOTE 3).
+///
+/// Spec: ISO/IEC 23008-12 §6.5.40.2 — ItemFullProperty(`cmin`,
+/// version=0, flags).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Cmin {
+    /// The full 24-bit `flags` field of the FullBox header. The
+    /// low bit selects simplified vs. full intrinsics (§6.5.40.3) and
+    /// the two 5-bit shift operands embedded in it select the
+    /// `denominator` / `skewDenominator` (§6.5.40.1); preserved whole
+    /// so an unknown future flag bit round-trips. See
+    /// [`Self::denominator_shift`] / [`Self::skew_denominator_shift`]
+    /// for the decoded shift operands and [`Self::has_skew`] for the
+    /// low-bit test.
+    pub flags: u32,
+    /// `focal_length_x` (§6.5.40.3) — the horizontal focal length in
+    /// image widths, signed. Normalise via [`Self::focal_length_x_value`].
+    pub focal_length_x: i32,
+    /// `principal_point_x` (§6.5.40.3) — the principal-point
+    /// x-coordinate in image widths, signed. Normalise via
+    /// [`Self::principal_point_x_value`].
+    pub principal_point_x: i32,
+    /// `principal_point_y` (§6.5.40.3) — the principal-point
+    /// y-coordinate in image heights, signed. Normalise via
+    /// [`Self::principal_point_y_value`].
+    pub principal_point_y: i32,
+    /// `focal_length_y` (§6.5.40.3) — the vertical focal length in
+    /// image heights, signed. Present only in the full-intrinsics form
+    /// (`flags & 1`); `None` for the simplified form, in which case
+    /// `fy` is inferred equal to `fx` (§6.5.40.3).
+    pub focal_length_y: Option<i32>,
+    /// `skew_factor` (§6.5.40.3) — the camera-system skew factor,
+    /// signed. Present only in the full-intrinsics form (`flags & 1`);
+    /// `None` for the simplified form, in which case `s` is inferred to
+    /// be `0` (§6.5.40.3).
+    pub skew_factor: Option<i32>,
+}
+
+impl Cmin {
+    /// §6.5.40.3 low-flag bit selecting full (skew + separate vertical
+    /// focal length) intrinsics over the simplified form.
+    pub const FLAG_FULL_INTRINSICS: u32 = 0x1;
+
+    /// True when the full-intrinsics tail (`focal_length_y` +
+    /// `skew_factor`) is present per §6.5.40.3 (`flags & 1 == 1`).
+    pub fn has_skew(&self) -> bool {
+        self.flags & Self::FLAG_FULL_INTRINSICS != 0
+    }
+
+    /// `denominatorShiftOperand = (flags & 0x001F00) >> 8` per
+    /// §6.5.40.1 — the power-of-two shift applied to the focal-length /
+    /// principal-point fields. Returned as the raw operand; see
+    /// [`Self::denominator`] for `1 << operand`.
+    pub fn denominator_shift(&self) -> u32 {
+        (self.flags & 0x0000_1F00) >> 8
+    }
+
+    /// `skewDenominatorShiftOperand = (flags & 0x1F0000) >> 16` per
+    /// §6.5.40.1 — the power-of-two shift applied to the skew factor.
+    /// Returned as the raw operand; see [`Self::skew_denominator`] for
+    /// `1 << operand`.
+    pub fn skew_denominator_shift(&self) -> u32 {
+        (self.flags & 0x001F_0000) >> 16
+    }
+
+    /// `denominator = 1 << denominatorShiftOperand` per §6.5.40.1 —
+    /// the common denominator of the focal-length and principal-point
+    /// formulas. The operand is a 5-bit field (`0..=31`), so the shift
+    /// always fits a `u64`.
+    pub fn denominator(&self) -> u64 {
+        1u64 << self.denominator_shift()
+    }
+
+    /// `skewDenominator = 1 << skewDenominatorShiftOperand` per
+    /// §6.5.40.1 — the denominator of the skew formula. The operand is
+    /// a 5-bit field (`0..=31`), so the shift always fits a `u64`.
+    pub fn skew_denominator(&self) -> u64 {
+        1u64 << self.skew_denominator_shift()
+    }
+
+    /// `fx = focal_length_x × image_width / denominator` per
+    /// §6.5.40.1 (floating-point division, NOTE 3).
+    pub fn focal_length_x_value(&self, image_width: u32) -> f64 {
+        f64::from(self.focal_length_x) * f64::from(image_width) / self.denominator() as f64
+    }
+
+    /// `fy = focal_length_y × image_height / denominator` per
+    /// §6.5.40.1. When [`Self::focal_length_y`] is absent (simplified
+    /// intrinsics) the value of `fy` is inferred equal to `fx`
+    /// (§6.5.40.3), so this falls back to
+    /// [`Self::focal_length_x_value`] computed against `image_width`.
+    pub fn focal_length_y_value(&self, image_width: u32, image_height: u32) -> f64 {
+        match self.focal_length_y {
+            Some(fl_y) => f64::from(fl_y) * f64::from(image_height) / self.denominator() as f64,
+            None => self.focal_length_x_value(image_width),
+        }
+    }
+
+    /// `cx = principal_point_x × image_width / denominator` per
+    /// §6.5.40.1 (floating-point division, NOTE 3).
+    pub fn principal_point_x_value(&self, image_width: u32) -> f64 {
+        f64::from(self.principal_point_x) * f64::from(image_width) / self.denominator() as f64
+    }
+
+    /// `cy = principal_point_y × image_height / denominator` per
+    /// §6.5.40.1 (floating-point division, NOTE 3).
+    pub fn principal_point_y_value(&self, image_height: u32) -> f64 {
+        f64::from(self.principal_point_y) * f64::from(image_height) / self.denominator() as f64
+    }
+
+    /// `s = skew_factor / skewDenominator` per §6.5.40.1. When
+    /// [`Self::skew_factor`] is absent (simplified intrinsics) the value
+    /// of `s` is inferred to be `0` (§6.5.40.3).
+    pub fn skew_value(&self) -> f64 {
+        match self.skew_factor {
+            Some(skew) => f64::from(skew) / self.skew_denominator() as f64,
+            None => 0.0,
+        }
+    }
+}
+
 /// Wipe Transition Effect transformative property (`wipe`) — HEIF
 /// §6.5.30.
 ///
@@ -2100,6 +2277,8 @@ pub enum Property {
     /// Progressive-derived-image-item-information descriptive property
     /// (HEIF §6.5.37).
     Prdi(Prdi),
+    /// Camera-intrinsic-matrix descriptive property (HEIF §6.5.40).
+    Cmin(Cmin),
     Other(BoxType, Vec<u8>),
 }
 
@@ -2143,6 +2322,7 @@ impl Property {
             Property::Stpe(_) => STPE,
             Property::Ssld(_) => SSLD,
             Property::Prdi(_) => PRDI,
+            Property::Cmin(_) => CMIN,
             Property::Other(t, _) => *t,
         }
     }
@@ -2668,6 +2848,7 @@ fn parse_ipco(payload: &[u8]) -> Result<Vec<Property>> {
             x if x == &STPE => Property::Stpe(parse_stpe(body)?),
             x if x == &SSLD => Property::Ssld(parse_ssld(body)?),
             x if x == &PRDI => Property::Prdi(parse_prdi(body)?),
+            x if x == &CMIN => Property::Cmin(parse_cmin(body)?),
             other => Property::Other(*other, body.to_vec()),
         };
         out.push(prop);
@@ -3670,6 +3851,68 @@ fn parse_prdi(body: &[u8]) -> Result<Prdi> {
         flags,
         step_count,
         item_counts,
+    })
+}
+
+/// Parse `cmin` (CameraIntrinsicMatrixProperty — HEIF §6.5.40).
+/// ItemFullProperty(`cmin`, version=0, flags) followed by:
+///
+/// ```text
+/// signed int(32) focal_length_x;
+/// signed int(32) principal_point_x;
+/// signed int(32) principal_point_y;
+/// if (flags & 1) {
+///     signed int(32) focal_length_y;
+///     signed int(32) skew_factor;
+/// }
+/// ```
+///
+/// per §6.5.40.2. The low `flags` bit selects the simplified (no skew,
+/// square pixels) vs. full intrinsics form: when clear, `focal_length_y`
+/// and `skew_factor` are absent and inferred per §6.5.40.3
+/// (`fy = fx`, `s = 0`). The two 5-bit shift operands embedded in
+/// `flags` (`0x001F00` for the focal-length / principal-point
+/// denominator, `0x1F0000` for the skew denominator) are preserved
+/// whole in [`Cmin::flags`] and decoded by the projection helpers.
+///
+/// An unknown `version` is rejected (§6.5.40.2 declares `version = 0`)
+/// so a future layout cannot be misread as v0. The three mandatory
+/// fields are always required; the two-field tail is required only when
+/// `flags & 1` is set (a truncated tail is rejected). Trailing bytes
+/// past the parsed fields are ignored, mirroring the
+/// forward-compatibility behaviour of the other FullBox-headed property
+/// parsers in this module.
+fn parse_cmin(body: &[u8]) -> Result<Cmin> {
+    let (version, flags, rest) = parse_full_box(body)?;
+    if version != 0 {
+        return Err(Error::invalid(format!("avif: cmin version {version} != 0")));
+    }
+    let full = flags & Cmin::FLAG_FULL_INTRINSICS != 0;
+    let need = if full { 20 } else { 12 };
+    if rest.len() < need {
+        return Err(Error::invalid(format!(
+            "avif: cmin too short ({} < {need})",
+            rest.len()
+        )));
+    }
+    let focal_length_x = read_u32(rest, 0)? as i32;
+    let principal_point_x = read_u32(rest, 4)? as i32;
+    let principal_point_y = read_u32(rest, 8)? as i32;
+    let (focal_length_y, skew_factor) = if full {
+        (
+            Some(read_u32(rest, 12)? as i32),
+            Some(read_u32(rest, 16)? as i32),
+        )
+    } else {
+        (None, None)
+    };
+    Ok(Cmin {
+        flags,
+        focal_length_x,
+        principal_point_x,
+        principal_point_y,
+        focal_length_y,
+        skew_factor,
     })
 }
 
@@ -6703,6 +6946,272 @@ mod tests {
             Some(Property::Afbr(a)) => assert_eq!(a.flash_exposure_stops(), Some(-0.5)),
             other => panic!("expected Afbr, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // HEIF §6.5.40 CameraIntrinsicMatrixProperty (`cmin`) — parse +
+    // helpers
+    // -----------------------------------------------------------------
+
+    /// Build a `cmin` body — FullBox(v=0, flags) followed by the three
+    /// mandatory `signed int(32)` fields, and, when the full-intrinsics
+    /// `flags & 1` bit is set, the two-field tail. The `flags` value is
+    /// packed into the low three bytes of the FullBox header.
+    fn cmin_body(flags: u32, fx: i32, cx: i32, cy: i32, tail: Option<(i32, i32)>) -> Vec<u8> {
+        let mut buf = vec![0u8]; // version = 0
+        buf.extend_from_slice(&flags.to_be_bytes()[1..]); // 24-bit flags
+        buf.extend_from_slice(&(fx as u32).to_be_bytes());
+        buf.extend_from_slice(&(cx as u32).to_be_bytes());
+        buf.extend_from_slice(&(cy as u32).to_be_bytes());
+        if let Some((fy, skew)) = tail {
+            buf.extend_from_slice(&(fy as u32).to_be_bytes());
+            buf.extend_from_slice(&(skew as u32).to_be_bytes());
+        }
+        buf
+    }
+
+    /// The simplified form (`flags & 1 == 0`) reads exactly the three
+    /// mandatory fields and leaves `focal_length_y` / `skew_factor`
+    /// absent. Distinct, asymmetric values per field so a cross-wire
+    /// between them would surface immediately.
+    #[test]
+    fn cmin_simplified_reads_three_mandatory_fields() {
+        let c = parse_cmin(&cmin_body(0, 100, 20, 30, None)).unwrap();
+        assert_eq!(c.focal_length_x, 100);
+        assert_eq!(c.principal_point_x, 20);
+        assert_eq!(c.principal_point_y, 30);
+        assert_eq!(c.focal_length_y, None);
+        assert_eq!(c.skew_factor, None);
+        assert!(!c.has_skew());
+    }
+
+    /// The full form (`flags & 1 == 1`) appends `focal_length_y` and
+    /// `skew_factor` after the three mandatory fields, in the
+    /// §6.5.40.2 declaration order.
+    #[test]
+    fn cmin_full_reads_focal_y_then_skew() {
+        let c = parse_cmin(&cmin_body(1, 100, 20, 30, Some((110, 5)))).unwrap();
+        assert_eq!(c.focal_length_x, 100);
+        assert_eq!(c.principal_point_x, 20);
+        assert_eq!(c.principal_point_y, 30);
+        assert_eq!(c.focal_length_y, Some(110));
+        assert_eq!(c.skew_factor, Some(5));
+        assert!(c.has_skew());
+    }
+
+    /// All five fields are `signed int(32)`. A writer that emits a
+    /// negative principal point (off-centre optical axis) or a negative
+    /// skew must round-trip through the `as i32` cast — not wrap to a
+    /// large unsigned value.
+    #[test]
+    fn cmin_fields_are_signed() {
+        let c = parse_cmin(&cmin_body(1, -1, -20, -30, Some((-110, -5)))).unwrap();
+        assert_eq!(c.focal_length_x, -1);
+        assert_eq!(c.principal_point_x, -20);
+        assert_eq!(c.principal_point_y, -30);
+        assert_eq!(c.focal_length_y, Some(-110));
+        assert_eq!(c.skew_factor, Some(-5));
+        // Signed endpoints round-trip.
+        let c = parse_cmin(&cmin_body(
+            1,
+            i32::MIN,
+            i32::MAX,
+            0,
+            Some((i32::MIN, i32::MAX)),
+        ))
+        .unwrap();
+        assert_eq!(c.focal_length_x, i32::MIN);
+        assert_eq!(c.principal_point_x, i32::MAX);
+        assert_eq!(c.focal_length_y, Some(i32::MIN));
+        assert_eq!(c.skew_factor, Some(i32::MAX));
+    }
+
+    /// §6.5.40.1 — `denominator = 1 << ((flags & 0x001F00) >> 8)` and
+    /// `skewDenominator = 1 << ((flags & 0x1F0000) >> 16)`. The shift
+    /// operands are decoded from the two 5-bit flag sub-fields.
+    #[test]
+    fn cmin_denominators_decoded_from_flags() {
+        // denominatorShiftOperand = 8 → denominator = 256;
+        // skewDenominatorShiftOperand = 4 → skewDenominator = 16;
+        // low bit set for the full form.
+        let flags = (8u32 << 8) | (4u32 << 16) | 1;
+        let c = parse_cmin(&cmin_body(flags, 0, 0, 0, Some((0, 0)))).unwrap();
+        assert_eq!(c.denominator_shift(), 8);
+        assert_eq!(c.skew_denominator_shift(), 4);
+        assert_eq!(c.denominator(), 256);
+        assert_eq!(c.skew_denominator(), 16);
+        // A zero shift operand means denominator == 1 (no scaling).
+        let c = parse_cmin(&cmin_body(0, 0, 0, 0, None)).unwrap();
+        assert_eq!(c.denominator(), 1);
+        assert_eq!(c.skew_denominator(), 1);
+        // The maximum 5-bit shift operand (31) is representable in u64.
+        let flags = (31u32 << 8) | (31u32 << 16);
+        let c = parse_cmin(&cmin_body(flags, 0, 0, 0, None)).unwrap();
+        assert_eq!(c.denominator(), 1u64 << 31);
+        assert_eq!(c.skew_denominator(), 1u64 << 31);
+    }
+
+    /// §6.5.40.1 matrix-entry projections fold in the `image_width` /
+    /// `image_height` from the associated `ispe` and the flag-derived
+    /// denominator. `fx = focal_length_x × width / denominator`, etc.,
+    /// using floating-point division per NOTE 3.
+    #[test]
+    fn cmin_matrix_entry_projections() {
+        // denominatorShiftOperand = 8 → denominator = 256; full form.
+        let flags = (8u32 << 8) | 1;
+        // fx = 256 × 640 / 256 = 640; cx = 128 × 640 / 256 = 320;
+        // cy = 96 × 480 / 256 = 180; fy = 256 × 480 / 256 = 480;
+        // s = 0 / 1 = 0.
+        let c = parse_cmin(&cmin_body(flags, 256, 128, 96, Some((256, 0)))).unwrap();
+        assert!((c.focal_length_x_value(640) - 640.0).abs() < 1e-9);
+        assert!((c.focal_length_y_value(640, 480) - 480.0).abs() < 1e-9);
+        assert!((c.principal_point_x_value(640) - 320.0).abs() < 1e-9);
+        assert!((c.principal_point_y_value(480) - 180.0).abs() < 1e-9);
+        assert!((c.skew_value() - 0.0).abs() < 1e-12);
+    }
+
+    /// §6.5.40.3 inferences for the simplified form: when
+    /// `focal_length_y` is absent `fy` is inferred equal to `fx`, and
+    /// when `skew_factor` is absent `s` is inferred to be `0`.
+    #[test]
+    fn cmin_simplified_infers_fy_equals_fx_and_zero_skew() {
+        // denominator = 1; fx = 100 × 640 / 1 = 64000.
+        let c = parse_cmin(&cmin_body(0, 100, 0, 0, None)).unwrap();
+        let fx = c.focal_length_x_value(640);
+        // fy inferred equal to fx even though image_height differs.
+        assert!((c.focal_length_y_value(640, 480) - fx).abs() < 1e-9);
+        // s inferred to be 0 when skew_factor is absent.
+        assert_eq!(c.skew_value(), 0.0);
+    }
+
+    /// §6.5.40.1 skew formula `s = skew_factor / skewDenominator`. A
+    /// negative skew (non-square pixels with a shear) round-trips.
+    #[test]
+    fn cmin_skew_value_uses_skew_denominator() {
+        // skewDenominatorShiftOperand = 2 → skewDenominator = 4; full.
+        let flags = (2u32 << 16) | 1;
+        let c = parse_cmin(&cmin_body(flags, 0, 0, 0, Some((0, 6)))).unwrap();
+        assert!((c.skew_value() - 1.5).abs() < 1e-12);
+        let c = parse_cmin(&cmin_body(flags, 0, 0, 0, Some((0, -6)))).unwrap();
+        assert!((c.skew_value() - (-1.5)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn cmin_rejects_unknown_version() {
+        // version=1 with an otherwise well-formed v0 simplified body.
+        let mut buf = cmin_body(0, 1, 2, 3, None);
+        buf[0] = 1;
+        assert!(parse_cmin(&buf).is_err());
+    }
+
+    /// A body shorter than the three mandatory 32-bit fields is
+    /// rejected; for the full form the parser additionally requires the
+    /// two-field tail (a truncated tail must not be partially read).
+    #[test]
+    fn cmin_rejects_truncated_body() {
+        // FullBox header alone — no fields.
+        let buf = vec![0u8; 4];
+        assert!(parse_cmin(&buf).is_err());
+        // Header + only two of the three mandatory fields.
+        let mut buf = vec![0u8; 4];
+        buf.extend_from_slice(&[0u8; 8]);
+        assert!(parse_cmin(&buf).is_err());
+        // Full form flagged but the tail is missing (only the three
+        // mandatory fields present).
+        let buf = cmin_body(0, 1, 2, 3, None);
+        let mut buf_full = buf.clone();
+        buf_full[3] = 1; // set flags low bit → full form
+        assert!(parse_cmin(&buf_full).is_err());
+        // Full form with only one of the two tail fields.
+        let mut buf = cmin_body(1, 1, 2, 3, Some((4, 5)));
+        buf.truncate(buf.len() - 4); // drop skew_factor
+        assert!(parse_cmin(&buf).is_err());
+    }
+
+    /// Trailing bytes past the parsed fields are forward-compat space —
+    /// ignored by the parser, mirroring every other FullBox-headed
+    /// property parser in this module.
+    #[test]
+    fn cmin_tolerates_trailing_bytes() {
+        let mut body = cmin_body(1, 100, 20, 30, Some((110, 5)));
+        body.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let c = parse_cmin(&body).unwrap();
+        assert_eq!(c.focal_length_x, 100);
+        assert_eq!(c.skew_factor, Some(5));
+    }
+
+    #[test]
+    fn cmin_dispatched_through_parse_ipco() {
+        let body = cmin_body(1, 256, 128, 96, Some((256, 0)));
+        let mut ipco = Vec::new();
+        let s = 8 + body.len() as u32;
+        ipco.extend_from_slice(&s.to_be_bytes());
+        ipco.extend_from_slice(b"cmin");
+        ipco.extend_from_slice(&body);
+        let props = parse_ipco(&ipco).unwrap();
+        assert_eq!(props.len(), 1);
+        match &props[0] {
+            Property::Cmin(c) => {
+                assert_eq!(c.focal_length_x, 256);
+                assert_eq!(c.focal_length_y, Some(256));
+                assert_eq!(c.skew_factor, Some(0));
+            }
+            other => panic!("expected Cmin, got {other:?}"),
+        }
+        assert_eq!(props[0].kind(), *b"cmin");
+    }
+
+    /// A recognised `cmin` property — even when flagged essential —
+    /// does NOT trip [`Meta::unsupported_essential_properties`].
+    #[test]
+    fn cmin_essential_association_is_recognised() {
+        let m = Meta {
+            properties: vec![Property::Cmin(Cmin::default())],
+            associations: vec![ItemPropertyAssociation {
+                item_id: 1,
+                entries: vec![PropertyAssociation {
+                    index: 0,
+                    essential: true,
+                }],
+            }],
+            ..Meta::default()
+        };
+        assert!(!m.has_unsupported_essential_property(1));
+        assert!(m.unsupported_essential_properties(1).is_empty());
+    }
+
+    /// §6.5.40.1 caps `cmin` at one per item (`At most one`). A
+    /// `Meta::property_for(item_id, b"cmin")` lookup finds the
+    /// associated single instance via the standard `ipma` walk.
+    #[test]
+    fn cmin_lookup_via_property_for() {
+        let flags = (8u32 << 8) | 1;
+        let m = Meta {
+            properties: vec![Property::Cmin(Cmin {
+                flags,
+                focal_length_x: 256,
+                principal_point_x: 128,
+                principal_point_y: 96,
+                focal_length_y: Some(256),
+                skew_factor: Some(0),
+            })],
+            associations: vec![ItemPropertyAssociation {
+                item_id: 9,
+                entries: vec![PropertyAssociation {
+                    index: 0,
+                    essential: false,
+                }],
+            }],
+            ..Meta::default()
+        };
+        match m.property_for(9, b"cmin") {
+            Some(Property::Cmin(c)) => {
+                assert_eq!(c.denominator(), 256);
+                assert!((c.focal_length_x_value(640) - 640.0).abs() < 1e-9);
+            }
+            other => panic!("expected Cmin, got {other:?}"),
+        }
+        assert!(m.property_for(99, b"cmin").is_none());
     }
 
     // -----------------------------------------------------------------

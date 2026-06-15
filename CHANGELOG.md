@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- ISO/IEC 23008-12 §6.5.40 CameraIntrinsicMatrixProperty (`cmin`)
+  descriptive item-property parser — describes the pinhole-camera
+  intrinsic matrix of the camera that captured the associated image
+  item, surfaced as `Property::Cmin(Cmin { flags, focal_length_x,
+  principal_point_x, principal_point_y, focal_length_y, skew_factor })`
+  (re-exported as `oxideav_avif::Cmin`). The body shape is taken
+  verbatim from §6.5.40.2 — an ItemFullProperty(`cmin`, version=0,
+  flags) with three mandatory `signed int(32)` fields
+  (`focal_length_x`, `principal_point_x`, `principal_point_y`) followed,
+  **only** when `flags & 1` is set (full intrinsics per §6.5.40.3), by a
+  `signed int(32) focal_length_y` + `signed int(32) skew_factor` tail.
+  For the simplified form (`flags & 1 == 0`, no skew / square pixels)
+  the tail is absent and `focal_length_y` / `skew_factor` are `None`;
+  the §6.5.40.3 inferences (`fy = fx`, `s = 0`) are applied by the
+  projection helpers. The two 5-bit power-of-two shift operands embedded
+  in `flags` are decoded per §6.5.40.1
+  (`denominator = 1 << ((flags & 0x001F00) >> 8)`,
+  `skewDenominator = 1 << ((flags & 0x1F0000) >> 16)`) and exposed via
+  `Cmin::{denominator_shift, skew_denominator_shift, denominator,
+  skew_denominator, has_skew}` plus the `Cmin::FLAG_FULL_INTRINSICS`
+  constant; the whole 24-bit `flags` field is preserved so an unknown
+  future bit round-trips. The §6.5.40.1 matrix-entry formulas (which
+  fold in the `image_width` / `image_height` from the associated `ispe`)
+  are applied by `Cmin::{focal_length_x_value, focal_length_y_value,
+  principal_point_x_value, principal_point_y_value, skew_value}`, each
+  returning the floating-point matrix entry (a floating-point, not
+  integer, division per §6.5.40.1 NOTE 3). All five wire fields are
+  reinterpreted as `i32` so a negative principal point or skew
+  round-trips correctly. Unknown `version` rejected, a body short of the
+  three mandatory fields (or, for the full form, the two-field tail)
+  rejected, trailing bytes ignored; descriptive per §6.5.40.1 so a
+  recognised `cmin` never trips
+  `Meta::unsupported_essential_properties`. +13 unit tests (default lib
+  499, standalone lib 484).
+
 - ISO/IEC 23008-12 §6.5.30–§6.5.35 slideshow transition-effect item-property
   family — six new descriptive/transformative properties that document
   suggested transitions and timing between consecutive items of a slideshow
