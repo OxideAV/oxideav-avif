@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/OxideAV/oxideav-avif/compare/v0.0.8...v0.0.9) - 2026-06-15
+
+### Other
+
+- HEIF §6.5.40 cmin camera-intrinsic-matrix item property
+- HEIF §6.5.30–§6.5.35 slideshow transition-effect item properties
+- HEIF §6.5.37 prdi progressive-derived-image-item-information property
+- HEIF §6.5.28 subs sub-sample-information item property
+- HEIF §6.5.29 tols target-output-layer-set item property
+- HEIF §6.5.27 pano panorama-information item-property parser
+- parse HEIF §6.5.26 dobr depth-of-field-information item property
+- HEIF §6.5.25 afbr flash-exposure-information item-property parser
+- HEIF §6.5.24 fobr focus-information item-property parser
+- HEIF §6.5.23 wbbr white-balance-information item-property parser
+- HEIF §6.5.22 aebr auto-exposure-information item-property parser
+- drop release-plz.toml — use release-plz defaults across the workspace
+- HEIF §6.5.21 altt accessibility-text item-property parser
+- HEIF §6.5.20 udes user-description item-property parser
+- HEIF §6.5.19 mdft modification-time item-property parser
+- HEIF §6.5.18 crtt creation-time item-property parser
+- HEIF §6.5.13 iscl + §6.5.17 rref parsers + §7 audit extension
+- AVIS mdhd media-timescale plumb + EditListEntry second-conversion helpers
+- AVIS aggregator (inspect_avis / AvisInfo)
+- AVIS edit list (edts/elst) parse + §8.6.6.3 shall audit
+- §8.2 / §8.3 AVIS sequence-track profile compliance audit
+- §3 AV1 Image Sequence shall-level compliance audit
+- §8.2 / §8.3 AVIF profile compliance audit + attribution scrub
+
 ### Added
 
 - ISO/IEC 23008-12 §6.5.40 CameraIntrinsicMatrixProperty (`cmin`)
