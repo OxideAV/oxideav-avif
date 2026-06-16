@@ -194,6 +194,20 @@ pub struct AvisMeta {
     /// widened to a single shape so callers stay version-agnostic;
     /// `audit_edit_list` consumes this field directly.
     pub edit_list: Vec<EditListEntry>,
+    /// Sample-to-group mappings decoded from the first track's `stbl`
+    /// (`sbgp` ISO/IEC 14496-12:2015 §8.9.2 and/or `csgp`
+    /// :2020 §8.9.5). One entry per `grouping_type` present. Empty when
+    /// the track carries no sample-grouping boxes. Each entry's
+    /// per-sample group index is recovered via
+    /// [`crate::sample_group::SampleToGroup::group_index_for_sample`].
+    pub sample_to_groups: Vec<crate::sample_group::SampleToGroup>,
+    /// Sample-group description headers from the first track's `stbl`
+    /// (`sgpd` §8.9.3). One entry per `grouping_type`; pair each with
+    /// the matching [`Self::sample_to_groups`] entry by `grouping_type`.
+    /// Only the generic header (grouping type, default index, entry
+    /// count) is decoded — per-entry payloads are grouping-type
+    /// specific and not interpreted here.
+    pub sample_group_descriptions: Vec<crate::sample_group::SampleGroupDescription>,
 }
 
 /// Walk the container and build a sample table. The input buffer must
@@ -217,6 +231,8 @@ pub fn parse_avis(file: &[u8]) -> Result<AvisMeta> {
     let samples = sample_table(stbl)?;
     let av1_codec_config = find_av1c_in_stbl(stbl);
     let sample_description_types = sample_description_types_in_stbl(stbl);
+    let sample_to_groups = crate::sample_group::parse_sample_to_groups(stbl);
+    let sample_group_descriptions = crate::sample_group::parse_sample_group_descriptions(stbl);
     Ok(AvisMeta {
         timescale,
         media_timescale,
@@ -226,6 +242,8 @@ pub fn parse_avis(file: &[u8]) -> Result<AvisMeta> {
         handler,
         sample_description_types,
         edit_list,
+        sample_to_groups,
+        sample_group_descriptions,
     })
 }
 
@@ -1423,6 +1441,11 @@ pub struct AvisInfo {
     /// `true` when the first track carries an `edts/elst` with at
     /// least one entry (the §8.6.5 implicit-identity case is `false`).
     pub has_edit_list: bool,
+    /// Number of sample-to-group mappings (`sbgp`/`csgp`) decoded from
+    /// the first track's `stbl` — one per `grouping_type`. `0` when the
+    /// track carries no sample-grouping boxes. The full mappings are on
+    /// [`AvisMeta::sample_to_groups`] via [`parse_avis`].
+    pub sample_to_group_count: u32,
     /// av1-avif v1.2.0 §3 `shall`-level audit (track handler `'pict'`,
     /// single `'av01'` SampleEntry, identical Sequence Header OBUs
     /// across samples). One record per AVIS file (each AVIS carries
@@ -1573,6 +1596,7 @@ fn build_avis_info(meta: AvisMeta, brands: crate::parser::BrandClass, file: &[u8
         sample_description_types: meta.sample_description_types,
         brands,
         has_edit_list: !meta.edit_list.is_empty(),
+        sample_to_group_count: meta.sample_to_groups.len() as u32,
         sequence_compliance,
         profile_compliance,
         edit_list_compliance,
@@ -2014,6 +2038,8 @@ mod tests {
             handler: Some(HANDLER_PICT),
             sample_description_types: vec![AV01],
             edit_list: Vec::new(),
+            sample_to_groups: Vec::new(),
+            sample_group_descriptions: Vec::new(),
         };
         let audit = audit_avis_sequence(&meta, &file);
         assert!(
@@ -2037,6 +2063,8 @@ mod tests {
             handler: Some(*b"vide"),
             sample_description_types: vec![AV01],
             edit_list: Vec::new(),
+            sample_to_groups: Vec::new(),
+            sample_group_descriptions: Vec::new(),
         };
         let audit = audit_avis_sequence(&meta, &[]);
         assert!(!audit.is_compliant());
@@ -2058,6 +2086,8 @@ mod tests {
             handler: None,
             sample_description_types: vec![AV01],
             edit_list: Vec::new(),
+            sample_to_groups: Vec::new(),
+            sample_group_descriptions: Vec::new(),
         };
         let audit = audit_avis_sequence(&meta, &[]);
         assert!(!audit.handler_is_pict);
@@ -2076,6 +2106,8 @@ mod tests {
             handler: Some(HANDLER_PICT),
             sample_description_types: vec![AV01, AV01],
             edit_list: Vec::new(),
+            sample_to_groups: Vec::new(),
+            sample_group_descriptions: Vec::new(),
         };
         let audit = audit_avis_sequence(&meta, &[]);
         assert!(!audit.is_compliant());
@@ -2098,6 +2130,8 @@ mod tests {
             handler: Some(HANDLER_PICT),
             sample_description_types: Vec::new(),
             edit_list: Vec::new(),
+            sample_to_groups: Vec::new(),
+            sample_group_descriptions: Vec::new(),
         };
         let audit = audit_avis_sequence(&meta, &[]);
         assert!(!audit.single_sample_description);
@@ -2121,6 +2155,8 @@ mod tests {
             handler: Some(HANDLER_PICT),
             sample_description_types: vec![*b"hvc1"],
             edit_list: Vec::new(),
+            sample_to_groups: Vec::new(),
+            sample_group_descriptions: Vec::new(),
         };
         let audit = audit_avis_sequence(&meta, &[]);
         assert!(audit.single_sample_description);
@@ -2164,6 +2200,8 @@ mod tests {
             handler: Some(HANDLER_PICT),
             sample_description_types: vec![AV01],
             edit_list: Vec::new(),
+            sample_to_groups: Vec::new(),
+            sample_group_descriptions: Vec::new(),
         };
         let audit = audit_avis_sequence(&meta, &file);
         assert_eq!(audit.sequence_header_obu_count, 2);
@@ -2190,6 +2228,8 @@ mod tests {
             handler: Some(HANDLER_PICT),
             sample_description_types: vec![AV01],
             edit_list: Vec::new(),
+            sample_to_groups: Vec::new(),
+            sample_group_descriptions: Vec::new(),
         };
         let audit = audit_avis_sequence(&meta, &sh);
         assert!(audit.is_compliant());
@@ -2215,6 +2255,8 @@ mod tests {
             handler: Some(HANDLER_PICT),
             sample_description_types: vec![AV01],
             edit_list: Vec::new(),
+            sample_to_groups: Vec::new(),
+            sample_group_descriptions: Vec::new(),
         };
         let audit = audit_avis_sequence(&meta, &frame);
         assert!(audit.is_compliant());
@@ -2251,6 +2293,8 @@ mod tests {
             handler: Some(HANDLER_PICT),
             sample_description_types: vec![AV01],
             edit_list: Vec::new(),
+            sample_to_groups: Vec::new(),
+            sample_group_descriptions: Vec::new(),
         };
         let audit = audit_avis_sequence(&meta, &sh);
         assert_eq!(audit.sequence_header_obu_count, 1);
@@ -2364,6 +2408,8 @@ mod tests {
             handler: Some(HANDLER_PICT),
             sample_description_types: vec![AV01],
             edit_list: Vec::new(),
+            sample_to_groups: Vec::new(),
+            sample_group_descriptions: Vec::new(),
         }
     }
 

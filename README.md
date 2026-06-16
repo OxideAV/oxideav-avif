@@ -58,6 +58,7 @@ encoder, which oxideav does not yet have); `make_encoder` returns
 | Alpha auxiliary | `auxl` + `auxC` detection + composition (`Gray8→YA8`, `Yuv→YuvA`) + av1-avif §4.1 bit-depth audit |
 | Post-transforms | `clap` → `irot` → `imir`, applied in that order (HEIF §6.5.10) |
 | AVIS image sequences | sample-table walk (`parse_avis` / `sample_table`) + `inspect_avis` aggregator + §3 / §8.2 / §8.3 audits + `edts/elst` edit list (ISO/IEC 14496-12 §8.6.6) + `mdhd` media-timescale plumb |
+| Sample grouping | `sbgp` (SampleToGroupBox, ISO/IEC 14496-12:2015 §8.9.2, v0/v1) + `csgp` (CompactSampleToGroupBox, :2020 §8.9.5 — 4/8/16/32-bit packed field widths, pattern expansion, `traf` fragment-local msb) + `sgpd` generic header (§8.9.3, v0/v1/v2 default index); per-sample group-index lookup via `SampleToGroup::group_index_for_sample`, surfaced on `AvisMeta::{sample_to_groups, sample_group_descriptions}` |
 
 ## Installation
 

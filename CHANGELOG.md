@@ -16,6 +16,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- ISO/IEC 14496-12 sample-grouping family for AVIS image-sequence
+  tracks (`sample_group` module): `sbgp` (SampleToGroupBox, :2015
+  §8.9.2, v0 + v1 `grouping_type_parameter`) and `csgp`
+  (CompactSampleToGroupBox, :2020 §8.9.5 — `FullBox.flags` packs three
+  2-bit field-width codes `4 << code` ∈ {4,8,16,32} bits plus a
+  `grouping_type_parameter_present` bit; patterns expand to run-length
+  form) decode into a normalised `SampleToGroup` with ordered
+  `SampleToGroupRun`s and a `group_index_for_sample` per-sample lookup.
+  A `csgp` index's most-significant bit is decoded as the `traf`
+  fragment-local / global selector via
+  `SampleToGroupRun::{is_fragment_local, description_index}`. The
+  `sgpd` (SampleGroupDescriptionBox, §8.9.3) generic header — grouping
+  type, v1 `default_length`, v2 `default_group_description_index`,
+  entry count — parses into `SampleGroupDescription`. `parse_avis` now
+  surfaces both via `AvisMeta::{sample_to_groups,
+  sample_group_descriptions}`, and `AvisInfo::sample_to_group_count`
+  reports the mapping count. New public API: `parse_sbgp` /
+  `parse_csgp` / `parse_sgpd` / `parse_sample_to_groups` /
+  `parse_sample_group_descriptions` plus the `SampleToGroup`,
+  `SampleToGroupRun`, `SampleToGroupKind`, `SampleGroupDescription`
+  types. (`csgp` box layout per
+  `docs/container/isobmff/post-2015-additions.md`; `sbgp`/`sgpd` per
+  the staged :2015 ISOBMFF spec text.)
 - ISO/IEC 23008-12 §6.5.39 CameraExtrinsicMatrixProperty (`cmex`)
   descriptive item-property parser — describes the spatial setup of the
   camera(s): a cartesian position (µm) and an orientation of the camera

@@ -99,6 +99,7 @@ pub mod image;
 pub mod inspect;
 pub mod meta;
 pub mod parser;
+pub mod sample_group;
 pub mod transform;
 
 #[cfg(feature = "registry")]
@@ -140,6 +141,10 @@ pub use parser::{
     audit_mif1, classify_brands, item_bytes_owned, parse, parse_header, AvifHeader, AvifImage,
     BrandClass, BRAND_AVIF, BRAND_AVIO, BRAND_AVIS, BRAND_MA1A, BRAND_MA1B, BRAND_MIAF, BRAND_MIF1,
     BRAND_MSF1, ITEM_TYPE_AV01, ITEM_TYPE_GRID,
+};
+pub use sample_group::{
+    parse_csgp, parse_sample_group_descriptions, parse_sample_to_groups, parse_sbgp, parse_sgpd,
+    SampleGroupDescription, SampleToGroup, SampleToGroupKind, SampleToGroupRun,
 };
 pub use transform::{apply_clap, apply_imir, apply_irot, crop_top_left};
 
