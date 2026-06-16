@@ -39,6 +39,14 @@ const STSS: BoxType = b(b"stss");
 const STSD: BoxType = b(b"stsd");
 const AV01: BoxType = b(b"av01");
 const AV1C: BoxType = b(b"av1C");
+const PRFT: BoxType = b(b"prft");
+
+/// NTP-epoch offset relative to the Unix epoch, in seconds. The NTP
+/// timescale counts seconds since 1900-01-01T00:00:00Z; the Unix epoch
+/// is 1970-01-01T00:00:00Z, which is 70 years (17 leap days included)
+/// = 2_208_988_800 seconds later. Used to convert a `prft`
+/// `ntp_timestamp` to a Unix instant. Spec: RFC 5905 §6.
+pub const NTP_UNIX_EPOCH_OFFSET_SECONDS: u64 = 2_208_988_800;
 
 /// Four-CC for the picture track handler (ISO/IEC 14496-12 §8.4.3).
 /// `mdia/hdlr/handler_type` carries this for any image sequence track,
@@ -146,6 +154,137 @@ impl EditListEntry {
     }
 }
 
+/// One `prft` ProducerReferenceTimeBox (ISO/IEC 14496-12 §8.16.5).
+///
+/// `prft` is a top-level (`File`-container) box that supplies a
+/// wall-clock instant at which a movie fragment / segment was produced.
+/// It relates to the **next** `moof` in bitstream order, binding an NTP
+/// UTC time to a media time on one reference track so a real-time
+/// consumer can pace itself against the producer. AVIS sequences carried
+/// as fragmented / segmented files (`moof`-based) may carry one or more
+/// of these before each fragment; they sit alongside `styp` / `sidx`,
+/// not inside `moov`.
+///
+/// All fields are widened to their largest version shape (`u64`
+/// `media_time`) so callers stay version-agnostic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProducerReferenceTime {
+    /// FullBox `version` (`0` or `1`). v0 carries a 32-bit `media_time`;
+    /// v1 widens it to 64-bit. Other versions are rejected at parse.
+    pub version: u8,
+    /// FullBox `flags`. The 2015 edition sets this to `0`; later
+    /// editions define named bits annotating what the NTP time
+    /// represents (encoder input/output, finalization, file-write,
+    /// arbitrary association). Preserved verbatim for those readers.
+    pub flags: u32,
+    /// `track_ID` of the reference track this time is associated with
+    /// (ISO/IEC 14496-12 §8.16.5.3).
+    pub reference_track_id: u32,
+    /// UTC instant in NTP 64-bit format: high 32 bits are seconds since
+    /// 1900-01-01, low 32 bits are fractional seconds (RFC 5905).
+    pub ntp_timestamp: u64,
+    /// The same instant expressed in the reference track's media
+    /// timescale (`mdhd::timescale`). v0 sources this from a 32-bit
+    /// field; v1 from a 64-bit field.
+    pub media_time: u64,
+}
+
+impl ProducerReferenceTime {
+    /// Whether the §8.16.5 `flags` mark the NTP time as the frame's
+    /// encoder input/output time (`0x000001`, later-edition bit).
+    pub fn is_encoder_input_output(&self) -> bool {
+        self.flags & 0x000001 != 0
+    }
+
+    /// Whether the §8.16.5 `flags` mark the NTP time as the segment
+    /// finalization (complete) time (`0x000002`, later-edition bit).
+    pub fn is_finalization_time(&self) -> bool {
+        self.flags & 0x000002 != 0
+    }
+
+    /// Whether the §8.16.5 `flags` mark the NTP time as the file /
+    /// segment write time (`0x000004`, later-edition bit).
+    pub fn is_file_write_time(&self) -> bool {
+        self.flags & 0x000004 != 0
+    }
+
+    /// Integer NTP seconds-since-1900 (high 32 bits of
+    /// [`Self::ntp_timestamp`]).
+    pub fn ntp_seconds(&self) -> u32 {
+        (self.ntp_timestamp >> 32) as u32
+    }
+
+    /// Fractional NTP seconds (low 32 bits of [`Self::ntp_timestamp`]),
+    /// in units of 1/2^32 second.
+    pub fn ntp_fraction(&self) -> u32 {
+        (self.ntp_timestamp & 0xFFFF_FFFF) as u32
+    }
+
+    /// Convert [`Self::ntp_timestamp`] to floating-point seconds since
+    /// the Unix epoch (1970-01-01). Returns `None` when the NTP integer
+    /// part predates the Unix epoch (i.e. before 1970), which an AVIS
+    /// producer time should never be.
+    pub fn unix_seconds(&self) -> Option<f64> {
+        let secs = self.ntp_seconds() as u64;
+        let unix_secs = secs.checked_sub(NTP_UNIX_EPOCH_OFFSET_SECONDS)?;
+        let frac = self.ntp_fraction() as f64 / u64::from(u32::MAX).wrapping_add(1) as f64;
+        Some(unix_secs as f64 + frac)
+    }
+}
+
+/// Parse a single `prft` box payload (the bytes after the
+/// size/type header, including the FullBox `version`/`flags`).
+///
+/// Body layout (ISO/IEC 14496-12 §8.16.5.2): `reference_track_ID(32)`,
+/// `ntp_timestamp(64)`, then `media_time` — 32-bit for v0, 64-bit for
+/// v1. Total body 16 bytes (v0) or 20 bytes (v1) after the 4-byte
+/// FullBox prefix. Rejects versions other than 0/1 and truncated bodies.
+pub fn parse_prft(payload: &[u8]) -> Result<ProducerReferenceTime> {
+    let (version, flags, rest) = parse_full_box(payload)?;
+    if version > 1 {
+        return Err(Error::InvalidData(format!(
+            "avis: prft version {version} unsupported (expected 0 or 1)"
+        )));
+    }
+    let reference_track_id = read_u32(rest, 0)?;
+    let ntp_timestamp = read_u64(rest, 4)?;
+    let media_time = if version == 0 {
+        u64::from(read_u32(rest, 12)?)
+    } else {
+        read_u64(rest, 12)?
+    };
+    Ok(ProducerReferenceTime {
+        version,
+        flags,
+        reference_track_id,
+        ntp_timestamp,
+        media_time,
+    })
+}
+
+/// Collect every top-level `prft` ProducerReferenceTimeBox in the file,
+/// in bitstream order (ISO/IEC 14496-12 §8.16.5). `prft` is a
+/// `File`-container box that precedes the movie fragment it documents,
+/// so it is found by walking the file's top-level boxes — not inside
+/// `moov`. Returns an empty vector for a non-fragmented AVIS (the common
+/// case). A malformed `prft` is skipped rather than failing the whole
+/// walk so a still-image / non-fragmented file's other boxes stay
+/// reachable.
+pub fn parse_producer_reference_times(file: &[u8]) -> Vec<ProducerReferenceTime> {
+    let mut out = Vec::new();
+    for hdr in iter_boxes(file) {
+        let Ok(hdr) = hdr else { break };
+        if hdr.box_type != PRFT {
+            continue;
+        }
+        let payload = &file[hdr.payload_start..hdr.end()];
+        if let Ok(prft) = parse_prft(payload) {
+            out.push(prft);
+        }
+    }
+    out
+}
+
 /// Container-side description of an AVIS image sequence.
 #[derive(Clone, Debug)]
 pub struct AvisMeta {
@@ -208,6 +347,13 @@ pub struct AvisMeta {
     /// count) is decoded — per-entry payloads are grouping-type
     /// specific and not interpreted here.
     pub sample_group_descriptions: Vec<crate::sample_group::SampleGroupDescription>,
+    /// Top-level `prft` ProducerReferenceTimeBox entries in bitstream
+    /// order (ISO/IEC 14496-12 §8.16.5). Each binds an NTP UTC instant
+    /// to a media time on its `reference_track_id`, documenting when a
+    /// fragment / segment was produced. Empty for a non-fragmented AVIS
+    /// (the common case) — `prft` only appears in `moof`-based
+    /// fragmented / segmented files.
+    pub producer_reference_times: Vec<ProducerReferenceTime>,
 }
 
 /// Walk the container and build a sample table. The input buffer must
@@ -233,6 +379,9 @@ pub fn parse_avis(file: &[u8]) -> Result<AvisMeta> {
     let sample_description_types = sample_description_types_in_stbl(stbl);
     let sample_to_groups = crate::sample_group::parse_sample_to_groups(stbl);
     let sample_group_descriptions = crate::sample_group::parse_sample_group_descriptions(stbl);
+    // `prft` is a top-level (File-container) box — walk the file, not
+    // moov. Empty for a non-fragmented AVIS.
+    let producer_reference_times = parse_producer_reference_times(file);
     Ok(AvisMeta {
         timescale,
         media_timescale,
@@ -244,6 +393,7 @@ pub fn parse_avis(file: &[u8]) -> Result<AvisMeta> {
         edit_list,
         sample_to_groups,
         sample_group_descriptions,
+        producer_reference_times,
     })
 }
 
@@ -2040,6 +2190,7 @@ mod tests {
             edit_list: Vec::new(),
             sample_to_groups: Vec::new(),
             sample_group_descriptions: Vec::new(),
+            producer_reference_times: Vec::new(),
         };
         let audit = audit_avis_sequence(&meta, &file);
         assert!(
@@ -2065,6 +2216,7 @@ mod tests {
             edit_list: Vec::new(),
             sample_to_groups: Vec::new(),
             sample_group_descriptions: Vec::new(),
+            producer_reference_times: Vec::new(),
         };
         let audit = audit_avis_sequence(&meta, &[]);
         assert!(!audit.is_compliant());
@@ -2088,6 +2240,7 @@ mod tests {
             edit_list: Vec::new(),
             sample_to_groups: Vec::new(),
             sample_group_descriptions: Vec::new(),
+            producer_reference_times: Vec::new(),
         };
         let audit = audit_avis_sequence(&meta, &[]);
         assert!(!audit.handler_is_pict);
@@ -2108,6 +2261,7 @@ mod tests {
             edit_list: Vec::new(),
             sample_to_groups: Vec::new(),
             sample_group_descriptions: Vec::new(),
+            producer_reference_times: Vec::new(),
         };
         let audit = audit_avis_sequence(&meta, &[]);
         assert!(!audit.is_compliant());
@@ -2132,6 +2286,7 @@ mod tests {
             edit_list: Vec::new(),
             sample_to_groups: Vec::new(),
             sample_group_descriptions: Vec::new(),
+            producer_reference_times: Vec::new(),
         };
         let audit = audit_avis_sequence(&meta, &[]);
         assert!(!audit.single_sample_description);
@@ -2157,6 +2312,7 @@ mod tests {
             edit_list: Vec::new(),
             sample_to_groups: Vec::new(),
             sample_group_descriptions: Vec::new(),
+            producer_reference_times: Vec::new(),
         };
         let audit = audit_avis_sequence(&meta, &[]);
         assert!(audit.single_sample_description);
@@ -2202,6 +2358,7 @@ mod tests {
             edit_list: Vec::new(),
             sample_to_groups: Vec::new(),
             sample_group_descriptions: Vec::new(),
+            producer_reference_times: Vec::new(),
         };
         let audit = audit_avis_sequence(&meta, &file);
         assert_eq!(audit.sequence_header_obu_count, 2);
@@ -2230,6 +2387,7 @@ mod tests {
             edit_list: Vec::new(),
             sample_to_groups: Vec::new(),
             sample_group_descriptions: Vec::new(),
+            producer_reference_times: Vec::new(),
         };
         let audit = audit_avis_sequence(&meta, &sh);
         assert!(audit.is_compliant());
@@ -2257,6 +2415,7 @@ mod tests {
             edit_list: Vec::new(),
             sample_to_groups: Vec::new(),
             sample_group_descriptions: Vec::new(),
+            producer_reference_times: Vec::new(),
         };
         let audit = audit_avis_sequence(&meta, &frame);
         assert!(audit.is_compliant());
@@ -2295,6 +2454,7 @@ mod tests {
             edit_list: Vec::new(),
             sample_to_groups: Vec::new(),
             sample_group_descriptions: Vec::new(),
+            producer_reference_times: Vec::new(),
         };
         let audit = audit_avis_sequence(&meta, &sh);
         assert_eq!(audit.sequence_header_obu_count, 1);
@@ -2410,6 +2570,7 @@ mod tests {
             edit_list: Vec::new(),
             sample_to_groups: Vec::new(),
             sample_group_descriptions: Vec::new(),
+            producer_reference_times: Vec::new(),
         }
     }
 
@@ -3255,5 +3416,134 @@ mod tests {
         }];
         let info = build_avis_info(meta, brands_with(false, false), &[]);
         assert!(info.media_duration_seconds().is_none());
+    }
+
+    // ----- prft ProducerReferenceTimeBox (ISO/IEC 14496-12 §8.16.5) -----
+
+    /// Build a `prft` body (FullBox prefix + fields) for the given
+    /// version. `media_time` is truncated to 32 bits for v0.
+    fn prft_body(version: u8, flags: u32, track_id: u32, ntp: u64, media_time: u64) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&track_id.to_be_bytes());
+        body.extend_from_slice(&ntp.to_be_bytes());
+        if version == 0 {
+            body.extend_from_slice(&(media_time as u32).to_be_bytes());
+        } else {
+            body.extend_from_slice(&media_time.to_be_bytes());
+        }
+        full_box_bytes(version, flags, &body)
+    }
+
+    #[test]
+    fn parse_prft_v0_reads_32bit_media_time() {
+        let ntp = (3_900_000_000u64 << 32) | 0x8000_0000;
+        let payload = prft_body(0, 0, 7, ntp, 123_456);
+        let p = parse_prft(&payload).unwrap();
+        assert_eq!(p.version, 0);
+        assert_eq!(p.flags, 0);
+        assert_eq!(p.reference_track_id, 7);
+        assert_eq!(p.ntp_timestamp, ntp);
+        assert_eq!(p.media_time, 123_456);
+        assert_eq!(p.ntp_seconds(), 3_900_000_000);
+        assert_eq!(p.ntp_fraction(), 0x8000_0000);
+    }
+
+    #[test]
+    fn parse_prft_v1_reads_64bit_media_time() {
+        let big = 0x1_0000_0001u64; // exceeds u32 — must not truncate
+        let payload = prft_body(1, 0, 1, 0, big);
+        let p = parse_prft(&payload).unwrap();
+        assert_eq!(p.version, 1);
+        assert_eq!(p.media_time, big);
+    }
+
+    #[test]
+    fn parse_prft_rejects_unknown_version() {
+        let payload = prft_body(1, 0, 1, 0, 0);
+        let mut bad = payload.clone();
+        bad[0] = 2; // version 2
+        assert!(parse_prft(&bad).is_err());
+    }
+
+    #[test]
+    fn parse_prft_rejects_truncated_v0_body() {
+        // 4-byte FullBox prefix + 12 bytes (missing the 4-byte media_time).
+        let payload = &prft_body(0, 0, 1, 0, 0)[..16];
+        assert!(parse_prft(payload).is_err());
+    }
+
+    #[test]
+    fn parse_prft_rejects_truncated_v1_body() {
+        // v1 needs 20 body bytes after the prefix; cut to 16.
+        let payload = &prft_body(1, 0, 1, 0, 0)[..16];
+        assert!(parse_prft(payload).is_err());
+    }
+
+    #[test]
+    fn prft_flag_bits_decode() {
+        let p = parse_prft(&prft_body(0, 0x000001, 1, 0, 0)).unwrap();
+        assert!(p.is_encoder_input_output());
+        assert!(!p.is_finalization_time());
+        let p = parse_prft(&prft_body(0, 0x000002, 1, 0, 0)).unwrap();
+        assert!(p.is_finalization_time());
+        let p = parse_prft(&prft_body(0, 0x000004, 1, 0, 0)).unwrap();
+        assert!(p.is_file_write_time());
+    }
+
+    #[test]
+    fn prft_unix_seconds_converts_ntp_epoch() {
+        // NTP seconds == NTP_UNIX_EPOCH_OFFSET → Unix instant 0.0.
+        let ntp = NTP_UNIX_EPOCH_OFFSET_SECONDS << 32;
+        let p = parse_prft(&prft_body(0, 0, 1, ntp, 0)).unwrap();
+        let unix = p.unix_seconds().unwrap();
+        assert!((unix - 0.0).abs() < 1e-6, "got {unix}");
+
+        // Add 10 seconds and half a fractional second.
+        let ntp = ((NTP_UNIX_EPOCH_OFFSET_SECONDS + 10) << 32) | 0x8000_0000;
+        let p = parse_prft(&prft_body(0, 0, 1, ntp, 0)).unwrap();
+        let unix = p.unix_seconds().unwrap();
+        assert!((unix - 10.5).abs() < 1e-6, "got {unix}");
+    }
+
+    #[test]
+    fn prft_unix_seconds_none_before_unix_epoch() {
+        // NTP seconds < the 1970 offset → predates Unix epoch.
+        let ntp = (1000u64) << 32;
+        let p = parse_prft(&prft_body(0, 0, 1, ntp, 0)).unwrap();
+        assert!(p.unix_seconds().is_none());
+    }
+
+    #[test]
+    fn parse_producer_reference_times_walks_top_level_in_order() {
+        // styp + two prft + a (dummy) moof at the top level: order preserved,
+        // moof ignored, both prft collected.
+        let mut file = Vec::new();
+        file.extend_from_slice(&wrap_box(b"styp", &[0u8; 8]));
+        file.extend_from_slice(&wrap_box(b"prft", &prft_body(0, 0, 1, 100 << 32, 10)));
+        file.extend_from_slice(&wrap_box(b"prft", &prft_body(1, 0, 2, 200 << 32, 20)));
+        file.extend_from_slice(&wrap_box(b"moof", &[0u8; 4]));
+        let prfts = parse_producer_reference_times(&file);
+        assert_eq!(prfts.len(), 2);
+        assert_eq!(prfts[0].reference_track_id, 1);
+        assert_eq!(prfts[0].ntp_seconds(), 100);
+        assert_eq!(prfts[1].reference_track_id, 2);
+        assert_eq!(prfts[1].version, 1);
+    }
+
+    #[test]
+    fn parse_producer_reference_times_empty_when_absent() {
+        let file = wrap_box(b"moov", &[0u8; 4]);
+        assert!(parse_producer_reference_times(&file).is_empty());
+    }
+
+    #[test]
+    fn parse_producer_reference_times_skips_malformed() {
+        // A truncated prft body is skipped; the valid one still lands.
+        let mut file = Vec::new();
+        file.extend_from_slice(&wrap_box(b"prft", &prft_body(0, 0, 1, 100 << 32, 10)[..10]));
+        file.extend_from_slice(&wrap_box(b"prft", &prft_body(0, 0, 9, 300 << 32, 30)));
+        let prfts = parse_producer_reference_times(&file);
+        assert_eq!(prfts.len(), 1);
+        assert_eq!(prfts[0].reference_track_id, 9);
     }
 }

@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- ISO/IEC 14496-12 §8.16.5 `prft` ProducerReferenceTimeBox parser for
+  fragmented / segmented AVIS image sequences (`avis` module):
+  `parse_prft` decodes a single box body (v0 32-bit / v1 64-bit
+  `media_time`, NTP 64-bit `ntp_timestamp`, `reference_track_ID`),
+  rejecting unknown versions + truncated bodies.
+  `parse_producer_reference_times` walks the file's top-level boxes
+  (`prft` is a `File`-container box that precedes the `moof` it
+  documents, sitting beside `styp` / `sidx`) and collects every entry
+  in bitstream order, skipping malformed ones. Surfaced on
+  `AvisMeta::producer_reference_times` (empty for the common
+  non-fragmented case). `ProducerReferenceTime` exposes NTP
+  seconds/fraction split, later-edition flag-bit helpers
+  (`is_encoder_input_output` / `is_finalization_time` /
+  `is_file_write_time`), and `unix_seconds` (NTP→Unix epoch conversion
+  via the new `NTP_UNIX_EPOCH_OFFSET_SECONDS` constant, RFC 5905).
+
 ## [0.0.10](https://github.com/OxideAV/oxideav-avif/compare/v0.0.9...v0.0.10) - 2026-06-15
 
 ### Other
