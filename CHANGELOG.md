@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- AVIF §6.5.36 `amve` AmbientViewingEnvironmentBox descriptive item
+  property (`meta` module): `Amve` carries the post-2015 ISO/IEC
+  14496-12 ambient-viewing-environment HDR metadata — a fixed 8-byte
+  plain `Box` (no version/flags) with `ambient_illuminance`
+  (`unsigned int(32)`, units of 0.0001 lux) and `ambient_light_x` /
+  `ambient_light_y` (`unsigned int(16)` each, CIE 1931 chromaticity in
+  units of 0.00002). `parse_amve` rejects bodies shorter than 8 bytes;
+  `Amve::illuminance_lux` / `Amve::light_xy` decode the scaled values.
+  Routed through `Property::Amve` (kind dispatch + `ipco` parse),
+  extracted onto `AvifImage::amve` and surfaced on `AvifInfo::amve`
+  (primary-item, with grid-item → first-tile fallback) plus
+  `AvifInfo::has_ambient_viewing_environment`. Unlike `mdcv`/`clli`,
+  which describe the content's mastering environment, `amve` describes
+  the viewer's nominal ambient environment — the two are complementary
+  and the box maps field-for-field to the `ambient_viewing_environment`
+  SEI (no scaling conversion). Validated against the BT.2035 / D65
+  worked example (10 lux, x=0.3127, y=0.3290; wire body
+  `00 01 86 A0 3D 13 40 42`).
 - ISO/IEC 14496-12 §8.16.5 `prft` ProducerReferenceTimeBox parser for
   fragmented / segmented AVIS image sequences (`avis` module):
   `parse_prft` decodes a single box body (v0 32-bit / v1 64-bit

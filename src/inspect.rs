@@ -12,7 +12,7 @@ use crate::cicp::{effective_cicp, CicpTriple};
 use crate::error::{AvifError as Error, Result};
 use crate::grid::ImageGrid;
 use crate::meta::{
-    Cclv, Clli, Colr, Ispe, Mdcv, Meta, Pasp, Pixi, Property, ITEM_TYPE_EXIF, ITEM_TYPE_MIME,
+    Amve, Cclv, Clli, Colr, Ispe, Mdcv, Meta, Pasp, Pixi, Property, ITEM_TYPE_EXIF, ITEM_TYPE_MIME,
 };
 use crate::parser::{
     classify_brands, item_bytes, parse, parse_header, AvifHeader, AvifImage, BrandClass,
@@ -24,6 +24,7 @@ const COLR: BoxType = b(b"colr");
 const MDCV: BoxType = b(b"mdcv");
 const CLLI: BoxType = b(b"clli");
 const CCLV: BoxType = b(b"cclv");
+const AMVE: BoxType = b(b"amve");
 
 /// High-level view of an AVIF file after the HEIF pass — useful for
 /// callers that want to inspect dimensions + colour info without
@@ -69,6 +70,13 @@ pub struct AvifInfo {
     /// Same semantics as `clli`; some encoders emit this in lieu of or
     /// alongside `clli`. `None` when the box is absent.
     pub cclv: Option<Cclv>,
+    /// Ambient viewing environment HDR metadata (`amve`, AVIF §6.5.36).
+    /// Present when the primary item (or grid item / first tile) carries
+    /// an `amve` item property. Describes the *viewer's* nominal ambient
+    /// environment (illuminance + ambient-light chromaticity) — distinct
+    /// from `mdcv`/`clli`, which describe the *content's* mastering
+    /// environment. `None` when the box is absent.
+    pub amve: Option<Amve>,
     /// Bit depth derived from `av1C` — `None` when `av1c` is empty.
     /// 8 = standard, 10 or 12 = HDR. Avoids callers having to re-parse
     /// the `av1C` record to know the coded depth.
@@ -301,6 +309,16 @@ impl AvifInfo {
         self.clli
             .map(|c| c.max_pic_average_light_level)
             .or_else(|| self.cclv.map(|c| c.max_pic_average_light_level))
+    }
+
+    /// True when an ambient-viewing-environment (`amve`) item property is
+    /// attached to the primary item. Distinct from [`has_hdr_metadata`],
+    /// which reports the *content's* mastering metadata — `amve` describes
+    /// the *viewer's* nominal ambient environment.
+    ///
+    /// [`has_hdr_metadata`]: Self::has_hdr_metadata
+    pub fn has_ambient_viewing_environment(&self) -> bool {
+        self.amve.is_some()
     }
 
     /// True when at least one thumbnail item is linked to the primary
@@ -663,6 +681,7 @@ pub(crate) fn build_info(
     let mdcv = img.mdcv;
     let clli = img.clli;
     let cclv = img.cclv;
+    let amve = img.amve;
     let primary_id = img.primary_item_id;
     let thumbnail_item_ids = img.meta.iref_sources_of(b"thmb", primary_id);
     let (exif_item_id, xmp_item_id) = resolve_metadata_items(&img.meta, primary_id);
@@ -730,6 +749,7 @@ pub(crate) fn build_info(
         mdcv,
         clli,
         cclv,
+        amve,
         bit_depth,
         monochrome,
         chroma_subsampling,
@@ -845,6 +865,13 @@ pub(crate) fn build_info_grid(
             _ => None,
         },
     };
+    let amve = match hdr.meta.property_for(primary_id, &AMVE) {
+        Some(Property::Amve(a)) => Some(*a),
+        _ => match hdr.meta.property_for(first_tile_id, &AMVE) {
+            Some(Property::Amve(a)) => Some(*a),
+            _ => None,
+        },
+    };
     let (bit_depth, monochrome, chroma_subsampling) = decode_av1c_flags(&av1c);
     let thumbnail_item_ids = hdr.meta.iref_sources_of(b"thmb", primary_id);
     let (exif_item_id, xmp_item_id) = resolve_metadata_items(&hdr.meta, primary_id);
@@ -907,6 +934,7 @@ pub(crate) fn build_info_grid(
         mdcv,
         clli,
         cclv,
+        amve,
         bit_depth,
         monochrome,
         chroma_subsampling,

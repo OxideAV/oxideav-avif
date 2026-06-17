@@ -7,7 +7,7 @@ use crate::error::{AvifError as Error, Result};
 
 use crate::box_parser::{b, iter_boxes, parse_full_box, read_u32, type_str, BoxType};
 use crate::meta::{
-    Cclv, Clli, Colr, Ispe, ItemInfo, ItemLocation, Mdcv, Meta, Pasp, Pixi, Property,
+    Amve, Cclv, Clli, Colr, Ispe, ItemInfo, ItemLocation, Mdcv, Meta, Pasp, Pixi, Property,
 };
 
 const FTYP: BoxType = b(b"ftyp");
@@ -66,6 +66,8 @@ pub struct AvifImage<'a> {
     pub clli: Option<Clli>,
     /// Colour volume luminance (`cclv` draft extension, same semantics as `clli`).
     pub cclv: Option<Cclv>,
+    /// Ambient viewing environment HDR metadata (`amve`, AVIF §6.5.36).
+    pub amve: Option<Amve>,
 }
 
 /// Header-only parse that stops after `ftyp` + `meta` have been walked.
@@ -277,6 +279,10 @@ pub fn parse(file: &[u8]) -> Result<AvifImage<'_>> {
         Some(Property::Cclv(v)) => Some(*v),
         _ => None,
     };
+    let amve = match meta.property_for(primary_id, b"amve") {
+        Some(Property::Amve(v)) => Some(*v),
+        _ => None,
+    };
 
     Ok(AvifImage {
         major_brand,
@@ -294,6 +300,7 @@ pub fn parse(file: &[u8]) -> Result<AvifImage<'_>> {
         mdcv,
         clli,
         cclv,
+        amve,
     })
 }
 
@@ -594,6 +601,7 @@ mod tests {
         assert!(img.mdcv.is_none(), "SDR fixture must not have mdcv");
         assert!(img.clli.is_none(), "SDR fixture must not have clli");
         assert!(img.cclv.is_none(), "SDR fixture must not have cclv");
+        assert!(img.amve.is_none(), "SDR fixture must not have amve");
     }
 
     /// `item_bytes_owned` on a single-extent iloc returns the same data

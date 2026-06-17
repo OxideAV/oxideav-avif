@@ -57,6 +57,8 @@ const AUXC: BoxType = b(b"auxC");
 const MDCV: BoxType = b(b"mdcv");
 const CLLI: BoxType = b(b"clli");
 const CCLV: BoxType = b(b"cclv");
+/// AVIF §6.5.36 / ISO/IEC 14496-12 — Ambient Viewing Environment.
+const AMVE: BoxType = b(b"amve");
 /// HEIF §6.5.7 — Relative Location property.
 const RLOC: BoxType = b(b"rloc");
 /// HEIF §6.5.11 — Layer Selector property.
@@ -533,6 +535,62 @@ pub struct Cclv {
     pub max_content_light_level: u16,
     /// Max frame-average light level in cd/m².
     pub max_pic_average_light_level: u16,
+}
+
+/// Ambient Viewing Environment (`amve`) — the nominal viewing-environment
+/// HDR metadata, carried as an `ipco` descriptive item property and
+/// associated with an image item via `ipma`. AVIF §6.5.36 references it
+/// as box type `amve` (no version/flags — a plain `Box`, NOT a `FullBox`)
+/// with the field definitions attributed to ISO/IEC 14496-12 (post-2015
+/// Ambient Viewing Environment Box).
+///
+/// The three fields are the same syntax elements, with the same units and
+/// ranges, as the `ambient_viewing_environment` SEI message and the
+/// ISO/IEC 23091-3 ambient-viewing-environment parameters — a decoder can
+/// populate the bitstream AVE SEI from this box field-for-field, with no
+/// scaling conversion required.
+///
+/// The 8-byte body layout is:
+///
+/// ```text
+/// unsigned int(32) ambient_illuminance;  // units of 0.0001 lux
+/// unsigned int(16) ambient_light_x;      // CIE 1931 x, units of 0.00002
+/// unsigned int(16) ambient_light_y;      // CIE 1931 y, units of 0.00002
+/// ```
+///
+/// Unlike `mdcv`/`clli`, which describe the *content's* mastering
+/// environment, `amve` describes the *viewer's* nominal ambient
+/// environment, so the two are complementary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Amve {
+    /// Environmental illuminance of the ambient viewing environment, in
+    /// units of 0.0001 lux (`lux = value / 10000`). `0` is permitted by
+    /// the syntax but generally treated as "unknown" by consumers.
+    pub ambient_illuminance: u32,
+    /// Normalised CIE 1931 *x* chromaticity of the ambient light, in
+    /// units of 0.00002 (`x = value * 0.00002`); range 0..=50000.
+    pub ambient_light_x: u16,
+    /// Normalised CIE 1931 *y* chromaticity of the ambient light, in
+    /// units of 0.00002 (`y = value * 0.00002`); range 0..=50000.
+    pub ambient_light_y: u16,
+}
+
+impl Amve {
+    /// `ambient_illuminance` decoded into lux (`value / 10000.0`).
+    #[inline]
+    pub fn illuminance_lux(&self) -> f64 {
+        f64::from(self.ambient_illuminance) / 10000.0
+    }
+
+    /// CIE 1931 (x, y) chromaticity of the ambient light, decoded to
+    /// the normalised 0.0..=1.0 range (`value * 0.00002`).
+    #[inline]
+    pub fn light_xy(&self) -> (f64, f64) {
+        (
+            f64::from(self.ambient_light_x) * 0.00002,
+            f64::from(self.ambient_light_y) * 0.00002,
+        )
+    }
 }
 
 /// Image Scaling transformative property (`iscl`) — HEIF §6.5.13.
@@ -2450,6 +2508,8 @@ pub enum Property {
     Clli(Clli),
     /// Colour volume luminance — draft AVIF supplement equivalent to `clli`.
     Cclv(Cclv),
+    /// Ambient viewing environment HDR metadata (AVIF §6.5.36).
+    Amve(Amve),
     /// Relative-location property (HEIF §6.5.7).
     Rloc(Rloc),
     /// Layer-selector property (HEIF §6.5.11).
@@ -2523,6 +2583,7 @@ impl Property {
             Property::Mdcv(_) => MDCV,
             Property::Clli(_) => CLLI,
             Property::Cclv(_) => CCLV,
+            Property::Amve(_) => AMVE,
             Property::Rloc(_) => RLOC,
             Property::Lsel(_) => LSEL,
             Property::A1op(_) => A1OP,
@@ -3050,6 +3111,7 @@ fn parse_ipco(payload: &[u8]) -> Result<Vec<Property>> {
             x if x == &MDCV => Property::Mdcv(parse_mdcv(body)?),
             x if x == &CLLI => Property::Clli(parse_clli(body)?),
             x if x == &CCLV => Property::Cclv(parse_cclv(body)?),
+            x if x == &AMVE => Property::Amve(parse_amve(body)?),
             x if x == &RLOC => Property::Rloc(parse_rloc(body)?),
             x if x == &LSEL => Property::Lsel(parse_lsel(body)?),
             x if x == &A1OP => Property::A1op(parse_a1op(body)?),
@@ -3247,6 +3309,24 @@ fn parse_cclv(body: &[u8]) -> Result<Cclv> {
     Ok(Cclv {
         max_content_light_level: read_u16(body, 0)?,
         max_pic_average_light_level: read_u16(body, 2)?,
+    })
+}
+
+/// Parse `amve` (AmbientViewingEnvironmentBox — AVIF §6.5.36). A plain
+/// `Box` (no version/flags) with a fixed 8-byte body: a big-endian
+/// `unsigned int(32)` illuminance followed by two big-endian
+/// `unsigned int(16)` CIE 1931 chromaticity values.
+fn parse_amve(body: &[u8]) -> Result<Amve> {
+    if body.len() < 8 {
+        return Err(Error::invalid(format!(
+            "avif: amve too short ({} < 8)",
+            body.len()
+        )));
+    }
+    Ok(Amve {
+        ambient_illuminance: read_u32(body, 0)?,
+        ambient_light_x: read_u16(body, 4)?,
+        ambient_light_y: read_u16(body, 6)?,
     })
 }
 
@@ -4603,6 +4683,46 @@ mod tests {
     fn cclv_rejects_truncated() {
         let buf = vec![0u8; 1];
         assert!(parse_cclv(&buf).is_err());
+    }
+
+    /// `amve` round-trip against the spec's BT.2035 / D65 worked example
+    /// (10 lux, x=0.3127, y=0.3290). Wire body: 00 01 86 A0 3D 13 40 42.
+    #[test]
+    fn amve_round_trip() {
+        let buf = [0x00, 0x01, 0x86, 0xA0, 0x3D, 0x13, 0x40, 0x42];
+        let a = parse_amve(&buf).unwrap();
+        assert_eq!(a.ambient_illuminance, 100_000);
+        assert_eq!(a.ambient_light_x, 15635);
+        assert_eq!(a.ambient_light_y, 16450);
+        // Decoded helpers.
+        assert!((a.illuminance_lux() - 10.0).abs() < 1e-9);
+        let (x, y) = a.light_xy();
+        assert!((x - 0.3127).abs() < 1e-9);
+        assert!((y - 0.3290).abs() < 1e-9);
+    }
+
+    /// `amve` dispatches through `parse_ipco` and reports its kind.
+    #[test]
+    fn amve_property_kind_round_trip() {
+        let body = [0x00, 0x01, 0x86, 0xA0, 0x3D, 0x13, 0x40, 0x42];
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(8u32 + body.len() as u32).to_be_bytes());
+        buf.extend_from_slice(b"amve");
+        buf.extend_from_slice(&body);
+        let props = parse_ipco(&buf).unwrap();
+        assert_eq!(props.len(), 1);
+        assert_eq!(props[0].kind(), AMVE);
+        match &props[0] {
+            Property::Amve(a) => assert_eq!(a.ambient_illuminance, 100_000),
+            other => panic!("expected Amve, got {other:?}"),
+        }
+    }
+
+    /// `amve` rejects a body shorter than the fixed 8 bytes.
+    #[test]
+    fn amve_rejects_truncated() {
+        let buf = vec![0u8; 7];
+        assert!(parse_amve(&buf).is_err());
     }
 
     /// Build a synthetic v2 `infe` payload with the given item_type +

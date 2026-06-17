@@ -50,7 +50,7 @@ encoder, which oxideav does not yet have); `make_encoder` returns
 | Thumbnails | `thmb` iref enumeration via `AvifInfo::thumbnail_item_ids` |
 | Premultiplied alpha | HEIF `prem` iref detected and surfaced |
 | CICP colour signalling | `colr` nclx → `CicpTriple` with H.273 defaults; ICC + Unknown fall back to Unspecified |
-| HDR metadata | `mdcv` (ST 2086), `clli` (MaxCLL/MaxFALL), `cclv` |
+| HDR metadata | `mdcv` (ST 2086), `clli` (MaxCLL/MaxFALL), `cclv`, `amve` ambient viewing environment (AVIF §6.5.36 / ISO/IEC 14496-12; 0.0001-lux illuminance + CIE 1931 ambient-light chromaticity, surfaced on `AvifInfo::amve`) |
 | `av1C` introspection | bit depth (8/10/12), monochrome flag, chroma subsampling decoded into `AvifInfo` |
 | Sequence Header OBU audit | av1-avif §2.1 "exactly one Sequence Header OBU" container-layer audit |
 | Primary item data | resolved via `iloc` construction_method 0; single-extent zero-copy slice, multi-extent concatenated (HEIF §8.11.3.3) |
