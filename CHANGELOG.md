@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- AVIS `ssix` SubsegmentIndexBox (ISO/IEC 14496-12 §8.16.4, `avis`
+  module): `SubsegmentIndex` / `SubsegmentRange` types plus `parse_ssix`
+  and the top-level `parse_subsegment_indexes` walk. `ssix` is a
+  `File`-container box that follows the `sidx` it documents and maps each
+  indexed subsegment to its `leva`-level byte-range partitions —
+  `subsegment_count` × (`range_count` × `(level: u8, range_size: u24)`),
+  all big-endian — enabling partial-subsegment (byte-range) access in
+  DASH-style fragmented / segmented AVIS delivery. `parse_ssix` is
+  `FullBox('ssix', 0, 0)`: it rejects non-zero versions and truncated
+  bodies; the top-level walk skips a malformed `ssix` so other boxes stay
+  reachable. Surfaced on `AvisMeta::subsegment_indexes` (empty for the
+  common non-fragmented still-image case). Companion to the existing
+  `prft` top-level walk.
+
 - AVIF §6.5.36 `amve` AmbientViewingEnvironmentBox descriptive item
   property (`meta` module): `Amve` carries the post-2015 ISO/IEC
   14496-12 ambient-viewing-environment HDR metadata — a fixed 8-byte

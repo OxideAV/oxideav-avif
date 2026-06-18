@@ -111,9 +111,10 @@ pub mod decoder;
 pub use alpha::{composite_alpha, find_alpha_item_id, ALPHA_URN_PREFIX};
 pub use avis::{
     audit_avis_profile_compliance, audit_avis_sequence, audit_edit_list, inspect_avis, parse_avis,
-    parse_prft, parse_producer_reference_times, sample_bytes, sample_table, AvisInfo, AvisMeta,
-    AvisProfileCompliance, AvisSequenceCompliance, EditListCompliance, EditListEntry,
-    ProducerReferenceTime, Sample, HANDLER_PICT, NTP_UNIX_EPOCH_OFFSET_SECONDS,
+    parse_prft, parse_producer_reference_times, parse_ssix, parse_subsegment_indexes, sample_bytes,
+    sample_table, AvisInfo, AvisMeta, AvisProfileCompliance, AvisSequenceCompliance,
+    EditListCompliance, EditListEntry, ProducerReferenceTime, Sample, SubsegmentIndex,
+    SubsegmentRange, HANDLER_PICT, NTP_UNIX_EPOCH_OFFSET_SECONDS,
 };
 pub use cicp::{
     effective_cicp, is_matrix_reserved, is_primaries_reserved, is_transfer_reserved, matrix_name,

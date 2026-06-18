@@ -40,6 +40,7 @@ const STSD: BoxType = b(b"stsd");
 const AV01: BoxType = b(b"av01");
 const AV1C: BoxType = b(b"av1C");
 const PRFT: BoxType = b(b"prft");
+const SSIX: BoxType = b(b"ssix");
 
 /// NTP-epoch offset relative to the Unix epoch, in seconds. The NTP
 /// timescale counts seconds since 1900-01-01T00:00:00Z; the Unix epoch
@@ -285,6 +286,124 @@ pub fn parse_producer_reference_times(file: &[u8]) -> Vec<ProducerReferenceTime>
     out
 }
 
+/// One `(level, range_size)` pair inside an `ssix` subsegment
+/// (ISO/IEC 14496-12 §8.16.4 SubsegmentIndexBox).
+///
+/// A subsegment is partitioned into contiguous byte ranges, one per
+/// `leva` Level Assignment Box level. `level` names the level (matching
+/// a `leva` entry); `range_size` is the byte length of this level's
+/// slice of the subsegment. Ranges within a subsegment are contiguous
+/// and together cover every byte of it, so a client can fetch a partial
+/// subsegment (e.g. just the base layer) by summing leading ranges.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SubsegmentRange {
+    /// Level (per the `leva` Level Assignment Box) to which this partial
+    /// subsegment is assigned. `unsigned int(8)` on the wire.
+    pub level: u8,
+    /// Size in bytes of this level's contiguous byte range within the
+    /// subsegment. `unsigned int(24)` on the wire (max 16 MiB − 1).
+    pub range_size: u32,
+}
+
+/// One `ssix` SubsegmentIndexBox (ISO/IEC 14496-12 §8.16.4).
+///
+/// `ssix` is a top-level (`File`-container) box that sits immediately
+/// after the `sidx` Segment Index Box it documents and maps each
+/// indexed subsegment to a list of level→byte-range partitions. With
+/// the companion `leva` box it lets a client fetch byte-range subsets of
+/// a subsegment (partial-subsegment access), e.g. a temporal base layer
+/// without higher enhancement layers. Fragmented / segmented AVIS
+/// sequences (DASH-style `moof`-based delivery) may carry these
+/// alongside `styp` / `sidx` / `prft`; a non-fragmented still-image
+/// AVIF never does.
+///
+/// `subsegment_count` shall equal the `reference_count` of the preceding
+/// `sidx`; each subsegment's `range_count` shall be ≥ 2.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubsegmentIndex {
+    /// One entry per indexed subsegment, in bitstream order. Each is the
+    /// ordered list of `(level, range_size)` partitions covering that
+    /// subsegment. The outer length is the box's `subsegment_count`.
+    pub subsegments: Vec<Vec<SubsegmentRange>>,
+}
+
+/// Parse a single `ssix` box payload (the bytes after the size/type
+/// header, including the FullBox `version`/`flags`).
+///
+/// Body layout (ISO/IEC 14496-12 §8.16.4.2): `subsegment_count(32)`,
+/// then for each subsegment `range_count(32)` followed by `range_count`
+/// `(level: u8, range_size: u24)` pairs (4 bytes each). The box is
+/// `FullBox('ssix', 0, 0)`; versions other than 0 and truncated bodies
+/// are rejected. All integers big-endian.
+pub fn parse_ssix(payload: &[u8]) -> Result<SubsegmentIndex> {
+    let (version, _flags, rest) = parse_full_box(payload)?;
+    if version != 0 {
+        return Err(Error::InvalidData(format!(
+            "avis: ssix version {version} unsupported (expected 0)"
+        )));
+    }
+    let subsegment_count = read_u32(rest, 0)?;
+    let mut subsegments = Vec::with_capacity(subsegment_count.min(1024) as usize);
+    let mut at = 4usize;
+    for _ in 0..subsegment_count {
+        let range_count = read_u32(rest, at)?;
+        at = at
+            .checked_add(4)
+            .ok_or_else(|| Error::InvalidData("avis: ssix offset overflow".to_string()))?;
+        let mut ranges = Vec::with_capacity(range_count.min(1024) as usize);
+        for _ in 0..range_count {
+            let level = *rest
+                .get(at)
+                .ok_or_else(|| Error::InvalidData("avis: ssix truncated range".to_string()))?;
+            // `range_size` is 24-bit big-endian: bytes at+1..=at+3.
+            let b0 = u32::from(
+                *rest
+                    .get(at + 1)
+                    .ok_or_else(|| Error::InvalidData("avis: ssix truncated range".to_string()))?,
+            );
+            let b1 = u32::from(
+                *rest
+                    .get(at + 2)
+                    .ok_or_else(|| Error::InvalidData("avis: ssix truncated range".to_string()))?,
+            );
+            let b2 = u32::from(
+                *rest
+                    .get(at + 3)
+                    .ok_or_else(|| Error::InvalidData("avis: ssix truncated range".to_string()))?,
+            );
+            let range_size = (b0 << 16) | (b1 << 8) | b2;
+            ranges.push(SubsegmentRange { level, range_size });
+            at = at
+                .checked_add(4)
+                .ok_or_else(|| Error::InvalidData("avis: ssix offset overflow".to_string()))?;
+        }
+        subsegments.push(ranges);
+    }
+    Ok(SubsegmentIndex { subsegments })
+}
+
+/// Collect every top-level `ssix` SubsegmentIndexBox in the file, in
+/// bitstream order (ISO/IEC 14496-12 §8.16.4). `ssix` is a
+/// `File`-container box that follows the `sidx` it documents, so it is
+/// found by walking the file's top-level boxes — not inside `moov`.
+/// Returns an empty vector for a non-fragmented AVIS (the common case).
+/// A malformed `ssix` is skipped rather than failing the whole walk so a
+/// still-image / non-fragmented file's other boxes stay reachable.
+pub fn parse_subsegment_indexes(file: &[u8]) -> Vec<SubsegmentIndex> {
+    let mut out = Vec::new();
+    for hdr in iter_boxes(file) {
+        let Ok(hdr) = hdr else { break };
+        if hdr.box_type != SSIX {
+            continue;
+        }
+        let payload = &file[hdr.payload_start..hdr.end()];
+        if let Ok(ssix) = parse_ssix(payload) {
+            out.push(ssix);
+        }
+    }
+    out
+}
+
 /// Container-side description of an AVIS image sequence.
 #[derive(Clone, Debug)]
 pub struct AvisMeta {
@@ -354,6 +473,13 @@ pub struct AvisMeta {
     /// (the common case) — `prft` only appears in `moof`-based
     /// fragmented / segmented files.
     pub producer_reference_times: Vec<ProducerReferenceTime>,
+    /// Top-level `ssix` SubsegmentIndexBox entries in bitstream order
+    /// (ISO/IEC 14496-12 §8.16.4). Each maps a `sidx`-indexed
+    /// subsegment to its `leva`-level byte-range partitions, enabling
+    /// partial-subsegment (byte-range) access. Empty for a
+    /// non-fragmented AVIS (the common case) — `ssix` only appears in
+    /// `sidx`-indexed fragmented / segmented files.
+    pub subsegment_indexes: Vec<SubsegmentIndex>,
 }
 
 /// Walk the container and build a sample table. The input buffer must
@@ -382,6 +508,9 @@ pub fn parse_avis(file: &[u8]) -> Result<AvisMeta> {
     // `prft` is a top-level (File-container) box — walk the file, not
     // moov. Empty for a non-fragmented AVIS.
     let producer_reference_times = parse_producer_reference_times(file);
+    // `ssix` is also a top-level (File-container) box, following the
+    // `sidx` it documents. Empty for a non-fragmented AVIS.
+    let subsegment_indexes = parse_subsegment_indexes(file);
     Ok(AvisMeta {
         timescale,
         media_timescale,
@@ -394,6 +523,7 @@ pub fn parse_avis(file: &[u8]) -> Result<AvisMeta> {
         sample_to_groups,
         sample_group_descriptions,
         producer_reference_times,
+        subsegment_indexes,
     })
 }
 
@@ -2191,6 +2321,7 @@ mod tests {
             sample_to_groups: Vec::new(),
             sample_group_descriptions: Vec::new(),
             producer_reference_times: Vec::new(),
+            subsegment_indexes: Vec::new(),
         };
         let audit = audit_avis_sequence(&meta, &file);
         assert!(
@@ -2217,6 +2348,7 @@ mod tests {
             sample_to_groups: Vec::new(),
             sample_group_descriptions: Vec::new(),
             producer_reference_times: Vec::new(),
+            subsegment_indexes: Vec::new(),
         };
         let audit = audit_avis_sequence(&meta, &[]);
         assert!(!audit.is_compliant());
@@ -2241,6 +2373,7 @@ mod tests {
             sample_to_groups: Vec::new(),
             sample_group_descriptions: Vec::new(),
             producer_reference_times: Vec::new(),
+            subsegment_indexes: Vec::new(),
         };
         let audit = audit_avis_sequence(&meta, &[]);
         assert!(!audit.handler_is_pict);
@@ -2262,6 +2395,7 @@ mod tests {
             sample_to_groups: Vec::new(),
             sample_group_descriptions: Vec::new(),
             producer_reference_times: Vec::new(),
+            subsegment_indexes: Vec::new(),
         };
         let audit = audit_avis_sequence(&meta, &[]);
         assert!(!audit.is_compliant());
@@ -2287,6 +2421,7 @@ mod tests {
             sample_to_groups: Vec::new(),
             sample_group_descriptions: Vec::new(),
             producer_reference_times: Vec::new(),
+            subsegment_indexes: Vec::new(),
         };
         let audit = audit_avis_sequence(&meta, &[]);
         assert!(!audit.single_sample_description);
@@ -2313,6 +2448,7 @@ mod tests {
             sample_to_groups: Vec::new(),
             sample_group_descriptions: Vec::new(),
             producer_reference_times: Vec::new(),
+            subsegment_indexes: Vec::new(),
         };
         let audit = audit_avis_sequence(&meta, &[]);
         assert!(audit.single_sample_description);
@@ -2359,6 +2495,7 @@ mod tests {
             sample_to_groups: Vec::new(),
             sample_group_descriptions: Vec::new(),
             producer_reference_times: Vec::new(),
+            subsegment_indexes: Vec::new(),
         };
         let audit = audit_avis_sequence(&meta, &file);
         assert_eq!(audit.sequence_header_obu_count, 2);
@@ -2388,6 +2525,7 @@ mod tests {
             sample_to_groups: Vec::new(),
             sample_group_descriptions: Vec::new(),
             producer_reference_times: Vec::new(),
+            subsegment_indexes: Vec::new(),
         };
         let audit = audit_avis_sequence(&meta, &sh);
         assert!(audit.is_compliant());
@@ -2416,6 +2554,7 @@ mod tests {
             sample_to_groups: Vec::new(),
             sample_group_descriptions: Vec::new(),
             producer_reference_times: Vec::new(),
+            subsegment_indexes: Vec::new(),
         };
         let audit = audit_avis_sequence(&meta, &frame);
         assert!(audit.is_compliant());
@@ -2455,6 +2594,7 @@ mod tests {
             sample_to_groups: Vec::new(),
             sample_group_descriptions: Vec::new(),
             producer_reference_times: Vec::new(),
+            subsegment_indexes: Vec::new(),
         };
         let audit = audit_avis_sequence(&meta, &sh);
         assert_eq!(audit.sequence_header_obu_count, 1);
@@ -2571,6 +2711,7 @@ mod tests {
             sample_to_groups: Vec::new(),
             sample_group_descriptions: Vec::new(),
             producer_reference_times: Vec::new(),
+            subsegment_indexes: Vec::new(),
         }
     }
 
@@ -3545,5 +3686,127 @@ mod tests {
         let prfts = parse_producer_reference_times(&file);
         assert_eq!(prfts.len(), 1);
         assert_eq!(prfts[0].reference_track_id, 9);
+    }
+
+    /// Build an `ssix` body (FullBox v0/flags0 prefix + payload) from a
+    /// list of subsegments, each a slice of `(level, range_size)` pairs.
+    /// `range_size` is emitted as 24-bit big-endian.
+    fn ssix_body(subsegments: &[&[(u8, u32)]]) -> Vec<u8> {
+        let mut body = vec![0u8, 0, 0, 0]; // version 0, flags 0
+        body.extend_from_slice(&(subsegments.len() as u32).to_be_bytes());
+        for ss in subsegments {
+            body.extend_from_slice(&(ss.len() as u32).to_be_bytes());
+            for &(level, range_size) in *ss {
+                body.push(level);
+                body.push((range_size >> 16) as u8);
+                body.push((range_size >> 8) as u8);
+                body.push(range_size as u8);
+            }
+        }
+        body
+    }
+
+    #[test]
+    fn parse_ssix_reads_levels_and_24bit_ranges() {
+        let body = ssix_body(&[
+            &[(1, 0x10_0000), (2, 0x20_0000)],
+            &[(1, 100), (2, 200), (3, 300)],
+        ]);
+        let ssix = parse_ssix(&body).unwrap();
+        assert_eq!(ssix.subsegments.len(), 2);
+        assert_eq!(ssix.subsegments[0].len(), 2);
+        assert_eq!(
+            ssix.subsegments[0][0],
+            SubsegmentRange {
+                level: 1,
+                range_size: 0x10_0000
+            }
+        );
+        assert_eq!(
+            ssix.subsegments[0][1],
+            SubsegmentRange {
+                level: 2,
+                range_size: 0x20_0000
+            }
+        );
+        assert_eq!(ssix.subsegments[1].len(), 3);
+        assert_eq!(ssix.subsegments[1][2].level, 3);
+        assert_eq!(ssix.subsegments[1][2].range_size, 300);
+    }
+
+    #[test]
+    fn parse_ssix_max_24bit_range_size() {
+        // range_size is unsigned int(24): top value is 0xFFFFFF.
+        let body = ssix_body(&[&[(0, 0xFF_FFFF), (1, 0)]]);
+        let ssix = parse_ssix(&body).unwrap();
+        assert_eq!(ssix.subsegments[0][0].range_size, 0xFF_FFFF);
+        assert_eq!(ssix.subsegments[0][1].range_size, 0);
+    }
+
+    #[test]
+    fn parse_ssix_empty_subsegment_count() {
+        let body = ssix_body(&[]);
+        let ssix = parse_ssix(&body).unwrap();
+        assert!(ssix.subsegments.is_empty());
+    }
+
+    #[test]
+    fn parse_ssix_rejects_unknown_version() {
+        let mut body = ssix_body(&[&[(1, 1), (2, 2)]]);
+        body[0] = 1; // version 1
+        assert!(parse_ssix(&body).is_err());
+    }
+
+    #[test]
+    fn parse_ssix_rejects_truncated_range() {
+        // Declares one subsegment with one range but cuts the last byte.
+        let mut body = ssix_body(&[&[(1, 0x123456)]]);
+        body.pop();
+        assert!(parse_ssix(&body).is_err());
+    }
+
+    #[test]
+    fn parse_ssix_rejects_truncated_range_count() {
+        // subsegment_count = 1 but no range_count follows.
+        let body = vec![0u8, 0, 0, 0, 0, 0, 0, 1];
+        assert!(parse_ssix(&body).is_err());
+    }
+
+    #[test]
+    fn parse_subsegment_indexes_walks_top_level_in_order() {
+        // styp + sidx + two ssix + a (dummy) moof: order preserved,
+        // non-ssix ignored, both ssix collected.
+        let mut file = Vec::new();
+        file.extend_from_slice(&wrap_box(b"styp", &[0u8; 8]));
+        file.extend_from_slice(&wrap_box(b"sidx", &[0u8; 12]));
+        file.extend_from_slice(&wrap_box(b"ssix", &ssix_body(&[&[(1, 10), (2, 20)]])));
+        file.extend_from_slice(&wrap_box(b"ssix", &ssix_body(&[&[(1, 30), (2, 40)]])));
+        file.extend_from_slice(&wrap_box(b"moof", &[0u8; 4]));
+        let idx = parse_subsegment_indexes(&file);
+        assert_eq!(idx.len(), 2);
+        assert_eq!(idx[0].subsegments[0][0].range_size, 10);
+        assert_eq!(idx[1].subsegments[0][1].range_size, 40);
+    }
+
+    #[test]
+    fn parse_subsegment_indexes_empty_when_absent() {
+        let file = wrap_box(b"moov", &[0u8; 4]);
+        assert!(parse_subsegment_indexes(&file).is_empty());
+    }
+
+    #[test]
+    fn parse_subsegment_indexes_skips_malformed() {
+        // A truncated ssix is skipped; the valid one still lands.
+        let truncated = {
+            let mut b = ssix_body(&[&[(1, 0x123456)]]);
+            b.pop();
+            b
+        };
+        let mut file = Vec::new();
+        file.extend_from_slice(&wrap_box(b"ssix", &truncated));
+        file.extend_from_slice(&wrap_box(b"ssix", &ssix_body(&[&[(7, 77), (8, 88)]])));
+        let idx = parse_subsegment_indexes(&file);
+        assert_eq!(idx.len(), 1);
+        assert_eq!(idx[0].subsegments[0][0].level, 7);
     }
 }
