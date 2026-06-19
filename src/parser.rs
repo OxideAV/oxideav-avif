@@ -2,12 +2,15 @@
 //! resolve the primary item's payload inside `mdat` → return the AV1
 //! OBU byte slice + the properties the downstream decoder needs.
 
+use std::borrow::Cow;
+
 use crate::derived::Mif1Compliance;
 use crate::error::{AvifError as Error, Result};
 
 use crate::box_parser::{b, iter_boxes, parse_full_box, read_u32, type_str, BoxType};
 use crate::meta::{
-    Amve, Cclv, Clli, Colr, Ispe, ItemInfo, ItemLocation, Mdcv, Meta, Pasp, Pixi, Property,
+    Amve, Cclv, Clli, Colr, IlocExtent, Ispe, ItemInfo, ItemLocation, Mdcv, Meta, Pasp, Pixi,
+    Property,
 };
 
 const FTYP: BoxType = b(b"ftyp");
@@ -50,8 +53,16 @@ pub struct AvifImage<'a> {
     pub meta: Meta,
     pub primary_item_id: u32,
     pub primary_item: ItemInfo,
-    /// AV1 OBU bitstream for the primary item (a slice into the file).
-    pub primary_item_data: &'a [u8],
+    /// AV1 OBU bitstream for the primary item.
+    ///
+    /// For the common case — a single-extent `construction_method == 0`
+    /// (file-offset) item — this borrows directly into `file` with no
+    /// allocation ([`Cow::Borrowed`]). When the primary item's bytes live
+    /// in the `meta` box's `idat` (`construction_method == 1`, HEIF
+    /// §8.11.3 / ISO/IEC 14496-12 §8.11.3) or span multiple extents, the
+    /// extents are concatenated into an owned buffer ([`Cow::Owned`]).
+    /// Deref-coerces to `&[u8]` for all reads.
+    pub primary_item_data: Cow<'a, [u8]>,
     /// `av1C` configuration record body (the 4-byte AV1CodecConfigurationRecord
     /// prefix + embedded config OBUs). `None` if the property store
     /// doesn't ship one — a malformed file.
@@ -109,10 +120,38 @@ pub fn parse_header(file: &[u8]) -> Result<AvifHeader<'_>> {
     })
 }
 
-/// Resolve an item's payload bytes via its `iloc` entry. Public so the
-/// grid / alpha paths can independently fetch tile + alpha items.
+/// Resolve a single-extent, `construction_method == 0` item's payload
+/// bytes via its `iloc` entry as a zero-copy slice into `file`. Public so
+/// the grid / alpha paths can independently fetch tile + alpha items.
+///
+/// Items stored in the `meta` box's `idat` (`construction_method == 1`)
+/// or spanning multiple extents are not file-offset slices; for those use
+/// [`item_bytes_with_idat`] (returns an owned [`Cow`]) instead. This
+/// helper errors on cm ≠ 0 and on multi-extent items.
 pub fn item_bytes<'a>(file: &'a [u8], loc: &ItemLocation) -> Result<&'a [u8]> {
     resolve_item_bytes(file, loc)
+}
+
+/// Resolve an item's payload bytes via its `iloc` entry, handling both
+/// `construction_method == 0` (file-offset, bytes inside `file`) and
+/// `construction_method == 1` (idat-offset, bytes inside the `meta` box's
+/// `idat`, passed in via `idat`), and multi-extent items of either method.
+///
+/// The common single-extent cm=0 case returns a zero-copy
+/// [`Cow::Borrowed`] into `file`; idat-backed or multi-extent items
+/// concatenate into a [`Cow::Owned`] buffer.
+///
+/// Spec: ISO/IEC 14496-12 §8.11.3 — `construction_method` 0 (file_offset:
+/// absolute offsets into the file) and 1 (idat_offset: box offsets into
+/// the `idat` of the same `meta`, `data_reference_index` / `extent_index`
+/// unused, data origin = first byte of `data[]` in the ItemDataBox).
+/// `construction_method == 2` (item_offset) is not resolved here.
+pub fn item_bytes_with_idat<'a>(
+    file: &'a [u8],
+    idat: Option<&[u8]>,
+    loc: &ItemLocation,
+) -> Result<Cow<'a, [u8]>> {
+    resolve_item_bytes_with_idat(file, idat, loc)
 }
 
 /// Audit a file against the HEIF §10.2.1.1 `mif1` structural-brand
@@ -245,7 +284,7 @@ pub fn parse(file: &[u8]) -> Result<AvifImage<'_>> {
     let loc = meta
         .location_by_id(primary_id)
         .ok_or_else(|| Error::invalid("avif: primary item missing in iloc"))?;
-    let primary_data = resolve_item_bytes(file, loc)?;
+    let primary_data = resolve_item_bytes_with_idat(file, meta.idat.as_deref(), loc)?;
 
     let av1c = match meta.property_for(primary_id, b"av1C") {
         Some(Property::Av1C(bytes)) => Some(bytes.clone()),
@@ -451,13 +490,89 @@ fn resolve_item_bytes<'a>(file: &'a [u8], loc: &ItemLocation) -> Result<&'a [u8]
     }
 }
 
-/// Resolve an item's payload bytes, concatenating multiple extents when
-/// necessary. This may allocate when the item spans more than one extent.
+/// Pick the backing buffer for an `iloc` entry given its
+/// `construction_method`: `file` for method 0, the meta box's `idat` for
+/// method 1. Method 2 (item_offset) is not supported.
+fn backing_for<'a>(file: &'a [u8], idat: Option<&'a [u8]>, loc: &ItemLocation) -> Result<&'a [u8]> {
+    match loc.construction_method {
+        0 => Ok(file),
+        1 => idat.ok_or_else(|| {
+            Error::invalid(format!(
+                "avif: item {} uses idat construction_method but the meta box has no idat",
+                loc.id
+            ))
+        }),
+        m => Err(Error::unsupported(format!(
+            "avif: iloc construction_method {m} not supported (only file-offset and idat)",
+        ))),
+    }
+}
+
+/// `construction_method`-aware resolution. Returns a zero-copy
+/// [`Cow::Borrowed`] into `file` only for the single-extent cm=0 case;
+/// every idat-backed item (and any multi-extent item) concatenates into an
+/// owned buffer. Keeping the borrowed branch tied solely to `file` (and
+/// never to `idat`) lets callers move the `Meta` that owns the `idat` while
+/// still holding a cm=0 borrow.
+fn resolve_item_bytes_with_idat<'a>(
+    file: &'a [u8],
+    idat: Option<&[u8]>,
+    loc: &ItemLocation,
+) -> Result<Cow<'a, [u8]>> {
+    if loc.extents.is_empty() {
+        return Err(Error::invalid("avif: iloc entry has no extents"));
+    }
+    // Fast path: single-extent file-offset item borrows directly into
+    // `file` with no allocation.
+    if loc.construction_method == 0 && loc.extents.len() == 1 {
+        let (start, end) = extent_range(file, loc, &loc.extents[0], 0)?;
+        return Ok(Cow::Borrowed(&file[start..end]));
+    }
+    // Everything else (idat-backed, or multi-extent of either method)
+    // concatenates the extents into an owned buffer (HEIF §8.11.3.3).
+    let backing = backing_for(file, idat, loc)?;
+    let mut out = Vec::new();
+    for (i, e) in loc.extents.iter().enumerate() {
+        let (start, end) = extent_range(backing, loc, e, i)?;
+        out.extend_from_slice(&backing[start..end]);
+    }
+    Ok(Cow::Owned(out))
+}
+
+/// Bounds-check one extent against `backing` and return its byte range.
+fn extent_range(
+    backing: &[u8],
+    loc: &ItemLocation,
+    e: &IlocExtent,
+    i: usize,
+) -> Result<(usize, usize)> {
+    let start = loc
+        .base_offset
+        .checked_add(e.offset)
+        .ok_or_else(|| Error::invalid(format!("avif: iloc extent {i} offset overflow")))?;
+    let end = start
+        .checked_add(e.length)
+        .ok_or_else(|| Error::invalid(format!("avif: iloc extent {i} length overflow")))?;
+    let (start, end) = (start as usize, end as usize);
+    if end > backing.len() {
+        return Err(Error::invalid(format!(
+            "avif: iloc extent {i} {start}..{end} exceeds backing length {}",
+            backing.len()
+        )));
+    }
+    Ok((start, end))
+}
+
+/// Resolve a `construction_method == 0` item's payload bytes,
+/// concatenating multiple extents when necessary. This may allocate when
+/// the item spans more than one extent.
 ///
-/// For the common single-extent case this calls [`item_bytes`] internally
-/// and returns the slice as an owned copy — a small allocation to keep the
-/// API uniform. Callers that want zero-copy access for single-extent items
-/// should use [`item_bytes`] directly.
+/// For the common single-extent case this borrows the slice and copies it
+/// to an owned buffer — a small allocation to keep the API uniform.
+/// Callers that want zero-copy access for single-extent items should use
+/// [`item_bytes`] directly; callers that need to resolve idat-backed
+/// (`construction_method == 1`) items should use
+/// [`item_bytes_owned_with_idat`].
 pub fn item_bytes_owned(file: &[u8], loc: &ItemLocation) -> Result<Vec<u8>> {
     if loc.construction_method != 0 {
         return Err(Error::unsupported(format!(
@@ -465,33 +580,21 @@ pub fn item_bytes_owned(file: &[u8], loc: &ItemLocation) -> Result<Vec<u8>> {
             loc.construction_method
         )));
     }
-    if loc.extents.is_empty() {
-        return Err(Error::invalid("avif: iloc entry has no extents"));
-    }
-    if loc.extents.len() == 1 {
-        // Common path: single extent — delegate to slice resolver.
-        return item_bytes(file, loc).map(|s| s.to_vec());
-    }
-    // Multi-extent: concatenate all extents in order (HEIF §8.11.3.3).
-    let mut out = Vec::new();
-    for (i, e) in loc.extents.iter().enumerate() {
-        let start = loc
-            .base_offset
-            .checked_add(e.offset)
-            .ok_or_else(|| Error::invalid(format!("avif: iloc extent {i} offset overflow")))?;
-        let end = start
-            .checked_add(e.length)
-            .ok_or_else(|| Error::invalid(format!("avif: iloc extent {i} length overflow")))?;
-        let (start, end) = (start as usize, end as usize);
-        if end > file.len() {
-            return Err(Error::invalid(format!(
-                "avif: iloc extent {i} {start}..{end} exceeds file length {}",
-                file.len()
-            )));
-        }
-        out.extend_from_slice(&file[start..end]);
-    }
-    Ok(out)
+    resolve_item_bytes_with_idat(file, None, loc).map(Cow::into_owned)
+}
+
+/// Resolve an item's payload bytes to an owned buffer, handling both
+/// file-offset (`construction_method == 0`) and idat-offset
+/// (`construction_method == 1`, bytes inside the `meta` box's `idat`)
+/// items as well as multi-extent items of either method.
+///
+/// See [`item_bytes_with_idat`] for the zero-copy-when-possible variant.
+pub fn item_bytes_owned_with_idat(
+    file: &[u8],
+    idat: Option<&[u8]>,
+    loc: &ItemLocation,
+) -> Result<Vec<u8>> {
+    resolve_item_bytes_with_idat(file, idat, loc).map(Cow::into_owned)
 }
 
 #[cfg(test)]
@@ -674,6 +777,126 @@ mod tests {
         };
         let err = item_bytes_owned(b"data", &loc).unwrap_err();
         assert!(matches!(err, crate::error::AvifError::Unsupported(_)));
+    }
+
+    /// `item_bytes_with_idat` resolves a single-extent `construction_method
+    /// == 1` (idat-offset) item from the `idat` slice, indexing
+    /// base_offset + extent.offset into `data[]` (ISO/IEC 14496-12
+    /// §8.11.3, construction method 1). The result is owned, never a
+    /// borrow into `file`.
+    #[test]
+    fn item_bytes_with_idat_single_extent_idat() {
+        use crate::meta::{IlocExtent, ItemLocation};
+        let file = b"\x00\x00\x00\x00"; // file bytes are irrelevant for cm=1
+        let idat = b"....HELLO...."; // payload "HELLO" lives at offset 4
+        let loc = ItemLocation {
+            id: 7,
+            construction_method: 1,
+            data_reference_index: 0,
+            base_offset: 4,
+            extents: vec![IlocExtent {
+                offset: 0,
+                length: 5,
+            }],
+        };
+        let bytes = item_bytes_with_idat(file, Some(idat), &loc).unwrap();
+        assert_eq!(&*bytes, b"HELLO");
+        assert!(matches!(bytes, Cow::Owned(_)), "idat items are owned");
+        // The owned helper agrees.
+        let owned = item_bytes_owned_with_idat(file, Some(idat), &loc).unwrap();
+        assert_eq!(owned, b"HELLO");
+    }
+
+    /// A cm=0 single-extent item stays zero-copy: `item_bytes_with_idat`
+    /// returns a borrow into `file`, with no allocation.
+    #[test]
+    fn item_bytes_with_idat_cm0_is_borrowed() {
+        use crate::meta::{IlocExtent, ItemLocation};
+        let file = b"xxxHELLOxxx";
+        let loc = ItemLocation {
+            id: 1,
+            construction_method: 0,
+            data_reference_index: 0,
+            base_offset: 3,
+            extents: vec![IlocExtent {
+                offset: 0,
+                length: 5,
+            }],
+        };
+        let bytes = item_bytes_with_idat(file, None, &loc).unwrap();
+        assert_eq!(&*bytes, b"HELLO");
+        assert!(
+            matches!(bytes, Cow::Borrowed(_)),
+            "cm=0 single-extent must stay zero-copy"
+        );
+    }
+
+    /// `item_bytes_with_idat` concatenates multi-extent idat items in
+    /// declaration order (HEIF §8.11.3.3).
+    #[test]
+    fn item_bytes_with_idat_multi_extent_idat() {
+        use crate::meta::{IlocExtent, ItemLocation};
+        let idat = b"AAAA____BBBB"; // extents 0..4 and 8..12 inside idat
+        let loc = ItemLocation {
+            id: 2,
+            construction_method: 1,
+            data_reference_index: 0,
+            base_offset: 0,
+            extents: vec![
+                IlocExtent {
+                    offset: 0,
+                    length: 4,
+                },
+                IlocExtent {
+                    offset: 8,
+                    length: 4,
+                },
+            ],
+        };
+        let bytes = item_bytes_with_idat(b"", Some(idat), &loc).unwrap();
+        assert_eq!(&*bytes, b"AAAABBBB");
+    }
+
+    /// A cm=1 item with no `idat` available is an invalid file, not a
+    /// silent empty payload.
+    #[test]
+    fn item_bytes_with_idat_missing_idat_errors() {
+        use crate::meta::{IlocExtent, ItemLocation};
+        let loc = ItemLocation {
+            id: 9,
+            construction_method: 1,
+            data_reference_index: 0,
+            base_offset: 0,
+            extents: vec![IlocExtent {
+                offset: 0,
+                length: 2,
+            }],
+        };
+        let err = item_bytes_with_idat(b"data", None, &loc).unwrap_err();
+        assert!(
+            matches!(err, crate::error::AvifError::InvalidData(_)),
+            "missing idat for a cm=1 item must be Invalid: {err:?}"
+        );
+    }
+
+    /// An idat extent that runs past the `idat` buffer is rejected — the
+    /// bounds check is against the idat length, not the file length.
+    #[test]
+    fn item_bytes_with_idat_extent_out_of_bounds() {
+        use crate::meta::{IlocExtent, ItemLocation};
+        let idat = b"short";
+        let loc = ItemLocation {
+            id: 3,
+            construction_method: 1,
+            data_reference_index: 0,
+            base_offset: 0,
+            extents: vec![IlocExtent {
+                offset: 0,
+                length: 100,
+            }],
+        };
+        let err = item_bytes_with_idat(b"", Some(idat), &loc).unwrap_err();
+        assert!(matches!(err, crate::error::AvifError::InvalidData(_)));
     }
 
     /// `audit_mif1` against the Microsoft monochrome AVIF fixture

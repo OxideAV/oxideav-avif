@@ -213,7 +213,7 @@ impl AvifDecoder {
         } else if primary_info.item_type == ITEM_TYPE_AV01 {
             let img = parse(file).map_err(core_err)?;
             let (f, fmt, w, h) = decode_av01_item(
-                img.primary_item_data,
+                &img.primary_item_data,
                 img.av1c
                     .as_deref()
                     .ok_or_else(|| Error::invalid("avif: primary item missing av1C"))?,

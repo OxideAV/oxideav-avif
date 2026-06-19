@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `idat`-backed item byte resolution (ISO/IEC 14496-12 §8.11.3
+  `construction_method == 1`, idat_offset). Previously every byte-fetch
+  path hard-rejected non-zero construction methods, so a primary image
+  item (or grid tile / alpha auxiliary) whose payload lived in the `meta`
+  box's `idat` could not be resolved at all. New
+  `item_bytes_with_idat` / `item_bytes_owned_with_idat` resolve an
+  `iloc` entry against either the file (cm=0) or the `idat` (cm=1),
+  concatenating multi-extent items of either method; the extent offset
+  indexes into the first byte of `data[]` in the ItemDataBox.
+  `AvifImage::primary_item_data` is now a `Cow<[u8]>` — still a zero-copy
+  borrow into the file for the common single-extent cm=0 case, owned when
+  the bytes are reconstructed from `idat` or multiple extents. `parse`
+  and `inspect` now transparently resolve an idat-backed primary `av01`
+  item. `construction_method == 2` (item_offset) remains unsupported.
+
 - Derived-image geometry resolution (HEIF §6.3 / §6.6.2, `derived`
   module): a box-graph-only evaluation surface that computes derived-image
   output geometry without decoding any AV1 bitstream. New

@@ -21,7 +21,9 @@
 
 use oxideav_core::{CodecId, Error, Packet, TimeBase};
 
-use oxideav_avif::{box_parser::b, inspect, parse_avis, parse_header, AvifDecoder, ImageGrid};
+use oxideav_avif::{
+    box_parser::b, inspect, parse, parse_avis, parse_header, AvifDecoder, ImageGrid,
+};
 use oxideav_core::Decoder;
 
 const MONO: &[u8] = include_bytes!("fixtures/monochrome.avif");
@@ -2182,6 +2184,176 @@ fn build_synthetic_av01_with_colr(
     file.extend_from_slice(&meta);
     file.extend_from_slice(&mdat);
     file
+}
+
+/// Build a synthetic single-item AVIF whose primary `av01` item is stored
+/// in an `idat` (ItemDataBox) inside the `meta` box, addressed via an
+/// `iloc` entry with `construction_method == 1` (idat_offset). There is no
+/// `mdat`. Exercises ISO/IEC 14496-12 §8.11.3 construction method 1: the
+/// extent offset indexes into the first byte of `data[]` in the `idat`.
+///
+/// `obu` is the primary payload to embed; `prefix` pads `data[]` so the
+/// extent offset is non-zero (proves base_offset/extent.offset addressing
+/// into idat, not just a happy-path offset-0).
+fn build_idat_backed_av01(obu: &[u8], prefix: &[u8]) -> Vec<u8> {
+    fn u32be(v: u32) -> [u8; 4] {
+        v.to_be_bytes()
+    }
+    fn u16be(v: u16) -> [u8; 2] {
+        v.to_be_bytes()
+    }
+    fn box_bytes(btype: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let size = (8 + body.len()) as u32;
+        let mut out = size.to_be_bytes().to_vec();
+        out.extend_from_slice(btype);
+        out.extend_from_slice(body);
+        out
+    }
+    fn full_box(btype: &[u8; 4], version: u8, flags: u32, body: &[u8]) -> Vec<u8> {
+        let mut payload = vec![
+            version,
+            (flags >> 16) as u8,
+            (flags >> 8) as u8,
+            flags as u8,
+        ];
+        payload.extend_from_slice(body);
+        box_bytes(btype, &payload)
+    }
+    fn infe_v2(id: u16, item_type: &[u8; 4]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&id.to_be_bytes());
+        body.extend_from_slice(&[0u8, 0]); // protection_index
+        body.extend_from_slice(item_type);
+        body.push(0); // name null terminator
+        full_box(b"infe", 2, 0, &body)
+    }
+
+    // ftyp
+    let mut ftyp_body = Vec::new();
+    ftyp_body.extend_from_slice(b"avif");
+    ftyp_body.extend_from_slice(&u32be(0));
+    ftyp_body.extend_from_slice(b"mif1");
+    ftyp_body.extend_from_slice(b"miaf");
+    let ftyp = box_bytes(b"ftyp", &ftyp_body);
+
+    // hdlr
+    let mut hdlr_body = Vec::new();
+    hdlr_body.extend_from_slice(&[0u8; 4]);
+    hdlr_body.extend_from_slice(b"pict");
+    hdlr_body.extend_from_slice(&[0u8; 12]);
+    hdlr_body.extend_from_slice(b"\0");
+    let hdlr = full_box(b"hdlr", 0, 0, &hdlr_body);
+
+    // pitm -> item 1
+    let pitm = full_box(b"pitm", 0, 0, &u16be(1));
+
+    // iinf with one av01 item
+    let infe1 = infe_v2(1, b"av01");
+    let mut iinf_body = Vec::new();
+    iinf_body.extend_from_slice(&u16be(1));
+    iinf_body.extend_from_slice(&infe1);
+    let iinf = full_box(b"iinf", 0, 0, &iinf_body);
+
+    // properties: ispe + av1C + pixi
+    let mut ispe_body = Vec::new();
+    ispe_body.extend_from_slice(&u32be(8));
+    ispe_body.extend_from_slice(&u32be(8));
+    let ispe = full_box(b"ispe", 0, 0, &ispe_body);
+    let av1c = box_bytes(b"av1C", &[0x81u8, 0, 0, 0]);
+    let mut pixi_body = vec![0u8; 4];
+    pixi_body.push(1);
+    pixi_body.push(8);
+    let pixi = box_bytes(b"pixi", &pixi_body);
+
+    let mut ipco_body = Vec::new();
+    ipco_body.extend_from_slice(&ispe);
+    ipco_body.extend_from_slice(&av1c);
+    ipco_body.extend_from_slice(&pixi);
+    let ipco = box_bytes(b"ipco", &ipco_body);
+
+    let mut ipma_body = Vec::new();
+    ipma_body.extend_from_slice(&u32be(1)); // entry_count
+    ipma_body.extend_from_slice(&1u16.to_be_bytes());
+    ipma_body.push(3); // assoc_count
+    ipma_body.push(1);
+    ipma_body.push(2);
+    ipma_body.push(3);
+    let ipma = full_box(b"ipma", 0, 0, &ipma_body);
+
+    let mut iprp_body = Vec::new();
+    iprp_body.extend_from_slice(&ipco);
+    iprp_body.extend_from_slice(&ipma);
+    let iprp = box_bytes(b"iprp", &iprp_body);
+
+    // idat: data[] = prefix || obu. The extent offset is prefix.len().
+    let mut idat_payload = Vec::new();
+    idat_payload.extend_from_slice(prefix);
+    idat_payload.extend_from_slice(obu);
+    let idat = box_bytes(b"idat", &idat_payload);
+
+    // iloc v1 (carries construction_method): single item, cm=1, one extent.
+    // v1 layout: offset_size/length_size byte, base_offset_size/index_size
+    // byte, item_count(u16), then per item: id(u16), reserved12+cm4(u16),
+    // data_ref_idx(u16), base_offset(0 bytes since base_offset_size=0),
+    // extent_count(u16), per extent: offset(u32), length(u32).
+    let mut iloc_inner = Vec::new();
+    iloc_inner.push(0x44); // offset_size=4, length_size=4
+    iloc_inner.push(0x00); // base_offset_size=0, index_size=0
+    iloc_inner.extend_from_slice(&u16be(1)); // item_count
+    iloc_inner.extend_from_slice(&u16be(1)); // item id
+    iloc_inner.extend_from_slice(&u16be(1)); // reserved(12)=0 | construction_method(4)=1
+    iloc_inner.extend_from_slice(&u16be(0)); // data_reference_index
+    iloc_inner.extend_from_slice(&u16be(1)); // extent_count
+    iloc_inner.extend_from_slice(&u32be(prefix.len() as u32)); // extent offset into idat
+    iloc_inner.extend_from_slice(&u32be(obu.len() as u32)); // extent length
+    let iloc = full_box(b"iloc", 1, 0, &iloc_inner);
+
+    // meta = hdlr + pitm + iinf + iprp + idat + iloc
+    let mut meta_body = Vec::new();
+    meta_body.extend_from_slice(&[0u8; 4]); // fullbox header
+    meta_body.extend_from_slice(&hdlr);
+    meta_body.extend_from_slice(&pitm);
+    meta_body.extend_from_slice(&iinf);
+    meta_body.extend_from_slice(&iprp);
+    meta_body.extend_from_slice(&idat);
+    meta_body.extend_from_slice(&iloc);
+    let meta = box_bytes(b"meta", &meta_body);
+
+    let mut file = Vec::new();
+    file.extend_from_slice(&ftyp);
+    file.extend_from_slice(&meta);
+    file
+}
+
+/// `parse` resolves a primary `av01` item whose bytes live in the `idat`
+/// box via `construction_method == 1`, with the extent offset addressing
+/// into `data[]` past a non-zero prefix (ISO/IEC 14496-12 §8.11.3).
+#[test]
+fn idat_backed_primary_item_resolves() {
+    let obu: Vec<u8> = (0..16u8).map(|i| i.wrapping_mul(7)).collect();
+    let prefix = [0xEEu8; 5];
+    let file = build_idat_backed_av01(&obu, &prefix);
+
+    let img = parse(&file).expect("parse idat-backed av01");
+    assert_eq!(img.primary_item_id, 1);
+    assert_eq!(&img.primary_item.item_type, b"av01");
+    // The resolved primary bytes are exactly the OBU we embedded — proving
+    // the offset addressed into idat data[] past the 5-byte prefix.
+    assert_eq!(&*img.primary_item_data, obu.as_slice());
+    let ispe = img.ispe.expect("ispe");
+    assert_eq!((ispe.width, ispe.height), (8, 8));
+}
+
+/// `inspect` surfaces the OBU bytes of an idat-backed primary item — the
+/// inspection path resolves construction_method 1 the same as `parse`.
+#[test]
+fn idat_backed_primary_item_inspect_obu_bytes() {
+    let obu: Vec<u8> = vec![0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc];
+    let file = build_idat_backed_av01(&obu, &[]);
+    let info = inspect(&file).expect("inspect idat-backed av01");
+    assert_eq!(info.width, 8);
+    assert_eq!(info.height, 8);
+    assert_eq!(info.obu_bytes, obu);
 }
 
 /// Build a synthetic single-item AVIF whose primary item carries the
