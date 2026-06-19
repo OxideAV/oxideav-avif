@@ -31,6 +31,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   primary path. A file that stores its grid tiles, alpha plane, or
   metadata items in `idat` rather than `mdat` now resolves end-to-end.
 
+### Changed
+
+- The `inspect` path now reuses the `idat` (ItemDataBox) payload captured
+  by `Meta::parse` instead of re-walking the file with a private
+  `extract_idat` helper (now removed). Single source of truth for the
+  meta box's `idat`; behaviour is unchanged.
+
 - Derived-image geometry resolution (HEIF §6.3 / §6.6.2, `derived`
   module): a box-graph-only evaluation surface that computes derived-image
   output geometry without decoding any AV1 bitstream. New

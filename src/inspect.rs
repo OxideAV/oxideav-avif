@@ -20,8 +20,6 @@ use crate::parser::{
 };
 
 const AV1C: BoxType = b(b"av1C");
-const META_BOX: BoxType = b(b"meta");
-const IDAT_BOX: BoxType = b(b"idat");
 const COLR: BoxType = b(b"colr");
 const MDCV: BoxType = b(b"mdcv");
 const CLLI: BoxType = b(b"clli");
@@ -707,36 +705,6 @@ fn decode_av1c_flags(av1c: &[u8]) -> (Option<u8>, bool, Option<(bool, bool)>) {
     (Some(bit_depth), monochrome, subsampling)
 }
 
-/// Extract the `idat` (ItemDataBox) payload from a file's `meta` box, if
-/// present. Derived-image descriptors (`grid` / `iovl`) and other items
-/// using `iloc` construction_method 1 reference offsets into this buffer.
-/// Returns `None` when the file has no top-level `meta` box or no `idat`
-/// inside it (the common still-image case where descriptors live in `mdat`
-/// via construction_method 0).
-///
-/// Spec: ISO/IEC 14496-12 §8.11.11 (ItemDataBox); §8.11.3.3 cm=1.
-fn extract_idat(file: &[u8]) -> Option<Vec<u8>> {
-    for hdr in crate::box_parser::iter_boxes(file) {
-        let hdr = hdr.ok()?;
-        if hdr.box_type != META_BOX {
-            continue;
-        }
-        let meta_payload = file.get(hdr.payload_start..hdr.end())?;
-        // The meta box is a FullBox; skip its 4-byte version/flags header.
-        let body = meta_payload.get(4..)?;
-        for inner in crate::box_parser::iter_boxes(body) {
-            let inner = inner.ok()?;
-            if inner.box_type == IDAT_BOX {
-                return body
-                    .get(inner.payload_start..inner.end())
-                    .map(<[u8]>::to_vec);
-            }
-        }
-        return None;
-    }
-    None
-}
-
 pub(crate) fn build_info(
     img: &AvifImage<'_>,
     has_alpha: bool,
@@ -815,10 +783,11 @@ pub(crate) fn build_info(
     let alpha_bit_depth_compliance = crate::derived::audit_alpha_bit_depth(&img.meta);
     let sequence_header_obu_compliance = crate::derived::audit_sequence_header_obu(&img.meta, file);
     let avif_profile_compliance = crate::derived::audit_avif_profile_compliance(&img.meta, &brands);
-    let idat = extract_idat(file);
-    let overlay_resolutions = crate::derived::resolve_overlays(&img.meta, file, idat.as_deref());
-    let iden_resolutions =
-        crate::derived::resolve_iden_derivations(&img.meta, file, idat.as_deref());
+    // `Meta::parse` already captured the meta box's `idat` (ItemDataBox)
+    // payload; reuse it rather than re-walking the file.
+    let idat = img.meta.idat.as_deref();
+    let overlay_resolutions = crate::derived::resolve_overlays(&img.meta, file, idat);
+    let iden_resolutions = crate::derived::resolve_iden_derivations(&img.meta, file, idat);
     Ok(AvifInfo {
         width,
         height,
@@ -1006,11 +975,9 @@ pub(crate) fn build_info_grid(
     let sequence_header_obu_compliance =
         crate::derived::audit_sequence_header_obu(&hdr.meta, hdr.file);
     let avif_profile_compliance = crate::derived::audit_avif_profile_compliance(&hdr.meta, &brands);
-    let idat = extract_idat(hdr.file);
-    let overlay_resolutions =
-        crate::derived::resolve_overlays(&hdr.meta, hdr.file, idat.as_deref());
-    let iden_resolutions =
-        crate::derived::resolve_iden_derivations(&hdr.meta, hdr.file, idat.as_deref());
+    let idat = hdr.meta.idat.as_deref();
+    let overlay_resolutions = crate::derived::resolve_overlays(&hdr.meta, hdr.file, idat);
+    let iden_resolutions = crate::derived::resolve_iden_derivations(&hdr.meta, hdr.file, idat);
     Ok(AvifInfo {
         width: grid.output_width,
         height: grid.output_height,
@@ -1099,12 +1066,11 @@ pub(crate) fn build_info_derived(
     brands: BrandClass,
     mif1_compliance: crate::derived::Mif1Compliance,
 ) -> Result<AvifInfo> {
-    let idat = extract_idat(hdr.file);
-    let (width, height) =
-        crate::derived::reconstructed_dims(&hdr.meta, primary_id, hdr.file, idat.as_deref())
-            .ok_or_else(|| {
-                Error::invalid("avif: could not resolve derived primary output dimensions")
-            })?;
+    let idat = hdr.meta.idat.as_deref();
+    let (width, height) = crate::derived::reconstructed_dims(&hdr.meta, primary_id, hdr.file, idat)
+        .ok_or_else(|| {
+            Error::invalid("avif: could not resolve derived primary output dimensions")
+        })?;
     // The derived primary's own output image folds in its transformative
     // properties (§6.3).
     let (width, height) =
@@ -1217,10 +1183,8 @@ pub(crate) fn build_info_derived(
     let sequence_header_obu_compliance =
         crate::derived::audit_sequence_header_obu(&hdr.meta, hdr.file);
     let avif_profile_compliance = crate::derived::audit_avif_profile_compliance(&hdr.meta, &brands);
-    let overlay_resolutions =
-        crate::derived::resolve_overlays(&hdr.meta, hdr.file, idat.as_deref());
-    let iden_resolutions =
-        crate::derived::resolve_iden_derivations(&hdr.meta, hdr.file, idat.as_deref());
+    let overlay_resolutions = crate::derived::resolve_overlays(&hdr.meta, hdr.file, idat);
+    let iden_resolutions = crate::derived::resolve_iden_derivations(&hdr.meta, hdr.file, idat);
     Ok(AvifInfo {
         width,
         height,
