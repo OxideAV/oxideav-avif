@@ -2135,6 +2135,502 @@ pub fn audit_avif_profile_compliance(
     out
 }
 
+// ===========================================================================
+// Derived-image geometry resolution (HEIF §6.3 / §6.6.2)
+// ===========================================================================
+//
+// §6.3 defines the *output image* of any image item as the result of
+// applying its transformative item properties — in ItemPropertyAssociation
+// order — to the item's *reconstructed image*. For a coded item the
+// reconstructed image is the decoded picture (`ispe` dimensions); for a
+// derived item it is the result of the derivation operation (the
+// descriptor's `output_width`/`output_height` for `grid` / `iovl`, or the
+// single input's output image for `iden`).
+//
+// The helpers below resolve this geometry **without decoding any AV1
+// bitstream** — they walk only the box-level item-property graph. They are
+// the dimension half of derived-image evaluation: a caller that later wires
+// in a real AV1 decoder uses them to size the output canvas, place overlay
+// inputs, and crop/rotate identity derivations, and to validate that the
+// declared geometry is self-consistent before any pixels exist.
+
+/// A transformative item property that changes (or preserves) the pixel
+/// dimensions of the image it is applied to, in the order it appears in the
+/// item's `ipma` association. Descriptive properties (`ispe`, `colr`,
+/// `pixi`, …) do not appear here — only the four transformative properties
+/// HEIF defines that affect output geometry.
+///
+/// Spec: ISO/IEC 23008-12 §6.5.10 (`irot`), §6.5.12 (`imir`), §6.5.8 /
+/// §6.5.9 (`clap`), §6.5.13 (`iscl`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DimTransform {
+    /// Counter-clockwise rotation, `angle` × 90°. 90°/270° swap width and
+    /// height; 0°/180° preserve them.
+    Rotate { angle: u8 },
+    /// Mirror about an axis. Does not change dimensions.
+    Mirror { axis: u8 },
+    /// Clean-aperture crop. The output dimensions are the clean-aperture
+    /// width/height rounded to nearest integer (`§6.5.9` rationals), or the
+    /// input unchanged when the crop falls outside the input rectangle.
+    Crop {
+        width_n: i32,
+        width_d: i32,
+        height_n: i32,
+        height_d: i32,
+    },
+    /// Rational scale per §6.5.13: `ceil(input * num / den)` independently
+    /// on each axis.
+    Scale {
+        target_width_numerator: u16,
+        target_width_denominator: u16,
+        target_height_numerator: u16,
+        target_height_denominator: u16,
+    },
+}
+
+impl DimTransform {
+    /// Apply this transform's effect on dimensions to `(w, h)`. Returns the
+    /// post-transform `(width, height)`. Defensive: a degenerate crop or a
+    /// zero-denominator scale leaves the dimensions unchanged (mirroring the
+    /// no-op fall-throughs in [`crate::transform`]).
+    pub fn apply_dims(&self, w: u32, h: u32) -> (u32, u32) {
+        match *self {
+            DimTransform::Rotate { angle } => {
+                if angle % 2 == 1 {
+                    (h, w)
+                } else {
+                    (w, h)
+                }
+            }
+            DimTransform::Mirror { .. } => (w, h),
+            DimTransform::Crop {
+                width_n,
+                width_d,
+                height_n,
+                height_d,
+            } => {
+                if width_d == 0 || height_d == 0 {
+                    return (w, h);
+                }
+                // §6.5.9: clean-aperture width/height are signed rationals;
+                // round to nearest integer (same rounding as
+                // `transform::apply_clap`).
+                let cw = (width_n as i64 + width_d as i64 / 2) / width_d as i64;
+                let ch = (height_n as i64 + height_d as i64 / 2) / height_d as i64;
+                if cw <= 0 || ch <= 0 || cw > w as i64 || ch > h as i64 {
+                    return (w, h);
+                }
+                (cw as u32, ch as u32)
+            }
+            DimTransform::Scale {
+                target_width_numerator,
+                target_width_denominator,
+                target_height_numerator,
+                target_height_denominator,
+            } => {
+                let iscl = crate::meta::Iscl {
+                    target_width_numerator,
+                    target_width_denominator,
+                    target_height_numerator,
+                    target_height_denominator,
+                };
+                iscl.scaled_dims(w, h).unwrap_or((w, h))
+            }
+        }
+    }
+}
+
+/// The ordered list of dimension-affecting transformative item properties
+/// associated with `item_id`, in `ipma` association order. Non-transformative
+/// properties are skipped. An item with no transformative properties yields
+/// an empty vector (its output image equals its reconstructed image — §6.3).
+///
+/// Per §6.5.11, a `lsel` (layer selector) — when present — precedes every
+/// transformative property in the association order; it carries no geometry
+/// effect and so does not appear in the returned list, but the relative
+/// order of the transformative properties that follow it is preserved.
+pub fn transform_chain(meta: &crate::meta::Meta, item_id: u32) -> Vec<DimTransform> {
+    use crate::meta::Property;
+    let Some(assoc) = meta.assoc_by_id(item_id) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for pa in &assoc.entries {
+        let Some(prop) = meta.properties.get(pa.index as usize) else {
+            continue;
+        };
+        match prop {
+            Property::Irot(r) => out.push(DimTransform::Rotate { angle: r.angle }),
+            Property::Imir(m) => out.push(DimTransform::Mirror { axis: m.axis }),
+            Property::Clap(c) => out.push(DimTransform::Crop {
+                width_n: c.clean_aperture_width_n,
+                width_d: c.clean_aperture_width_d,
+                height_n: c.clean_aperture_height_n,
+                height_d: c.clean_aperture_height_d,
+            }),
+            Property::Iscl(s) => out.push(DimTransform::Scale {
+                target_width_numerator: s.target_width_numerator,
+                target_width_denominator: s.target_width_denominator,
+                target_height_numerator: s.target_height_numerator,
+                target_height_denominator: s.target_height_denominator,
+            }),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Apply an item's transform chain to a reconstructed `(width, height)`,
+/// returning the **output-image** dimensions per HEIF §6.3. Equivalent to
+/// folding [`DimTransform::apply_dims`] over [`transform_chain`].
+pub fn output_dims_from_reconstructed(
+    meta: &crate::meta::Meta,
+    item_id: u32,
+    reconstructed_w: u32,
+    reconstructed_h: u32,
+) -> (u32, u32) {
+    let mut dims = (reconstructed_w, reconstructed_h);
+    for t in transform_chain(meta, item_id) {
+        dims = t.apply_dims(dims.0, dims.1);
+    }
+    dims
+}
+
+/// Resolve the **reconstructed-image** dimensions of an item from the
+/// box-level graph alone (no AV1 decode):
+///
+/// * a `grid` item → its descriptor `output_width`/`output_height`;
+/// * an `iovl` item → its descriptor `output_width`/`output_height`;
+/// * an `iden` item → the output dimensions of its single `dimg` input
+///   (recursively resolved);
+/// * any other item (coded `av01`, etc.) → its `ispe` dimensions.
+///
+/// Returns `None` when the dimensions cannot be determined: a coded item
+/// without an `ispe`, a `grid`/`iovl` whose descriptor payload can't be
+/// resolved or parsed, an `iden` without exactly one input, or a derivation
+/// chain that exceeds [`MAX_DERIVATION_DEPTH`] (cycle guard). `idat`/`mdat`
+/// resolution of the `grid`/`iovl` descriptor bytes uses `file_bytes` and
+/// the optional `idat` slice via the standard `iloc` resolver.
+pub fn reconstructed_dims(
+    meta: &crate::meta::Meta,
+    item_id: u32,
+    file_bytes: &[u8],
+    idat: Option<&[u8]>,
+) -> Option<(u32, u32)> {
+    reconstructed_dims_inner(meta, item_id, file_bytes, idat, 0)
+}
+
+/// Resolve a derived-item descriptor's payload bytes (`grid` / `iovl` body)
+/// from its `iloc` entry, handling both `construction_method == 0`
+/// (file-offset, the bytes live in `mdat`/elsewhere in `file_bytes`) and
+/// `construction_method == 1` (idat-offset, the bytes live in the `meta`
+/// box's `idat` and are passed in via `idat`). Returns `None` when the
+/// item has no `iloc`, when an idat extent is referenced without an `idat`
+/// slice, or when any extent runs past the backing buffer.
+///
+/// Spec: ISO/IEC 14496-12 §8.11.3 (`iloc` construction methods); HEIF
+/// §6.6.2 derived-item payloads conventionally use `idat` (cm=1).
+fn resolve_descriptor_bytes(
+    meta: &crate::meta::Meta,
+    item_id: u32,
+    file_bytes: &[u8],
+    idat: Option<&[u8]>,
+) -> Option<Vec<u8>> {
+    let loc = meta.location_by_id(item_id)?;
+    let backing: &[u8] = match loc.construction_method {
+        0 => file_bytes,
+        1 => idat?,
+        // construction_method 2 (item-offset) is not resolved here.
+        _ => return None,
+    };
+    if loc.extents.is_empty() {
+        return None;
+    }
+    let mut out = Vec::new();
+    for e in &loc.extents {
+        let start = loc.base_offset.checked_add(e.offset)?;
+        let end = start.checked_add(e.length)?;
+        let (start, end) = (usize::try_from(start).ok()?, usize::try_from(end).ok()?);
+        if end > backing.len() || start > end {
+            return None;
+        }
+        out.extend_from_slice(&backing[start..end]);
+    }
+    Some(out)
+}
+
+/// Maximum derivation-chain recursion depth before [`reconstructed_dims`]
+/// gives up. A well-formed file nests at most a handful of derivations; a
+/// deeper chain is almost certainly a `dimg` cycle, which this bound breaks
+/// without unbounded recursion.
+pub const MAX_DERIVATION_DEPTH: u32 = 16;
+
+fn reconstructed_dims_inner(
+    meta: &crate::meta::Meta,
+    item_id: u32,
+    file_bytes: &[u8],
+    idat: Option<&[u8]>,
+    depth: u32,
+) -> Option<(u32, u32)> {
+    if depth > MAX_DERIVATION_DEPTH {
+        return None;
+    }
+    let item = meta.item_by_id(item_id)?;
+    let grid = b(b"grid");
+    let dimg = b(b"dimg");
+    if item.item_type == grid {
+        let bytes = resolve_descriptor_bytes(meta, item_id, file_bytes, idat)?;
+        let g = crate::grid::ImageGrid::parse(&bytes).ok()?;
+        return Some((g.output_width, g.output_height));
+    }
+    if item.item_type == crate::meta::ITEM_TYPE_IOVL {
+        let bytes = resolve_descriptor_bytes(meta, item_id, file_bytes, idat)?;
+        let refs = meta.iref_targets(&dimg, item_id).len();
+        let o = ImageOverlay::parse(&bytes, refs).ok()?;
+        return Some((o.output_width, o.output_height));
+    }
+    if item.item_type == crate::meta::ITEM_TYPE_IDEN {
+        let inputs = meta.iref_targets(&dimg, item_id);
+        if inputs.len() != 1 {
+            return None;
+        }
+        // §6.6.2.1 + §6.3: the iden's reconstructed image is the *output
+        // image* of its single input.
+        let (iw, ih) = reconstructed_dims_inner(meta, inputs[0], file_bytes, idat, depth + 1)?;
+        return Some(output_dims_from_reconstructed(meta, inputs[0], iw, ih));
+    }
+    // Coded item: reconstructed dimensions are the `ispe` extents.
+    match meta.property_for(item_id, &b(b"ispe")) {
+        Some(crate::meta::Property::Ispe(ispe)) => Some((ispe.width, ispe.height)),
+        _ => None,
+    }
+}
+
+/// Where one input image of an `iovl` overlay lands on the canvas, and what
+/// portion of it is visible after clipping. All coordinates are canvas-space
+/// pixels with the origin at the top-left corner (§6.6.2.2.3).
+///
+/// The input image occupies `[offset_x, offset_x + input_width)` ×
+/// `[offset_y, offset_y + input_height)`. Per §6.6.2.2.3 a pixel is included
+/// in the reconstructed image only when its canvas coordinate is in
+/// `[0, output_width)` × `[0, output_height)`; the [`visible`](Self::visible)
+/// rectangle is that intersection, expressed back in canvas coordinates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OverlayPlacement {
+    /// The source image item id (from the parallel `dimg` iref `to_ids`).
+    pub source_item_id: u32,
+    /// Declared horizontal offset of the input's left column on the canvas.
+    pub offset_x: i64,
+    /// Declared vertical offset of the input's top row on the canvas.
+    pub offset_y: i64,
+    /// Input image output-image width (post its own transforms).
+    pub input_width: u32,
+    /// Input image output-image height.
+    pub input_height: u32,
+}
+
+impl OverlayPlacement {
+    /// The visible canvas rectangle as `(x, y, width, height)` after
+    /// clipping the input against `[0, canvas_w) × [0, canvas_h)`. Returns
+    /// `None` when the input lands entirely off-canvas (no visible pixels).
+    pub fn visible(&self, canvas_w: u32, canvas_h: u32) -> Option<(u32, u32, u32, u32)> {
+        let left = self.offset_x.max(0);
+        let top = self.offset_y.max(0);
+        let right = (self.offset_x + i64::from(self.input_width)).min(i64::from(canvas_w));
+        let bottom = (self.offset_y + i64::from(self.input_height)).min(i64::from(canvas_h));
+        if right <= left || bottom <= top {
+            return None;
+        }
+        Some((
+            left as u32,
+            top as u32,
+            (right - left) as u32,
+            (bottom - top) as u32,
+        ))
+    }
+
+    /// True when the input image is wholly inside the canvas (no clipping
+    /// occurs).
+    pub fn fully_visible(&self, canvas_w: u32, canvas_h: u32) -> bool {
+        self.offset_x >= 0
+            && self.offset_y >= 0
+            && self.offset_x + i64::from(self.input_width) <= i64::from(canvas_w)
+            && self.offset_y + i64::from(self.input_height) <= i64::from(canvas_h)
+    }
+
+    /// True when no pixel of the input lands on the canvas.
+    pub fn off_canvas(&self, canvas_w: u32, canvas_h: u32) -> bool {
+        self.visible(canvas_w, canvas_h).is_none()
+    }
+}
+
+/// A fully resolved `iovl` overlay derivation: the parsed descriptor plus
+/// each input's resolved placement against the canvas (§6.6.2.2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OverlayResolution {
+    /// The `iovl` derived item id.
+    pub iovl_item_id: u32,
+    /// The parsed descriptor (canvas fill, output dimensions, offsets).
+    pub descriptor: ImageOverlay,
+    /// One placement per input, bottom-most first (layering order matches
+    /// the `dimg` iref `to_ids` order, §6.6.2.2.1).
+    pub placements: Vec<OverlayPlacement>,
+}
+
+impl OverlayResolution {
+    /// Canvas dimensions `(output_width, output_height)`.
+    pub fn canvas(&self) -> (u32, u32) {
+        (self.descriptor.output_width, self.descriptor.output_height)
+    }
+
+    /// True when at least one canvas pixel is left to the fill colour — i.e.
+    /// the union of every input's visible rectangle does not cover the whole
+    /// canvas. Computed conservatively from a coverage scan bounded by the
+    /// canvas area; for very large canvases (> 4M pixels) it returns `true`
+    /// without scanning, since a partial fill is the common case and the
+    /// exact answer isn't worth a multi-megabyte allocation.
+    pub fn canvas_partially_filled(&self) -> bool {
+        let (cw, ch) = self.canvas();
+        let area = u64::from(cw) * u64::from(ch);
+        if area == 0 {
+            return false;
+        }
+        if area > 4_000_000 {
+            return true;
+        }
+        let mut covered = vec![false; area as usize];
+        for p in &self.placements {
+            if let Some((x, y, w, h)) = p.visible(cw, ch) {
+                for row in y..y + h {
+                    let base = (u64::from(row) * u64::from(cw)) as usize;
+                    for col in x..x + w {
+                        covered[base + col as usize] = true;
+                    }
+                }
+            }
+        }
+        covered.iter().any(|&c| !c)
+    }
+}
+
+/// Resolve every `iovl` overlay item in `meta` end-to-end: parse the
+/// descriptor, pair each placement with its `dimg` source item, and resolve
+/// each source's output dimensions from the box graph. Returns one
+/// [`OverlayResolution`] per `iovl` item, in `iinf` declaration order;
+/// `iovl` items whose descriptor can't be resolved/parsed are skipped.
+///
+/// Spec: ISO/IEC 23008-12 §6.6.2.2. `file_bytes` + the optional `idat`
+/// slice resolve the descriptor payload via the standard `iloc` resolver;
+/// each input's dimensions come from [`reconstructed_dims`] +
+/// [`output_dims_from_reconstructed`] so inputs that are themselves grids,
+/// overlays, or transformed coded items resolve correctly.
+pub fn resolve_overlays(
+    meta: &crate::meta::Meta,
+    file_bytes: &[u8],
+    idat: Option<&[u8]>,
+) -> Vec<OverlayResolution> {
+    let dimg = b(b"dimg");
+    let mut out = Vec::new();
+    for iovl_id in meta.item_ids_of_type(&crate::meta::ITEM_TYPE_IOVL) {
+        let Some(bytes) = resolve_descriptor_bytes(meta, iovl_id, file_bytes, idat) else {
+            continue;
+        };
+        let sources = meta.iref_targets(&dimg, iovl_id);
+        let Ok(descriptor) = ImageOverlay::parse(&bytes, sources.len()) else {
+            continue;
+        };
+        let mut placements = Vec::with_capacity(descriptor.entries.len());
+        for (entry, &src) in descriptor.entries.iter().zip(sources.iter()) {
+            let (iw, ih) = reconstructed_dims(meta, src, file_bytes, idat)
+                .map(|(w, h)| output_dims_from_reconstructed(meta, src, w, h))
+                .unwrap_or((0, 0));
+            placements.push(OverlayPlacement {
+                source_item_id: src,
+                offset_x: i64::from(entry.horizontal_offset),
+                offset_y: i64::from(entry.vertical_offset),
+                input_width: iw,
+                input_height: ih,
+            });
+        }
+        out.push(OverlayResolution {
+            iovl_item_id: iovl_id,
+            descriptor,
+            placements,
+        });
+    }
+    out
+}
+
+/// A fully resolved `iden` identity derivation: the single source item, its
+/// reconstructed dimensions, the transform chain applied by the iden item
+/// itself, and the resulting output dimensions (§6.6.2.1 + §6.3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IdenResolution {
+    /// The `iden` derived item id.
+    pub iden_item_id: u32,
+    /// The single `dimg` source item id (the image the identity derivation
+    /// re-presents), or `None` when the iden does not have exactly one input.
+    pub source_item_id: Option<u32>,
+    /// The source's reconstructed dimensions, or `None` when unresolvable.
+    pub source_dims: Option<(u32, u32)>,
+    /// The dimension-affecting transformative properties on the **iden item
+    /// itself**, in `ipma` order. These are the whole point of an identity
+    /// derivation (§6.6.2.1 NOTE 2: e.g. a `clap` crop of the original).
+    pub transforms: Vec<DimTransform>,
+    /// The iden item's output dimensions after applying `transforms` to
+    /// `source_dims`, or `None` when `source_dims` is `None`.
+    pub output_dims: Option<(u32, u32)>,
+}
+
+/// Resolve every `iden` identity-derivation item in `meta` end-to-end:
+/// find the single `dimg` source, resolve its reconstructed dimensions from
+/// the box graph, collect the transformative properties on the iden item,
+/// and compute the resulting output dimensions. Returns one
+/// [`IdenResolution`] per `iden` item, in `iinf` declaration order.
+///
+/// Spec: ISO/IEC 23008-12 §6.6.2.1. The reconstructed image of an `iden`
+/// item is the *output image* of its single input (§6.3); the iden's own
+/// output image then applies the iden item's transformative properties.
+/// Because the source's output dimensions already fold in *its* transforms,
+/// `source_dims` here is the source's output image, and `output_dims` folds
+/// the iden's transforms on top.
+pub fn resolve_iden_derivations(
+    meta: &crate::meta::Meta,
+    file_bytes: &[u8],
+    idat: Option<&[u8]>,
+) -> Vec<IdenResolution> {
+    let dimg = b(b"dimg");
+    let mut out = Vec::new();
+    for iden_id in meta.item_ids_of_type(&crate::meta::ITEM_TYPE_IDEN) {
+        let inputs = meta.iref_targets(&dimg, iden_id);
+        let source_item_id = if inputs.len() == 1 {
+            Some(inputs[0])
+        } else {
+            None
+        };
+        let source_dims = source_item_id.and_then(|src| {
+            reconstructed_dims(meta, src, file_bytes, idat)
+                .map(|(w, h)| output_dims_from_reconstructed(meta, src, w, h))
+        });
+        let transforms = transform_chain(meta, iden_id);
+        let output_dims = source_dims.map(|(w, h)| {
+            let mut d = (w, h);
+            for t in &transforms {
+                d = t.apply_dims(d.0, d.1);
+            }
+            d
+        });
+        out.push(IdenResolution {
+            iden_item_id: iden_id,
+            source_item_id,
+            source_dims,
+            transforms,
+            output_dims,
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4666,5 +5162,577 @@ mod tests {
         assert_eq!(r[3].item_id, 2);
         assert_eq!(r[3].profile, AvifProfile::Advanced);
         assert!(!r[3].is_compliant()); // seq_profile=2 fails Advanced too
+    }
+
+    // -----------------------------------------------------------------------
+    // Derived-image geometry resolution (HEIF §6.3 / §6.6.2)
+    // -----------------------------------------------------------------------
+
+    use crate::meta::{
+        Clap as MClap, Imir as MImir, Irot as MIrot, Iscl as MIscl, ItemInfo as MII,
+        ItemPropertyAssociation as MIpa, Meta as MMeta, Property as MProp,
+        PropertyAssociation as MPa,
+    };
+
+    fn geo_ii(id: u32, item_type: &[u8; 4]) -> MII {
+        MII {
+            id,
+            item_type: *item_type,
+            name: String::new(),
+            content_type: None,
+            content_encoding: None,
+            item_uri_type: None,
+            flags: 0,
+        }
+    }
+
+    fn geo_assoc(item_id: u32, indices: &[u16]) -> MIpa {
+        MIpa {
+            item_id,
+            entries: indices
+                .iter()
+                .map(|&index| MPa {
+                    index,
+                    essential: true,
+                })
+                .collect(),
+        }
+    }
+
+    fn ispe_prop(w: u32, h: u32) -> MProp {
+        MProp::Ispe(crate::meta::Ispe {
+            width: w,
+            height: h,
+        })
+    }
+
+    /// `DimTransform::apply_dims` — rotation by 90°/270° swaps W/H; 0°/180°
+    /// preserve.
+    #[test]
+    fn dim_transform_rotate_swaps_at_odd_quarter_turns() {
+        assert_eq!(
+            DimTransform::Rotate { angle: 0 }.apply_dims(40, 30),
+            (40, 30)
+        );
+        assert_eq!(
+            DimTransform::Rotate { angle: 1 }.apply_dims(40, 30),
+            (30, 40)
+        );
+        assert_eq!(
+            DimTransform::Rotate { angle: 2 }.apply_dims(40, 30),
+            (40, 30)
+        );
+        assert_eq!(
+            DimTransform::Rotate { angle: 3 }.apply_dims(40, 30),
+            (30, 40)
+        );
+    }
+
+    /// Mirror never changes dimensions (§6.5.12).
+    #[test]
+    fn dim_transform_mirror_preserves_dims() {
+        assert_eq!(
+            DimTransform::Mirror { axis: 0 }.apply_dims(40, 30),
+            (40, 30)
+        );
+        assert_eq!(
+            DimTransform::Mirror { axis: 1 }.apply_dims(40, 30),
+            (40, 30)
+        );
+    }
+
+    /// Crop reduces dimensions to the clean-aperture width/height; a crop
+    /// larger than the input is a no-op (defensive, matches `apply_clap`).
+    #[test]
+    fn dim_transform_crop_to_clean_aperture() {
+        let c = DimTransform::Crop {
+            width_n: 20,
+            width_d: 1,
+            height_n: 10,
+            height_d: 1,
+        };
+        assert_eq!(c.apply_dims(40, 30), (20, 10));
+        // Crop wider than input → unchanged.
+        let big = DimTransform::Crop {
+            width_n: 100,
+            width_d: 1,
+            height_n: 10,
+            height_d: 1,
+        };
+        assert_eq!(big.apply_dims(40, 30), (40, 30));
+        // Zero denominator → unchanged.
+        let zero = DimTransform::Crop {
+            width_n: 20,
+            width_d: 0,
+            height_n: 10,
+            height_d: 1,
+        };
+        assert_eq!(zero.apply_dims(40, 30), (40, 30));
+    }
+
+    /// Scale applies `ceil(input * num / den)` per §6.5.13.
+    #[test]
+    fn dim_transform_scale_ceil() {
+        let s = DimTransform::Scale {
+            target_width_numerator: 3,
+            target_width_denominator: 2,
+            target_height_numerator: 1,
+            target_height_denominator: 2,
+        };
+        // 40 * 3 / 2 = 60; 30 * 1 / 2 = 15.
+        assert_eq!(s.apply_dims(40, 30), (60, 15));
+        // Ceiling: 41 * 1 / 2 = 20.5 → 21.
+        assert_eq!(
+            DimTransform::Scale {
+                target_width_numerator: 1,
+                target_width_denominator: 2,
+                target_height_numerator: 1,
+                target_height_denominator: 1,
+            }
+            .apply_dims(41, 9),
+            (21, 9)
+        );
+    }
+
+    /// `transform_chain` collects only the dimension-affecting transformative
+    /// properties, in `ipma` order, skipping descriptive properties.
+    #[test]
+    fn transform_chain_preserves_ipma_order_skips_descriptive() {
+        let meta = MMeta {
+            items: vec![geo_ii(1, b"av01")],
+            properties: vec![
+                ispe_prop(100, 50),              // 0: descriptive, skipped
+                MProp::Irot(MIrot { angle: 1 }), // 1: rotate
+                MProp::Clap(MClap {
+                    // 2: crop
+                    clean_aperture_width_n: 40,
+                    clean_aperture_width_d: 1,
+                    clean_aperture_height_n: 30,
+                    clean_aperture_height_d: 1,
+                    horiz_off_n: 0,
+                    horiz_off_d: 1,
+                    vert_off_n: 0,
+                    vert_off_d: 1,
+                }),
+                MProp::Imir(MImir { axis: 1 }), // 3: mirror
+            ],
+            // ipma order: ispe, irot, clap, imir.
+            associations: vec![geo_assoc(1, &[0, 1, 2, 3])],
+            ..MMeta::default()
+        };
+        let chain = transform_chain(&meta, 1);
+        assert_eq!(chain.len(), 3);
+        assert_eq!(chain[0], DimTransform::Rotate { angle: 1 });
+        assert!(matches!(chain[1], DimTransform::Crop { .. }));
+        assert_eq!(chain[2], DimTransform::Mirror { axis: 1 });
+    }
+
+    /// `output_dims_from_reconstructed` folds the chain in order: a coded
+    /// 100×50 image rotated 90° → 50×100, then clap-cropped to 40×30.
+    #[test]
+    fn output_dims_folds_chain_in_order() {
+        let meta = MMeta {
+            items: vec![geo_ii(1, b"av01")],
+            properties: vec![
+                MProp::Irot(MIrot { angle: 1 }),
+                MProp::Clap(MClap {
+                    clean_aperture_width_n: 40,
+                    clean_aperture_width_d: 1,
+                    clean_aperture_height_n: 30,
+                    clean_aperture_height_d: 1,
+                    horiz_off_n: 0,
+                    horiz_off_d: 1,
+                    vert_off_n: 0,
+                    vert_off_d: 1,
+                }),
+            ],
+            associations: vec![geo_assoc(1, &[0, 1])],
+            ..MMeta::default()
+        };
+        // Reconstructed 100×50, rotate → 50×100, crop → 40×30.
+        assert_eq!(output_dims_from_reconstructed(&meta, 1, 100, 50), (40, 30));
+        // Empty chain → identity.
+        let bare = MMeta {
+            items: vec![geo_ii(9, b"av01")],
+            ..MMeta::default()
+        };
+        assert_eq!(output_dims_from_reconstructed(&bare, 9, 100, 50), (100, 50));
+    }
+
+    /// `reconstructed_dims` for a coded item reads `ispe`.
+    #[test]
+    fn reconstructed_dims_coded_uses_ispe() {
+        let meta = MMeta {
+            items: vec![geo_ii(1, b"av01")],
+            properties: vec![ispe_prop(640, 480)],
+            associations: vec![geo_assoc(1, &[0])],
+            ..MMeta::default()
+        };
+        assert_eq!(reconstructed_dims(&meta, 1, &[], None), Some((640, 480)));
+        // No ispe → None.
+        let bare = MMeta {
+            items: vec![geo_ii(2, b"av01")],
+            ..MMeta::default()
+        };
+        assert_eq!(reconstructed_dims(&bare, 2, &[], None), None);
+    }
+
+    /// Build a 16-bit `iovl` descriptor with the given canvas + offsets.
+    fn iovl_desc(out_w: u16, out_h: u16, offsets: &[(i16, i16)]) -> Vec<u8> {
+        let mut buf = vec![0u8, 0u8]; // version 0, flags 0 (16-bit fields)
+        for _ in 0..4 {
+            buf.extend_from_slice(&0u16.to_be_bytes()); // canvas fill
+        }
+        buf.extend_from_slice(&out_w.to_be_bytes());
+        buf.extend_from_slice(&out_h.to_be_bytes());
+        for &(x, y) in offsets {
+            buf.extend_from_slice(&x.to_be_bytes());
+            buf.extend_from_slice(&y.to_be_bytes());
+        }
+        buf
+    }
+
+    /// End-to-end `iovl` resolution against an `idat`-backed descriptor:
+    /// two inputs placed on a 200×200 canvas, the second partially clipped
+    /// at the right/bottom edge.
+    #[test]
+    fn resolve_overlays_idat_with_clipping() {
+        // idat holds the iovl descriptor at offset 0.
+        let desc = iovl_desc(200, 200, &[(10, 20), (160, 170)]);
+        let idat = desc.clone();
+        let meta = MMeta {
+            items: vec![geo_ii(1, b"iovl"), geo_ii(2, b"av01"), geo_ii(3, b"av01")],
+            properties: vec![ispe_prop(80, 60), ispe_prop(80, 60)],
+            associations: vec![geo_assoc(2, &[0]), geo_assoc(3, &[1])],
+            irefs: vec![IrefEntry {
+                reference_type: *b"dimg",
+                from_id: 1,
+                to_ids: vec![2, 3],
+            }],
+            locations: vec![ItemLocation {
+                id: 1,
+                construction_method: 1, // idat
+                data_reference_index: 0,
+                base_offset: 0,
+                extents: vec![IlocExtent {
+                    offset: 0,
+                    length: desc.len() as u64,
+                }],
+            }],
+            ..MMeta::default()
+        };
+        let res = resolve_overlays(&meta, &[], Some(&idat));
+        assert_eq!(res.len(), 1);
+        let r = &res[0];
+        assert_eq!(r.iovl_item_id, 1);
+        assert_eq!(r.canvas(), (200, 200));
+        assert_eq!(r.placements.len(), 2);
+
+        // First input: fully visible at (10, 20), 80×60.
+        let p0 = &r.placements[0];
+        assert_eq!(p0.source_item_id, 2);
+        assert_eq!((p0.input_width, p0.input_height), (80, 60));
+        assert!(p0.fully_visible(200, 200));
+        assert_eq!(p0.visible(200, 200), Some((10, 20, 80, 60)));
+
+        // Second input: at (160, 170), 80×60 → clipped to (160,170,40,30).
+        let p1 = &r.placements[1];
+        assert_eq!(p1.source_item_id, 3);
+        assert!(!p1.fully_visible(200, 200));
+        assert_eq!(p1.visible(200, 200), Some((160, 170, 40, 30)));
+        // Not fully covered → fill colour shows through.
+        assert!(r.canvas_partially_filled());
+    }
+
+    /// An overlay input placed entirely off-canvas (negative beyond its own
+    /// extent) is reported as off-canvas with no visible rectangle.
+    #[test]
+    fn overlay_placement_off_canvas() {
+        let p = OverlayPlacement {
+            source_item_id: 5,
+            offset_x: -100,
+            offset_y: 0,
+            input_width: 50,
+            input_height: 50,
+        };
+        assert!(p.off_canvas(200, 200));
+        assert_eq!(p.visible(200, 200), None);
+        // A negative offset that still overlaps → partial visible rect.
+        let q = OverlayPlacement { offset_x: -10, ..p };
+        assert_eq!(q.visible(200, 200), Some((0, 0, 40, 50)));
+    }
+
+    /// End-to-end `iden` resolution: an identity derivation that crops its
+    /// 100×80 source via a `clap` carried on the iden item itself
+    /// (§6.6.2.1 NOTE 2).
+    #[test]
+    fn resolve_iden_applies_iden_transforms() {
+        let meta = MMeta {
+            items: vec![geo_ii(1, b"iden"), geo_ii(2, b"av01")],
+            properties: vec![
+                ispe_prop(100, 80), // 0: source ispe
+                MProp::Clap(MClap {
+                    // 1: clap on the iden item
+                    clean_aperture_width_n: 50,
+                    clean_aperture_width_d: 1,
+                    clean_aperture_height_n: 40,
+                    clean_aperture_height_d: 1,
+                    horiz_off_n: 0,
+                    horiz_off_d: 1,
+                    vert_off_n: 0,
+                    vert_off_d: 1,
+                }),
+            ],
+            associations: vec![geo_assoc(2, &[0]), geo_assoc(1, &[1])],
+            irefs: vec![IrefEntry {
+                reference_type: *b"dimg",
+                from_id: 1,
+                to_ids: vec![2],
+            }],
+            ..MMeta::default()
+        };
+        let res = resolve_iden_derivations(&meta, &[], None);
+        assert_eq!(res.len(), 1);
+        let r = &res[0];
+        assert_eq!(r.iden_item_id, 1);
+        assert_eq!(r.source_item_id, Some(2));
+        assert_eq!(r.source_dims, Some((100, 80)));
+        assert_eq!(r.transforms.len(), 1);
+        assert_eq!(r.output_dims, Some((50, 40)));
+    }
+
+    /// An `iden` whose source is itself a grid resolves transitively: the
+    /// grid's `output_width/height` become the iden's source dims, then the
+    /// iden's `irot` swaps them.
+    #[test]
+    fn reconstructed_dims_iden_over_grid_with_rotation() {
+        // grid descriptor: version 0, flags 0, rows=1, cols=1, 256×128.
+        let mut grid = vec![0u8, 0u8, 0u8, 0u8];
+        grid.extend_from_slice(&256u16.to_be_bytes());
+        grid.extend_from_slice(&128u16.to_be_bytes());
+        let idat = grid.clone();
+        let meta = MMeta {
+            items: vec![geo_ii(1, b"iden"), geo_ii(2, b"grid"), geo_ii(3, b"av01")],
+            properties: vec![
+                ispe_prop(256, 128),             // 0: tile ispe (unused for grid dims)
+                MProp::Irot(MIrot { angle: 1 }), // 1: rotate on the iden
+            ],
+            associations: vec![geo_assoc(3, &[0]), geo_assoc(1, &[1])],
+            irefs: vec![
+                IrefEntry {
+                    reference_type: *b"dimg",
+                    from_id: 1,
+                    to_ids: vec![2],
+                },
+                IrefEntry {
+                    reference_type: *b"dimg",
+                    from_id: 2,
+                    to_ids: vec![3],
+                },
+            ],
+            locations: vec![ItemLocation {
+                id: 2,
+                construction_method: 1,
+                data_reference_index: 0,
+                base_offset: 0,
+                extents: vec![IlocExtent {
+                    offset: 0,
+                    length: grid.len() as u64,
+                }],
+            }],
+            ..MMeta::default()
+        };
+        // iden reconstructed dims = output image of its grid source = 256×128
+        // (grid has no transforms), then the iden's irot swaps → 128×256.
+        let res = resolve_iden_derivations(&meta, &[], Some(&idat));
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].source_dims, Some((256, 128)));
+        assert_eq!(res[0].output_dims, Some((128, 256)));
+    }
+
+    /// A `dimg` cycle (iden → iden → …) is broken by the depth guard rather
+    /// than recursing forever.
+    #[test]
+    fn reconstructed_dims_cycle_guard() {
+        let meta = MMeta {
+            items: vec![geo_ii(1, b"iden"), geo_ii(2, b"iden")],
+            irefs: vec![
+                IrefEntry {
+                    reference_type: *b"dimg",
+                    from_id: 1,
+                    to_ids: vec![2],
+                },
+                IrefEntry {
+                    reference_type: *b"dimg",
+                    from_id: 2,
+                    to_ids: vec![1],
+                },
+            ],
+            ..MMeta::default()
+        };
+        // Must terminate and return None rather than overflow the stack.
+        assert_eq!(reconstructed_dims(&meta, 1, &[], None), None);
+    }
+
+    /// `iscl` participates in the chain — verify a coded item scaled 2×.
+    #[test]
+    fn output_dims_with_iscl() {
+        let meta = MMeta {
+            items: vec![geo_ii(1, b"av01")],
+            properties: vec![MProp::Iscl(MIscl {
+                target_width_numerator: 2,
+                target_width_denominator: 1,
+                target_height_numerator: 2,
+                target_height_denominator: 1,
+            })],
+            associations: vec![geo_assoc(1, &[0])],
+            ..MMeta::default()
+        };
+        assert_eq!(output_dims_from_reconstructed(&meta, 1, 64, 48), (128, 96));
+    }
+
+    // -----------------------------------------------------------------------
+    // Property / fuzz tests for the box-parsing surface
+    // -----------------------------------------------------------------------
+    //
+    // These hammer the descriptor parsers and the geometry resolver with
+    // pseudo-random and adversarially-shaped byte inputs. The contract under
+    // test is **total**: a parser must return `Ok(_)` or `Err(_)` and never
+    // panic (no slice-index OOB, no integer overflow in debug, no
+    // unbounded recursion) for *any* input. The PRNG is a deterministic
+    // splitmix64 so a failure reproduces from the printed seed.
+
+    /// Deterministic splitmix64 — no external crate, reproducible from seed.
+    struct SplitMix64(u64);
+
+    impl SplitMix64 {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        /// A pseudo-random byte vector of length `0..=max_len`.
+        fn bytes(&mut self, max_len: usize) -> Vec<u8> {
+            let len = (self.next() as usize) % (max_len + 1);
+            (0..len).map(|_| (self.next() & 0xff) as u8).collect()
+        }
+    }
+
+    /// `ImageOverlay::parse` is total over arbitrary bytes × arbitrary
+    /// reference counts — it never panics, only returns `Ok`/`Err`.
+    #[test]
+    fn fuzz_image_overlay_parse_is_total() {
+        let mut rng = SplitMix64(0x0AF1_2026_0341_0001);
+        for _ in 0..20_000 {
+            let buf = rng.bytes(48);
+            let refs = (rng.next() as usize) % 8;
+            // Must not panic regardless of input.
+            let _ = ImageOverlay::parse(&buf, refs);
+        }
+    }
+
+    /// `GainMapMetadata::parse` (ISO 21496-1 Annex C.2) is total — random
+    /// payloads must not panic on the flag byte, version bounds, or the
+    /// per-channel rational reads.
+    #[test]
+    fn fuzz_gain_map_metadata_parse_is_total() {
+        let mut rng = SplitMix64(0x0AF1_2026_0341_0002);
+        for _ in 0..20_000 {
+            let buf = rng.bytes(160);
+            let _ = GainMapMetadata::parse(&buf);
+        }
+    }
+
+    /// `SampleTransform::parse` (av1-avif §4.2.3) is total over random
+    /// descriptor bytes × reference counts — the postfix token stream
+    /// validation must reject malformed input without panicking.
+    #[test]
+    fn fuzz_sample_transform_parse_is_total() {
+        let mut rng = SplitMix64(0x0AF1_2026_0341_0003);
+        for _ in 0..20_000 {
+            let buf = rng.bytes(64);
+            let refs = (rng.next() % 8) as u32;
+            let _ = SampleTransform::parse(&buf, refs);
+        }
+    }
+
+    /// `parse_grpl` (HEIF §9.4 EntityToGroupBox container) is total over
+    /// random `grpl` payloads.
+    #[test]
+    fn fuzz_parse_grpl_is_total() {
+        let mut rng = SplitMix64(0x0AF1_2026_0341_0004);
+        for _ in 0..20_000 {
+            let buf = rng.bytes(80);
+            let _ = parse_grpl(&buf);
+        }
+    }
+
+    /// The geometry resolver is total over a randomly-shaped item graph:
+    /// `resolve_overlays`, `resolve_iden_derivations`, and
+    /// `reconstructed_dims` must terminate (cycle guard) and never panic
+    /// for any meta layout × backing buffer.
+    #[test]
+    fn fuzz_geometry_resolver_is_total() {
+        let mut rng = SplitMix64(0x0AF1_2026_0341_0005);
+        let types: [&[u8; 4]; 5] = [b"av01", b"grid", b"iovl", b"iden", b"sato"];
+        for _ in 0..5_000 {
+            let item_count = 1 + (rng.next() as usize % 6);
+            let mut items = Vec::new();
+            let mut properties = Vec::new();
+            let mut associations = Vec::new();
+            let mut irefs = Vec::new();
+            let mut locations = Vec::new();
+            for i in 0..item_count {
+                let id = (i + 1) as u32;
+                let t = types[(rng.next() as usize) % types.len()];
+                items.push(geo_ii(id, t));
+                // Random ispe property + association.
+                let w = (rng.next() % 600) as u32;
+                let h = (rng.next() % 600) as u32;
+                properties.push(ispe_prop(w, h));
+                associations.push(geo_assoc(id, &[(properties.len() - 1) as u16]));
+                // A random dimg edge to another (possibly self → cycle).
+                if rng.next() & 1 == 0 {
+                    let to = 1 + (rng.next() as u32 % item_count as u32);
+                    irefs.push(IrefEntry {
+                        reference_type: *b"dimg",
+                        from_id: id,
+                        to_ids: vec![to],
+                    });
+                }
+                // A random idat-backed location.
+                if rng.next() & 1 == 0 {
+                    locations.push(ItemLocation {
+                        id,
+                        construction_method: (rng.next() % 3) as u8,
+                        data_reference_index: 0,
+                        base_offset: rng.next() % 64,
+                        extents: vec![IlocExtent {
+                            offset: rng.next() % 64,
+                            length: rng.next() % 64,
+                        }],
+                    });
+                }
+            }
+            let meta = MMeta {
+                items,
+                properties,
+                associations,
+                irefs,
+                locations,
+                ..MMeta::default()
+            };
+            let file = rng.bytes(128);
+            let idat = rng.bytes(128);
+            // None of these may panic or fail to terminate.
+            let _ = resolve_overlays(&meta, &file, Some(&idat));
+            let _ = resolve_iden_derivations(&meta, &file, Some(&idat));
+            for id in 1..=item_count as u32 {
+                let _ = reconstructed_dims(&meta, id, &file, Some(&idat));
+            }
+        }
     }
 }

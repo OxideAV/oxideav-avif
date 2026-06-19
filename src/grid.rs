@@ -168,7 +168,9 @@ pub fn composite_grid(
         let dst_y = row as u32 * tile_h;
         if dst_x >= out_w || dst_y >= out_h {
             // Tiles entirely outside the declared output rectangle are
-            // silently dropped — goavif behaves the same.
+            // silently dropped (HEIF §6.6.2.3: the grid is trimmed to
+            // output_width/output_height, so over-hang tiles contribute
+            // nothing).
             continue;
         }
         let copy_w = (out_w - dst_x).min(tile_w);

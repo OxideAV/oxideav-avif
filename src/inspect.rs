@@ -20,6 +20,8 @@ use crate::parser::{
 };
 
 const AV1C: BoxType = b(b"av1C");
+const META_BOX: BoxType = b(b"meta");
+const IDAT_BOX: BoxType = b(b"idat");
 const COLR: BoxType = b(b"colr");
 const MDCV: BoxType = b(b"mdcv");
 const CLLI: BoxType = b(b"clli");
@@ -255,6 +257,21 @@ pub struct AvifInfo {
     /// compatible-brands list. Combine with
     /// [`Self::avif_profile_strict_compliant`] for a one-call gate.
     pub avif_profile_compliance: Vec<crate::derived::AvifProfileCompliance>,
+    /// Fully resolved `'iovl'` image-overlay derivations (HEIF §6.6.2.2),
+    /// one entry per `iovl` item in `iinf` declaration order. Each carries
+    /// the parsed descriptor (canvas dimensions + fill colour) plus, per
+    /// input, the resolved placement rectangle and clip region against the
+    /// canvas — all computed from the box graph alone (no AV1 decode).
+    /// Empty for files without any overlay derivation. See
+    /// [`crate::derived::OverlayResolution`].
+    pub overlay_resolutions: Vec<crate::derived::OverlayResolution>,
+    /// Fully resolved `'iden'` identity derivations (HEIF §6.6.2.1), one
+    /// entry per `iden` item in `iinf` declaration order. Each carries the
+    /// single source item id, the source's reconstructed dimensions, the
+    /// transform chain the iden item applies, and the resulting output
+    /// dimensions. Empty for files without any identity derivation. See
+    /// [`crate::derived::IdenResolution`].
+    pub iden_resolutions: Vec<crate::derived::IdenResolution>,
 }
 
 impl AvifInfo {
@@ -403,6 +420,29 @@ impl AvifInfo {
         self.iden_compliance.iter().all(|i| i.is_compliant())
     }
 
+    /// True when the file carries at least one resolved `'iovl'` overlay
+    /// derivation ([`Self::overlay_resolutions`] non-empty).
+    pub fn has_overlay(&self) -> bool {
+        !self.overlay_resolutions.is_empty()
+    }
+
+    /// The resolved overlay derivation for `iovl_item_id`, if present.
+    pub fn overlay_for(&self, iovl_item_id: u32) -> Option<&crate::derived::OverlayResolution> {
+        self.overlay_resolutions
+            .iter()
+            .find(|o| o.iovl_item_id == iovl_item_id)
+    }
+
+    /// The resolved identity derivation for `iden_item_id`, if present.
+    pub fn iden_resolution_for(
+        &self,
+        iden_item_id: u32,
+    ) -> Option<&crate::derived::IdenResolution> {
+        self.iden_resolutions
+            .iter()
+            .find(|i| i.iden_item_id == iden_item_id)
+    }
+
     /// True when every AV1 Alpha Image Item's pairing with its master
     /// AV1 Image Item passes the av1-avif §4.1 bit-depth-match `shall`
     /// (and both items carry an `av1C` whose flag byte is reachable).
@@ -499,6 +539,10 @@ pub fn inspect(file: &[u8]) -> Result<AvifInfo> {
     let mif1_compliance = crate::parser::audit_mif1(file)?;
     if primary_info.item_type == ITEM_TYPE_GRID {
         build_info_grid(&hdr, primary_id, brands, mif1_compliance)
+    } else if primary_info.item_type == crate::meta::ITEM_TYPE_IOVL
+        || primary_info.item_type == crate::meta::ITEM_TYPE_IDEN
+    {
+        build_info_derived(&hdr, primary_id, brands, mif1_compliance)
     } else {
         let img = parse(file)?;
         build_info(
@@ -657,6 +701,36 @@ fn decode_av1c_flags(av1c: &[u8]) -> (Option<u8>, bool, Option<(bool, bool)>) {
     (Some(bit_depth), monochrome, subsampling)
 }
 
+/// Extract the `idat` (ItemDataBox) payload from a file's `meta` box, if
+/// present. Derived-image descriptors (`grid` / `iovl`) and other items
+/// using `iloc` construction_method 1 reference offsets into this buffer.
+/// Returns `None` when the file has no top-level `meta` box or no `idat`
+/// inside it (the common still-image case where descriptors live in `mdat`
+/// via construction_method 0).
+///
+/// Spec: ISO/IEC 14496-12 §8.11.11 (ItemDataBox); §8.11.3.3 cm=1.
+fn extract_idat(file: &[u8]) -> Option<Vec<u8>> {
+    for hdr in crate::box_parser::iter_boxes(file) {
+        let hdr = hdr.ok()?;
+        if hdr.box_type != META_BOX {
+            continue;
+        }
+        let meta_payload = file.get(hdr.payload_start..hdr.end())?;
+        // The meta box is a FullBox; skip its 4-byte version/flags header.
+        let body = meta_payload.get(4..)?;
+        for inner in crate::box_parser::iter_boxes(body) {
+            let inner = inner.ok()?;
+            if inner.box_type == IDAT_BOX {
+                return body
+                    .get(inner.payload_start..inner.end())
+                    .map(<[u8]>::to_vec);
+            }
+        }
+        return None;
+    }
+    None
+}
+
 pub(crate) fn build_info(
     img: &AvifImage<'_>,
     has_alpha: bool,
@@ -735,6 +809,10 @@ pub(crate) fn build_info(
     let alpha_bit_depth_compliance = crate::derived::audit_alpha_bit_depth(&img.meta);
     let sequence_header_obu_compliance = crate::derived::audit_sequence_header_obu(&img.meta, file);
     let avif_profile_compliance = crate::derived::audit_avif_profile_compliance(&img.meta, &brands);
+    let idat = extract_idat(file);
+    let overlay_resolutions = crate::derived::resolve_overlays(&img.meta, file, idat.as_deref());
+    let iden_resolutions =
+        crate::derived::resolve_iden_derivations(&img.meta, file, idat.as_deref());
     Ok(AvifInfo {
         width,
         height,
@@ -774,6 +852,8 @@ pub(crate) fn build_info(
         alpha_bit_depth_compliance,
         sequence_header_obu_compliance,
         avif_profile_compliance,
+        overlay_resolutions,
+        iden_resolutions,
     })
 }
 
@@ -920,6 +1000,11 @@ pub(crate) fn build_info_grid(
     let sequence_header_obu_compliance =
         crate::derived::audit_sequence_header_obu(&hdr.meta, hdr.file);
     let avif_profile_compliance = crate::derived::audit_avif_profile_compliance(&hdr.meta, &brands);
+    let idat = extract_idat(hdr.file);
+    let overlay_resolutions =
+        crate::derived::resolve_overlays(&hdr.meta, hdr.file, idat.as_deref());
+    let iden_resolutions =
+        crate::derived::resolve_iden_derivations(&hdr.meta, hdr.file, idat.as_deref());
     Ok(AvifInfo {
         width: grid.output_width,
         height: grid.output_height,
@@ -959,6 +1044,218 @@ pub(crate) fn build_info_grid(
         alpha_bit_depth_compliance,
         sequence_header_obu_compliance,
         avif_profile_compliance,
+        overlay_resolutions,
+        iden_resolutions,
+    })
+}
+
+/// Walk the `'dimg'` derivation chain from `item_id` down to the first
+/// coded `'av01'` leaf, returning its item id. Grid / iovl / iden / sato /
+/// tmap items recurse into their inputs; a coded item returns itself. Bounded
+/// by [`crate::derived::MAX_DERIVATION_DEPTH`] to break `dimg` cycles.
+///
+/// Used to find a representative coded item from which a derived-primary
+/// `AvifInfo` can borrow the `av1C` configuration record (bit depth,
+/// monochrome flag, chroma subsampling) — the derivation's inputs are
+/// required to share colour/format information (av1-avif §4.2.3.1), so the
+/// first leaf is representative.
+fn first_coded_leaf(meta: &Meta, item_id: u32, depth: u32) -> Option<u32> {
+    if depth > crate::derived::MAX_DERIVATION_DEPTH {
+        return None;
+    }
+    let item = meta.item_by_id(item_id)?;
+    if item.item_type == crate::parser::ITEM_TYPE_AV01 {
+        return Some(item_id);
+    }
+    // Any derived item: descend into its first `dimg` input.
+    let inputs = meta.iref_targets(b"dimg", item_id);
+    for src in inputs {
+        if let Some(leaf) = first_coded_leaf(meta, src, depth + 1) {
+            return Some(leaf);
+        }
+    }
+    None
+}
+
+/// Build an [`AvifInfo`] for a file whose primary item is a non-grid
+/// derived image — an `'iovl'` overlay (HEIF §6.6.2.2) or an `'iden'`
+/// identity derivation (§6.6.2.1). Reports the derivation's reconstructed
+/// output dimensions (resolved from the box graph) and borrows the
+/// representative `av1C` from the first coded leaf in the derivation chain.
+///
+/// Mirrors [`build_info_grid`]'s property-fallback shape (primary item
+/// first, then the representative coded leaf) for the descriptive
+/// properties that describe the reconstructed image (`pixi`, `pasp`,
+/// `colr`, HDR metadata).
+pub(crate) fn build_info_derived(
+    hdr: &AvifHeader<'_>,
+    primary_id: u32,
+    brands: BrandClass,
+    mif1_compliance: crate::derived::Mif1Compliance,
+) -> Result<AvifInfo> {
+    let idat = extract_idat(hdr.file);
+    let (width, height) =
+        crate::derived::reconstructed_dims(&hdr.meta, primary_id, hdr.file, idat.as_deref())
+            .ok_or_else(|| {
+                Error::invalid("avif: could not resolve derived primary output dimensions")
+            })?;
+    // The derived primary's own output image folds in its transformative
+    // properties (§6.3).
+    let (width, height) =
+        crate::derived::output_dims_from_reconstructed(&hdr.meta, primary_id, width, height);
+
+    let leaf_id = first_coded_leaf(&hdr.meta, primary_id, 0)
+        .ok_or_else(|| Error::invalid("avif: derived primary has no coded av01 leaf for av1C"))?;
+    let av1c = match hdr.meta.property_for(leaf_id, &AV1C) {
+        Some(Property::Av1C(bytes)) => bytes.clone(),
+        _ => {
+            return Err(Error::invalid(
+                "avif: derived primary's coded leaf missing av1C property",
+            ))
+        }
+    };
+    let bits_per_channel = match hdr.meta.property_for(primary_id, b"pixi") {
+        Some(Property::Pixi(p)) => p.bits_per_channel.clone(),
+        _ => match hdr.meta.property_for(leaf_id, b"pixi") {
+            Some(Property::Pixi(p)) => p.bits_per_channel.clone(),
+            _ => Vec::new(),
+        },
+    };
+    let pasp = match hdr.meta.property_for(primary_id, b"pasp") {
+        Some(Property::Pasp(p)) => Some(*p),
+        _ => match hdr.meta.property_for(leaf_id, b"pasp") {
+            Some(Property::Pasp(p)) => Some(*p),
+            _ => None,
+        },
+    };
+    let colour = match hdr.meta.property_for(primary_id, &COLR) {
+        Some(Property::Colr(c)) => Some(c.clone()),
+        _ => match hdr.meta.property_for(leaf_id, &COLR) {
+            Some(Property::Colr(c)) => Some(c.clone()),
+            _ => None,
+        },
+    };
+    let mdcv = match hdr.meta.property_for(primary_id, &MDCV) {
+        Some(Property::Mdcv(m)) => Some(*m),
+        _ => match hdr.meta.property_for(leaf_id, &MDCV) {
+            Some(Property::Mdcv(m)) => Some(*m),
+            _ => None,
+        },
+    };
+    let clli = match hdr.meta.property_for(primary_id, &CLLI) {
+        Some(Property::Clli(c)) => Some(*c),
+        _ => match hdr.meta.property_for(leaf_id, &CLLI) {
+            Some(Property::Clli(c)) => Some(*c),
+            _ => None,
+        },
+    };
+    let cclv = match hdr.meta.property_for(primary_id, &CCLV) {
+        Some(Property::Cclv(c)) => Some(*c),
+        _ => match hdr.meta.property_for(leaf_id, &CCLV) {
+            Some(Property::Cclv(c)) => Some(*c),
+            _ => None,
+        },
+    };
+    let amve = match hdr.meta.property_for(primary_id, &AMVE) {
+        Some(Property::Amve(a)) => Some(*a),
+        _ => match hdr.meta.property_for(leaf_id, &AMVE) {
+            Some(Property::Amve(a)) => Some(*a),
+            _ => None,
+        },
+    };
+    let (bit_depth, monochrome, chroma_subsampling) = decode_av1c_flags(&av1c);
+    let thumbnail_item_ids = hdr.meta.iref_sources_of(b"thmb", primary_id);
+    let (exif_item_id, xmp_item_id) = resolve_metadata_items(&hdr.meta, primary_id);
+    let has_alpha = find_alpha_item_id(&hdr.meta, primary_id).is_some();
+    let premultiplied_alpha = if has_alpha {
+        match find_alpha_item_id(&hdr.meta, primary_id) {
+            Some(alpha_id) => hdr.meta.irefs.iter().any(|e| {
+                &e.reference_type == b"prem"
+                    && e.from_id == alpha_id
+                    && e.to_ids.contains(&primary_id)
+            }),
+            None => false,
+        }
+    } else {
+        false
+    };
+    let aux_items = hdr.meta.aux_items_for(primary_id);
+    let alpha_aux_kind = aux_items
+        .iter()
+        .find(|(_, k)| matches!(k, crate::meta::AuxKind::Alpha))
+        .map(|(_, k)| *k);
+    let depth_map_item_id = aux_items
+        .iter()
+        .find(|(_, k)| matches!(k, crate::meta::AuxKind::DepthMap))
+        .map(|(id, _)| *id);
+    let hdr_gain_map_item_id = aux_items
+        .iter()
+        .find(|(_, k)| matches!(k, crate::meta::AuxKind::HdrGainMap))
+        .map(|(id, _)| *id);
+    let entity_group_count = hdr.meta.groups().map(|g| g.len()).unwrap_or(0);
+    let operating_point = match hdr.meta.property_for(primary_id, b"a1op") {
+        Some(Property::A1op(a)) => Some(*a),
+        _ => None,
+    };
+    let layered_index = match hdr.meta.property_for(primary_id, b"a1lx") {
+        Some(Property::A1lx(a)) => Some(*a),
+        _ => None,
+    };
+    let sato_item_ids = hdr.meta.item_ids_of_type(&crate::meta::ITEM_TYPE_SATO);
+    let tmap_item_ids = hdr.meta.item_ids_of_type(&crate::meta::ITEM_TYPE_TMAP);
+    let tone_map_compliance = crate::derived::audit_tone_map(&hdr.meta);
+    let grid_derivation_compliance = crate::derived::audit_grid_derivations(&hdr.meta);
+    let iden_item_ids = hdr.meta.item_ids_of_type(&crate::meta::ITEM_TYPE_IDEN);
+    let iden_compliance = crate::derived::audit_iden_derivations(&hdr.meta);
+    let alpha_bit_depth_compliance = crate::derived::audit_alpha_bit_depth(&hdr.meta);
+    let sequence_header_obu_compliance =
+        crate::derived::audit_sequence_header_obu(&hdr.meta, hdr.file);
+    let avif_profile_compliance = crate::derived::audit_avif_profile_compliance(&hdr.meta, &brands);
+    let overlay_resolutions =
+        crate::derived::resolve_overlays(&hdr.meta, hdr.file, idat.as_deref());
+    let iden_resolutions =
+        crate::derived::resolve_iden_derivations(&hdr.meta, hdr.file, idat.as_deref());
+    Ok(AvifInfo {
+        width,
+        height,
+        bits_per_channel,
+        pasp,
+        av1c,
+        obu_bytes: Vec::new(),
+        is_grid: false,
+        has_alpha,
+        brands,
+        colour,
+        mdcv,
+        clli,
+        cclv,
+        amve,
+        bit_depth,
+        monochrome,
+        chroma_subsampling,
+        thumbnail_item_ids,
+        exif_item_id,
+        xmp_item_id,
+        premultiplied_alpha,
+        aux_items,
+        alpha_aux_kind,
+        depth_map_item_id,
+        hdr_gain_map_item_id,
+        entity_group_count,
+        mif1_compliance,
+        operating_point,
+        layered_index,
+        sato_item_ids,
+        tmap_item_ids,
+        tone_map_compliance,
+        grid_derivation_compliance,
+        iden_item_ids,
+        iden_compliance,
+        alpha_bit_depth_compliance,
+        sequence_header_obu_compliance,
+        avif_profile_compliance,
+        overlay_resolutions,
+        iden_resolutions,
     })
 }
 

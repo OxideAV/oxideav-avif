@@ -154,7 +154,8 @@ fn crop_rect(
 
 /// Apply a `clap` (clean-aperture) crop. Dimensions that fall outside
 /// the source rectangle or whose denominators are zero return the input
-/// unchanged (matches goavif's defensive behaviour).
+/// unchanged (defensive: a malformed `clap` is treated as a no-op rather
+/// than an error so the rest of the image still renders).
 ///
 /// `clap` crop width / height / horizontal / vertical offsets are signed
 /// rationals. The spec defines the crop centre as
@@ -188,8 +189,8 @@ pub fn apply_clap(
     if cw <= 0 || ch <= 0 || cw > w || ch > h {
         return Ok((frame.clone(), width, height));
     }
-    // Centre, as a float (matches goavif's rounding exactly; denominators
-    // are 32-bit so f64 has enough precision).
+    // Centre, as a float per the §6.5.9 clean-aperture geometry;
+    // denominators are 32-bit so f64 has enough precision.
     let centre_x = (w - 1) as f64 / 2.0 + clap.horiz_off_n as f64 / clap.horiz_off_d as f64;
     let centre_y = (h - 1) as f64 / 2.0 + clap.vert_off_n as f64 / clap.vert_off_d as f64;
     let mut x0 = (centre_x - (cw - 1) as f64 / 2.0 + 0.5).floor() as i64;

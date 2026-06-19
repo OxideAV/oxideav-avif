@@ -3493,3 +3493,208 @@ fn bbb_alpha_fixture_avif_profile_audit_per_av01_item() {
     }
     assert!(info.avif_profile_strict_compliant());
 }
+
+/// Build a synthetic `iovl`-primary AVIF: the primary item (id 1) is an
+/// image-overlay derived image whose descriptor lives in `mdat` (iloc
+/// construction_method 0). It places two 2×2 av01 inputs on a 4×4 canvas —
+/// input 1 fully visible at (0,0), input 2 clipped at (3,3).
+fn build_synthetic_iovl_avif() -> Vec<u8> {
+    fn u32be(v: u32) -> [u8; 4] {
+        v.to_be_bytes()
+    }
+    fn u16be(v: u16) -> [u8; 2] {
+        v.to_be_bytes()
+    }
+    fn box_bytes(btype: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let size = (8 + body.len()) as u32;
+        let mut out = size.to_be_bytes().to_vec();
+        out.extend_from_slice(btype);
+        out.extend_from_slice(body);
+        out
+    }
+    fn full_box(btype: &[u8; 4], version: u8, flags: u32, body: &[u8]) -> Vec<u8> {
+        let mut payload = vec![
+            version,
+            (flags >> 16) as u8,
+            (flags >> 8) as u8,
+            flags as u8,
+        ];
+        payload.extend_from_slice(body);
+        box_bytes(btype, &payload)
+    }
+
+    let mut ftyp_body = Vec::new();
+    ftyp_body.extend_from_slice(b"avif");
+    ftyp_body.extend_from_slice(&u32be(0));
+    ftyp_body.extend_from_slice(b"mif1");
+    ftyp_body.extend_from_slice(b"miaf");
+    let ftyp = box_bytes(b"ftyp", &ftyp_body);
+
+    let mut hdlr_body = Vec::new();
+    hdlr_body.extend_from_slice(&[0u8; 4]);
+    hdlr_body.extend_from_slice(b"pict");
+    hdlr_body.extend_from_slice(&[0u8; 12]);
+    hdlr_body.extend_from_slice(b"\0");
+    let hdlr = full_box(b"hdlr", 0, 0, &hdlr_body);
+
+    // Primary = item 1 (the iovl).
+    let pitm = full_box(b"pitm", 0, 0, &u16be(1));
+
+    fn infe_v2(id: u16, item_type: &[u8; 4]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&id.to_be_bytes());
+        body.extend_from_slice(&[0u8, 0]);
+        body.extend_from_slice(item_type);
+        body.push(0);
+        full_box(b"infe", 2, 0, &body)
+    }
+    let mut iinf_body = Vec::new();
+    iinf_body.extend_from_slice(&u16be(3));
+    iinf_body.extend_from_slice(&infe_v2(1, b"iovl"));
+    iinf_body.extend_from_slice(&infe_v2(2, b"av01"));
+    iinf_body.extend_from_slice(&infe_v2(3, b"av01"));
+    let iinf = full_box(b"iinf", 0, 0, &iinf_body);
+
+    // iref dimg: from 1 → {2, 3}.
+    let mut dimg_body = Vec::new();
+    dimg_body.extend_from_slice(&u16be(1));
+    dimg_body.extend_from_slice(&u16be(2));
+    dimg_body.extend_from_slice(&u16be(2));
+    dimg_body.extend_from_slice(&u16be(3));
+    let iref = full_box(b"iref", 0, 0, &box_bytes(b"dimg", &dimg_body));
+
+    // iovl descriptor: 16-bit, canvas 4×4, offsets (0,0) + (3,3).
+    let iovl_desc = {
+        let mut b = vec![0u8, 0u8];
+        for _ in 0..4 {
+            b.extend_from_slice(&u16be(0));
+        }
+        b.extend_from_slice(&u16be(4));
+        b.extend_from_slice(&u16be(4));
+        b.extend_from_slice(&u16be(0));
+        b.extend_from_slice(&u16be(0));
+        b.extend_from_slice(&u16be(3));
+        b.extend_from_slice(&u16be(3));
+        b
+    };
+    let tile1 = vec![0xAAu8; 8];
+    let tile2 = vec![0xBBu8; 8];
+
+    let mut tile_ispe_body = Vec::new();
+    tile_ispe_body.extend_from_slice(&u32be(2));
+    tile_ispe_body.extend_from_slice(&u32be(2));
+    let tile_ispe = full_box(b"ispe", 0, 0, &tile_ispe_body);
+    let mut iovl_ispe_body = Vec::new();
+    iovl_ispe_body.extend_from_slice(&u32be(4));
+    iovl_ispe_body.extend_from_slice(&u32be(4));
+    let iovl_ispe = full_box(b"ispe", 0, 0, &iovl_ispe_body);
+    let av1c = box_bytes(b"av1C", &[0x81u8, 0, 0, 0]);
+
+    let mut ipco_body = Vec::new();
+    ipco_body.extend_from_slice(&iovl_ispe); // prop 1
+    ipco_body.extend_from_slice(&tile_ispe); // prop 2
+    ipco_body.extend_from_slice(&av1c); // prop 3
+    let ipco = box_bytes(b"ipco", &ipco_body);
+
+    let mut ipma_body = Vec::new();
+    ipma_body.extend_from_slice(&u32be(3));
+    ipma_body.extend_from_slice(&1u16.to_be_bytes());
+    ipma_body.push(1);
+    ipma_body.push(1 & 0x7f);
+    ipma_body.extend_from_slice(&2u16.to_be_bytes());
+    ipma_body.push(2);
+    ipma_body.push(2 & 0x7f);
+    ipma_body.push(3 & 0x7f);
+    ipma_body.extend_from_slice(&3u16.to_be_bytes());
+    ipma_body.push(2);
+    ipma_body.push(2 & 0x7f);
+    ipma_body.push(3 & 0x7f);
+    let ipma = full_box(b"ipma", 0, 0, &ipma_body);
+
+    let mut iprp_body = Vec::new();
+    iprp_body.extend_from_slice(&ipco);
+    iprp_body.extend_from_slice(&ipma);
+    let iprp = box_bytes(b"iprp", &iprp_body);
+
+    let ftyp_size = ftyp.len();
+    let iloc_size = 8 + 4 + 1 + 1 + 2 + 3 * 14;
+    let meta_payload_size =
+        4 + hdlr.len() + pitm.len() + iinf.len() + iref.len() + iprp.len() + iloc_size;
+    let meta_size = 8 + meta_payload_size;
+    let mdat_payload_start = ftyp_size + meta_size + 8;
+    let iovl_off = mdat_payload_start;
+    let tile1_off = iovl_off + iovl_desc.len();
+    let tile2_off = tile1_off + tile1.len();
+
+    let mut iloc_inner = Vec::new();
+    iloc_inner.push(0x44);
+    iloc_inner.push(0x00);
+    iloc_inner.extend_from_slice(&u16be(3));
+    for (id, off, len) in [
+        (1u16, iovl_off as u32, iovl_desc.len() as u32),
+        (2, tile1_off as u32, tile1.len() as u32),
+        (3, tile2_off as u32, tile2.len() as u32),
+    ] {
+        iloc_inner.extend_from_slice(&id.to_be_bytes());
+        iloc_inner.extend_from_slice(&u16be(0));
+        iloc_inner.extend_from_slice(&u16be(1));
+        iloc_inner.extend_from_slice(&u32be(off));
+        iloc_inner.extend_from_slice(&u32be(len));
+    }
+    let iloc = full_box(b"iloc", 0, 0, &iloc_inner);
+
+    let mut meta_body = Vec::new();
+    meta_body.extend_from_slice(&[0u8; 4]);
+    meta_body.extend_from_slice(&hdlr);
+    meta_body.extend_from_slice(&pitm);
+    meta_body.extend_from_slice(&iinf);
+    meta_body.extend_from_slice(&iref);
+    meta_body.extend_from_slice(&iprp);
+    meta_body.extend_from_slice(&iloc);
+    let meta = box_bytes(b"meta", &meta_body);
+    assert_eq!(meta.len(), meta_size, "iovl meta size recalc");
+
+    let mut mdat_body = Vec::new();
+    mdat_body.extend_from_slice(&iovl_desc);
+    mdat_body.extend_from_slice(&tile1);
+    mdat_body.extend_from_slice(&tile2);
+    let mdat = box_bytes(b"mdat", &mdat_body);
+
+    let mut file = Vec::new();
+    file.extend_from_slice(&ftyp);
+    file.extend_from_slice(&meta);
+    file.extend_from_slice(&mdat);
+    file
+}
+
+/// `inspect()` resolves an `iovl`-primary overlay derivation end-to-end:
+/// the descriptor is parsed, the canvas dimensions are reported as the
+/// image dimensions, each `dimg` source's output dimensions come from its
+/// `ispe`, and each placement is clipped against the canvas (HEIF §6.6.2.2).
+#[test]
+fn inspect_resolves_iovl_primary_overlay_placements() {
+    let file = build_synthetic_iovl_avif();
+    let info = inspect(&file).expect("inspect synthetic iovl primary");
+    assert!(!info.is_grid);
+    assert_eq!(info.width, 4, "iovl canvas width reported as image width");
+    assert_eq!(info.height, 4);
+    assert!(info.has_overlay());
+    assert_eq!(info.overlay_resolutions.len(), 1);
+
+    let res = info.overlay_for(1).expect("overlay for item 1");
+    assert_eq!(res.canvas(), (4, 4));
+    assert_eq!(res.placements.len(), 2);
+
+    let p0 = &res.placements[0];
+    assert_eq!(p0.source_item_id, 2);
+    assert_eq!((p0.input_width, p0.input_height), (2, 2));
+    assert_eq!(p0.visible(4, 4), Some((0, 0, 2, 2)));
+    assert!(p0.fully_visible(4, 4));
+
+    let p1 = &res.placements[1];
+    assert_eq!(p1.source_item_id, 3);
+    assert!(!p1.fully_visible(4, 4));
+    assert_eq!(p1.visible(4, 4), Some((3, 3, 1, 1)));
+
+    assert!(res.canvas_partially_filled());
+}

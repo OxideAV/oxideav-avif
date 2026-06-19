@@ -9,6 +9,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Derived-image geometry resolution (HEIF §6.3 / §6.6.2, `derived`
+  module): a box-graph-only evaluation surface that computes derived-image
+  output geometry without decoding any AV1 bitstream. New
+  `DimTransform` enumerates the four dimension-affecting transformative
+  item properties (`irot` rotate, `imir` mirror, `clap` clean-aperture
+  crop, `iscl` rational scale); `transform_chain` collects them per item
+  in `ipma` association order (skipping descriptive properties);
+  `output_dims_from_reconstructed` folds the chain to the §6.3 output
+  image dimensions; and `reconstructed_dims` resolves an item's
+  reconstructed dimensions from the graph — `grid`/`iovl` descriptor
+  `output_width`/`output_height`, an `iden`'s single recursively-resolved
+  input, or a coded item's `ispe` — bounded by `MAX_DERIVATION_DEPTH`
+  (16) to break `dimg` cycles. `resolve_overlays` fully resolves every
+  `iovl` overlay end-to-end (HEIF §6.6.2.2): each `OverlayResolution`
+  pairs the parsed descriptor with one `OverlayPlacement` per input
+  carrying the resolved offset + input dimensions, and
+  `OverlayPlacement::{visible, fully_visible, off_canvas}` clip the input
+  against `[0, output_width) × [0, output_height)` per §6.6.2.2.3;
+  `OverlayResolution::canvas_partially_filled` reports whether the fill
+  colour shows through. `resolve_iden_derivations` resolves every `iden`
+  identity derivation (§6.6.2.1): each `IdenResolution` carries the single
+  source item, the source's reconstructed dimensions, the iden item's own
+  transform chain, and the resulting output dimensions (the §6.6.2.1
+  NOTE 2 "crop of the original" case). Descriptor payloads resolve via a
+  local `iloc` reader handling both `construction_method` 0 (file) and 1
+  (`idat`). The new surface is re-exported from the crate root and
+  surfaced on `AvifInfo::{overlay_resolutions, iden_resolutions}` with
+  `has_overlay` / `overlay_for` / `iden_resolution_for` accessors. The
+  `inspect()` primary dispatch now accepts `iovl` and `iden` derived
+  primaries (new `build_info_derived` path: reports the derivation's
+  output dimensions and borrows the representative `av1C` from the first
+  coded `av01` leaf in the `dimg` chain), alongside the existing grid and
+  coded-item paths.
+
+- Property/fuzz tests for the box-parsing surface (`derived` module):
+  five deterministic splitmix64-seeded property tests assert that
+  `ImageOverlay::parse`, `GainMapMetadata::parse`, `SampleTransform::parse`,
+  `parse_grpl`, and the full geometry resolver (`resolve_overlays` /
+  `resolve_iden_derivations` / `reconstructed_dims`) are **total** — they
+  return `Ok`/`Err` and never panic, overflow, or fail to terminate —
+  across ~85 000 random and adversarially-shaped byte/graph inputs
+  (including `dimg` cycles).
+
 - AVIS `ssix` SubsegmentIndexBox (ISO/IEC 14496-12 §8.16.4, `avis`
   module): `SubsegmentIndex` / `SubsegmentRange` types plus `parse_ssix`
   and the top-level `parse_subsegment_indexes` walk. `ssix` is a

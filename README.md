@@ -43,7 +43,7 @@ encoder, which oxideav does not yet have); `make_encoder` returns
 | Tone Map (`tmap`) | four-CC detection + §4.2.2 compliance audit + `GainMapMetadata::parse` (ISO 21496-1:2025 Annex C.2) |
 | AV1 layered properties | `a1op` operating-point selector + `a1lx` layered-image index (av1-avif §2.3.2) |
 | Auxiliary classification | `auxC` URN routed to `Alpha` / `DepthMap` / `HdrGainMap` / `Other` |
-| Derived images | `iovl` ImageOverlay descriptor + `iden` item-type constant (composition pending a decoder) |
+| Derived images | `iovl` overlay + `iden` identity derivations resolved end-to-end (HEIF §6.3 / §6.6.2) via a box-graph geometry resolver — no AV1 decode: `transform_chain` / `output_dims_from_reconstructed` apply `irot`/`imir`/`clap`/`iscl` in `ipma` order (§6.3); `reconstructed_dims` resolves grid/iovl descriptor dims + recursive `iden` inputs + coded `ispe` (cycle-guarded, depth 16); `resolve_overlays` clips each `OverlayPlacement` against the canvas (§6.6.2.2.3); `resolve_iden_derivations` folds the iden's own transforms over its source. Surfaced on `AvifInfo::{overlay_resolutions, iden_resolutions}`; `inspect()` accepts `iovl`/`iden` derived primaries. Pixel composition still pending a decoder |
 | Entity grouping (`grpl`) | typed `EntityGroup` per `EntityToGroupBox`; `altr` / `ster` / `eqiv` / panorama recognised (HEIF §9.4) |
 | Brand compliance audit | `audit_mif1` (HEIF §10.2.1.1); MIAF Baseline (MA1B) / Advanced (MA1A) profile dispatch + av1-avif §8.2/§8.3 profile audit |
 | Metadata items | `cdsc` iref resolves Exif + XMP attached to the primary; raw bytes on demand via `item_payload_bytes` |
