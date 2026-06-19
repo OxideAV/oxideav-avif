@@ -2344,6 +2344,183 @@ fn idat_backed_primary_item_resolves() {
     assert_eq!((ispe.width, ispe.height), (8, 8));
 }
 
+/// Build an AVIF whose primary `av01` item lives in `mdat` (cm=0) while an
+/// `Exif` metadata item is stored in the `meta` box's `idat` (cm=1). Used
+/// to prove `item_payload_bytes` resolves an idat-backed metadata item.
+fn build_avif_with_idat_exif(exif_payload: &[u8]) -> Vec<u8> {
+    fn u32be(v: u32) -> [u8; 4] {
+        v.to_be_bytes()
+    }
+    fn u16be(v: u16) -> [u8; 2] {
+        v.to_be_bytes()
+    }
+    fn box_bytes(btype: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let size = (8 + body.len()) as u32;
+        let mut out = size.to_be_bytes().to_vec();
+        out.extend_from_slice(btype);
+        out.extend_from_slice(body);
+        out
+    }
+    fn full_box(btype: &[u8; 4], version: u8, flags: u32, body: &[u8]) -> Vec<u8> {
+        let mut payload = vec![
+            version,
+            (flags >> 16) as u8,
+            (flags >> 8) as u8,
+            flags as u8,
+        ];
+        payload.extend_from_slice(body);
+        box_bytes(btype, &payload)
+    }
+    fn infe_v2(id: u16, item_type: &[u8; 4]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&id.to_be_bytes());
+        body.extend_from_slice(&[0u8, 0]);
+        body.extend_from_slice(item_type);
+        body.push(0);
+        full_box(b"infe", 2, 0, &body)
+    }
+
+    let mut ftyp_body = Vec::new();
+    ftyp_body.extend_from_slice(b"avif");
+    ftyp_body.extend_from_slice(&u32be(0));
+    ftyp_body.extend_from_slice(b"mif1");
+    ftyp_body.extend_from_slice(b"miaf");
+    let ftyp = box_bytes(b"ftyp", &ftyp_body);
+
+    let mut hdlr_body = Vec::new();
+    hdlr_body.extend_from_slice(&[0u8; 4]);
+    hdlr_body.extend_from_slice(b"pict");
+    hdlr_body.extend_from_slice(&[0u8; 12]);
+    hdlr_body.extend_from_slice(b"\0");
+    let hdlr = full_box(b"hdlr", 0, 0, &hdlr_body);
+
+    let pitm = full_box(b"pitm", 0, 0, &u16be(1));
+
+    // iinf: item 1 = av01, item 2 = Exif.
+    let infe1 = infe_v2(1, b"av01");
+    let infe2 = infe_v2(2, b"Exif");
+    let mut iinf_body = Vec::new();
+    iinf_body.extend_from_slice(&u16be(2));
+    iinf_body.extend_from_slice(&infe1);
+    iinf_body.extend_from_slice(&infe2);
+    let iinf = full_box(b"iinf", 0, 0, &iinf_body);
+
+    // cdsc iref: Exif (2) describes the primary (1).
+    let mut cdsc = Vec::new();
+    cdsc.extend_from_slice(&u16be(2)); // from_item
+    cdsc.extend_from_slice(&u16be(1)); // ref_count
+    cdsc.extend_from_slice(&u16be(1)); // to_item
+    let cdsc_box = box_bytes(b"cdsc", &cdsc);
+    let iref = full_box(b"iref", 0, 0, &cdsc_box);
+
+    // properties for item 1: ispe + av1C + pixi.
+    let mut ispe_body = Vec::new();
+    ispe_body.extend_from_slice(&u32be(8));
+    ispe_body.extend_from_slice(&u32be(8));
+    let ispe = full_box(b"ispe", 0, 0, &ispe_body);
+    let av1c = box_bytes(b"av1C", &[0x81u8, 0, 0, 0]);
+    let mut pixi_body = vec![0u8; 4];
+    pixi_body.push(1);
+    pixi_body.push(8);
+    let pixi = box_bytes(b"pixi", &pixi_body);
+    let mut ipco_body = Vec::new();
+    ipco_body.extend_from_slice(&ispe);
+    ipco_body.extend_from_slice(&av1c);
+    ipco_body.extend_from_slice(&pixi);
+    let ipco = box_bytes(b"ipco", &ipco_body);
+    let mut ipma_body = Vec::new();
+    ipma_body.extend_from_slice(&u32be(1));
+    ipma_body.extend_from_slice(&1u16.to_be_bytes());
+    ipma_body.push(3);
+    ipma_body.push(1);
+    ipma_body.push(2);
+    ipma_body.push(3);
+    let ipma = full_box(b"ipma", 0, 0, &ipma_body);
+    let mut iprp_body = Vec::new();
+    iprp_body.extend_from_slice(&ipco);
+    iprp_body.extend_from_slice(&ipma);
+    let iprp = box_bytes(b"iprp", &iprp_body);
+
+    // idat holds the Exif payload at offset 0.
+    let idat = box_bytes(b"idat", exif_payload);
+
+    let obu = vec![0xAAu8; 8];
+
+    // iloc v1 with two items:
+    //   item 1 (av01): cm=0, extent into mdat (offset filled after layout).
+    //   item 2 (Exif): cm=1, extent at offset 0 into idat.
+    // base_offset_size=0, offset_size=4, length_size=4, index_size=0.
+    // Per-item v1 layout: id(2) cm(2) data_ref(2) extent_count(2)
+    //   [offset(4) length(4)].
+    // Each item header+extent = 8 + 8 = 16 bytes; two items = 32.
+    let iloc_header = 1 /*v*/ + 3 /*flags*/ + 1 /*size byte*/ + 1 /*size byte*/ + 2 /*count*/;
+    let iloc_size = 8 + iloc_header + 32;
+    let ftyp_size = ftyp.len();
+    let meta_payload_size =
+        4 + hdlr.len() + pitm.len() + iinf.len() + iref.len() + iprp.len() + idat.len() + iloc_size;
+    let meta_size = 8 + meta_payload_size;
+    let mdat_payload_start = ftyp_size + meta_size + 8;
+
+    let mut iloc_inner = Vec::new();
+    iloc_inner.push(0x44); // offset_size=4, length_size=4
+    iloc_inner.push(0x00); // base_offset_size=0, index_size=0
+    iloc_inner.extend_from_slice(&u16be(2)); // item_count
+                                             // item 1 av01 cm=0
+    iloc_inner.extend_from_slice(&u16be(1));
+    iloc_inner.extend_from_slice(&u16be(0)); // cm=0
+    iloc_inner.extend_from_slice(&u16be(0)); // data_ref
+    iloc_inner.extend_from_slice(&u16be(1)); // extent_count
+    iloc_inner.extend_from_slice(&u32be(mdat_payload_start as u32));
+    iloc_inner.extend_from_slice(&u32be(obu.len() as u32));
+    // item 2 Exif cm=1
+    iloc_inner.extend_from_slice(&u16be(2));
+    iloc_inner.extend_from_slice(&u16be(1)); // cm=1
+    iloc_inner.extend_from_slice(&u16be(0)); // data_ref (unused)
+    iloc_inner.extend_from_slice(&u16be(1)); // extent_count
+    iloc_inner.extend_from_slice(&u32be(0)); // offset into idat data[]
+    iloc_inner.extend_from_slice(&u32be(exif_payload.len() as u32));
+    let iloc = full_box(b"iloc", 1, 0, &iloc_inner);
+
+    let mut meta_body = Vec::new();
+    meta_body.extend_from_slice(&[0u8; 4]);
+    meta_body.extend_from_slice(&hdlr);
+    meta_body.extend_from_slice(&pitm);
+    meta_body.extend_from_slice(&iinf);
+    meta_body.extend_from_slice(&iref);
+    meta_body.extend_from_slice(&iprp);
+    meta_body.extend_from_slice(&idat);
+    meta_body.extend_from_slice(&iloc);
+    let meta = box_bytes(b"meta", &meta_body);
+    assert_eq!(meta.len(), meta_size, "meta size recalc");
+
+    let mdat = box_bytes(b"mdat", &obu);
+    let mut file = Vec::new();
+    file.extend_from_slice(&ftyp);
+    file.extend_from_slice(&meta);
+    file.extend_from_slice(&mdat);
+    file
+}
+
+/// `item_payload_bytes` resolves an `Exif` metadata item whose bytes live
+/// in the `meta` box's `idat` (construction_method 1) while the primary
+/// `av01` item is at a file offset (construction_method 0) — proving the
+/// mixed-method path.
+#[test]
+fn idat_backed_metadata_item_payload_resolves() {
+    use oxideav_avif::item_payload_bytes;
+    let exif = b"\x00\x00\x00\x00MM\x00\x2aDEADBEEF".to_vec();
+    let file = build_avif_with_idat_exif(&exif);
+
+    // The primary av01 (cm=0) still parses and surfaces via inspect.
+    let info = inspect(&file).expect("inspect mixed-method file");
+    assert_eq!((info.width, info.height), (8, 8));
+    assert_eq!(info.exif_item_id, Some(2));
+
+    // The Exif item (cm=1, idat) resolves to exactly the embedded bytes.
+    let got = item_payload_bytes(&file, 2).expect("resolve idat-backed Exif");
+    assert_eq!(got, exif);
+}
+
 /// `inspect` surfaces the OBU bytes of an idat-backed primary item — the
 /// inspection path resolves construction_method 1 the same as `parse`.
 #[test]

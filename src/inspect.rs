@@ -15,7 +15,7 @@ use crate::meta::{
     Amve, Cclv, Clli, Colr, Ispe, Mdcv, Meta, Pasp, Pixi, Property, ITEM_TYPE_EXIF, ITEM_TYPE_MIME,
 };
 use crate::parser::{
-    classify_brands, item_bytes, parse, parse_header, AvifHeader, AvifImage, BrandClass,
+    classify_brands, item_bytes_with_idat, parse, parse_header, AvifHeader, AvifImage, BrandClass,
     ITEM_TYPE_GRID,
 };
 
@@ -612,9 +612,12 @@ fn resolve_metadata_items(meta: &Meta, target_id: u32) -> (Option<u32>, Option<u
 /// for single-extent items this is a zero-copy slice copied into a
 /// `Vec<u8>` (the API returns owned bytes for uniformity).
 ///
-/// Errors when the item is missing from `iloc`, when its
-/// `construction_method` isn't file-offset (0), or when an extent runs
-/// off the end of `file`.
+/// Resolves items stored both at file offsets (`construction_method ==
+/// 0`) and inside the `meta` box's `idat` (`construction_method == 1`,
+/// ISO/IEC 14496-12 §8.11.3). Errors when the item is missing from
+/// `iloc`, when its `construction_method` is the unsupported item-offset
+/// method (2), when a cm=1 item references an absent `idat`, or when an
+/// extent runs off the end of its backing buffer.
 ///
 /// For Exif items (`item_type == 'Exif'`), HEIF §A.2.1 specifies that
 /// the first 4 bytes of the resolved payload are a big-endian
@@ -634,7 +637,10 @@ pub fn item_payload_bytes(file: &[u8], item_id: u32) -> Result<Vec<u8>> {
         .meta
         .location_by_id(item_id)
         .ok_or_else(|| Error::invalid(format!("avif: item {item_id} missing in iloc")))?;
-    crate::parser::item_bytes_owned(file, loc)
+    // Resolve against both the file (construction_method 0) and the meta
+    // box's idat (construction_method 1) so metadata items (Exif / XMP /
+    // mime / tmap) stored in the ItemDataBox resolve too.
+    crate::parser::item_bytes_owned_with_idat(file, hdr.meta.idat.as_deref(), loc)
 }
 
 /// Resolve a `'tmap'` item's payload bytes and parse them as an ISO
@@ -868,8 +874,8 @@ pub(crate) fn build_info_grid(
         .meta
         .location_by_id(primary_id)
         .ok_or_else(|| Error::invalid("avif: grid item missing in iloc"))?;
-    let grid_bytes = item_bytes(hdr.file, loc)?;
-    let grid = ImageGrid::parse(grid_bytes)?;
+    let grid_bytes = item_bytes_with_idat(hdr.file, hdr.meta.idat.as_deref(), loc)?;
+    let grid = ImageGrid::parse(&grid_bytes)?;
     // Tile list.
     let dimg = b(b"dimg");
     let tile_ids = hdr.meta.iref_targets(&dimg, primary_id);

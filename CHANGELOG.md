@@ -24,6 +24,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `inspect` now transparently resolve an idat-backed primary `av01`
   item. `construction_method == 2` (item_offset) remains unsupported.
 
+- All item-decode paths are now idat-aware: the grid descriptor + grid
+  tile decode, the alpha auxiliary decode, the grid-descriptor inspection
+  path, and `item_payload_bytes` (Exif / XMP / mime / `tmap` metadata
+  extraction) resolve `construction_method == 1` items the same as the
+  primary path. A file that stores its grid tiles, alpha plane, or
+  metadata items in `idat` rather than `mdat` now resolves end-to-end.
+
 - Derived-image geometry resolution (HEIF §6.3 / §6.6.2, `derived`
   module): a box-graph-only evaluation surface that computes derived-image
   output geometry without decoding any AV1 bitstream. New

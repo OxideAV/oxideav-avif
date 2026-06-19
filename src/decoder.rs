@@ -30,7 +30,8 @@ use crate::image::{AvifFrame, AvifPixelFormat, AvifPlane};
 use crate::inspect::{build_info, build_info_grid, AvifInfo};
 use crate::meta::{ItemLocation, Property};
 use crate::parser::{
-    classify_brands, item_bytes, parse, parse_header, AvifHeader, ITEM_TYPE_AV01, ITEM_TYPE_GRID,
+    classify_brands, item_bytes_with_idat, parse, parse_header, AvifHeader, ITEM_TYPE_AV01,
+    ITEM_TYPE_GRID,
 };
 use crate::transform::{apply_clap, apply_imir, apply_irot, crop_top_left};
 
@@ -524,8 +525,9 @@ fn decode_grid_primary(
         .meta
         .location_by_id(grid_id)
         .ok_or_else(|| Error::invalid("avif: grid item missing in iloc"))?;
-    let grid_bytes = item_bytes(hdr.file, loc).map_err(core_err)?;
-    let grid = ImageGrid::parse(grid_bytes).map_err(core_err)?;
+    let grid_bytes =
+        item_bytes_with_idat(hdr.file, hdr.meta.idat.as_deref(), loc).map_err(core_err)?;
+    let grid = ImageGrid::parse(&grid_bytes).map_err(core_err)?;
     let tile_ids = hdr.meta.iref_targets(&DIMG, grid_id);
     if tile_ids.is_empty() {
         return Err(Error::invalid("avif: grid item has no dimg iref"));
@@ -555,7 +557,8 @@ fn decode_grid_primary(
             .meta
             .location_by_id(*tid)
             .ok_or_else(|| Error::invalid(format!("avif: grid tile {i} missing iloc")))?;
-        let tile_bytes = item_bytes(hdr.file, tile_loc).map_err(core_err)?;
+        let tile_bytes =
+            item_bytes_with_idat(hdr.file, hdr.meta.idat.as_deref(), tile_loc).map_err(core_err)?;
         let av1c = match hdr.meta.property_for(*tid, &AV1C) {
             Some(Property::Av1C(bytes)) => bytes.clone(),
             _ => {
@@ -568,7 +571,8 @@ fn decode_grid_primary(
             Some(Property::Ispe(e)) => Some((e.width, e.height)),
             _ => None,
         };
-        let (tile_core, fmt_core, mut fw, mut fh) = decode_av01_item(tile_bytes, &av1c, ispe_dims)?;
+        let (tile_core, fmt_core, mut fw, mut fh) =
+            decode_av01_item(&tile_bytes, &av1c, ispe_dims)?;
         let mut tile = core_to_avif_frame(tile_core);
         let fmt = from_core_pix(fmt_core)?;
         // Clamp tile to ispe dims if the AV1 decoder emitted a padded
@@ -622,7 +626,7 @@ fn decode_alpha_item(
         .meta
         .location_by_id(alpha_id)
         .ok_or_else(|| Error::invalid("avif: alpha item missing in iloc"))?;
-    let bytes = item_bytes(hdr.file, loc).map_err(core_err)?;
+    let bytes = item_bytes_with_idat(hdr.file, hdr.meta.idat.as_deref(), loc).map_err(core_err)?;
     let av1c = match hdr.meta.property_for(alpha_id, &AV1C) {
         Some(Property::Av1C(b)) => b.clone(),
         _ => return Err(Error::invalid("avif: alpha item missing av1C property")),
@@ -631,7 +635,7 @@ fn decode_alpha_item(
         Some(Property::Ispe(e)) => Some((e.width, e.height)),
         _ => None,
     };
-    decode_av01_item(bytes, &av1c, ispe)
+    decode_av01_item(&bytes, &av1c, ispe)
 }
 
 impl Decoder for AvifDecoder {

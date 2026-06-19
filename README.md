@@ -53,7 +53,7 @@ encoder, which oxideav does not yet have); `make_encoder` returns
 | HDR metadata | `mdcv` (ST 2086), `clli` (MaxCLL/MaxFALL), `cclv`, `amve` ambient viewing environment (AVIF §6.5.36 / ISO/IEC 14496-12; 0.0001-lux illuminance + CIE 1931 ambient-light chromaticity, surfaced on `AvifInfo::amve`) |
 | `av1C` introspection | bit depth (8/10/12), monochrome flag, chroma subsampling decoded into `AvifInfo` |
 | Sequence Header OBU audit | av1-avif §2.1 "exactly one Sequence Header OBU" container-layer audit |
-| Primary item data | resolved via `iloc` construction_method 0; single-extent zero-copy slice, multi-extent concatenated (HEIF §8.11.3.3) |
+| Primary item data | resolved via `iloc` construction_method 0 (file-offset) **and 1** (idat-offset — bytes in the `meta` box's `idat` / ItemDataBox, ISO/IEC 14496-12 §8.11.3); single-extent cm=0 is a zero-copy slice, idat-backed or multi-extent items are concatenated (§8.11.3.3). `item_bytes_with_idat` / `item_bytes_owned_with_idat` expose the construction-method-aware resolver; grid tiles, the alpha auxiliary, and metadata items (`item_payload_bytes`: Exif / XMP / mime / `tmap`) are all idat-aware. construction_method 2 (item-offset) unsupported |
 | Grid primary items | grid descriptor parse + `dimg` tile composition + av1-avif §7 derivation-chain audit |
 | Alpha auxiliary | `auxl` + `auxC` detection + composition (`Gray8→YA8`, `Yuv→YuvA`) + av1-avif §4.1 bit-depth audit |
 | Post-transforms | `clap` → `irot` → `imir`, applied in that order (HEIF §6.5.10) |
