@@ -722,6 +722,7 @@ mod tests {
             extents: vec![IlocExtent {
                 offset: 0,
                 length: 11,
+                extent_index: 0,
             }],
         };
         let slice = item_bytes(data, &loc).unwrap();
@@ -744,10 +745,12 @@ mod tests {
                 IlocExtent {
                     offset: 0,
                     length: 4,
+                    extent_index: 0,
                 },
                 IlocExtent {
                     offset: 8,
                     length: 4,
+                    extent_index: 0,
                 },
             ],
         };
@@ -773,6 +776,7 @@ mod tests {
             extents: vec![IlocExtent {
                 offset: 0,
                 length: 4,
+                extent_index: 0,
             }],
         };
         let err = item_bytes_owned(b"data", &loc).unwrap_err();
@@ -797,6 +801,7 @@ mod tests {
             extents: vec![IlocExtent {
                 offset: 0,
                 length: 5,
+                extent_index: 0,
             }],
         };
         let bytes = item_bytes_with_idat(file, Some(idat), &loc).unwrap();
@@ -821,6 +826,7 @@ mod tests {
             extents: vec![IlocExtent {
                 offset: 0,
                 length: 5,
+                extent_index: 0,
             }],
         };
         let bytes = item_bytes_with_idat(file, None, &loc).unwrap();
@@ -846,10 +852,12 @@ mod tests {
                 IlocExtent {
                     offset: 0,
                     length: 4,
+                    extent_index: 0,
                 },
                 IlocExtent {
                     offset: 8,
                     length: 4,
+                    extent_index: 0,
                 },
             ],
         };
@@ -870,6 +878,7 @@ mod tests {
             extents: vec![IlocExtent {
                 offset: 0,
                 length: 2,
+                extent_index: 0,
             }],
         };
         let err = item_bytes_with_idat(b"data", None, &loc).unwrap_err();
@@ -893,6 +902,7 @@ mod tests {
             extents: vec![IlocExtent {
                 offset: 0,
                 length: 100,
+                extent_index: 0,
             }],
         };
         let err = item_bytes_with_idat(b"", Some(idat), &loc).unwrap_err();

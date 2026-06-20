@@ -213,10 +213,21 @@ impl ItemInfo {
 
 /// One `iloc` extent (offset + length pair inside the referenced data
 /// blob). AVIF primary items are usually single-extent.
-#[derive(Clone, Debug)]
+///
+/// For `construction_method == 2` (item_offset) entries, `extent_index`
+/// carries the 1-based index of the `'iloc'` item reference (declared in
+/// the `iref` box, source = this item) that names the item supplying this
+/// extent's data origin (ISO/IEC 14496-12 §8.11.3.3). For methods 0 / 1
+/// the field is unused and left at its default of `0`; the parser also
+/// records `0` when the box's `index_size` is `0`, in which case the spec
+/// implies the value `1` for cm=2 resolution.
+#[derive(Clone, Debug, Default)]
 pub struct IlocExtent {
     pub offset: u64,
     pub length: u64,
+    /// 1-based `'iloc'` iref index, used only by `construction_method == 2`.
+    /// `0` means "not present in the box" (cm=2 then implies `1`).
+    pub extent_index: u64,
 }
 
 /// One `iloc` entry.
@@ -3055,15 +3066,27 @@ fn parse_iloc(payload: &[u8]) -> Result<Vec<ItemLocation>> {
         cursor += 2;
         let mut extents = Vec::with_capacity(extent_count as usize);
         for _ in 0..extent_count {
-            // v1/v2: optional extent_index before offset/length.
-            if (version == 1 || version == 2) && index_size > 0 {
+            // v1/v2: optional extent_index before offset/length. The spec
+            // (§8.11.3.3) only assigns it meaning for construction_method
+            // 2 (item_offset), where it is the 1-based index of the
+            // 'iloc' item reference naming the data-origin item; we
+            // capture it unconditionally so the cm=2 resolver can use it.
+            let extent_index = if (version == 1 || version == 2) && index_size > 0 {
+                let v = read_var_uint(body, cursor, index_size)?;
                 cursor += index_size;
-            }
+                v
+            } else {
+                0
+            };
             let offset = read_var_uint(body, cursor, offset_size)?;
             cursor += offset_size;
             let length = read_var_uint(body, cursor, length_size)?;
             cursor += length_size;
-            extents.push(IlocExtent { offset, length });
+            extents.push(IlocExtent {
+                offset,
+                length,
+                extent_index,
+            });
         }
         out.push(ItemLocation {
             id: item_id,
@@ -4454,6 +4477,69 @@ mod tests {
             }
             _ => panic!("expected nclx"),
         }
+    }
+
+    /// Build an `iloc` payload (FullBox body) for a single v1 entry whose
+    /// extents carry the supplied `(extent_index, offset, length)` tuples.
+    /// `cm` is the construction_method nibble; `index_size` selects the
+    /// per-extent `extent_index` field width (0 / 4 / 8 bytes). offsets /
+    /// lengths are emitted as 4-byte fields.
+    fn build_iloc_v1(cm: u8, index_size: u8, extents: &[(u64, u32, u32)]) -> Vec<u8> {
+        let mut p = Vec::new();
+        p.push(1); // version
+        p.extend_from_slice(&[0, 0, 0]); // flags
+                                         // offset_size=4, length_size=4 in byte 0; base_offset_size=0,
+                                         // index_size in byte 1.
+        p.push(0x44);
+        // base_offset_size = 0 (high nibble), index_size in the low nibble.
+        p.push(index_size & 0x0f);
+        p.extend_from_slice(&1u16.to_be_bytes()); // item_count = 1
+        p.extend_from_slice(&7u16.to_be_bytes()); // item_ID = 7
+        p.extend_from_slice(&[0x00, cm & 0x0f]); // reserved(12)+construction_method(4)
+        p.extend_from_slice(&0u16.to_be_bytes()); // data_reference_index
+                                                  // base_offset_size == 0 → no base_offset bytes.
+        p.extend_from_slice(&(extents.len() as u16).to_be_bytes());
+        for (idx, off, len) in extents {
+            match index_size {
+                0 => {}
+                4 => p.extend_from_slice(&(*idx as u32).to_be_bytes()),
+                8 => p.extend_from_slice(&idx.to_be_bytes()),
+                _ => unreachable!(),
+            }
+            p.extend_from_slice(&off.to_be_bytes());
+            p.extend_from_slice(&len.to_be_bytes());
+        }
+        p
+    }
+
+    #[test]
+    fn iloc_v1_cm2_captures_extent_index() {
+        // construction_method=2 (item_offset), index_size=4. The §8.11.3.3
+        // extent_index must be parsed and retained on each extent.
+        let payload = build_iloc_v1(2, 4, &[(3, 100, 16), (5, 200, 0)]);
+        let locs = parse_iloc(&payload).unwrap();
+        assert_eq!(locs.len(), 1);
+        let l = &locs[0];
+        assert_eq!(l.id, 7);
+        assert_eq!(l.construction_method, 2);
+        assert_eq!(l.extents.len(), 2);
+        assert_eq!(l.extents[0].extent_index, 3);
+        assert_eq!(l.extents[0].offset, 100);
+        assert_eq!(l.extents[0].length, 16);
+        assert_eq!(l.extents[1].extent_index, 5);
+        assert_eq!(l.extents[1].offset, 200);
+        assert_eq!(l.extents[1].length, 0);
+    }
+
+    #[test]
+    fn iloc_v1_index_size_zero_yields_zero_extent_index() {
+        // index_size=0 → no extent_index field is present; the parser
+        // records 0 (the cm=2 resolver then implies the value 1).
+        let payload = build_iloc_v1(0, 0, &[(0, 42, 8)]);
+        let locs = parse_iloc(&payload).unwrap();
+        assert_eq!(locs[0].extents[0].extent_index, 0);
+        assert_eq!(locs[0].extents[0].offset, 42);
+        assert_eq!(locs[0].construction_method, 0);
     }
 
     #[test]

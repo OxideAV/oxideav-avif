@@ -3745,6 +3745,7 @@ mod tests {
             extents: vec![IlocExtent {
                 offset: 1000,
                 length: 16,
+                extent_index: 0,
             }],
         }
     }
@@ -3761,6 +3762,7 @@ mod tests {
             extents: vec![IlocExtent {
                 offset: 0,
                 length: 0,
+                extent_index: 0,
             }],
         }
     }
@@ -4401,7 +4403,11 @@ mod tests {
                 construction_method: 0,
                 data_reference_index: 0,
                 base_offset: 0,
-                extents: vec![IlocExtent { offset: 0, length }],
+                extents: vec![IlocExtent {
+                    offset: 0,
+                    length,
+                    extent_index: 0,
+                }],
             }],
             ..Meta::default()
         };
@@ -4628,6 +4634,7 @@ mod tests {
                     extents: vec![IlocExtent {
                         offset: off1,
                         length: s1.len() as u64,
+                        extent_index: 0,
                     }],
                 },
                 ItemLocation {
@@ -4638,6 +4645,7 @@ mod tests {
                     extents: vec![IlocExtent {
                         offset: off2,
                         length: s2.len() as u64,
+                        extent_index: 0,
                     }],
                 },
             ],
@@ -5417,6 +5425,7 @@ mod tests {
                 extents: vec![IlocExtent {
                     offset: 0,
                     length: desc.len() as u64,
+                    extent_index: 0,
                 }],
             }],
             ..MMeta::default()
@@ -5538,6 +5547,7 @@ mod tests {
                 extents: vec![IlocExtent {
                     offset: 0,
                     length: grid.len() as u64,
+                    extent_index: 0,
                 }],
             }],
             ..MMeta::default()
@@ -5713,6 +5723,7 @@ mod tests {
                         extents: vec![IlocExtent {
                             offset: rng.next() % 64,
                             length: rng.next() % 64,
+                            extent_index: 0,
                         }],
                     });
                 }
