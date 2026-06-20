@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `construction_method == 2` (item_offset) `iloc` resolution (ISO/IEC
+  14496-12 §8.11.3.3). The per-extent `extent_index` is now parsed and
+  retained on `IlocExtent` (previously discarded); for a cm=2 item it is
+  the 1-based index of the `'iloc'` item reference naming the
+  data-origin item (0 implies 1). New `item_bytes_owned_full(file, meta,
+  item_id)` resolves any of the three construction methods, following the
+  `'iloc'` iref for cm=2 and slicing `base_offset + extent_offset` (with
+  `extent_length == 0` meaning the whole referenced item) out of the
+  referenced item's concatenated data. The data-origin item is resolved
+  through the same path, so cm=2 may chain through cm=0 / cm=1 items;
+  recursion is depth-capped and self-/cycle-references are rejected.
+  `inspect::item_payload_bytes` now routes through this resolver, so
+  Exif / XMP / mime / `tmap` metadata items stored as item offsets into
+  another item resolve too.
 - `idat`-backed item byte resolution (ISO/IEC 14496-12 §8.11.3
   `construction_method == 1`, idat_offset). Previously every byte-fetch
   path hard-rejected non-zero construction methods, so a primary image
@@ -22,7 +36,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   borrow into the file for the common single-extent cm=0 case, owned when
   the bytes are reconstructed from `idat` or multiple extents. `parse`
   and `inspect` now transparently resolve an idat-backed primary `av01`
-  item. `construction_method == 2` (item_offset) remains unsupported.
+  item. (`construction_method == 2` / item_offset support was added
+  subsequently — see the cm=2 entry above.)
 
 - All item-decode paths are now idat-aware: the grid descriptor + grid
   tile decode, the alpha auxiliary decode, the grid-descriptor inspection

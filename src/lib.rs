@@ -142,10 +142,10 @@ pub use meta::{
     ITEM_TYPE_MIME, ITEM_TYPE_SATO, ITEM_TYPE_TMAP, ITEM_TYPE_URI,
 };
 pub use parser::{
-    audit_mif1, classify_brands, item_bytes, item_bytes_owned, item_bytes_owned_with_idat,
-    item_bytes_with_idat, parse, parse_header, AvifHeader, AvifImage, BrandClass, BRAND_AVIF,
-    BRAND_AVIO, BRAND_AVIS, BRAND_MA1A, BRAND_MA1B, BRAND_MIAF, BRAND_MIF1, BRAND_MSF1,
-    ITEM_TYPE_AV01, ITEM_TYPE_GRID,
+    audit_mif1, classify_brands, item_bytes, item_bytes_owned, item_bytes_owned_full,
+    item_bytes_owned_with_idat, item_bytes_with_idat, parse, parse_header, AvifHeader, AvifImage,
+    BrandClass, BRAND_AVIF, BRAND_AVIO, BRAND_AVIS, BRAND_MA1A, BRAND_MA1B, BRAND_MIAF, BRAND_MIF1,
+    BRAND_MSF1, ITEM_TYPE_AV01, ITEM_TYPE_GRID,
 };
 pub use sample_group::{
     parse_csgp, parse_sample_group_descriptions, parse_sample_to_groups, parse_sbgp, parse_sgpd,
