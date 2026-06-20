@@ -597,11 +597,335 @@ pub fn item_bytes_owned_with_idat(
     resolve_item_bytes_with_idat(file, idat, loc).map(Cow::into_owned)
 }
 
+/// `iref` reference type linking a `construction_method == 2` (item_offset)
+/// item to the item(s) supplying its data origin (ISO/IEC 14496-12
+/// §8.11.3.3 — "the item reference with referenceType 'iloc'").
+const ILOC_REF: BoxType = b(b"iloc");
+
+/// Maximum depth of `construction_method == 2` indirection we will follow
+/// before declaring the chain malformed. cm=2 items may reference other
+/// items, so a hostile / broken file could form a cycle or a very deep
+/// chain; the spec warns against self-reference "to avoid infinite
+/// recursion" (§8.11.3.3) but does not mandate a depth, so we cap it.
+const MAX_ILOC_DEPTH: usize = 16;
+
+/// Resolve an item's payload bytes to an owned buffer for *any* of the
+/// three `construction_method`s, including `construction_method == 2`
+/// (item_offset). Unlike [`item_bytes_owned_with_idat`], which only
+/// understands file-offset and idat-offset items, this resolver consults
+/// the whole [`Meta`] so it can follow the `'iloc'` item reference that a
+/// cm=2 entry uses to name its data-origin item.
+///
+/// Spec: ISO/IEC 14496-12 §8.11.3.3. For a cm=2 extent the data origin is
+/// "the first byte of the concatenated data (of all the extents) of"
+/// the referenced item. The extent's `extent_index` is the 1-based index
+/// into the `'iloc'` iref entries whose source is this item; an
+/// `extent_index` of 0 (i.e. the box carried `index_size == 0`) implies
+/// the value 1. `extent_offset` (plus `base_offset`) then indexes into
+/// that concatenated data and `extent_length` bounds it, with a length of
+/// 0 meaning "the entire referenced item".
+///
+/// The referenced item is itself resolved through this same function, so
+/// a cm=2 item may point at a cm=0 / cm=1 item (the common case) or, in
+/// principle, another cm=2 item; recursion is bounded by
+/// [`MAX_ILOC_DEPTH`] to reject cycles and pathological chains.
+pub fn item_bytes_owned_full(file: &[u8], meta: &Meta, item_id: u32) -> Result<Vec<u8>> {
+    resolve_full(file, meta, item_id, 0)
+}
+
+fn resolve_full(file: &[u8], meta: &Meta, item_id: u32, depth: usize) -> Result<Vec<u8>> {
+    if depth > MAX_ILOC_DEPTH {
+        return Err(Error::invalid(format!(
+            "avif: iloc construction_method 2 chain exceeds depth {MAX_ILOC_DEPTH} (cycle?) at item {item_id}"
+        )));
+    }
+    let loc = meta
+        .location_by_id(item_id)
+        .ok_or_else(|| Error::invalid(format!("avif: item {item_id} missing in iloc")))?;
+
+    if loc.construction_method != 2 {
+        // file-offset / idat-offset items resolve without touching the
+        // item graph.
+        return item_bytes_owned_with_idat(file, meta.idat.as_deref(), loc);
+    }
+
+    if loc.extents.is_empty() {
+        return Err(Error::invalid(format!(
+            "avif: item {item_id} construction_method 2 entry has no extents"
+        )));
+    }
+
+    // The ordered list of items this item points at via 'iloc' irefs.
+    let refs = meta.iref_targets(&ILOC_REF, item_id);
+    if refs.is_empty() {
+        return Err(Error::invalid(format!(
+            "avif: item {item_id} uses construction_method 2 but has no 'iloc' item reference"
+        )));
+    }
+
+    let mut out = Vec::new();
+    for (i, e) in loc.extents.iter().enumerate() {
+        // 1-based extent_index into `refs`; 0 implies 1 (§8.11.3.3).
+        let one_based = if e.extent_index == 0 {
+            1
+        } else {
+            e.extent_index
+        };
+        let idx = (one_based as usize)
+            .checked_sub(1)
+            .filter(|&z| z < refs.len())
+            .ok_or_else(|| {
+                Error::invalid(format!(
+                    "avif: item {item_id} extent {i} extent_index {one_based} out of range (1..={})",
+                    refs.len()
+                ))
+            })?;
+        let ref_id = refs[idx];
+        if ref_id == item_id {
+            return Err(Error::invalid(format!(
+                "avif: item {item_id} construction_method 2 self-references (infinite recursion)"
+            )));
+        }
+        // Data origin = the referenced item's full concatenated bytes.
+        let origin = resolve_full(file, meta, ref_id, depth + 1)?;
+        // base_offset + extent_offset index into that origin; a length of
+        // 0 means "the entire referenced item" from `start`.
+        let start = loc.base_offset.checked_add(e.offset).ok_or_else(|| {
+            Error::invalid(format!("avif: item {item_id} extent {i} offset overflow"))
+        })?;
+        let start = usize::try_from(start).map_err(|_| {
+            Error::invalid(format!("avif: item {item_id} extent {i} offset too large"))
+        })?;
+        if start > origin.len() {
+            return Err(Error::invalid(format!(
+                "avif: item {item_id} extent {i} offset {start} exceeds referenced item {ref_id} length {}",
+                origin.len()
+            )));
+        }
+        let end = if e.length == 0 {
+            origin.len()
+        } else {
+            let len = usize::try_from(e.length).map_err(|_| {
+                Error::invalid(format!("avif: item {item_id} extent {i} length too large"))
+            })?;
+            let end = start.checked_add(len).ok_or_else(|| {
+                Error::invalid(format!("avif: item {item_id} extent {i} length overflow"))
+            })?;
+            if end > origin.len() {
+                return Err(Error::invalid(format!(
+                    "avif: item {item_id} extent {i} {start}..{end} exceeds referenced item {ref_id} length {}",
+                    origin.len()
+                )));
+            }
+            end
+        };
+        out.extend_from_slice(&origin[start..end]);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::meta::{IrefEntry, ItemLocation, Meta};
 
     const FIXTURE: &[u8] = include_bytes!("../tests/fixtures/monochrome.avif");
+
+    /// Helper: a single-extent cm=0 (file-offset) location for `id`
+    /// pointing at `offset..offset+length` inside the file.
+    fn cm0_loc(id: u32, offset: u64, length: u64) -> ItemLocation {
+        ItemLocation {
+            id,
+            construction_method: 0,
+            data_reference_index: 0,
+            base_offset: 0,
+            extents: vec![IlocExtent {
+                offset,
+                length,
+                extent_index: 0,
+            }],
+        }
+    }
+
+    /// Helper: a cm=2 (item-offset) location whose single extent uses
+    /// `extent_index` to select an `'iloc'` iref target, slicing
+    /// `offset..offset+length` (length 0 = whole referenced item).
+    fn cm2_loc(id: u32, extent_index: u64, offset: u64, length: u64) -> ItemLocation {
+        ItemLocation {
+            id,
+            construction_method: 2,
+            data_reference_index: 0,
+            base_offset: 0,
+            extents: vec![IlocExtent {
+                offset,
+                length,
+                extent_index,
+            }],
+        }
+    }
+
+    fn iloc_iref(from_id: u32, to_ids: Vec<u32>) -> IrefEntry {
+        IrefEntry {
+            reference_type: *b"iloc",
+            from_id,
+            to_ids,
+        }
+    }
+
+    /// Build a `Meta` carrying only the locations / irefs / idat the cm=2
+    /// resolver consults (struct-update keeps clippy's
+    /// field_reassign_with_default happy).
+    fn mk_meta(locations: Vec<ItemLocation>, irefs: Vec<IrefEntry>, idat: Option<Vec<u8>>) -> Meta {
+        Meta {
+            locations,
+            irefs,
+            idat,
+            ..Meta::default()
+        }
+    }
+
+    #[test]
+    fn cm2_whole_referenced_item() {
+        // Base item 1 = bytes 4..12 of the file. cm=2 item 2 references
+        // item 1 via an 'iloc' iref (extent_index 1) and copies the whole
+        // referenced item (length 0).
+        let file: Vec<u8> = (0u8..16).collect();
+        let meta = mk_meta(
+            vec![cm0_loc(1, 4, 8), cm2_loc(2, 1, 0, 0)],
+            vec![iloc_iref(2, vec![1])],
+            None,
+        );
+        let got = item_bytes_owned_full(&file, &meta, 2).unwrap();
+        assert_eq!(got, (4u8..12).collect::<Vec<u8>>());
+    }
+
+    #[test]
+    fn cm2_sub_range_of_referenced_item() {
+        // Slice bytes 2..5 of the referenced item's data (which is file
+        // bytes 4..12, so file bytes 6..9).
+        let file: Vec<u8> = (0u8..16).collect();
+        let meta = mk_meta(
+            vec![cm0_loc(1, 4, 8), cm2_loc(2, 1, 2, 3)],
+            vec![iloc_iref(2, vec![1])],
+            None,
+        );
+        let got = item_bytes_owned_full(&file, &meta, 2).unwrap();
+        assert_eq!(got, vec![6, 7, 8]);
+    }
+
+    #[test]
+    fn cm2_extent_index_zero_implies_one() {
+        // extent_index 0 (box carried index_size==0) implies index 1.
+        let file: Vec<u8> = (0u8..16).collect();
+        let meta = mk_meta(
+            vec![cm0_loc(1, 4, 8), cm2_loc(2, 0, 0, 0)],
+            vec![iloc_iref(2, vec![1])],
+            None,
+        );
+        let got = item_bytes_owned_full(&file, &meta, 2).unwrap();
+        assert_eq!(got, (4u8..12).collect::<Vec<u8>>());
+    }
+
+    #[test]
+    fn cm2_selects_second_iloc_reference() {
+        // Two 'iloc' targets; extent_index 2 picks the second (item 3).
+        let file: Vec<u8> = (0u8..32).collect();
+        let meta = mk_meta(
+            vec![cm0_loc(1, 0, 8), cm0_loc(3, 20, 4), cm2_loc(2, 2, 0, 0)],
+            vec![iloc_iref(2, vec![1, 3])],
+            None,
+        );
+        let got = item_bytes_owned_full(&file, &meta, 2).unwrap();
+        assert_eq!(got, (20u8..24).collect::<Vec<u8>>());
+    }
+
+    #[test]
+    fn cm2_origin_resolves_through_idat() {
+        // The referenced item is itself idat-backed (cm=1); the cm=2 item
+        // must resolve through to the idat bytes.
+        let file: Vec<u8> = vec![0xff; 8];
+        let mut base = cm0_loc(1, 4, 8);
+        base.construction_method = 1; // idat-offset
+        let meta = mk_meta(
+            vec![base, cm2_loc(2, 1, 0, 0)],
+            vec![iloc_iref(2, vec![1])],
+            Some((100u8..116).collect()),
+        );
+        let got = item_bytes_owned_full(&file, &meta, 2).unwrap();
+        assert_eq!(got, (104u8..112).collect::<Vec<u8>>());
+    }
+
+    #[test]
+    fn cm2_missing_iref_errors() {
+        let file: Vec<u8> = (0u8..16).collect();
+        // No 'iloc' iref declared for item 2.
+        let meta = mk_meta(vec![cm0_loc(1, 4, 8), cm2_loc(2, 1, 0, 0)], vec![], None);
+        let err = item_bytes_owned_full(&file, &meta, 2).unwrap_err();
+        assert!(format!("{err}").contains("no 'iloc' item reference"));
+    }
+
+    #[test]
+    fn cm2_extent_index_out_of_range_errors() {
+        let file: Vec<u8> = (0u8..16).collect();
+        let meta = mk_meta(
+            vec![cm0_loc(1, 4, 8), cm2_loc(2, 5, 0, 0)],
+            vec![iloc_iref(2, vec![1])],
+            None,
+        );
+        let err = item_bytes_owned_full(&file, &meta, 2).unwrap_err();
+        assert!(format!("{err}").contains("out of range"));
+    }
+
+    #[test]
+    fn cm2_self_reference_rejected() {
+        let file: Vec<u8> = (0u8..16).collect();
+        let meta = mk_meta(
+            vec![cm2_loc(2, 1, 0, 0)],
+            vec![iloc_iref(2, vec![2])], // points at itself
+            None,
+        );
+        let err = item_bytes_owned_full(&file, &meta, 2).unwrap_err();
+        assert!(format!("{err}").contains("self-reference"));
+    }
+
+    #[test]
+    fn cm2_cycle_bounded_by_depth() {
+        // 2 -> 3 -> 2 (mutual reference) is caught by the depth cap.
+        let file: Vec<u8> = (0u8..16).collect();
+        let meta = mk_meta(
+            vec![cm2_loc(2, 1, 0, 0), cm2_loc(3, 1, 0, 0)],
+            vec![iloc_iref(2, vec![3]), iloc_iref(3, vec![2])],
+            None,
+        );
+        let err = item_bytes_owned_full(&file, &meta, 2).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("depth") || msg.contains("recursion"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn cm2_sub_range_out_of_bounds_errors() {
+        // Referenced item is 8 bytes; offset 6 + length 4 overruns it.
+        let file: Vec<u8> = (0u8..16).collect();
+        let meta = mk_meta(
+            vec![cm0_loc(1, 4, 8), cm2_loc(2, 1, 6, 4)],
+            vec![iloc_iref(2, vec![1])],
+            None,
+        );
+        let err = item_bytes_owned_full(&file, &meta, 2).unwrap_err();
+        assert!(format!("{err}").contains("exceeds referenced item"));
+    }
+
+    #[test]
+    fn non_cm2_unaffected_by_full_resolver() {
+        // A plain cm=0 item resolves identically through the full path.
+        let file: Vec<u8> = (0u8..16).collect();
+        let meta = mk_meta(vec![cm0_loc(1, 3, 5)], vec![], None);
+        let got = item_bytes_owned_full(&file, &meta, 1).unwrap();
+        assert_eq!(got, (3u8..8).collect::<Vec<u8>>());
+    }
 
     #[test]
     fn classify_brands_baseline_profile() {

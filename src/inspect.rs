@@ -610,11 +610,13 @@ fn resolve_metadata_items(meta: &Meta, target_id: u32) -> (Option<u32>, Option<u
 /// for single-extent items this is a zero-copy slice copied into a
 /// `Vec<u8>` (the API returns owned bytes for uniformity).
 ///
-/// Resolves items stored both at file offsets (`construction_method ==
-/// 0`) and inside the `meta` box's `idat` (`construction_method == 1`,
-/// ISO/IEC 14496-12 §8.11.3). Errors when the item is missing from
-/// `iloc`, when its `construction_method` is the unsupported item-offset
-/// method (2), when a cm=1 item references an absent `idat`, or when an
+/// Resolves items stored at file offsets (`construction_method == 0`),
+/// inside the `meta` box's `idat` (`construction_method == 1`), and via
+/// item offsets into a referenced item's data (`construction_method ==
+/// 2`, the `'iloc'` iref naming the data-origin item — ISO/IEC 14496-12
+/// §8.11.3). Errors when the item is missing from `iloc`, when a cm=1
+/// item references an absent `idat`, when a cm=2 item has no `'iloc'`
+/// iref / an out-of-range `extent_index` / a self-reference, or when an
 /// extent runs off the end of its backing buffer.
 ///
 /// For Exif items (`item_type == 'Exif'`), HEIF §A.2.1 specifies that
@@ -631,14 +633,12 @@ fn resolve_metadata_items(meta: &Meta, target_id: u32) -> (Option<u32>, Option<u
 /// so the raw blob is usually directly consumable).
 pub fn item_payload_bytes(file: &[u8], item_id: u32) -> Result<Vec<u8>> {
     let hdr = parse_header(file)?;
-    let loc = hdr
-        .meta
-        .location_by_id(item_id)
-        .ok_or_else(|| Error::invalid(format!("avif: item {item_id} missing in iloc")))?;
-    // Resolve against both the file (construction_method 0) and the meta
-    // box's idat (construction_method 1) so metadata items (Exif / XMP /
-    // mime / tmap) stored in the ItemDataBox resolve too.
-    crate::parser::item_bytes_owned_with_idat(file, hdr.meta.idat.as_deref(), loc)
+    // Resolve across all three construction methods: file-offset (0),
+    // idat-offset (1) and item-offset (2, the `'iloc'` iref naming the
+    // data-origin item). The cm=2-aware resolver consults the whole
+    // `Meta` so metadata items (Exif / XMP / mime / tmap) stored as item
+    // offsets into another item resolve too.
+    crate::parser::item_bytes_owned_full(file, &hdr.meta, item_id)
 }
 
 /// Resolve a `'tmap'` item's payload bytes and parse them as an ISO
