@@ -1303,6 +1303,99 @@ impl GainMapMetadata {
             self.apply_component(baseline[2], gain[2], target_headroom, 2)?,
         ])
     }
+
+    /// Apply the gain map across a whole linear baseline RGB image plane,
+    /// recovering the linear alternate RGB plane (ISO 21496-1 §6.3
+    /// applied pixel-by-pixel).
+    ///
+    /// `baseline` is `width × height × 3` linear samples, interleaved as
+    /// `[R, G, B, R, G, B, …]` in row-major order (HDR reference white
+    /// `= 1.0`). `gain` is the decoded gain-map plane: either `width ×
+    /// height` samples (a single-component / achromatic gain map — the
+    /// same sample is applied to each colour component per §6.3 NOTE 2),
+    /// or `width × height × 3` interleaved samples (an RGB gain map).
+    /// Gain samples are the stored, normalized `[0, 1]` values
+    /// (`Gnormalized_γ`); the §6.2.1 unnormalization is performed
+    /// internally.
+    ///
+    /// The output is a freshly allocated `width × height × 3` interleaved
+    /// linear alternate RGB plane.
+    ///
+    /// Returns [`AvifError::InvalidData`](crate::error::AvifError::InvalidData)
+    /// when:
+    ///
+    /// * `width × height` overflows `usize`, or `baseline.len()` is not
+    ///   exactly `width × height × 3`;
+    /// * `gain.len()` is neither `width × height` (achromatic) nor
+    ///   `width × height × 3` (RGB);
+    /// * `channels` is empty (never the case for a [`Self::parse`] value).
+    ///
+    /// The §6.2.2 resampling step is the **caller's** responsibility: this
+    /// method requires the gain plane to already match the baseline
+    /// dimensions (§6.2.2 NOTE 3 — the alternate dimensions equal the
+    /// baseline dimensions). A gain map stored at a different resolution
+    /// must be resampled to `width × height` before being passed here.
+    pub fn apply_plane_rgb(
+        &self,
+        baseline: &[f64],
+        gain: &[f64],
+        width: u32,
+        height: u32,
+        target_headroom: f64,
+    ) -> Result<Vec<f64>> {
+        if self.channels.is_empty() {
+            return Err(Error::invalid(
+                "avif: gain map metadata has no channel records to apply",
+            ));
+        }
+        let px = (width as usize)
+            .checked_mul(height as usize)
+            .ok_or_else(|| Error::invalid("avif: gain map plane dimensions overflow usize"))?;
+        let rgb_len = px
+            .checked_mul(3)
+            .ok_or_else(|| Error::invalid("avif: gain map plane dimensions overflow usize"))?;
+        if baseline.len() != rgb_len {
+            return Err(Error::invalid(format!(
+                "avif: baseline plane length {} != width*height*3 = {rgb_len}",
+                baseline.len()
+            )));
+        }
+        // Achromatic (one sample/pixel, broadcast to RGB) or interleaved
+        // RGB gain plane (§6.3 NOTE 2 vs an RGB gain map).
+        let achromatic = match gain.len() {
+            n if n == px => true,
+            n if n == rgb_len => false,
+            other => {
+                return Err(Error::invalid(format!(
+                    "avif: gain plane length {other} is neither width*height = {px} \
+                     (achromatic) nor width*height*3 = {rgb_len} (RGB)"
+                )));
+            }
+        };
+
+        // The weight factor depends only on the target headroom, so it is
+        // constant across the whole plane — compute it once (§6.3
+        // Formula 3).
+        let w = self.weight_factor(target_headroom);
+
+        let mut out = vec![0.0f64; rgb_len];
+        for i in 0..px {
+            for c in 0..3 {
+                let base = baseline[i * 3 + c];
+                let g_sample = if achromatic { gain[i] } else { gain[i * 3 + c] };
+                // channel_for is Some for c in 0..3 with a non-empty
+                // channels vec (guaranteed above).
+                let ch = self
+                    .channel_for(c)
+                    .expect("channel_for is Some for c<3 with non-empty channels");
+                let g = ch.unnormalize_log2_gain(g_sample);
+                let k_base = ch.base_offset.as_f64();
+                let k_alt = ch.alternate_offset.as_f64();
+                out[i * 3 + c] = (base + k_base) * (w * g).exp2() - k_alt;
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Read a `numerator(int32) / denominator(uint32)` rational and reject a
@@ -5213,6 +5306,67 @@ mod tests {
         let m = GainMapMetadata::parse(&buf).unwrap();
         // Alternate = (2 + 0) · 2^(1 · 2) − 0 = 2 · 4 = 8.
         approx(m.apply_component(2.0, 0.5, 2.0, 0).unwrap(), 8.0);
+    }
+
+    /// `apply_plane_rgb` over an achromatic gain plane (one sample per
+    /// pixel) matches per-pixel `apply_rgb` with the sample broadcast to
+    /// all three colour components (§6.3 NOTE 2).
+    #[test]
+    fn apply_plane_rgb_achromatic_matches_per_pixel() {
+        let m = GainMapMetadata::parse(&build_singlechannel_gain_map()).unwrap();
+        // 2×1 image, interleaved RGB baseline.
+        let baseline = [0.25, 0.5, 0.75, 1.0, 0.125, 0.6];
+        let gain = [0.3, 0.9]; // one sample per pixel
+        let out = m.apply_plane_rgb(&baseline, &gain, 2, 1, 6.0).unwrap();
+        assert_eq!(out.len(), 6);
+        for p in 0..2 {
+            let base = [baseline[p * 3], baseline[p * 3 + 1], baseline[p * 3 + 2]];
+            let want = m.apply_rgb(base, [gain[p]; 3], 6.0).unwrap();
+            for c in 0..3 {
+                approx(out[p * 3 + c], want[c]);
+            }
+        }
+    }
+
+    /// `apply_plane_rgb` over an interleaved RGB gain plane consumes one
+    /// gain sample per colour component.
+    #[test]
+    fn apply_plane_rgb_interleaved_uses_per_component_gain() {
+        let m = GainMapMetadata::parse(&build_singlechannel_gain_map()).unwrap();
+        let baseline = [0.25, 0.5, 0.75]; // 1×1
+        let gain = [0.0, 0.5, 1.0]; // RGB gain plane, 1×1×3
+        let out = m.apply_plane_rgb(&baseline, &gain, 1, 1, 8.0).unwrap();
+        for c in 0..3 {
+            let want = m.apply_component(baseline[c], gain[c], 8.0, c).unwrap();
+            approx(out[c], want);
+        }
+    }
+
+    /// `apply_plane_rgb` rejects a baseline length that does not match
+    /// `width × height × 3` and a gain length that is neither the
+    /// achromatic nor the RGB size.
+    #[test]
+    fn apply_plane_rgb_rejects_mismatched_lengths() {
+        let m = GainMapMetadata::parse(&build_singlechannel_gain_map()).unwrap();
+        // baseline too short for 2×1×3 = 6.
+        let err = m
+            .apply_plane_rgb(&[0.0, 0.0, 0.0], &[0.0, 0.0], 2, 1, 6.0)
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)));
+        // gain length 5 is neither 2 (achromatic) nor 6 (RGB).
+        let baseline = [0.0; 6];
+        let err = m
+            .apply_plane_rgb(&baseline, &[0.0; 5], 2, 1, 6.0)
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)));
+    }
+
+    /// `apply_plane_rgb` on a zero-area plane is a valid empty result.
+    #[test]
+    fn apply_plane_rgb_zero_area_is_empty() {
+        let m = GainMapMetadata::parse(&build_singlechannel_gain_map()).unwrap();
+        let out = m.apply_plane_rgb(&[], &[], 0, 4, 8.0).unwrap();
+        assert!(out.is_empty());
     }
 
     // -------------------------------------------------------------------

@@ -25,6 +25,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   applying to R/G/B) is handled internally. 11 new unit tests cover the
   three formulas, gamma inversion, negative-span sign flip, per-component
   indexing, broadcast, and an Annex A.2 round trip.
+- `GainMapMetadata::apply_plane_rgb` — buffer-level §6.3 application over
+  a whole linear baseline RGB plane (`width × height × 3` interleaved),
+  producing the alternate RGB plane. Accepts either an achromatic gain
+  plane (`width × height`, broadcast to RGB per §6.3 NOTE 2) or an RGB
+  gain plane (`width × height × 3`); the §6.3 weight is computed once per
+  plane. Rejects length mismatches and dimension overflow, and documents
+  the §6.2.2 resampling step as the caller's responsibility (the gain
+  plane must already match the baseline dimensions). 4 new unit tests.
 
 - `construction_method == 2` (item_offset) `iloc` resolution (ISO/IEC
   14496-12 §8.11.3.3). The per-extent `extent_index` is now parsed and
