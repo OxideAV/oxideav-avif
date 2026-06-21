@@ -986,6 +986,42 @@ pub struct GainMapChannel {
     pub alternate_offset: GainMapRational,
 }
 
+impl GainMapChannel {
+    /// Unnormalize a stored gain-map sample for this component into the
+    /// log2 gain value `G`, applying ISO 21496-1 §6.2.1 Formula (1):
+    ///
+    /// ```text
+    /// G = [max(G) − min(G)] × (Gnormalized ^ (1/γ)) + min(G)
+    /// ```
+    ///
+    /// `normalized` is the stored, gamma-encoded sample in `[0, 1]`
+    /// (`Gnormalized_γ` in the spec's notation — the value as carried in
+    /// the gain-map image after the §A.3.4 gamma pre-compression). The
+    /// `(·)^(1/γ)` term inverts that gamma, then the `[min, max]` range
+    /// scaling inverts the §A.3.3 normalization, yielding `G` in log2
+    /// (stops) space ready for [`GainMapMetadata::apply_component`].
+    ///
+    /// `min(G)`, `max(G)` and `γ` are this channel's [`Self::gain_map_min`],
+    /// [`Self::gain_map_max`] and [`Self::gamma`]. The parser guarantees
+    /// `γ > 0` (non-zero numerator and denominator) so `1/γ` is finite,
+    /// and `max(G) ≥ min(G)` so the span is non-negative.
+    ///
+    /// The stored sample is clamped into `[0, 1]` before the gamma inverse
+    /// because `x^(1/γ)` is not real for negative `x` when `1/γ` is
+    /// non-integral; §A.3.3 defines `Gnormalized` on `[0, 1]` so an
+    /// out-of-range input is a writer error and is saturated rather than
+    /// allowed to produce a NaN.
+    pub fn unnormalize_log2_gain(&self, normalized: f64) -> f64 {
+        let min = self.gain_map_min.as_f64();
+        let max = self.gain_map_max.as_f64();
+        let gamma = self.gamma.as_f64();
+        let g_norm = normalized.clamp(0.0, 1.0);
+        // Invert the §A.3.4 gamma: Gnormalized = (Gnormalized_γ)^(1/γ).
+        let degammad = g_norm.powf(1.0 / gamma);
+        (max - min) * degammad + min
+    }
+}
+
 /// Parsed ISO 21496-1:2025 gain map metadata payload (Annex C.2) — the
 /// binary descriptor body carried by the AVIF / HEIF `'tmap'` (tone map)
 /// derived image item.
@@ -1151,6 +1187,121 @@ impl GainMapMetadata {
     /// for a value obtained from [`Self::parse`].
     pub fn channel_count(&self) -> usize {
         self.channels.len()
+    }
+
+    /// The weighting factor `W` for a target HDR headroom, per ISO 21496-1
+    /// §6.3 Formula (3):
+    ///
+    /// ```text
+    /// W = sign(H_alternate − H_baseline) × clamp((H_target − H_baseline) /
+    ///                                            (H_alternate − H_baseline), 0, 1)
+    /// ```
+    ///
+    /// `W` scales how much of the gain map is applied (§6.3 NOTE 4): at
+    /// `H_target == H_baseline` the gain map is not applied (`W == 0`),
+    /// and at `H_target == H_alternate` it is fully applied (`W == ±1`,
+    /// the sign following `sign(H_alternate − H_baseline)`). Targets
+    /// outside `[H_baseline, H_alternate]` are clamped so `W` stays in
+    /// `[−1, 1]`.
+    ///
+    /// `H_baseline` and `H_alternate` are [`Self::base_hdr_headroom`] and
+    /// [`Self::alternate_hdr_headroom`]; the parser guarantees they are
+    /// not equal (§5.2.7), so the denominator is non-zero.
+    pub fn weight_factor(&self, target_headroom: f64) -> f64 {
+        let h_base = self.base_hdr_headroom.as_f64();
+        let h_alt = self.alternate_hdr_headroom.as_f64();
+        let span = h_alt - h_base;
+        // span != 0 is guaranteed by the §5.2.7 parse check.
+        let frac = ((target_headroom - h_base) / span).clamp(0.0, 1.0);
+        span.signum() * frac
+    }
+
+    /// The per-component metadata record that applies to RGB component
+    /// `component` (`0 = R`, `1 = G`, `2 = B`), honouring the §5.2.5.1
+    /// broadcast rule: a single-channel metadata record applies to all
+    /// three colour components, while a three-channel record uses one
+    /// value per component. Returns `None` only when `channels` is empty
+    /// (never the case for a value from [`Self::parse`]) or `component`
+    /// exceeds 2.
+    fn channel_for(&self, component: usize) -> Option<&GainMapChannel> {
+        if component > 2 {
+            return None;
+        }
+        match self.channels.len() {
+            // Achromatic / single per-component metadata: broadcast.
+            1 => self.channels.first(),
+            // Per-component metadata: index directly.
+            _ => self.channels.get(component),
+        }
+    }
+
+    /// Apply the gain map to one linear baseline colour component and
+    /// recover the corresponding linear alternate component, per
+    /// ISO 21496-1 §6.3 Formula (2):
+    ///
+    /// ```text
+    /// Alternate = (Baseline + k_baseline) × 2^(W × G) − k_alternate
+    /// ```
+    ///
+    /// where `G` is the unnormalized log2 gain for this component
+    /// ([`GainMapChannel::unnormalize_log2_gain`] applied to the stored
+    /// `normalized` sample) and `W` is the weighting factor for
+    /// `target_headroom` ([`Self::weight_factor`]). `k_baseline` and
+    /// `k_alternate` are the channel's [`GainMapChannel::base_offset`] and
+    /// [`GainMapChannel::alternate_offset`].
+    ///
+    /// `component` is the RGB component index (`0 = R`, `1 = G`,
+    /// `2 = B`); the metadata channel is selected via the §5.2.5.1
+    /// broadcast rule (single-channel metadata applies to all three).
+    /// `baseline` is the linear baseline sample (scaled so HDR reference
+    /// white is `1.0`, per §A.2 / Annex B.2) and `normalized` is the
+    /// stored gain-map sample in `[0, 1]` for the gain-map component that
+    /// applies to this colour component — for an achromatic gain map
+    /// (§6.3 NOTE 2) the same sample is supplied for all three colour
+    /// components.
+    ///
+    /// Returns `None` when `component > 2` or `channels` is empty.
+    pub fn apply_component(
+        &self,
+        baseline: f64,
+        normalized: f64,
+        target_headroom: f64,
+        component: usize,
+    ) -> Option<f64> {
+        let ch = self.channel_for(component)?;
+        let g = ch.unnormalize_log2_gain(normalized);
+        let w = self.weight_factor(target_headroom);
+        let k_base = ch.base_offset.as_f64();
+        let k_alt = ch.alternate_offset.as_f64();
+        Some((baseline + k_base) * (w * g).exp2() - k_alt)
+    }
+
+    /// Apply the gain map to a linear baseline RGB pixel and recover the
+    /// linear alternate RGB pixel, per ISO 21496-1 §6.3 Formula (2)
+    /// applied to each of the three colour components.
+    ///
+    /// `baseline` is the linear baseline `[R, G, B]` (HDR reference white
+    /// `= 1.0`). `gain` is the stored gain-map sample(s): a 3-element
+    /// array carries one sample per colour component, while broadcasting
+    /// is the caller's job for an achromatic (single-component) gain-map
+    /// image — pass the one decoded gain-map sample in all three slots
+    /// (§6.3 NOTE 2). The per-component *metadata* broadcast (§5.2.5.1) is
+    /// handled internally, so a single-channel-metadata file still applies
+    /// correctly to all three colour components.
+    ///
+    /// Returns `None` when `channels` is empty (never the case for a value
+    /// from [`Self::parse`]).
+    pub fn apply_rgb(
+        &self,
+        baseline: [f64; 3],
+        gain: [f64; 3],
+        target_headroom: f64,
+    ) -> Option<[f64; 3]> {
+        Some([
+            self.apply_component(baseline[0], gain[0], target_headroom, 0)?,
+            self.apply_component(baseline[1], gain[1], target_headroom, 1)?,
+            self.apply_component(baseline[2], gain[2], target_headroom, 2)?,
+        ])
     }
 }
 
@@ -4878,6 +5029,190 @@ mod tests {
         buf[17..21].copy_from_slice(&2u32.to_be_bytes()); // alt denominator
         let err = GainMapMetadata::parse(&buf).unwrap_err();
         assert!(matches!(err, Error::InvalidData(_)));
+    }
+
+    // -- ISO 21496-1 §6 gain map application ------------------------------
+
+    /// Helper to compare two floats within a tight absolute tolerance.
+    fn approx(a: f64, b: f64) {
+        assert!((a - b).abs() < 1e-12, "expected {b}, got {a}");
+    }
+
+    /// §6.3 Formula (3): `W == 0` at the baseline headroom, `W == 1` at
+    /// the alternate headroom (positive span), and a linear interpolation
+    /// in between. The single-channel fixture has H_baseline = 2.5 and
+    /// H_alternate = 8.0 (span 5.5).
+    #[test]
+    fn weight_factor_spans_baseline_to_alternate() {
+        let m = GainMapMetadata::parse(&build_singlechannel_gain_map()).unwrap();
+        approx(m.weight_factor(2.5), 0.0); // at H_baseline → not applied
+        approx(m.weight_factor(8.0), 1.0); // at H_alternate → fully applied
+        approx(m.weight_factor(5.25), 0.5); // midpoint → half
+                                            // Targets outside [H_baseline, H_alternate] clamp into [0, 1].
+        approx(m.weight_factor(-100.0), 0.0);
+        approx(m.weight_factor(100.0), 1.0);
+    }
+
+    /// §6.3 Formula (3) with a negative span (H_alternate < H_baseline):
+    /// `sign(H_alternate − H_baseline)` flips W negative, and full
+    /// application yields `W == -1` (§6.3 NOTE 4).
+    #[test]
+    fn weight_factor_is_negative_when_alternate_below_baseline() {
+        // base_hdr = 5/1 = 5.0, alternate_hdr = 1/1 = 1.0 → span = -4.
+        let mut buf = build_singlechannel_gain_map();
+        buf[5..9].copy_from_slice(&5u32.to_be_bytes()); // base num
+        buf[9..13].copy_from_slice(&1u32.to_be_bytes()); // base den
+        buf[13..17].copy_from_slice(&1u32.to_be_bytes()); // alt num
+        buf[17..21].copy_from_slice(&1u32.to_be_bytes()); // alt den
+        let m = GainMapMetadata::parse(&buf).unwrap();
+        approx(m.weight_factor(5.0), 0.0); // at H_baseline
+        approx(m.weight_factor(1.0), -1.0); // at H_alternate → W = -1
+        approx(m.weight_factor(3.0), -0.5); // midpoint
+    }
+
+    /// §6.2.1 Formula (1) inverse-normalization with γ = 1: a normalized
+    /// sample of 1.0 maps to max(G), 0.0 to min(G), 0.5 to the midpoint.
+    /// The fixture channel has min(G) = −0.25, max(G) = 0.75.
+    #[test]
+    fn unnormalize_log2_gain_inverts_normalization() {
+        let m = GainMapMetadata::parse(&build_singlechannel_gain_map()).unwrap();
+        let ch = m.channels[0];
+        approx(ch.unnormalize_log2_gain(1.0), 0.75); // → max(G)
+        approx(ch.unnormalize_log2_gain(0.0), -0.25); // → min(G)
+        approx(ch.unnormalize_log2_gain(0.5), 0.25); // span 1.0 × 0.5 − 0.25
+                                                     // Out-of-range stored sample saturates rather than producing NaN.
+        approx(ch.unnormalize_log2_gain(2.0), 0.75);
+        approx(ch.unnormalize_log2_gain(-1.0), -0.25);
+    }
+
+    /// §6.2.1 Formula (1) with γ ≠ 1: the gamma inverse `x^(1/γ)` is
+    /// applied before the [min, max] range scaling. With γ = 2 and a
+    /// normalized sample of 0.25, `0.25^(1/2) = 0.5`, so the result is
+    /// the same midpoint as a γ = 1 sample of 0.5.
+    #[test]
+    fn unnormalize_log2_gain_applies_gamma_inverse() {
+        let mut buf = build_singlechannel_gain_map();
+        // channel gamma lives at offset 21 + 16 = 37 (num) / 41 (den).
+        buf[37..41].copy_from_slice(&2u32.to_be_bytes()); // gamma num = 2
+        buf[41..45].copy_from_slice(&1u32.to_be_bytes()); // gamma den = 1
+        let m = GainMapMetadata::parse(&buf).unwrap();
+        let ch = m.channels[0];
+        approx(ch.unnormalize_log2_gain(0.25), 0.25);
+        approx(ch.unnormalize_log2_gain(1.0), 0.75); // 1^anything = 1 → max
+        approx(ch.unnormalize_log2_gain(0.0), -0.25); // 0 → min
+    }
+
+    /// §6.3 Formula (2) end to end: at the baseline headroom W = 0 so
+    /// `2^(W·G) = 1` and the alternate reduces to
+    /// `(Baseline + k_baseline) − k_alternate`. Fixture offsets are
+    /// k_baseline = −0.125, k_alternate = 0.4375.
+    #[test]
+    fn apply_component_at_baseline_headroom_is_offset_only() {
+        let m = GainMapMetadata::parse(&build_singlechannel_gain_map()).unwrap();
+        // Baseline 1.0, target == H_baseline (2.5) → W = 0.
+        let out = m.apply_component(1.0, 1.0, 2.5, 0).unwrap();
+        approx(out, 1.0 + (-0.125) - 0.4375);
+    }
+
+    /// §6.3 Formula (2) at full application (target == H_alternate, W = 1)
+    /// with a maximal gain sample (G = max(G) = 0.75): the multiplicative
+    /// term is `2^0.75`.
+    #[test]
+    fn apply_component_at_full_application() {
+        let m = GainMapMetadata::parse(&build_singlechannel_gain_map()).unwrap();
+        // baseline 1.0, normalized 1.0 → G = 0.75, target 8.0 → W = 1.
+        let out = m.apply_component(1.0, 1.0, 8.0, 0).unwrap();
+        let expected = (1.0 + (-0.125)) * 0.75f64.exp2() - 0.4375;
+        approx(out, expected);
+    }
+
+    /// §5.2.5.1 broadcast: a single-channel metadata record applies to
+    /// all three RGB colour components, so each component uses the same
+    /// channel values, and `apply_rgb` matches `apply_component` per slot.
+    #[test]
+    fn apply_rgb_broadcasts_single_channel_metadata() {
+        let m = GainMapMetadata::parse(&build_singlechannel_gain_map()).unwrap();
+        let baseline = [0.5, 1.0, 0.25];
+        let gain = [0.0, 0.5, 1.0];
+        let rgb = m.apply_rgb(baseline, gain, 8.0).unwrap();
+        for c in 0..3 {
+            let want = m.apply_component(baseline[c], gain[c], 8.0, c).unwrap();
+            approx(rgb[c], want);
+        }
+    }
+
+    /// §5.2.5.1 per-component metadata: a three-channel record uses a
+    /// distinct value per colour component. The R/G/B channels carry
+    /// different min(G) values, so `channel_for` must index them rather
+    /// than broadcast channel 0.
+    #[test]
+    fn apply_component_indexes_per_component_metadata() {
+        // Three-channel payload: R/G/B min(G) = 0/0.5/1 (×1 den), max = 2,
+        // gamma = 1, offsets 0; base_hdr = 1, alt_hdr = 2.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0u16.to_be_bytes()); // minimum_version
+        buf.extend_from_slice(&0u16.to_be_bytes()); // writer_version
+        buf.push(0x80); // is_multichannel = 1
+        push_rational(&mut buf, 1, 1); // base_hdr_headroom = 1.0
+        push_rational(&mut buf, 2, 1); // alternate_hdr_headroom = 2.0
+        let mins = [(0i32, 1u32), (1, 2), (1, 1)]; // 0.0, 0.5, 1.0
+        for (mn, md) in mins {
+            push_rational(&mut buf, mn, md); // gain_map_min
+            push_rational(&mut buf, 2, 1); // gain_map_max = 2.0
+            push_rational(&mut buf, 1, 1); // gamma = 1
+            push_rational(&mut buf, 0, 1); // base_offset = 0
+            push_rational(&mut buf, 0, 1); // alternate_offset = 0
+        }
+        let m = GainMapMetadata::parse(&buf).unwrap();
+        assert_eq!(m.channel_count(), 3);
+        // normalized = 0 selects each component's min(G); with W = 1 at
+        // target 2.0 the result is baseline · 2^min(G).
+        let baseline = 1.0;
+        approx(
+            m.apply_component(baseline, 0.0, 2.0, 0).unwrap(),
+            baseline * 0.0f64.exp2(),
+        );
+        approx(
+            m.apply_component(baseline, 0.0, 2.0, 1).unwrap(),
+            baseline * 0.5f64.exp2(),
+        );
+        approx(
+            m.apply_component(baseline, 0.0, 2.0, 2).unwrap(),
+            baseline * 1.0f64.exp2(),
+        );
+    }
+
+    /// `apply_component` rejects an out-of-range colour-component index.
+    #[test]
+    fn apply_component_rejects_component_index_above_two() {
+        let m = GainMapMetadata::parse(&build_singlechannel_gain_map()).unwrap();
+        assert!(m.apply_component(1.0, 1.0, 8.0, 3).is_none());
+    }
+
+    /// §6.2 NOTE 3 / §6.3 round trip: a gain map computed from a known
+    /// baseline/alternate pair (Annex A.2 Formula (A.1)) reconstructs the
+    /// alternate when applied with W = 1. With zero offsets and γ = 1, the
+    /// log2-ratio stored as the gain and re-applied returns the alternate.
+    #[test]
+    fn apply_component_round_trips_a2_gain() {
+        // Construct metadata whose single channel spans the exact gain
+        // G = log2(alternate / baseline) for baseline = 2, alternate = 8
+        // → G = log2(4) = 2.0. Store min = max = 2.0 so any normalized
+        // sample unnormalizes to 2.0; offsets 0, gamma 1.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0u16.to_be_bytes());
+        buf.extend_from_slice(&0u16.to_be_bytes());
+        buf.push(0x00); // single channel
+        push_rational(&mut buf, 1, 1); // base_hdr = 1.0
+        push_rational(&mut buf, 2, 1); // alt_hdr  = 2.0 (W = 1 at target 2)
+        push_rational(&mut buf, 2, 1); // gain_map_min = 2.0
+        push_rational(&mut buf, 2, 1); // gain_map_max = 2.0
+        push_rational(&mut buf, 1, 1); // gamma
+        push_rational(&mut buf, 0, 1); // base_offset
+        push_rational(&mut buf, 0, 1); // alternate_offset
+        let m = GainMapMetadata::parse(&buf).unwrap();
+        // Alternate = (2 + 0) · 2^(1 · 2) − 0 = 2 · 4 = 8.
+        approx(m.apply_component(2.0, 0.5, 2.0, 0).unwrap(), 8.0);
     }
 
     // -------------------------------------------------------------------

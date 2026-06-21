@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Gain-map **application** surface (ISO 21496-1:2025 §6) on the parsed
+  `'tmap'` descriptor: the metadata can now be applied to a linear
+  baseline image to reconstruct the alternate (HDR) rendition, not just
+  parsed. `GainMapChannel::unnormalize_log2_gain` inverts the §A.3.3
+  normalization and §A.3.4 gamma (Formula 1) to recover the log2 gain
+  `G`; `GainMapMetadata::weight_factor` computes the §6.3 Formula (3)
+  weighting factor `W` for a target HDR headroom (clamped to
+  `[H_baseline, H_alternate]`, sign following `H_alternate − H_baseline`,
+  so `W == 0` at baseline and `W == ±1` at full application);
+  `GainMapMetadata::apply_component` combines them via §6.3 Formula (2)
+  `Alternate = (Baseline + k_baseline) · 2^(W·G) − k_alternate`, and
+  `GainMapMetadata::apply_rgb` applies it to all three colour components.
+  The §5.2.5.1 per-component-metadata broadcast (single-channel metadata
+  applying to R/G/B) is handled internally. 11 new unit tests cover the
+  three formulas, gamma inversion, negative-span sign flip, per-component
+  indexing, broadcast, and an Annex A.2 round trip.
+
 - `construction_method == 2` (item_offset) `iloc` resolution (ISO/IEC
   14496-12 §8.11.3.3). The per-extent `extent_index` is now parsed and
   retained on `IlocExtent` (previously discarded); for a cm=2 item it is
