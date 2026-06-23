@@ -2643,6 +2643,19 @@ fn reconstructed_dims_inner(
         let (iw, ih) = reconstructed_dims_inner(meta, inputs[0], file_bytes, idat, depth + 1)?;
         return Some(output_dims_from_reconstructed(meta, inputs[0], iw, ih));
     }
+    if item.item_type == crate::meta::ITEM_TYPE_TMAP {
+        // av1-avif §4.2.2 (tone-map derived image item): the rendered image
+        // has the spatial extents of the *base* image input. The base image
+        // is input `0` of the tmap's `dimg` iref; the remaining inputs are
+        // gain map(s) which may be coded at a lower resolution and are
+        // up-sampled to the base extents during tone mapping. The tmap's
+        // reconstructed image therefore takes the base input's output
+        // dimensions.
+        let inputs = meta.iref_targets(&dimg, item_id);
+        let base = *inputs.first()?;
+        let (iw, ih) = reconstructed_dims_inner(meta, base, file_bytes, idat, depth + 1)?;
+        return Some(output_dims_from_reconstructed(meta, base, iw, ih));
+    }
     // Coded item: reconstructed dimensions are the `ispe` extents.
     match meta.property_for(item_id, &b(b"ispe")) {
         Some(crate::meta::Property::Ispe(ispe)) => Some((ispe.width, ispe.height)),
@@ -2870,6 +2883,103 @@ pub fn resolve_iden_derivations(
             source_dims,
             transforms,
             output_dims,
+        });
+    }
+    out
+}
+
+/// A fully resolved `tmap` tone-map derivation: the base image input, the
+/// gain-map input(s), and the rendered (reconstructed) dimensions.
+///
+/// av1-avif §4.2.2 — a tone-map derived image item layers an additional
+/// "gain map" image onto a base image so that a single file serves both an
+/// SDR (the base) and an HDR (`base · 2^(W·gain)`) rendition. The rendered
+/// image has the spatial extents of the **base** image; gain maps may be
+/// coded at a lower resolution and are up-sampled. The structured byte-level
+/// reconstruction lives in [`GainMapMetadata`] + its §6 application surface;
+/// this record describes the derivation *geometry* — which item is the base,
+/// which are gain maps, and the resulting output dimensions — without an AV1
+/// decode, mirroring [`OverlayResolution`] / [`IdenResolution`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToneMapResolution {
+    /// The `tmap` derived item id.
+    pub tmap_item_id: u32,
+    /// The base image item id (`dimg` input `0`), or `None` when the tmap
+    /// has no `dimg` inputs at all.
+    pub base_item_id: Option<u32>,
+    /// Every gain-map image item id (`dimg` inputs `1..`). Empty when the
+    /// tmap declares only a base input.
+    pub gain_map_item_ids: Vec<u32>,
+    /// The base image's reconstructed dimensions (its `ispe`, folding in any
+    /// of its own derivations), or `None` when unresolvable. These are the
+    /// rendered dimensions of the tone-mapped output.
+    pub rendered_dims: Option<(u32, u32)>,
+    /// Each gain map's reconstructed dimensions, paired with the gain-map
+    /// item id, in `dimg` order: `(gain_map_item_id, dims)`. A gain map
+    /// coded smaller than [`Self::rendered_dims`] is up-sampled during tone
+    /// mapping; surfacing the coded extents lets callers report the
+    /// up-sampling ratio. `dims` is `None` when the gain map's dimensions
+    /// are unresolvable (missing `ispe`, malformed derivation, …).
+    pub gain_map_dims: Vec<(u32, Option<(u32, u32)>)>,
+}
+
+impl ToneMapResolution {
+    /// True when at least one gain map is coded at a strictly smaller
+    /// resolution than the rendered (base) dimensions — i.e. the tone-map
+    /// reconstruction must up-sample that gain map. `false` when the base
+    /// dims are unknown, when there are no gain maps, or when every gain
+    /// map already matches the rendered extents.
+    pub fn upsamples_gain_map(&self) -> bool {
+        let Some((bw, bh)) = self.rendered_dims else {
+            return false;
+        };
+        self.gain_map_dims.iter().any(|&(_, dims)| match dims {
+            Some((gw, gh)) => gw < bw || gh < bh,
+            None => false,
+        })
+    }
+}
+
+/// Resolve every `tmap` tone-map derivation item in `meta` end-to-end: read
+/// its `dimg` inputs (base = input 0, gain maps = the rest) and resolve each
+/// input's reconstructed dimensions from the box graph. Returns one
+/// [`ToneMapResolution`] per `tmap` item, in `iinf` declaration order.
+///
+/// Spec: av1-avif §4.2.2. The rendered output takes the base image's
+/// extents; gain maps may be coded smaller. No AV1 decode is performed — the
+/// gain-map byte reconstruction is a separate concern handled by
+/// [`GainMapMetadata`]. This resolver only describes the derivation geometry,
+/// mirroring [`resolve_overlays`] / [`resolve_iden_derivations`].
+pub fn resolve_tone_maps(
+    meta: &crate::meta::Meta,
+    file_bytes: &[u8],
+    idat: Option<&[u8]>,
+) -> Vec<ToneMapResolution> {
+    let dimg = b(b"dimg");
+    let mut out = Vec::new();
+    for tmap_id in meta.item_ids_of_type(&crate::meta::ITEM_TYPE_TMAP) {
+        let inputs = meta.iref_targets(&dimg, tmap_id);
+        let base_item_id = inputs.first().copied();
+        let gain_map_item_ids: Vec<u32> = inputs.iter().skip(1).copied().collect();
+        // Base image output dimensions are the rendered tone-map extents.
+        let rendered_dims = base_item_id.and_then(|base| {
+            reconstructed_dims(meta, base, file_bytes, idat)
+                .map(|(w, h)| output_dims_from_reconstructed(meta, base, w, h))
+        });
+        let gain_map_dims = gain_map_item_ids
+            .iter()
+            .map(|&gid| {
+                let dims = reconstructed_dims(meta, gid, file_bytes, idat)
+                    .map(|(w, h)| output_dims_from_reconstructed(meta, gid, w, h));
+                (gid, dims)
+            })
+            .collect::<Vec<_>>();
+        out.push(ToneMapResolution {
+            tmap_item_id: tmap_id,
+            base_item_id,
+            gain_map_item_ids,
+            rendered_dims,
+            gain_map_dims,
         });
     }
     out
@@ -6088,6 +6198,117 @@ mod tests {
             ..MMeta::default()
         };
         assert_eq!(output_dims_from_reconstructed(&meta, 1, 64, 48), (128, 96));
+    }
+
+    /// av1-avif §4.2.2: a `tmap` derived item's reconstructed dimensions are
+    /// the *base* image input's (input 0) output dimensions, not the gain
+    /// map's. Base = 200×150 coded, gain map = 100×75 coded; the tmap
+    /// resolves to 200×150.
+    #[test]
+    fn reconstructed_dims_tmap_takes_base_extents() {
+        let meta = MMeta {
+            items: vec![
+                geo_ii(1, b"tmap"),
+                geo_ii(2, b"av01"), // base
+                geo_ii(3, b"av01"), // gain map
+            ],
+            properties: vec![ispe_prop(200, 150), ispe_prop(100, 75)],
+            associations: vec![geo_assoc(2, &[0]), geo_assoc(3, &[1])],
+            irefs: vec![IrefEntry {
+                reference_type: *b"dimg",
+                from_id: 1,
+                to_ids: vec![2, 3],
+            }],
+            ..MMeta::default()
+        };
+        assert_eq!(reconstructed_dims(&meta, 1, &[], None), Some((200, 150)));
+    }
+
+    /// A `tmap` whose base input is itself a transformed coded item folds the
+    /// base's transforms into the rendered extents. Base coded 200×150 +
+    /// `irot` 90° → base output 150×200 → tmap reconstructs 150×200.
+    #[test]
+    fn reconstructed_dims_tmap_folds_base_transforms() {
+        let meta = MMeta {
+            items: vec![geo_ii(1, b"tmap"), geo_ii(2, b"av01"), geo_ii(3, b"av01")],
+            properties: vec![
+                ispe_prop(200, 150),             // 0: base ispe
+                MProp::Irot(MIrot { angle: 1 }), // 1: base irot (swaps dims)
+                ispe_prop(100, 75),              // 2: gain map ispe
+            ],
+            associations: vec![geo_assoc(2, &[0, 1]), geo_assoc(3, &[2])],
+            irefs: vec![IrefEntry {
+                reference_type: *b"dimg",
+                from_id: 1,
+                to_ids: vec![2, 3],
+            }],
+            ..MMeta::default()
+        };
+        assert_eq!(reconstructed_dims(&meta, 1, &[], None), Some((150, 200)));
+    }
+
+    /// `resolve_tone_maps` surfaces the base id, gain-map ids, rendered
+    /// extents, and per-gain-map coded dims, and detects gain-map
+    /// up-sampling.
+    #[test]
+    fn resolve_tone_maps_reports_geometry_and_upsampling() {
+        let meta = MMeta {
+            items: vec![geo_ii(1, b"tmap"), geo_ii(2, b"av01"), geo_ii(3, b"av01")],
+            properties: vec![ispe_prop(200, 150), ispe_prop(100, 75)],
+            associations: vec![geo_assoc(2, &[0]), geo_assoc(3, &[1])],
+            irefs: vec![IrefEntry {
+                reference_type: *b"dimg",
+                from_id: 1,
+                to_ids: vec![2, 3],
+            }],
+            ..MMeta::default()
+        };
+        let res = resolve_tone_maps(&meta, &[], None);
+        assert_eq!(res.len(), 1);
+        let r = &res[0];
+        assert_eq!(r.tmap_item_id, 1);
+        assert_eq!(r.base_item_id, Some(2));
+        assert_eq!(r.gain_map_item_ids, vec![3]);
+        assert_eq!(r.rendered_dims, Some((200, 150)));
+        assert_eq!(r.gain_map_dims, vec![(3, Some((100, 75)))]);
+        // 100×75 gain map under a 200×150 render → up-sampled.
+        assert!(r.upsamples_gain_map());
+    }
+
+    /// A gain map coded at the same extents as the base is not up-sampled.
+    #[test]
+    fn resolve_tone_maps_no_upsampling_when_gain_map_matches_base() {
+        let meta = MMeta {
+            items: vec![geo_ii(1, b"tmap"), geo_ii(2, b"av01"), geo_ii(3, b"av01")],
+            properties: vec![ispe_prop(200, 150)],
+            associations: vec![geo_assoc(2, &[0]), geo_assoc(3, &[0])],
+            irefs: vec![IrefEntry {
+                reference_type: *b"dimg",
+                from_id: 1,
+                to_ids: vec![2, 3],
+            }],
+            ..MMeta::default()
+        };
+        let r = &resolve_tone_maps(&meta, &[], None)[0];
+        assert_eq!(r.rendered_dims, Some((200, 150)));
+        assert_eq!(r.gain_map_dims, vec![(3, Some((200, 150)))]);
+        assert!(!r.upsamples_gain_map());
+    }
+
+    /// A `tmap` with no `dimg` inputs at all resolves to no dimensions and
+    /// an empty geometry record (defensive — malformed file).
+    #[test]
+    fn resolve_tone_maps_handles_inputless_tmap() {
+        let meta = MMeta {
+            items: vec![geo_ii(1, b"tmap")],
+            ..MMeta::default()
+        };
+        let r = &resolve_tone_maps(&meta, &[], None)[0];
+        assert_eq!(r.base_item_id, None);
+        assert!(r.gain_map_item_ids.is_empty());
+        assert_eq!(r.rendered_dims, None);
+        assert!(!r.upsamples_gain_map());
+        assert_eq!(reconstructed_dims(&meta, 1, &[], None), None);
     }
 
     // -----------------------------------------------------------------------

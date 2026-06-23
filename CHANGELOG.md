@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Tone-map (`'tmap'`) derivation geometry resolution** (av1-avif §4.2.2).
+  `reconstructed_dims` now resolves a `'tmap'` derived item to its **base**
+  image input's (`dimg` input 0) output dimensions — folding the base's own
+  transforms / grid / overlay derivation — instead of returning `None`. This
+  unblocks dimension resolution for the standard gain-map AVIF layout whose
+  primary item is the `'tmap'`. A new `resolve_tone_maps` resolver returns one
+  `ToneMapResolution` per `'tmap'` item (base id, gain-map input id(s),
+  rendered/base extents, per-gain-map coded extents) with
+  `ToneMapResolution::upsamples_gain_map` flagging gain maps coded smaller than
+  the rendered image. Surfaced on `AvifInfo::tone_map_resolutions` +
+  `AvifInfo::tone_map_resolution_for`, mirroring the existing `iovl` / `iden`
+  resolution surfaces. No AV1 decode — geometry from the box graph alone. 7
+  new unit tests.
 - Gain-map **application** surface (ISO 21496-1:2025 §6) on the parsed
   `'tmap'` descriptor: the metadata can now be applied to a linear
   baseline image to reconstruct the alternate (HDR) rendition, not just

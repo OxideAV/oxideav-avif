@@ -123,11 +123,12 @@ pub use cicp::{
 pub use derived::{
     audit_alpha_bit_depth, audit_avif_profile_compliance, audit_iden_derivations,
     audit_sequence_header_obu, audit_tone_map, output_dims_from_reconstructed, parse_grpl,
-    reconstructed_dims, resolve_iden_derivations, resolve_overlays, transform_chain,
-    AlphaBitDepthAudit, AvifProfile, AvifProfileCompliance, DimTransform, EntityGroup,
-    GainMapChannel, GainMapMetadata, GainMapRational, IdenCompliance, IdenResolution, ImageOverlay,
-    Mif1Compliance, OverlayEntry, OverlayPlacement, OverlayResolution, SampleTransform,
-    SequenceHeaderObuAudit, Token, ToneMapCompliance, MAX_DERIVATION_DEPTH,
+    reconstructed_dims, resolve_iden_derivations, resolve_overlays, resolve_tone_maps,
+    transform_chain, AlphaBitDepthAudit, AvifProfile, AvifProfileCompliance, DimTransform,
+    EntityGroup, GainMapChannel, GainMapMetadata, GainMapRational, IdenCompliance, IdenResolution,
+    ImageOverlay, Mif1Compliance, OverlayEntry, OverlayPlacement, OverlayResolution,
+    SampleTransform, SequenceHeaderObuAudit, Token, ToneMapCompliance, ToneMapResolution,
+    MAX_DERIVATION_DEPTH,
 };
 pub use error::{AvifError, Result};
 pub use grid::{composite_grid, ImageGrid};

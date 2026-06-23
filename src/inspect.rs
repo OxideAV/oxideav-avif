@@ -270,6 +270,16 @@ pub struct AvifInfo {
     /// dimensions. Empty for files without any identity derivation. See
     /// [`crate::derived::IdenResolution`].
     pub iden_resolutions: Vec<crate::derived::IdenResolution>,
+    /// Fully resolved `'tmap'` tone-map (gain-map) derivations (av1-avif
+    /// §4.2.2), one entry per `tmap` item in `iinf` declaration order. Each
+    /// carries the base image input id, the gain-map input id(s), the
+    /// rendered (base) dimensions, and each gain map's coded extents — all
+    /// from the box graph alone (no AV1 decode). The structured byte-level
+    /// gain-map metadata is parsed separately by
+    /// [`crate::derived::GainMapMetadata`]; this surfaces the derivation
+    /// *geometry*. Empty for files without a tone-map derivation. See
+    /// [`crate::derived::ToneMapResolution`].
+    pub tone_map_resolutions: Vec<crate::derived::ToneMapResolution>,
 }
 
 impl AvifInfo {
@@ -441,6 +451,20 @@ impl AvifInfo {
             .find(|i| i.iden_item_id == iden_item_id)
     }
 
+    /// The resolved tone-map (gain-map) derivation for `tmap_item_id`, if
+    /// present. Pairs with [`Self::tone_map_compliance`] (the av1-avif
+    /// §4.2.2 `should`-level audit) and [`gain_map_metadata`] (the
+    /// byte-level ISO 21496-1 descriptor): this accessor exposes the
+    /// derivation *geometry* (base / gain-map item ids + rendered extents).
+    pub fn tone_map_resolution_for(
+        &self,
+        tmap_item_id: u32,
+    ) -> Option<&crate::derived::ToneMapResolution> {
+        self.tone_map_resolutions
+            .iter()
+            .find(|t| t.tmap_item_id == tmap_item_id)
+    }
+
     /// True when every AV1 Alpha Image Item's pairing with its master
     /// AV1 Image Item passes the av1-avif §4.1 bit-depth-match `shall`
     /// (and both items carry an `av1C` whose flag byte is reachable).
@@ -539,7 +563,11 @@ pub fn inspect(file: &[u8]) -> Result<AvifInfo> {
         build_info_grid(&hdr, primary_id, brands, mif1_compliance)
     } else if primary_info.item_type == crate::meta::ITEM_TYPE_IOVL
         || primary_info.item_type == crate::meta::ITEM_TYPE_IDEN
+        || primary_info.item_type == crate::meta::ITEM_TYPE_TMAP
     {
+        // A `'tmap'` primary (gain-map layout) resolves to its base image
+        // input's extents (av1-avif §4.2.2) and borrows the base's `av1C`
+        // via the shared `first_coded_leaf` walk, exactly like `iovl`/`iden`.
         build_info_derived(&hdr, primary_id, brands, mif1_compliance)
     } else {
         let img = parse(file)?;
@@ -788,6 +816,7 @@ pub(crate) fn build_info(
     let idat = img.meta.idat.as_deref();
     let overlay_resolutions = crate::derived::resolve_overlays(&img.meta, file, idat);
     let iden_resolutions = crate::derived::resolve_iden_derivations(&img.meta, file, idat);
+    let tone_map_resolutions = crate::derived::resolve_tone_maps(&img.meta, file, idat);
     Ok(AvifInfo {
         width,
         height,
@@ -829,6 +858,7 @@ pub(crate) fn build_info(
         avif_profile_compliance,
         overlay_resolutions,
         iden_resolutions,
+        tone_map_resolutions,
     })
 }
 
@@ -978,6 +1008,7 @@ pub(crate) fn build_info_grid(
     let idat = hdr.meta.idat.as_deref();
     let overlay_resolutions = crate::derived::resolve_overlays(&hdr.meta, hdr.file, idat);
     let iden_resolutions = crate::derived::resolve_iden_derivations(&hdr.meta, hdr.file, idat);
+    let tone_map_resolutions = crate::derived::resolve_tone_maps(&hdr.meta, hdr.file, idat);
     Ok(AvifInfo {
         width: grid.output_width,
         height: grid.output_height,
@@ -1019,6 +1050,7 @@ pub(crate) fn build_info_grid(
         avif_profile_compliance,
         overlay_resolutions,
         iden_resolutions,
+        tone_map_resolutions,
     })
 }
 
@@ -1051,10 +1083,13 @@ fn first_coded_leaf(meta: &Meta, item_id: u32, depth: u32) -> Option<u32> {
 }
 
 /// Build an [`AvifInfo`] for a file whose primary item is a non-grid
-/// derived image — an `'iovl'` overlay (HEIF §6.6.2.2) or an `'iden'`
-/// identity derivation (§6.6.2.1). Reports the derivation's reconstructed
-/// output dimensions (resolved from the box graph) and borrows the
-/// representative `av1C` from the first coded leaf in the derivation chain.
+/// derived image — an `'iovl'` overlay (HEIF §6.6.2.2), an `'iden'`
+/// identity derivation (§6.6.2.1), or a `'tmap'` tone-map / gain-map
+/// derivation (av1-avif §4.2.2, whose reconstructed extents are the base
+/// input's). Reports the derivation's reconstructed output dimensions
+/// (resolved from the box graph) and borrows the representative `av1C`
+/// from the first coded leaf in the derivation chain (the base image for a
+/// `'tmap'`).
 ///
 /// Mirrors [`build_info_grid`]'s property-fallback shape (primary item
 /// first, then the representative coded leaf) for the descriptive
@@ -1185,6 +1220,7 @@ pub(crate) fn build_info_derived(
     let avif_profile_compliance = crate::derived::audit_avif_profile_compliance(&hdr.meta, &brands);
     let overlay_resolutions = crate::derived::resolve_overlays(&hdr.meta, hdr.file, idat);
     let iden_resolutions = crate::derived::resolve_iden_derivations(&hdr.meta, hdr.file, idat);
+    let tone_map_resolutions = crate::derived::resolve_tone_maps(&hdr.meta, hdr.file, idat);
     Ok(AvifInfo {
         width,
         height,
@@ -1226,6 +1262,7 @@ pub(crate) fn build_info_derived(
         avif_profile_compliance,
         overlay_resolutions,
         iden_resolutions,
+        tone_map_resolutions,
     })
 }
 
