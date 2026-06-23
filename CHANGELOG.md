@@ -29,6 +29,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `'sato'` primaries route through the derived-primary `AvifInfo` builder
   (borrowing a representative `av1C` via the shared coded-leaf walk) like
   `iovl`/`iden`/`tmap`. 2 new unit tests.
+- **`'grid'` tile-derivation geometry resolution** (ISO/IEC 23008-12
+  §6.6.2.3). New `resolve_grids` resolver returns one `GridResolution` per
+  `'grid'` item: the parsed descriptor, the common tile dimensions (from the
+  first tile's box-graph reconstructed extents), and one `GridTilePlacement`
+  per tile (source item id, row/col, row-major canvas origin).
+  `GridTilePlacement::visible` clips a tile against the canvas (§6.6.2.3.1
+  right/bottom trim); `is_trimmed` flags edge tiles;
+  `GridResolution::{covers_canvas, trimmed_tile_count}` report the §6.6.2.3.1
+  coverage `shall` and the trim count. Surfaced on
+  `AvifInfo::grid_resolutions` + `has_grid` + `grid_resolution_for`, mirroring
+  the `iovl`/`iden`/`tmap` surfaces — no AV1 decode. `ImageGrid` now derives
+  `PartialEq`/`Eq`. 2 new unit tests + grid integration assertions.
 - Gain-map **application** surface (ISO 21496-1:2025 §6) on the parsed
   `'tmap'` descriptor: the metadata can now be applied to a linear
   baseline image to reconstruct the alternate (HDR) rendition, not just

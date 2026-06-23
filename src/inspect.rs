@@ -280,6 +280,14 @@ pub struct AvifInfo {
     /// *geometry*. Empty for files without a tone-map derivation. See
     /// [`crate::derived::ToneMapResolution`].
     pub tone_map_resolutions: Vec<crate::derived::ToneMapResolution>,
+    /// Fully resolved `'grid'` tile derivations (ISO/IEC 23008-12 §6.6.2.3),
+    /// one entry per `grid` item in `iinf` declaration order. Each carries
+    /// the parsed descriptor (row/column counts + output dimensions), the
+    /// common tile dimensions, and per-tile row-major canvas placements with
+    /// right/bottom-trim awareness — all from the box graph alone (no AV1
+    /// decode). Empty for files without a grid derivation. See
+    /// [`crate::derived::GridResolution`].
+    pub grid_resolutions: Vec<crate::derived::GridResolution>,
 }
 
 impl AvifInfo {
@@ -463,6 +471,25 @@ impl AvifInfo {
         self.tone_map_resolutions
             .iter()
             .find(|t| t.tmap_item_id == tmap_item_id)
+    }
+
+    /// True when the file carries at least one resolved `'grid'` tile
+    /// derivation ([`Self::grid_resolutions`] non-empty).
+    pub fn has_grid(&self) -> bool {
+        !self.grid_resolutions.is_empty()
+    }
+
+    /// The resolved grid tile derivation for `grid_item_id`, if present.
+    /// Exposes the row/column layout, common tile dimensions, and per-tile
+    /// canvas placements (with right/bottom-trim awareness) without an AV1
+    /// decode (ISO/IEC 23008-12 §6.6.2.3).
+    pub fn grid_resolution_for(
+        &self,
+        grid_item_id: u32,
+    ) -> Option<&crate::derived::GridResolution> {
+        self.grid_resolutions
+            .iter()
+            .find(|g| g.grid_item_id == grid_item_id)
     }
 
     /// True when every AV1 Alpha Image Item's pairing with its master
@@ -820,6 +847,7 @@ pub(crate) fn build_info(
     let overlay_resolutions = crate::derived::resolve_overlays(&img.meta, file, idat);
     let iden_resolutions = crate::derived::resolve_iden_derivations(&img.meta, file, idat);
     let tone_map_resolutions = crate::derived::resolve_tone_maps(&img.meta, file, idat);
+    let grid_resolutions = crate::derived::resolve_grids(&img.meta, file, idat);
     Ok(AvifInfo {
         width,
         height,
@@ -862,6 +890,7 @@ pub(crate) fn build_info(
         overlay_resolutions,
         iden_resolutions,
         tone_map_resolutions,
+        grid_resolutions,
     })
 }
 
@@ -1012,6 +1041,7 @@ pub(crate) fn build_info_grid(
     let overlay_resolutions = crate::derived::resolve_overlays(&hdr.meta, hdr.file, idat);
     let iden_resolutions = crate::derived::resolve_iden_derivations(&hdr.meta, hdr.file, idat);
     let tone_map_resolutions = crate::derived::resolve_tone_maps(&hdr.meta, hdr.file, idat);
+    let grid_resolutions = crate::derived::resolve_grids(&hdr.meta, hdr.file, idat);
     Ok(AvifInfo {
         width: grid.output_width,
         height: grid.output_height,
@@ -1054,6 +1084,7 @@ pub(crate) fn build_info_grid(
         overlay_resolutions,
         iden_resolutions,
         tone_map_resolutions,
+        grid_resolutions,
     })
 }
 
@@ -1224,6 +1255,7 @@ pub(crate) fn build_info_derived(
     let overlay_resolutions = crate::derived::resolve_overlays(&hdr.meta, hdr.file, idat);
     let iden_resolutions = crate::derived::resolve_iden_derivations(&hdr.meta, hdr.file, idat);
     let tone_map_resolutions = crate::derived::resolve_tone_maps(&hdr.meta, hdr.file, idat);
+    let grid_resolutions = crate::derived::resolve_grids(&hdr.meta, hdr.file, idat);
     Ok(AvifInfo {
         width,
         height,
@@ -1266,6 +1298,7 @@ pub(crate) fn build_info_derived(
         overlay_resolutions,
         iden_resolutions,
         tone_map_resolutions,
+        grid_resolutions,
     })
 }
 

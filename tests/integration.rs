@@ -144,6 +144,21 @@ fn grid_descriptor_and_iref_resolved_from_meta() {
     // dimg iref must reference both tile items.
     let tiles = hdr.meta.iref_targets(&b(b"dimg"), primary);
     assert_eq!(tiles, vec![2, 3]);
+    // The structured grid-resolution surface resolves the same layout from
+    // the box graph: one grid, two tiles placed row-major on a 4×2 canvas.
+    assert!(info.has_grid());
+    let gr = info
+        .grid_resolution_for(primary)
+        .expect("grid resolution for primary");
+    assert_eq!(gr.canvas(), (4, 2));
+    assert_eq!(gr.placements.len(), 2);
+    assert_eq!(gr.placements[0].source_item_id, 2);
+    assert_eq!(gr.placements[0].origin_x, 0);
+    assert_eq!(gr.placements[1].source_item_id, 3);
+    // Second tile starts at column 1 → origin_x == tile_width.
+    if let Some((tw, _)) = gr.tile_dims {
+        assert_eq!(gr.placements[1].origin_x, tw);
+    }
 }
 
 /// The Link-U `kimono.rotate90.avif` advertises a non-zero irot. The

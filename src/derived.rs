@@ -3001,6 +3001,178 @@ pub fn resolve_tone_maps(
     out
 }
 
+/// Where one tile of a `'grid'` derived image lands on the reconstructed
+/// canvas, and what portion of it survives the right/bottom trim
+/// (ISO/IEC 23008-12 §6.6.2.3.1). Tiles are placed row-major, top row first,
+/// left to right, at `(col · tile_width, row · tile_height)` without gap or
+/// overlap; pixels at or beyond `output_width` / `output_height` are
+/// trimmed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GridTilePlacement {
+    /// The tile's source image item id (the `dimg` `to_id` at this index).
+    pub source_item_id: u32,
+    /// Zero-based grid row (`tile_index / columns`).
+    pub row: u16,
+    /// Zero-based grid column (`tile_index % columns`).
+    pub col: u16,
+    /// Canvas x of the tile's left column (`col · tile_width`).
+    pub origin_x: u32,
+    /// Canvas y of the tile's top row (`row · tile_height`).
+    pub origin_y: u32,
+}
+
+impl GridTilePlacement {
+    /// The visible canvas rectangle `(x, y, width, height)` after trimming
+    /// the tile against `[0, output_width) × [0, output_height)`
+    /// (§6.6.2.3.1 right/bottom trim). Returns `None` when the tile lands
+    /// entirely outside the canvas — which a spec-conformant grid never
+    /// does (the tiles must cover the canvas), but a malformed descriptor
+    /// might. `tile_w` / `tile_h` are the common tile dimensions.
+    pub fn visible(
+        &self,
+        tile_w: u32,
+        tile_h: u32,
+        output_width: u32,
+        output_height: u32,
+    ) -> Option<(u32, u32, u32, u32)> {
+        let right = (u64::from(self.origin_x) + u64::from(tile_w)).min(u64::from(output_width));
+        let bottom = (u64::from(self.origin_y) + u64::from(tile_h)).min(u64::from(output_height));
+        if right <= u64::from(self.origin_x) || bottom <= u64::from(self.origin_y) {
+            return None;
+        }
+        Some((
+            self.origin_x,
+            self.origin_y,
+            (right - u64::from(self.origin_x)) as u32,
+            (bottom - u64::from(self.origin_y)) as u32,
+        ))
+    }
+
+    /// True when the tile is trimmed on the right or bottom edge — i.e. it
+    /// extends past `output_width` / `output_height`. The right column and
+    /// bottom row of a grid whose `output` dims aren't a whole multiple of
+    /// the tile size are trimmed this way.
+    pub fn is_trimmed(
+        &self,
+        tile_w: u32,
+        tile_h: u32,
+        output_width: u32,
+        output_height: u32,
+    ) -> bool {
+        u64::from(self.origin_x) + u64::from(tile_w) > u64::from(output_width)
+            || u64::from(self.origin_y) + u64::from(tile_h) > u64::from(output_height)
+    }
+}
+
+/// A fully resolved `'grid'` derivation: the parsed descriptor, the common
+/// tile dimensions, and each tile's canvas placement (§6.6.2.3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GridResolution {
+    /// The `'grid'` derived item id.
+    pub grid_item_id: u32,
+    /// The parsed descriptor (row/column counts + output dimensions).
+    pub descriptor: crate::grid::ImageGrid,
+    /// The common tile dimensions `(tile_width, tile_height)` — every input
+    /// tile shares these (§6.6.2.3.1, "All input images shall have exactly
+    /// the same width and height"). Taken from the first tile's
+    /// reconstructed dimensions; `None` when that tile is unresolvable.
+    pub tile_dims: Option<(u32, u32)>,
+    /// One placement per tile, row-major (top row first, left to right),
+    /// in `dimg` `to_ids` order (§6.6.2.3.1).
+    pub placements: Vec<GridTilePlacement>,
+}
+
+impl GridResolution {
+    /// Canvas dimensions `(output_width, output_height)`.
+    pub fn canvas(&self) -> (u32, u32) {
+        (self.descriptor.output_width, self.descriptor.output_height)
+    }
+
+    /// True when the tiles "cover" the canvas as §6.6.2.3.1 requires:
+    /// `tile_width · columns ≥ output_width` and
+    /// `tile_height · rows ≥ output_height`. `false` when [`Self::tile_dims`]
+    /// is unknown (cannot verify coverage).
+    pub fn covers_canvas(&self) -> bool {
+        let Some((tw, th)) = self.tile_dims else {
+            return false;
+        };
+        u64::from(tw) * u64::from(self.descriptor.columns)
+            >= u64::from(self.descriptor.output_width)
+            && u64::from(th) * u64::from(self.descriptor.rows)
+                >= u64::from(self.descriptor.output_height)
+    }
+
+    /// The number of tiles trimmed on the right or bottom edge (§6.6.2.3.1).
+    /// Zero when the output dimensions are a whole multiple of the tile size.
+    /// Always zero when [`Self::tile_dims`] is unknown.
+    pub fn trimmed_tile_count(&self) -> usize {
+        let Some((tw, th)) = self.tile_dims else {
+            return 0;
+        };
+        let (ow, oh) = self.canvas();
+        self.placements
+            .iter()
+            .filter(|p| p.is_trimmed(tw, th, ow, oh))
+            .count()
+    }
+}
+
+/// Resolve every `'grid'` derived item in `meta` end-to-end: parse the
+/// descriptor, pair each `dimg` input with its row-major canvas placement,
+/// and resolve the common tile dimensions from the first tile's box-graph
+/// reconstructed dimensions. Returns one [`GridResolution`] per `'grid'`
+/// item, in `iinf` declaration order; grids whose descriptor can't be
+/// resolved/parsed are skipped.
+///
+/// Spec: ISO/IEC 23008-12 §6.6.2.3. Tiles are placed at
+/// `(col · tile_width, row · tile_height)` and the canvas is trimmed on the
+/// right/bottom to `output_width × output_height`. No AV1 decode — the
+/// geometry comes from the box graph alone, mirroring [`resolve_overlays`].
+pub fn resolve_grids(
+    meta: &crate::meta::Meta,
+    file_bytes: &[u8],
+    idat: Option<&[u8]>,
+) -> Vec<GridResolution> {
+    let grid_type = crate::parser::ITEM_TYPE_GRID;
+    let dimg = b(b"dimg");
+    let mut out = Vec::new();
+    for grid_id in meta.item_ids_of_type(&grid_type) {
+        let Some(bytes) = resolve_descriptor_bytes(meta, grid_id, file_bytes, idat) else {
+            continue;
+        };
+        let Ok(descriptor) = crate::grid::ImageGrid::parse(&bytes) else {
+            continue;
+        };
+        let tiles = meta.iref_targets(&dimg, grid_id);
+        // Common tile dimensions = first tile's reconstructed output image.
+        let tile_dims = tiles.first().and_then(|&first| {
+            reconstructed_dims(meta, first, file_bytes, idat)
+                .map(|(w, h)| output_dims_from_reconstructed(meta, first, w, h))
+        });
+        let cols = descriptor.columns;
+        let (tw, th) = tile_dims.unwrap_or((0, 0));
+        let mut placements = Vec::with_capacity(tiles.len());
+        for (idx, &tile_id) in tiles.iter().enumerate() {
+            let row = (idx as u32 / cols.max(1) as u32) as u16;
+            let col = (idx as u32 % cols.max(1) as u32) as u16;
+            placements.push(GridTilePlacement {
+                source_item_id: tile_id,
+                row,
+                col,
+                origin_x: u32::from(col) * tw,
+                origin_y: u32::from(row) * th,
+            });
+        }
+        out.push(GridResolution {
+            grid_item_id: grid_id,
+            descriptor,
+            tile_dims,
+            placements,
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6348,6 +6520,139 @@ mod tests {
             ..MMeta::default()
         };
         assert_eq!(reconstructed_dims(&meta, 1, &[], None), Some((320, 240)));
+    }
+
+    /// Build a 16-bit `ImageGrid` descriptor payload (version 0, flags 0).
+    fn build_grid_desc(rows: u8, cols: u8, out_w: u16, out_h: u16) -> Vec<u8> {
+        let mut b = vec![0u8, 0u8, rows.saturating_sub(1), cols.saturating_sub(1)];
+        b.extend_from_slice(&out_w.to_be_bytes());
+        b.extend_from_slice(&out_h.to_be_bytes());
+        b
+    }
+
+    /// `resolve_grids` resolves a 2×2 grid of 100×100 tiles into a 180×180
+    /// canvas: tiles placed row-major at (0,0)/(100,0)/(0,100)/(100,100),
+    /// with the right column + bottom row trimmed to the 180 px output.
+    #[test]
+    fn resolve_grids_places_tiles_and_trims_edges() {
+        let desc = build_grid_desc(2, 2, 180, 180);
+        let idat = desc.clone();
+        let meta = MMeta {
+            items: vec![
+                geo_ii(1, b"grid"),
+                geo_ii(2, b"av01"),
+                geo_ii(3, b"av01"),
+                geo_ii(4, b"av01"),
+                geo_ii(5, b"av01"),
+            ],
+            properties: vec![ispe_prop(100, 100)],
+            // every tile shares the same 100×100 ispe (property index 0)
+            associations: vec![
+                geo_assoc(2, &[0]),
+                geo_assoc(3, &[0]),
+                geo_assoc(4, &[0]),
+                geo_assoc(5, &[0]),
+            ],
+            irefs: vec![IrefEntry {
+                reference_type: *b"dimg",
+                from_id: 1,
+                to_ids: vec![2, 3, 4, 5],
+            }],
+            locations: vec![ItemLocation {
+                id: 1,
+                construction_method: 1,
+                data_reference_index: 0,
+                base_offset: 0,
+                extents: vec![IlocExtent {
+                    offset: 0,
+                    length: desc.len() as u64,
+                    extent_index: 0,
+                }],
+            }],
+            ..MMeta::default()
+        };
+        let res = resolve_grids(&meta, &[], Some(&idat));
+        assert_eq!(res.len(), 1);
+        let r = &res[0];
+        assert_eq!(r.grid_item_id, 1);
+        assert_eq!(r.canvas(), (180, 180));
+        assert_eq!(r.tile_dims, Some((100, 100)));
+        assert!(r.covers_canvas());
+        assert_eq!(r.placements.len(), 4);
+        // Row-major placement.
+        assert_eq!(
+            r.placements[0],
+            GridTilePlacement {
+                source_item_id: 2,
+                row: 0,
+                col: 0,
+                origin_x: 0,
+                origin_y: 0
+            }
+        );
+        assert_eq!(
+            r.placements[3],
+            GridTilePlacement {
+                source_item_id: 5,
+                row: 1,
+                col: 1,
+                origin_x: 100,
+                origin_y: 100
+            }
+        );
+        // Top-left tile fully inside; bottom-right tile trimmed to 80×80.
+        assert_eq!(
+            r.placements[0].visible(100, 100, 180, 180),
+            Some((0, 0, 100, 100))
+        );
+        assert_eq!(
+            r.placements[3].visible(100, 100, 180, 180),
+            Some((100, 100, 80, 80))
+        );
+        assert!(!r.placements[0].is_trimmed(100, 100, 180, 180));
+        assert!(r.placements[3].is_trimmed(100, 100, 180, 180));
+        // The right column (1) + bottom row (2) + corner = 3 trimmed tiles.
+        assert_eq!(r.trimmed_tile_count(), 3);
+    }
+
+    /// A grid whose output is a whole multiple of the tile size trims no
+    /// tiles and covers the canvas exactly.
+    #[test]
+    fn resolve_grids_no_trim_on_exact_multiple() {
+        let desc = build_grid_desc(1, 3, 192, 64);
+        let idat = desc.clone();
+        let meta = MMeta {
+            items: vec![
+                geo_ii(1, b"grid"),
+                geo_ii(2, b"av01"),
+                geo_ii(3, b"av01"),
+                geo_ii(4, b"av01"),
+            ],
+            properties: vec![ispe_prop(64, 64)],
+            associations: vec![geo_assoc(2, &[0]), geo_assoc(3, &[0]), geo_assoc(4, &[0])],
+            irefs: vec![IrefEntry {
+                reference_type: *b"dimg",
+                from_id: 1,
+                to_ids: vec![2, 3, 4],
+            }],
+            locations: vec![ItemLocation {
+                id: 1,
+                construction_method: 1,
+                data_reference_index: 0,
+                base_offset: 0,
+                extents: vec![IlocExtent {
+                    offset: 0,
+                    length: desc.len() as u64,
+                    extent_index: 0,
+                }],
+            }],
+            ..MMeta::default()
+        };
+        let r = &resolve_grids(&meta, &[], Some(&idat))[0];
+        assert_eq!(r.tile_dims, Some((64, 64)));
+        assert!(r.covers_canvas());
+        assert_eq!(r.trimmed_tile_count(), 0);
+        assert_eq!(r.placements[2].origin_x, 128);
     }
 
     /// A `tmap` with no `dimg` inputs at all resolves to no dimensions and

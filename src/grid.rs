@@ -19,7 +19,7 @@ use crate::image::{
 
 /// Parsed `ImageGridBox` payload. Dimensions may be 16-bit or 32-bit
 /// depending on `flags & 1` (bit 0 = 1 selects the 32-bit layout).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ImageGrid {
     pub version: u8,
     pub flags: u8,
