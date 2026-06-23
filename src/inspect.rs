@@ -564,10 +564,13 @@ pub fn inspect(file: &[u8]) -> Result<AvifInfo> {
     } else if primary_info.item_type == crate::meta::ITEM_TYPE_IOVL
         || primary_info.item_type == crate::meta::ITEM_TYPE_IDEN
         || primary_info.item_type == crate::meta::ITEM_TYPE_TMAP
+        || primary_info.item_type == crate::meta::ITEM_TYPE_SATO
     {
         // A `'tmap'` primary (gain-map layout) resolves to its base image
-        // input's extents (av1-avif §4.2.2) and borrows the base's `av1C`
-        // via the shared `first_coded_leaf` walk, exactly like `iovl`/`iden`.
+        // input's extents (av1-avif §4.2.2); a `'sato'` primary resolves to
+        // its own `ispe` (its inputs share those extents, §4.2.3.1). Both
+        // borrow a representative `av1C` via the shared `first_coded_leaf`
+        // walk, exactly like `iovl`/`iden`.
         build_info_derived(&hdr, primary_id, brands, mif1_compliance)
     } else {
         let img = parse(file)?;

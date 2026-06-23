@@ -22,6 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AvifInfo::tone_map_resolution_for`, mirroring the existing `iovl` / `iden`
   resolution surfaces. No AV1 decode — geometry from the box graph alone. 7
   new unit tests.
+- **`'sato'` (Sample Transform) derivation dimension resolution** (av1-avif
+  §4.2.3.1). `reconstructed_dims` now resolves a `'sato'` derived item to its
+  own `'ispe'` extents (its inputs share those extents), falling back to its
+  first input's reconstructed dimensions when the sato lacks an `'ispe'`.
+  `'sato'` primaries route through the derived-primary `AvifInfo` builder
+  (borrowing a representative `av1C` via the shared coded-leaf walk) like
+  `iovl`/`iden`/`tmap`. 2 new unit tests.
 - Gain-map **application** surface (ISO 21496-1:2025 §6) on the parsed
   `'tmap'` descriptor: the metadata can now be applied to a linear
   baseline image to reconstruct the alternate (HDR) rendition, not just

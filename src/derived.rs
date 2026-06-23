@@ -2656,6 +2656,22 @@ fn reconstructed_dims_inner(
         let (iw, ih) = reconstructed_dims_inner(meta, base, file_bytes, idat, depth + 1)?;
         return Some(output_dims_from_reconstructed(meta, base, iw, ih));
     }
+    if item.item_type == crate::meta::ITEM_TYPE_SATO {
+        // av1-avif §4.2.3.1: the Sample Transform Derived Image Item and all
+        // of its inputs "shall be associated with … an 'ispe' property" and
+        // "have the same dimensions as defined by the 'ispe' property". So a
+        // well-formed sato carries its own `ispe` (handled by the coded-item
+        // fall-through below). When it does not, fall back to its first
+        // input's reconstructed dimensions — every input shares the sato's
+        // extents, so input 0 is representative.
+        if let Some(crate::meta::Property::Ispe(ispe)) = meta.property_for(item_id, &b(b"ispe")) {
+            return Some((ispe.width, ispe.height));
+        }
+        let inputs = meta.iref_targets(&dimg, item_id);
+        let base = *inputs.first()?;
+        let (iw, ih) = reconstructed_dims_inner(meta, base, file_bytes, idat, depth + 1)?;
+        return Some(output_dims_from_reconstructed(meta, base, iw, ih));
+    }
     // Coded item: reconstructed dimensions are the `ispe` extents.
     match meta.property_for(item_id, &b(b"ispe")) {
         Some(crate::meta::Property::Ispe(ispe)) => Some((ispe.width, ispe.height)),
@@ -6293,6 +6309,45 @@ mod tests {
         assert_eq!(r.rendered_dims, Some((200, 150)));
         assert_eq!(r.gain_map_dims, vec![(3, Some((200, 150)))]);
         assert!(!r.upsamples_gain_map());
+    }
+
+    /// av1-avif §4.2.3.1: a `sato` Sample-Transform derived item carries its
+    /// own `ispe` (its inputs share those extents). `reconstructed_dims`
+    /// reads that `ispe` directly.
+    #[test]
+    fn reconstructed_dims_sato_reads_own_ispe() {
+        let meta = MMeta {
+            items: vec![geo_ii(1, b"sato"), geo_ii(2, b"av01"), geo_ii(3, b"av01")],
+            properties: vec![ispe_prop(320, 240)],
+            associations: vec![geo_assoc(1, &[0])],
+            irefs: vec![IrefEntry {
+                reference_type: *b"dimg",
+                from_id: 1,
+                to_ids: vec![2, 3],
+            }],
+            ..MMeta::default()
+        };
+        assert_eq!(reconstructed_dims(&meta, 1, &[], None), Some((320, 240)));
+    }
+
+    /// When a `sato` lacks its own `ispe` (malformed per §4.2.3.1), the
+    /// resolver falls back to its first input's reconstructed dimensions —
+    /// every input shares the sato's extents, so input 0 is representative.
+    #[test]
+    fn reconstructed_dims_sato_falls_back_to_input_extents() {
+        let meta = MMeta {
+            items: vec![geo_ii(1, b"sato"), geo_ii(2, b"av01"), geo_ii(3, b"av01")],
+            // No ispe on the sato item itself; only on the inputs.
+            properties: vec![ispe_prop(320, 240)],
+            associations: vec![geo_assoc(2, &[0]), geo_assoc(3, &[0])],
+            irefs: vec![IrefEntry {
+                reference_type: *b"dimg",
+                from_id: 1,
+                to_ids: vec![2, 3],
+            }],
+            ..MMeta::default()
+        };
+        assert_eq!(reconstructed_dims(&meta, 1, &[], None), Some((320, 240)));
     }
 
     /// A `tmap` with no `dimg` inputs at all resolves to no dimensions and
