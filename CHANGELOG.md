@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `DerivationGraph::coded_leaf_dims` (decode-buffer sizing: each leaf id
+  paired with its `'ispe'` reconstructed dimensions, in decode order) and
+  `DerivationGraph::nodes_at_depth` (the node ids at a given derivation
+  depth). The graph fuzz/totality test now also drives
+  `build_derivation_graph` on every item as a root across ~30 000
+  adversarially-shaped graphs, asserting termination, no duplicate nodes,
+  `depth ≤ MAX_DERIVATION_DEPTH`, and no duplicate coded leaves — plus
+  `resolve_grids` / `resolve_tone_maps` added to the same totality sweep.
+
 - **`construction_method == 2` (item-offset) derived-image descriptors**
   (ISO/IEC 14496-12 §8.11.3.3). The derived-geometry descriptor resolver
   (`resolve_descriptor_bytes`, behind `resolve_grids` / `resolve_overlays` /

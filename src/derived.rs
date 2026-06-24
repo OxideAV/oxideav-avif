@@ -3344,6 +3344,29 @@ impl DerivationGraph {
     pub fn derived_node_count(&self) -> usize {
         self.nodes.iter().filter(|n| !n.kind.is_coded()).count()
     }
+
+    /// The decode set paired with each leaf's reconstructed dimensions — the
+    /// `(item_id, Option<(width, height)>)` a renderer needs to size each
+    /// AV1 output buffer before composing the derivation. The dims are the
+    /// leaf's `'ispe'` extents (its own `'clap'`/`'irot'` are applied during
+    /// composition, not to the decode buffer), or `None` when the leaf
+    /// carries no `'ispe'`. In first-visit (decode) order, de-duplicated.
+    pub fn coded_leaf_dims(&self) -> Vec<(u32, Option<(u32, u32)>)> {
+        self.coded_leaf_ids
+            .iter()
+            .map(|&id| (id, self.node(id).and_then(|n| n.reconstructed_dims)))
+            .collect()
+    }
+
+    /// All node item ids at a given derivation `depth` (root = depth 0), in
+    /// first-visit order. Depth 0 is always just the root.
+    pub fn nodes_at_depth(&self, depth: u32) -> Vec<u32> {
+        self.nodes
+            .iter()
+            .filter(|n| n.depth == depth)
+            .map(|n| n.item_id)
+            .collect()
+    }
 }
 
 /// Walk the `'dimg'` derivation graph rooted at `root_item_id`, resolving
@@ -7207,6 +7230,12 @@ mod tests {
         assert_eq!(g.nodes.len(), 4);
         assert_eq!(g.derived_node_count(), 3);
         assert!(!g.truncated);
+        // Decode-buffer sizing: the single shared leaf is 50×50.
+        assert_eq!(g.coded_leaf_dims(), vec![(4, Some((50, 50)))]);
+        // Depth layers: overlay at 0, both idens at 1, leaf at 2.
+        assert_eq!(g.nodes_at_depth(0), vec![1]);
+        assert_eq!(g.nodes_at_depth(1), vec![2, 3]);
+        assert_eq!(g.nodes_at_depth(2), vec![4]);
     }
 
     /// A `dimg` cycle terminates the walk at the depth bound and sets the
@@ -7396,8 +7425,23 @@ mod tests {
             // None of these may panic or fail to terminate.
             let _ = resolve_overlays(&meta, &file, Some(&idat));
             let _ = resolve_iden_derivations(&meta, &file, Some(&idat));
+            let _ = resolve_grids(&meta, &file, Some(&idat));
+            let _ = resolve_tone_maps(&meta, &file, Some(&idat));
             for id in 1..=item_count as u32 {
                 let _ = reconstructed_dims(&meta, id, &file, Some(&idat));
+                // The unified graph walk must also be total: it terminates on
+                // any cyclic / adversarial dimg shape, visits each item once
+                // (no duplicate nodes), and never lists a coded leaf twice.
+                let g = build_derivation_graph(&meta, id, &file, Some(&idat));
+                let mut seen = std::collections::BTreeSet::new();
+                for n in &g.nodes {
+                    assert!(seen.insert(n.item_id), "duplicate node {}", n.item_id);
+                    assert!(n.depth <= MAX_DERIVATION_DEPTH);
+                }
+                let mut leaves = std::collections::BTreeSet::new();
+                for &leaf in &g.coded_leaf_ids {
+                    assert!(leaves.insert(leaf), "duplicate coded leaf {leaf}");
+                }
             }
         }
     }
