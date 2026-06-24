@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`construction_method == 2` (item-offset) derived-image descriptors**
+  (ISO/IEC 14496-12 §8.11.3.3). The derived-geometry descriptor resolver
+  (`resolve_descriptor_bytes`, behind `resolve_grids` / `resolve_overlays` /
+  `reconstructed_dims` / the derivation graph) previously skipped a `'grid'`
+  or `'iovl'` whose descriptor payload was stored as a range of another
+  item's data (cm=2), silently dropping it from the resolution surfaces. It
+  now delegates cm=2 to `item_bytes_owned_full`, which follows the `'iloc'`
+  item reference naming the data-origin item and recurses through cm=0/cm=1
+  origins (depth-capped, cycle-rejecting). A grid/overlay descriptor stored
+  this way (uncommon but spec-legal) now resolves end-to-end. 1 new unit
+  test.
+
 - **Unified derivation-graph resolution** (HEIF §6.6). New
   `build_derivation_graph` walks the `'dimg'` derivation graph rooted at any
   image item (typically the primary) and returns a `DerivationGraph`: every

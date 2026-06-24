@@ -2565,12 +2565,16 @@ pub fn reconstructed_dims(
 }
 
 /// Resolve a derived-item descriptor's payload bytes (`grid` / `iovl` body)
-/// from its `iloc` entry, handling both `construction_method == 0`
-/// (file-offset, the bytes live in `mdat`/elsewhere in `file_bytes`) and
-/// `construction_method == 1` (idat-offset, the bytes live in the `meta`
-/// box's `idat` and are passed in via `idat`). Returns `None` when the
+/// from its `iloc` entry, handling all three `construction_method`s:
+/// `0` (file-offset, the bytes live in `mdat`/elsewhere in `file_bytes`),
+/// `1` (idat-offset, the bytes live in the `meta` box's `idat` and are
+/// passed in via `idat`), and `2` (item-offset, the bytes are a range of
+/// another item's data named via the `'iloc'` item reference — resolved
+/// through [`crate::parser::item_bytes_owned_full`], which follows the iref
+/// and recurses through cm=0/cm=1 origin items). Returns `None` when the
 /// item has no `iloc`, when an idat extent is referenced without an `idat`
-/// slice, or when any extent runs past the backing buffer.
+/// slice, when a cm=2 chain is malformed/cyclic, or when any extent runs
+/// past the backing buffer.
 ///
 /// Spec: ISO/IEC 14496-12 §8.11.3 (`iloc` construction methods); HEIF
 /// §6.6.2 derived-item payloads conventionally use `idat` (cm=1).
@@ -2584,7 +2588,13 @@ fn resolve_descriptor_bytes(
     let backing: &[u8] = match loc.construction_method {
         0 => file_bytes,
         1 => idat?,
-        // construction_method 2 (item-offset) is not resolved here.
+        // construction_method 2 (item-offset): the descriptor bytes are a
+        // range of another item's data, named via the `'iloc'` item
+        // reference (ISO/IEC 14496-12 §8.11.3.3). Delegate to the cm=2-aware
+        // resolver, which consults the whole `Meta` to follow the iref and
+        // recurse through cm=0/cm=1 origin items. A grid / iovl descriptor
+        // stored this way (uncommon but spec-legal) now resolves.
+        2 => return crate::parser::item_bytes_owned_full(file_bytes, meta, item_id).ok(),
         _ => return None,
     };
     if loc.extents.is_empty() {
@@ -6900,6 +6910,80 @@ mod tests {
         assert!(r.covers_canvas());
         assert_eq!(r.trimmed_tile_count(), 0);
         assert_eq!(r.placements[2].origin_x, 128);
+    }
+
+    /// A `grid` descriptor stored via `construction_method == 2` (item-offset)
+    /// — its bytes are a range of another item's data, named through the
+    /// `'iloc'` item reference (ISO/IEC 14496-12 §8.11.3.3). `resolve_grids`
+    /// (through `resolve_descriptor_bytes`) now follows the iref instead of
+    /// silently skipping the grid.
+    #[test]
+    fn resolve_grids_resolves_cm2_item_offset_descriptor() {
+        // Item 10 holds the raw grid descriptor bytes at file offset (cm=0);
+        // the grid item 1 is cm=2 and points at item 10 via an `'iloc'` iref,
+        // taking the whole referenced item (extent_length 0).
+        let desc = build_grid_desc(1, 2, 128, 64);
+        // Lay the descriptor bytes into a synthetic file at offset 8.
+        let mut file = vec![0u8; 8];
+        file.extend_from_slice(&desc);
+        let meta = MMeta {
+            items: vec![
+                geo_ii(1, b"grid"),
+                geo_ii(2, b"av01"),
+                geo_ii(3, b"av01"),
+                geo_ii(10, b"av01"), // data-origin item (treated as bytes)
+            ],
+            properties: vec![ispe_prop(64, 64)],
+            associations: vec![geo_assoc(2, &[0]), geo_assoc(3, &[0])],
+            irefs: vec![
+                IrefEntry {
+                    reference_type: *b"dimg",
+                    from_id: 1,
+                    to_ids: vec![2, 3],
+                },
+                // The cm=2 data-origin reference: grid item 1 ← item 10.
+                IrefEntry {
+                    reference_type: *b"iloc",
+                    from_id: 1,
+                    to_ids: vec![10],
+                },
+            ],
+            locations: vec![
+                // grid item: cm=2, whole referenced item (length 0).
+                ItemLocation {
+                    id: 1,
+                    construction_method: 2,
+                    data_reference_index: 0,
+                    base_offset: 0,
+                    extents: vec![IlocExtent {
+                        offset: 0,
+                        length: 0,
+                        extent_index: 1,
+                    }],
+                },
+                // data-origin item 10: cm=0, points at the descriptor bytes
+                // in the synthetic file.
+                ItemLocation {
+                    id: 10,
+                    construction_method: 0,
+                    data_reference_index: 0,
+                    base_offset: 0,
+                    extents: vec![IlocExtent {
+                        offset: 8,
+                        length: desc.len() as u64,
+                        extent_index: 0,
+                    }],
+                },
+            ],
+            ..MMeta::default()
+        };
+        let res = resolve_grids(&meta, &file, None);
+        assert_eq!(res.len(), 1, "cm=2 grid descriptor must resolve");
+        let r = &res[0];
+        assert_eq!(r.canvas(), (128, 64));
+        assert_eq!(r.placements.len(), 2);
+        // The same descriptor is reachable through reconstructed_dims.
+        assert_eq!(reconstructed_dims(&meta, 1, &file, None), Some((128, 64)));
     }
 
     // -----------------------------------------------------------------------
