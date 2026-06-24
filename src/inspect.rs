@@ -699,6 +699,34 @@ pub fn item_payload_bytes(file: &[u8], item_id: u32) -> Result<Vec<u8>> {
     crate::parser::item_bytes_owned_full(file, &hdr.meta, item_id)
 }
 
+/// Walk the `'dimg'` derivation graph rooted at the file's **primary item**
+/// and return the decode-free dependency plan (HEIF §6.6). See
+/// [`crate::derived::DerivationGraph`].
+///
+/// One-call wrapper that parses the container header, resolves the primary
+/// item from `pitm`, and walks the derivation tree
+/// ([`crate::derived::build_derivation_graph`]) without decoding any AV1
+/// bitstream. The returned graph reports the output canvas size, every
+/// derived/coded node's box-graph geometry, and the distinct coded
+/// `'av01'` leaves a renderer must decode (de-duplicated, in first-visit
+/// order). For a plain coded primary the graph is a single `Coded` node.
+///
+/// Errors propagate from header parsing and from a missing/invalid `pitm`.
+pub fn derivation_graph(file: &[u8]) -> Result<crate::derived::DerivationGraph> {
+    let hdr = parse_header(file)?;
+    let primary_id = hdr
+        .meta
+        .primary_item_id
+        .ok_or_else(|| Error::invalid("avif: missing pitm"))?;
+    if hdr.meta.item_by_id(primary_id).is_none() {
+        return Err(Error::invalid("avif: pitm references unknown item"));
+    }
+    let idat = hdr.meta.idat.as_deref();
+    Ok(crate::derived::build_derivation_graph(
+        &hdr.meta, primary_id, hdr.file, idat,
+    ))
+}
+
 /// Resolve a `'tmap'` item's payload bytes and parse them as an ISO
 /// 21496-1:2025 Annex C.2 gain map metadata descriptor.
 ///

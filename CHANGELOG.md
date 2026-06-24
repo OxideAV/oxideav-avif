@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Unified derivation-graph resolution** (HEIF §6.6). New
+  `build_derivation_graph` walks the `'dimg'` derivation graph rooted at any
+  image item (typically the primary) and returns a `DerivationGraph`: every
+  reachable node (`DerivationNode` with `DerivationKind` ∈ `Coded` / `Grid` /
+  `Overlay` / `Identity` / `ToneMap` / `SampleTransform` / `Unknown`), each
+  node's box-graph-only `reconstructed_dims` + `output_dims` (the latter
+  folding the node's own `'clap'`/`'irot'`/`'imir'`/`'iscl'` transform chain
+  per §6.6.1), and the distinct coded `'av01'` leaf ids a renderer must decode
+  (`coded_leaf_ids`, de-duplicated, first-visit order). This ties the existing
+  per-derivation resolvers (`resolve_grids` / `resolve_overlays` /
+  `resolve_iden_derivations` / `resolve_tone_maps`) into a single traversal
+  that also handles **nested** derivations (e.g. an `'iden'` crop of a
+  `'grid'`, or a `'tmap'` whose base is itself a `'grid'`) and **diamond**
+  graphs (two derivations sharing a leaf → leaf listed once). The walk is an
+  iterative pre-order over an explicit stack (no native-stack blow-up on deep
+  nesting), visits each item id once, and is depth-bounded by
+  `MAX_DERIVATION_DEPTH` with a `truncated` flag set when a `'dimg'` cycle
+  hits the bound. `DerivationGraph` exposes `output_dims` / `root_is_coded` /
+  `node` / `derived_node_count`; `DerivationNode::transform_chain` and
+  `DerivationKind::is_coded` are convenience accessors. A one-call top-level
+  `inspect::derivation_graph(file)` wrapper parses the header, resolves the
+  primary from `pitm`, and returns the plan without any AV1 decode. New
+  re-exports: `build_derivation_graph`, `DerivationGraph`, `DerivationKind`,
+  `DerivationNode`, `derivation_graph`. 5 new unit tests (coded root, grid
+  root, iden-over-grid nesting, diamond dedup, cycle truncation) + 2
+  integration tests (monochrome coded primary, synthetic grid primary).
 - **Tone-map (`'tmap'`) derivation geometry resolution** (av1-avif §4.2.2).
   `reconstructed_dims` now resolves a `'tmap'` derived item to its **base**
   image input's (`dimg` input 0) output dimensions — folding the base's own

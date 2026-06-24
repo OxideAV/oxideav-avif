@@ -122,18 +122,21 @@ pub use cicp::{
 };
 pub use derived::{
     audit_alpha_bit_depth, audit_avif_profile_compliance, audit_iden_derivations,
-    audit_sequence_header_obu, audit_tone_map, output_dims_from_reconstructed, parse_grpl,
-    reconstructed_dims, resolve_grids, resolve_iden_derivations, resolve_overlays,
-    resolve_tone_maps, transform_chain, AlphaBitDepthAudit, AvifProfile, AvifProfileCompliance,
-    DimTransform, EntityGroup, GainMapChannel, GainMapMetadata, GainMapRational, GridResolution,
-    GridTilePlacement, IdenCompliance, IdenResolution, ImageOverlay, Mif1Compliance, OverlayEntry,
-    OverlayPlacement, OverlayResolution, SampleTransform, SequenceHeaderObuAudit, Token,
-    ToneMapCompliance, ToneMapResolution, MAX_DERIVATION_DEPTH,
+    audit_sequence_header_obu, audit_tone_map, build_derivation_graph,
+    output_dims_from_reconstructed, parse_grpl, reconstructed_dims, resolve_grids,
+    resolve_iden_derivations, resolve_overlays, resolve_tone_maps, transform_chain,
+    AlphaBitDepthAudit, AvifProfile, AvifProfileCompliance, DerivationGraph, DerivationKind,
+    DerivationNode, DimTransform, EntityGroup, GainMapChannel, GainMapMetadata, GainMapRational,
+    GridResolution, GridTilePlacement, IdenCompliance, IdenResolution, ImageOverlay,
+    Mif1Compliance, OverlayEntry, OverlayPlacement, OverlayResolution, SampleTransform,
+    SequenceHeaderObuAudit, Token, ToneMapCompliance, ToneMapResolution, MAX_DERIVATION_DEPTH,
 };
 pub use error::{AvifError, Result};
 pub use grid::{composite_grid, ImageGrid};
 pub use image::{AvifFrame, AvifPixelFormat, AvifPlane};
-pub use inspect::{gain_map_metadata, inspect, item_payload_bytes, transforms_for, AvifInfo};
+pub use inspect::{
+    derivation_graph, gain_map_metadata, inspect, item_payload_bytes, transforms_for, AvifInfo,
+};
 pub use meta::{
     A1lx, A1op, Aebr, Afbr, Altt, AuxC, AuxKind, Cclv, Clap, Clli, Cmex, Cmin, Colr, Crtt, Dobr,
     Fade, Fobr, Imir, IrefEntry, Irot, Iscl, Ispe, ItemInfo, ItemLocation, Lsel, Mdcv, Mdft, Meta,

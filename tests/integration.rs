@@ -161,6 +161,36 @@ fn grid_descriptor_and_iref_resolved_from_meta() {
     }
 }
 
+/// The top-level `derivation_graph` helper resolves a plain coded primary
+/// (the Microsoft monochrome fixture) into a single-node graph: the primary
+/// is the only coded leaf and the canvas matches `ispe`.
+#[test]
+fn derivation_graph_coded_primary_is_single_node() {
+    let g = oxideav_avif::derivation_graph(MONO).expect("derivation graph");
+    assert!(g.root_is_coded());
+    assert_eq!(g.nodes.len(), 1);
+    assert_eq!(g.coded_leaf_ids.len(), 1);
+    assert_eq!(g.output_dims(), Some((1280, 720)));
+    assert_eq!(g.coded_leaf_ids, vec![g.root_item_id]);
+    assert!(!g.truncated);
+}
+
+/// `derivation_graph` on a `grid` primary enumerates the two tile items as
+/// the decode set and reports the 4×2 canvas from the grid descriptor.
+#[test]
+fn derivation_graph_grid_primary_lists_tiles() {
+    let file = build_synthetic_grid_avif();
+    let g = oxideav_avif::derivation_graph(&file).expect("derivation graph");
+    assert!(!g.root_is_coded());
+    assert_eq!(g.output_dims(), Some((4, 2)));
+    // The grid's two tiles are the decode set, in dimg (row-major) order.
+    assert_eq!(g.coded_leaf_ids, vec![2, 3]);
+    assert_eq!(g.derived_node_count(), 1);
+    let root = &g.nodes[0];
+    assert_eq!(root.kind, oxideav_avif::DerivationKind::Grid);
+    assert_eq!(root.inputs, vec![2, 3]);
+}
+
 /// The Link-U `kimono.rotate90.avif` advertises a non-zero irot. The
 /// decoder should surface the irot property on the primary item.
 /// (Different encoders pick different angle values for "rotate 90°":

@@ -3173,6 +3173,253 @@ pub fn resolve_grids(
     out
 }
 
+/// The kind of a node in a [`DerivationGraph`] — i.e. how its reconstructed
+/// image is obtained (HEIF §6.6.1). A coded leaf is decoded directly from an
+/// AV1 bitstream; every other variant is a derived image item whose
+/// reconstructed image is computed from its `'dimg'` inputs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DerivationKind {
+    /// A coded image item (`'av01'`): the leaf a renderer actually decodes.
+    /// Its reconstructed image is the decoded AV1 frame, with extents from
+    /// the item's `'ispe'` property.
+    Coded,
+    /// A `'grid'` tile-mosaic derivation (§6.6.2.3).
+    Grid,
+    /// An `'iovl'` overlay derivation (§6.6.2.2).
+    Overlay,
+    /// An `'iden'` identity derivation (§6.6.2.1) — its reconstructed image
+    /// is its single input's output image; the geometry comes entirely from
+    /// the input plus this item's own transformative properties.
+    Identity,
+    /// A `'tmap'` tone-map / gain-map derivation (av1-avif §4.2.2). Its
+    /// rendered extents are the base (input 0) image's.
+    ToneMap,
+    /// A `'sato'` Sample-Transform derivation (av1-avif §4.2.3).
+    SampleTransform,
+    /// A derived item whose `item_type` this crate does not model
+    /// structurally; its inputs are still walked so a renderer sees the
+    /// dependency edges, but its geometry is taken from its first input.
+    Unknown,
+}
+
+impl DerivationKind {
+    /// Classify an item by its `item_type`.
+    fn classify(item_type: &BoxType, is_derived: bool) -> Self {
+        if item_type == &crate::parser::ITEM_TYPE_AV01 {
+            DerivationKind::Coded
+        } else if item_type == &crate::parser::ITEM_TYPE_GRID {
+            DerivationKind::Grid
+        } else if item_type == &crate::meta::ITEM_TYPE_IOVL {
+            DerivationKind::Overlay
+        } else if item_type == &crate::meta::ITEM_TYPE_IDEN {
+            DerivationKind::Identity
+        } else if item_type == &crate::meta::ITEM_TYPE_TMAP {
+            DerivationKind::ToneMap
+        } else if item_type == &crate::meta::ITEM_TYPE_SATO {
+            DerivationKind::SampleTransform
+        } else if is_derived {
+            DerivationKind::Unknown
+        } else {
+            // A non-`av01` item with no `'dimg'` inputs: treat as a coded
+            // leaf (it is the bottom of the chain and a renderer hands its
+            // bytes to whatever decoder matches the item type).
+            DerivationKind::Coded
+        }
+    }
+
+    /// True for the coded-leaf kind — the only nodes a renderer decodes
+    /// directly.
+    pub fn is_coded(self) -> bool {
+        matches!(self, DerivationKind::Coded)
+    }
+}
+
+/// One node in a [`DerivationGraph`]: an image item reachable from the root
+/// primary by walking `'dimg'` edges, together with its resolved geometry.
+///
+/// Geometry is the box-graph-only resolution (no AV1 decode):
+/// `reconstructed_dims` is the node's reconstructed image size (§6.3) and
+/// `output_dims` folds the node's own transformative item properties on top
+/// (§6.6.1). For a coded leaf the two differ only when the leaf carries a
+/// `'clap'`/`'irot'`/`'imir'`/`'iscl'` of its own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DerivationNode {
+    /// The image item id.
+    pub item_id: u32,
+    /// How this node's reconstructed image is obtained.
+    pub kind: DerivationKind,
+    /// The `'dimg'` input item ids, in reference order (empty for a coded
+    /// leaf). For `'grid'` this is the row-major tile list; for `'iovl'` the
+    /// bottom-to-top layer list; for `'iden'`/`'tmap'` the single/base input
+    /// first.
+    pub inputs: Vec<u32>,
+    /// The reconstructed-image dimensions, or `None` when unresolvable from
+    /// the box graph (e.g. a coded leaf with no `'ispe'`, or a derivation
+    /// whose descriptor cannot be parsed).
+    pub reconstructed_dims: Option<(u32, u32)>,
+    /// The output-image dimensions: [`Self::reconstructed_dims`] with this
+    /// node's own transform chain folded in (§6.3 / §6.6.1).
+    pub output_dims: Option<(u32, u32)>,
+    /// Recursion depth from the root primary (the root is depth 0).
+    pub depth: u32,
+}
+
+impl DerivationNode {
+    /// The node's own dimension-affecting transform chain (`'clap'` →
+    /// `'irot'` → `'imir'` → `'iscl'`, in `ipma` order). Convenience wrapper
+    /// over [`transform_chain`].
+    pub fn transform_chain(&self, meta: &crate::meta::Meta) -> Vec<DimTransform> {
+        transform_chain(meta, self.item_id)
+    }
+}
+
+/// A fully-walked derivation graph rooted at one image item (typically the
+/// primary), enumerating every image item reachable through `'dimg'` edges
+/// and the distinct coded leaves a renderer must decode (HEIF §6.6).
+///
+/// This is the decode-free dependency planner: given a derived primary, it
+/// reports (a) the output canvas size, (b) every node's resolved geometry,
+/// and (c) the set of coded `'av01'` items — with no duplicates and in
+/// first-visit order — that have to be decoded before the derivation can be
+/// reconstructed. It ties together the per-derivation resolvers
+/// ([`resolve_grids`] / [`resolve_overlays`] / [`resolve_iden_derivations`] /
+/// [`resolve_tone_maps`]) into a single traversal that also handles
+/// **nested** derivations (e.g. an `'iden'` crop of a `'grid'`, or a
+/// `'tmap'` whose base is itself a `'grid'`).
+///
+/// The traversal is depth-bounded by [`MAX_DERIVATION_DEPTH`] so a `'dimg'`
+/// cycle terminates; a node already visited is recorded once (its first
+/// visit) and not re-expanded, so a diamond-shaped graph (two derivations
+/// sharing an input) lists the shared leaf once.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DerivationGraph {
+    /// The root item id the graph was built from.
+    pub root_item_id: u32,
+    /// Every reachable node, in first-visit (pre-order) order. The root is
+    /// always `nodes[0]`.
+    pub nodes: Vec<DerivationNode>,
+    /// The distinct coded leaf item ids, in first-visit order — the decode
+    /// set. A renderer decodes each of these once and composes them per the
+    /// derivation tree.
+    pub coded_leaf_ids: Vec<u32>,
+    /// True when the walk hit [`MAX_DERIVATION_DEPTH`] before fully
+    /// expanding the graph (a probable `'dimg'` cycle or pathological
+    /// nesting). The partial graph collected up to the bound is still
+    /// returned.
+    pub truncated: bool,
+}
+
+impl DerivationGraph {
+    /// The root primary's output-image dimensions (the final canvas a
+    /// renderer paints). `None` when the root geometry is unresolvable.
+    pub fn output_dims(&self) -> Option<(u32, u32)> {
+        self.nodes.first().and_then(|n| n.output_dims)
+    }
+
+    /// True when the root is a coded image item (not a derivation) — i.e.
+    /// the file's primary is a plain coded picture and the graph has exactly
+    /// one node.
+    pub fn root_is_coded(&self) -> bool {
+        self.nodes
+            .first()
+            .is_some_and(|n| n.kind == DerivationKind::Coded)
+    }
+
+    /// Look up a node by item id (linear scan; graphs are small).
+    pub fn node(&self, item_id: u32) -> Option<&DerivationNode> {
+        self.nodes.iter().find(|n| n.item_id == item_id)
+    }
+
+    /// The number of derived (non-coded) nodes in the graph.
+    pub fn derived_node_count(&self) -> usize {
+        self.nodes.iter().filter(|n| !n.kind.is_coded()).count()
+    }
+}
+
+/// Walk the `'dimg'` derivation graph rooted at `root_item_id`, resolving
+/// every node's box-graph geometry and collecting the distinct coded leaves
+/// (HEIF §6.6). See [`DerivationGraph`].
+///
+/// No AV1 decode: all geometry comes from the box graph
+/// ([`reconstructed_dims`] + [`transform_chain`]). The walk is depth-bounded
+/// by [`MAX_DERIVATION_DEPTH`] (cycle guard) and visits each item id once.
+pub fn build_derivation_graph(
+    meta: &crate::meta::Meta,
+    root_item_id: u32,
+    file_bytes: &[u8],
+    idat: Option<&[u8]>,
+) -> DerivationGraph {
+    let dimg = b(b"dimg");
+    let mut nodes: Vec<DerivationNode> = Vec::new();
+    let mut visited: Vec<u32> = Vec::new();
+    let mut truncated = false;
+
+    // Iterative pre-order walk over a small explicit stack of (item, depth)
+    // so deep/adversarial nesting cannot blow the native stack. Children are
+    // pushed in reverse so they pop in `dimg` reference order.
+    let mut stack: Vec<(u32, u32)> = vec![(root_item_id, 0)];
+    while let Some((item_id, depth)) = stack.pop() {
+        if visited.contains(&item_id) {
+            continue;
+        }
+        if depth > MAX_DERIVATION_DEPTH {
+            truncated = true;
+            continue;
+        }
+        visited.push(item_id);
+
+        let Some(item) = meta.item_by_id(item_id) else {
+            // A `dimg` target that names no known item: record nothing but
+            // don't fail the whole walk.
+            continue;
+        };
+        let inputs = meta.iref_targets(&dimg, item_id);
+        let is_derived = !inputs.is_empty();
+        let kind = DerivationKind::classify(&item.item_type, is_derived);
+
+        let reconstructed = reconstructed_dims_inner(meta, item_id, file_bytes, idat, 0);
+        let output =
+            reconstructed.map(|(w, h)| output_dims_from_reconstructed(meta, item_id, w, h));
+
+        if !kind.is_coded() {
+            // Push children in reverse for pre-order `dimg` ordering.
+            for &child in inputs.iter().rev() {
+                stack.push((child, depth + 1));
+            }
+        }
+
+        nodes.push(DerivationNode {
+            item_id,
+            kind,
+            inputs,
+            reconstructed_dims: reconstructed,
+            output_dims: output,
+            depth,
+        });
+    }
+
+    // `nodes` is currently in stack-pop order; re-sort into ascending depth
+    // then first-visit (visited) order so callers get a stable pre-order
+    // view with the root first.
+    let visit_rank = |id: u32| visited.iter().position(|&v| v == id).unwrap_or(usize::MAX);
+    nodes.sort_by_key(|n| (n.depth, visit_rank(n.item_id)));
+
+    // Coded leaves in stable pre-order (the sorted node order), deduplicated
+    // — a diamond graph lists a shared leaf once.
+    let coded_leaf_ids: Vec<u32> = nodes
+        .iter()
+        .filter(|n| n.kind.is_coded())
+        .map(|n| n.item_id)
+        .collect();
+
+    DerivationGraph {
+        root_item_id,
+        nodes,
+        coded_leaf_ids,
+        truncated,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6653,6 +6900,260 @@ mod tests {
         assert!(r.covers_canvas());
         assert_eq!(r.trimmed_tile_count(), 0);
         assert_eq!(r.placements[2].origin_x, 128);
+    }
+
+    // -----------------------------------------------------------------------
+    // Unified derivation-graph walk (HEIF §6.6)
+    // -----------------------------------------------------------------------
+
+    /// A plain coded primary is a single-node graph whose root is `Coded`
+    /// and whose decode set is just that item.
+    #[test]
+    fn derivation_graph_coded_root_single_node() {
+        let meta = MMeta {
+            items: vec![geo_ii(1, b"av01")],
+            properties: vec![ispe_prop(640, 480)],
+            associations: vec![geo_assoc(1, &[0])],
+            ..MMeta::default()
+        };
+        let g = build_derivation_graph(&meta, 1, &[], None);
+        assert_eq!(g.root_item_id, 1);
+        assert_eq!(g.nodes.len(), 1);
+        assert!(g.root_is_coded());
+        assert_eq!(g.nodes[0].kind, DerivationKind::Coded);
+        assert_eq!(g.nodes[0].reconstructed_dims, Some((640, 480)));
+        assert_eq!(g.nodes[0].output_dims, Some((640, 480)));
+        assert_eq!(g.output_dims(), Some((640, 480)));
+        assert_eq!(g.coded_leaf_ids, vec![1]);
+        assert_eq!(g.derived_node_count(), 0);
+        assert!(!g.truncated);
+    }
+
+    /// A 2×2 grid primary: one `Grid` root + four `Coded` tiles. The decode
+    /// set is the four tiles in row-major order; the canvas is the grid
+    /// descriptor's output size.
+    #[test]
+    fn derivation_graph_grid_root_lists_tiles() {
+        let desc = build_grid_desc(2, 2, 200, 200);
+        let idat = desc.clone();
+        let meta = MMeta {
+            items: vec![
+                geo_ii(1, b"grid"),
+                geo_ii(2, b"av01"),
+                geo_ii(3, b"av01"),
+                geo_ii(4, b"av01"),
+                geo_ii(5, b"av01"),
+            ],
+            properties: vec![ispe_prop(100, 100)],
+            associations: vec![
+                geo_assoc(2, &[0]),
+                geo_assoc(3, &[0]),
+                geo_assoc(4, &[0]),
+                geo_assoc(5, &[0]),
+            ],
+            irefs: vec![IrefEntry {
+                reference_type: *b"dimg",
+                from_id: 1,
+                to_ids: vec![2, 3, 4, 5],
+            }],
+            locations: vec![ItemLocation {
+                id: 1,
+                construction_method: 1,
+                data_reference_index: 0,
+                base_offset: 0,
+                extents: vec![IlocExtent {
+                    offset: 0,
+                    length: desc.len() as u64,
+                    extent_index: 0,
+                }],
+            }],
+            ..MMeta::default()
+        };
+        let g = build_derivation_graph(&meta, 1, &[], Some(&idat));
+        assert!(!g.root_is_coded());
+        assert_eq!(g.nodes[0].kind, DerivationKind::Grid);
+        assert_eq!(g.nodes[0].inputs, vec![2, 3, 4, 5]);
+        assert_eq!(g.output_dims(), Some((200, 200)));
+        assert_eq!(g.coded_leaf_ids, vec![2, 3, 4, 5]);
+        assert_eq!(g.nodes.len(), 5);
+        assert_eq!(g.derived_node_count(), 1);
+        // The tiles sit at depth 1, the grid at depth 0.
+        assert_eq!(g.node(1).unwrap().depth, 0);
+        assert_eq!(g.node(2).unwrap().depth, 1);
+    }
+
+    /// Nested derivation: an `iden` crop (via `clap`) of a 2×2 grid. The
+    /// walk descends iden → grid → tiles, the root output folds the iden's
+    /// own `clap`, and the decode set is still the four grid tiles.
+    #[test]
+    fn derivation_graph_iden_over_grid_nests() {
+        let desc = build_grid_desc(2, 2, 200, 200);
+        let idat = desc.clone();
+        let meta = MMeta {
+            items: vec![
+                geo_ii(1, b"iden"),
+                geo_ii(2, b"grid"),
+                geo_ii(3, b"av01"),
+                geo_ii(4, b"av01"),
+                geo_ii(5, b"av01"),
+                geo_ii(6, b"av01"),
+            ],
+            // property 0 = tile ispe; property 1 = iden's clap crop to 150×120.
+            properties: vec![
+                ispe_prop(100, 100),
+                MProp::Clap(MClap {
+                    clean_aperture_width_n: 150,
+                    clean_aperture_width_d: 1,
+                    clean_aperture_height_n: 120,
+                    clean_aperture_height_d: 1,
+                    horiz_off_n: 0,
+                    horiz_off_d: 1,
+                    vert_off_n: 0,
+                    vert_off_d: 1,
+                }),
+            ],
+            associations: vec![
+                geo_assoc(1, &[1]), // iden carries the clap
+                geo_assoc(3, &[0]),
+                geo_assoc(4, &[0]),
+                geo_assoc(5, &[0]),
+                geo_assoc(6, &[0]),
+            ],
+            irefs: vec![
+                IrefEntry {
+                    reference_type: *b"dimg",
+                    from_id: 1,
+                    to_ids: vec![2],
+                },
+                IrefEntry {
+                    reference_type: *b"dimg",
+                    from_id: 2,
+                    to_ids: vec![3, 4, 5, 6],
+                },
+            ],
+            locations: vec![ItemLocation {
+                id: 2,
+                construction_method: 1,
+                data_reference_index: 0,
+                base_offset: 0,
+                extents: vec![IlocExtent {
+                    offset: 0,
+                    length: desc.len() as u64,
+                    extent_index: 0,
+                }],
+            }],
+            ..MMeta::default()
+        };
+        let g = build_derivation_graph(&meta, 1, &[], Some(&idat));
+        assert_eq!(g.nodes[0].kind, DerivationKind::Identity);
+        // iden reconstructed = grid output (200×200); iden output = clap crop.
+        assert_eq!(g.nodes[0].reconstructed_dims, Some((200, 200)));
+        assert_eq!(g.nodes[0].output_dims, Some((150, 120)));
+        assert_eq!(g.output_dims(), Some((150, 120)));
+        // Decode set is the four tiles, in row-major order.
+        assert_eq!(g.coded_leaf_ids, vec![3, 4, 5, 6]);
+        // Depth ordering: iden(0) → grid(1) → tiles(2).
+        assert_eq!(g.node(1).unwrap().depth, 0);
+        assert_eq!(g.node(2).unwrap().depth, 1);
+        assert_eq!(g.node(3).unwrap().depth, 2);
+        assert_eq!(g.derived_node_count(), 2);
+    }
+
+    /// A diamond graph — two `iden` derivations sharing one coded leaf via
+    /// an `iovl` — lists the shared leaf exactly once in the decode set.
+    #[test]
+    fn derivation_graph_diamond_dedups_shared_leaf() {
+        // overlay(1) → iden(2), iden(3); both iden → coded(4).
+        let ovl = {
+            let mut b = vec![0u8, 0u8]; // version, flags (16-bit)
+            b.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]); // canvas fill RGBA
+            b.extend_from_slice(&100u16.to_be_bytes()); // output_width
+            b.extend_from_slice(&100u16.to_be_bytes()); // output_height
+            b.extend_from_slice(&0i16.to_be_bytes()); // h offset 0
+            b.extend_from_slice(&0i16.to_be_bytes()); // v offset 0
+            b.extend_from_slice(&0i16.to_be_bytes()); // h offset 1
+            b.extend_from_slice(&0i16.to_be_bytes()); // v offset 1
+            b
+        };
+        let idat = ovl.clone();
+        let meta = MMeta {
+            items: vec![
+                geo_ii(1, b"iovl"),
+                geo_ii(2, b"iden"),
+                geo_ii(3, b"iden"),
+                geo_ii(4, b"av01"),
+            ],
+            properties: vec![ispe_prop(50, 50)],
+            associations: vec![geo_assoc(4, &[0])],
+            irefs: vec![
+                IrefEntry {
+                    reference_type: *b"dimg",
+                    from_id: 1,
+                    to_ids: vec![2, 3],
+                },
+                IrefEntry {
+                    reference_type: *b"dimg",
+                    from_id: 2,
+                    to_ids: vec![4],
+                },
+                IrefEntry {
+                    reference_type: *b"dimg",
+                    from_id: 3,
+                    to_ids: vec![4],
+                },
+            ],
+            locations: vec![ItemLocation {
+                id: 1,
+                construction_method: 1,
+                data_reference_index: 0,
+                base_offset: 0,
+                extents: vec![IlocExtent {
+                    offset: 0,
+                    length: ovl.len() as u64,
+                    extent_index: 0,
+                }],
+            }],
+            ..MMeta::default()
+        };
+        let g = build_derivation_graph(&meta, 1, &[], Some(&idat));
+        assert_eq!(g.nodes[0].kind, DerivationKind::Overlay);
+        // Both idens reachable, shared leaf listed once.
+        assert_eq!(g.coded_leaf_ids, vec![4]);
+        // 4 distinct nodes (iovl, iden×2, coded) — the leaf is not duplicated.
+        assert_eq!(g.nodes.len(), 4);
+        assert_eq!(g.derived_node_count(), 3);
+        assert!(!g.truncated);
+    }
+
+    /// A `dimg` cycle terminates the walk at the depth bound and sets the
+    /// `truncated` flag rather than recursing forever.
+    #[test]
+    fn derivation_graph_cycle_terminates_and_flags_truncation() {
+        // iden(1) → iden(2) → iden(1) — a 2-cycle.
+        let meta = MMeta {
+            items: vec![geo_ii(1, b"iden"), geo_ii(2, b"iden")],
+            irefs: vec![
+                IrefEntry {
+                    reference_type: *b"dimg",
+                    from_id: 1,
+                    to_ids: vec![2],
+                },
+                IrefEntry {
+                    reference_type: *b"dimg",
+                    from_id: 2,
+                    to_ids: vec![1],
+                },
+            ],
+            ..MMeta::default()
+        };
+        let g = build_derivation_graph(&meta, 1, &[], None);
+        // Each item visited once; the back-edge to an already-visited node
+        // is dropped, so only two nodes and no coded leaves.
+        assert_eq!(g.nodes.len(), 2);
+        assert!(g.coded_leaf_ids.is_empty());
+        // Geometry is unresolvable (no coded leaf) but the walk still
+        // terminated cleanly.
+        assert_eq!(g.output_dims(), None);
     }
 
     /// A `tmap` with no `dimg` inputs at all resolves to no dimensions and
