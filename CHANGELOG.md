@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Coded-item dependency roles** (HEIF §6.4.7 / §6.4.8 / §6.4.9).
+  `inspect::coded_item_dependencies` classifies an image item from its
+  *outgoing* item references into a `CodedItemDependencies` carrying the
+  `'pred'` predictively-coded decoding-order list (§6.4.9), the `'base'`
+  pre-derived-coded inputs (§6.4.7), the `'exbl'` scalable base-layer
+  reference (§6.4.8), and the `'tbas'` tile-base relation, with
+  `is_predictively_coded` / `is_pre_derived` / `has_dependencies`
+  projections. Backed by a new `Meta::iref_targets_of(reference_type,
+  from)` helper that walks references *out* of an item (concatenating the
+  `to_ids` of every matching entry in order — load-bearing for the
+  ordered `'pred'` dependency list). New re-exports:
+  `coded_item_dependencies`, `CodedItemDependencies`. 5 new tests.
+
 - **Text / font item enumeration** (HEIF §6.10.1 / §6.10.3).
   `inspect::text_items` (primary) and `text_items_for` (any image item)
   walk the `'text'` item reference that binds a text item to the image it

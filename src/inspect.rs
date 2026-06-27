@@ -833,6 +833,80 @@ pub fn is_font_item(item: &crate::meta::ItemInfo) -> bool {
             .unwrap_or(false)
 }
 
+/// The coded-image-item dependency role of an image item, derived from its
+/// outgoing item references (HEIF §6.4.7 / §6.4.8 / §6.4.9).
+///
+/// These are *coded* image-item relationships (a single coded item that
+/// depends on, or is pre-derived from, other coded items) — distinct from
+/// the `'dimg'` *derived* image graph (grid / overlay / iden / tmap), which
+/// is modelled by [`crate::derived::DerivationGraph`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CodedItemDependencies {
+    /// `'pred'` targets (§6.4.9) — the coded image items this predictively
+    /// coded item directly and indirectly depends on, **in decoding
+    /// order**. When non-empty the item is a predictively coded image item
+    /// (a P-frame-style item that must be decoded after these references);
+    /// concatenating their media data followed by this item's data forms a
+    /// decoder-configuration-conformant bitstream.
+    pub pred: Vec<u32>,
+    /// `'base'` targets (§6.4.7) — the images this *pre-derived coded
+    /// image* was derived from (e.g. the exposure-bracketed inputs of a
+    /// composite HDR still). When non-empty the item is a pre-derived
+    /// coded image.
+    pub base: Vec<u32>,
+    /// `'exbl'` targets (§6.4.8) — for a scalably coded image item, the
+    /// image item that is decoded first and used as the reference base
+    /// layer. When non-empty the item is a scalable-enhancement item.
+    pub exbl: Vec<u32>,
+    /// `'tbas'` target (§6.5) — the related (tile-base) image item this
+    /// item is a tile of, identified by a `'tbas'` item reference.
+    pub tbas: Option<u32>,
+}
+
+impl CodedItemDependencies {
+    /// `true` when the item is a predictively coded image item (§6.4.9) —
+    /// it has at least one `'pred'` reference.
+    pub fn is_predictively_coded(&self) -> bool {
+        !self.pred.is_empty()
+    }
+
+    /// `true` when the item is a pre-derived coded image (§6.4.7) — it has
+    /// at least one `'base'` reference.
+    pub fn is_pre_derived(&self) -> bool {
+        !self.base.is_empty()
+    }
+
+    /// `true` when the item carries any coded-item dependency reference
+    /// (`'pred'` / `'base'` / `'exbl'` / `'tbas'`).
+    pub fn has_dependencies(&self) -> bool {
+        self.is_predictively_coded()
+            || self.is_pre_derived()
+            || !self.exbl.is_empty()
+            || self.tbas.is_some()
+    }
+}
+
+/// Resolve the coded-image-item dependency role of `item_id` from its
+/// outgoing item references (HEIF §6.4.7 / §6.4.8 / §6.4.9). See
+/// [`CodedItemDependencies`].
+pub fn coded_item_dependencies(file: &[u8], item_id: u32) -> Result<CodedItemDependencies> {
+    let hdr = parse_header(file)?;
+    Ok(coded_item_dependencies_from_meta(&hdr.meta, item_id))
+}
+
+fn coded_item_dependencies_from_meta(meta: &Meta, item_id: u32) -> CodedItemDependencies {
+    const PRED: BoxType = b(b"pred");
+    const BASE: BoxType = b(b"base");
+    const EXBL: BoxType = b(b"exbl");
+    const TBAS: BoxType = b(b"tbas");
+    CodedItemDependencies {
+        pred: meta.iref_targets_of(&PRED, item_id),
+        base: meta.iref_targets_of(&BASE, item_id),
+        exbl: meta.iref_targets_of(&EXBL, item_id),
+        tbas: meta.iref_targets_of(&TBAS, item_id).into_iter().next(),
+    }
+}
+
 fn region_items_for_meta(
     file: &[u8],
     meta: &Meta,
@@ -2044,5 +2118,92 @@ mod tests {
         assert!(!is_font_item(&make_mime_item(1, "text/html")));
         assert!(!is_font_item(&make_mime_item(1, "application/rdf+xml")));
         assert!(!is_font_item(&make_item(1, b"av01")));
+    }
+
+    // -----------------------------------------------------------------
+    // Coded-item dependency roles (HEIF §6.4.7 / §6.4.8 / §6.4.9)
+    // -----------------------------------------------------------------
+
+    /// A `'pred'` reference list marks a predictively coded image item and
+    /// preserves the decoding order of its dependencies (§6.4.9).
+    #[test]
+    fn coded_deps_detects_predictive_item_with_order() {
+        let meta = Meta {
+            irefs: vec![IrefEntry {
+                reference_type: *b"pred",
+                from_id: 7,
+                to_ids: vec![3, 5, 6], // decoding order
+            }],
+            ..Meta::default()
+        };
+        let d = coded_item_dependencies_from_meta(&meta, 7);
+        assert!(d.is_predictively_coded());
+        assert!(d.has_dependencies());
+        assert_eq!(d.pred, vec![3, 5, 6]);
+        assert!(!d.is_pre_derived());
+        // A different item carries no deps.
+        assert!(!coded_item_dependencies_from_meta(&meta, 3).has_dependencies());
+    }
+
+    /// A `'base'` reference marks a pre-derived coded image and lists the
+    /// images it was derived from (§6.4.7).
+    #[test]
+    fn coded_deps_detects_pre_derived_base() {
+        let meta = Meta {
+            irefs: vec![IrefEntry {
+                reference_type: *b"base",
+                from_id: 1,
+                to_ids: vec![10, 11, 12],
+            }],
+            ..Meta::default()
+        };
+        let d = coded_item_dependencies_from_meta(&meta, 1);
+        assert!(d.is_pre_derived());
+        assert_eq!(d.base, vec![10, 11, 12]);
+        assert!(!d.is_predictively_coded());
+    }
+
+    /// `'exbl'` (scalable base-layer) and `'tbas'` (tile-base) references
+    /// are surfaced; `'tbas'` is a single related item.
+    #[test]
+    fn coded_deps_surfaces_exbl_and_tbas() {
+        let meta = Meta {
+            irefs: vec![
+                IrefEntry {
+                    reference_type: *b"exbl",
+                    from_id: 4,
+                    to_ids: vec![2],
+                },
+                IrefEntry {
+                    reference_type: *b"tbas",
+                    from_id: 4,
+                    to_ids: vec![8],
+                },
+            ],
+            ..Meta::default()
+        };
+        let d = coded_item_dependencies_from_meta(&meta, 4);
+        assert_eq!(d.exbl, vec![2]);
+        assert_eq!(d.tbas, Some(8));
+        assert!(d.has_dependencies());
+        assert!(!d.is_predictively_coded() && !d.is_pre_derived());
+    }
+
+    /// An item with no outgoing dependency references yields an empty
+    /// (all-default) role.
+    #[test]
+    fn coded_deps_empty_for_independent_item() {
+        let meta = Meta {
+            irefs: vec![IrefEntry {
+                // a cdsc edge that is irrelevant to coded-item deps
+                reference_type: *b"cdsc",
+                from_id: 2,
+                to_ids: vec![1],
+            }],
+            ..Meta::default()
+        };
+        let d = coded_item_dependencies_from_meta(&meta, 1);
+        assert_eq!(d, CodedItemDependencies::default());
+        assert!(!d.has_dependencies());
     }
 }

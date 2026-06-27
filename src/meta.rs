@@ -2958,6 +2958,27 @@ impl Meta {
         out
     }
 
+    /// Return the ordered list of target item ids reached by an iref of
+    /// `reference_type` whose `from_id == from`. Unlike
+    /// [`Self::iref_sources_of`] (which walks the reverse direction), this
+    /// follows the reference *out* of `from` — the natural direction for
+    /// reference types that express an item's own dependencies, e.g.
+    /// `'pred'` (predictive decoding order, §6.4.9), `'base'`
+    /// (pre-derived coded image inputs, §6.4.7), `'dimg'` (derived-image
+    /// inputs) or `'tbas'` (tile-base relation). When several iref entries
+    /// share the same `(reference_type, from_id)` their `to_ids` are
+    /// concatenated in entry order. Returns `Vec::new()` when nothing
+    /// matches.
+    pub fn iref_targets_of(&self, reference_type: &BoxType, from: u32) -> Vec<u32> {
+        let mut out = Vec::new();
+        for e in &self.irefs {
+            if &e.reference_type == reference_type && e.from_id == from {
+                out.extend_from_slice(&e.to_ids);
+            }
+        }
+        out
+    }
+
     /// True when the alpha auxiliary attached to `to_id` is signalled as
     /// premultiplied per HEIF iref type `prem`. The `prem` iref's
     /// `from_id` is the alpha item and `to_ids` contains the colour
@@ -5296,6 +5317,43 @@ mod tests {
         got.sort_unstable();
         assert_eq!(got, vec![10, 11]);
         assert!(m.iref_sources_of(b"thmb", 99).is_empty());
+    }
+
+    /// `iref_targets_of` walks references *out* of an item and
+    /// concatenates the `to_ids` of every matching entry in entry order
+    /// (the order matters for `'pred'` decoding-dependency lists).
+    #[test]
+    fn iref_targets_of_concatenates_in_entry_order() {
+        let m = Meta {
+            irefs: vec![
+                IrefEntry {
+                    reference_type: *b"pred",
+                    from_id: 7,
+                    to_ids: vec![3, 5],
+                },
+                // Second pred entry from the same item extends the list.
+                IrefEntry {
+                    reference_type: *b"pred",
+                    from_id: 7,
+                    to_ids: vec![6],
+                },
+                // Irrelevant: different reference_type / source.
+                IrefEntry {
+                    reference_type: *b"base",
+                    from_id: 7,
+                    to_ids: vec![99],
+                },
+                IrefEntry {
+                    reference_type: *b"pred",
+                    from_id: 8,
+                    to_ids: vec![1],
+                },
+            ],
+            ..Meta::default()
+        };
+        assert_eq!(m.iref_targets_of(b"pred", 7), vec![3, 5, 6]);
+        assert_eq!(m.iref_targets_of(b"base", 7), vec![99]);
+        assert!(m.iref_targets_of(b"pred", 99).is_empty());
     }
 
     /// `is_alpha_premultiplied_for` detects HEIF `prem` iref linking an

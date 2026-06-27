@@ -136,9 +136,9 @@ pub use error::{AvifError, Result};
 pub use grid::{composite_grid, ImageGrid};
 pub use image::{AvifFrame, AvifPixelFormat, AvifPlane};
 pub use inspect::{
-    derivation_graph, gain_map_metadata, inspect, is_font_item, item_payload_bytes, region_items,
-    region_items_for, text_items, text_items_for, transforms_for, AvifInfo, ResolvedRegionItem,
-    ResolvedTextItem,
+    coded_item_dependencies, derivation_graph, gain_map_metadata, inspect, is_font_item,
+    item_payload_bytes, region_items, region_items_for, text_items, text_items_for, transforms_for,
+    AvifInfo, CodedItemDependencies, ResolvedRegionItem, ResolvedTextItem,
 };
 pub use meta::{
     A1lx, A1op, Aebr, Afbr, Altt, AuxC, AuxKind, Cclv, Clap, Clli, Cmex, Cmin, Colr, Crtt, Dobr,
