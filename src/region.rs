@@ -18,11 +18,17 @@
 //! the reference-space → image-space scaling rule of §11.3.2.
 
 use crate::error::{AvifError as Error, Result};
+use crate::meta::Meta;
 
 /// HEIF §11.3.2 — region item type (`'rgan'`).
 pub const ITEM_TYPE_RGAN: [u8; 4] = *b"rgan";
 /// HEIF §11.2.2 — mask item type (`'mski'`).
 pub const ITEM_TYPE_MSKI: [u8; 4] = *b"mski";
+/// HEIF §11.3.3 — derived-region item reference type (`'drgn'`).
+pub const REF_TYPE_DRGN: [u8; 4] = *b"drgn";
+/// HEIF §6.6.2.1 — identity derivation item type (`'iden'`), reused by
+/// §11.3.3.2.1 for the identity derived-region item.
+pub const ITEM_TYPE_IDEN: [u8; 4] = *b"iden";
 
 /// One region geometry inside a [`RegionItem`] (HEIF §11.2.1).
 ///
@@ -184,6 +190,111 @@ impl RegionItem {
             regions,
         })
     }
+}
+
+/// Compliance + resolution of a §11.3.3.2.1 identity (`'iden'`) derived
+/// region item.
+///
+/// A derived region item carries a `'drgn'` item reference to its input
+/// region item(s) (§11.3.3.1). The only derivation type the spec defines
+/// is the identity transformation (`item_type == 'iden'`, §11.3.3.2.1),
+/// which `shall` have no item body and a `'drgn'` `reference_count` of
+/// exactly 1; the resulting regions are the input region item's regions
+/// with the derived item's transformative item properties applied.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DerivedRegionItem {
+    /// Item id of the derived region item (an `'iden'` item).
+    pub derived_item_id: u32,
+    /// The single input region item id named by the `'drgn'` reference,
+    /// when `drgn_reference_count == 1`. `None` when the input count is
+    /// non-conformant.
+    pub source_region_item_id: Option<u32>,
+    /// Number of `'drgn'` targets (§11.3.3.2.1 requires exactly 1).
+    pub drgn_reference_count: usize,
+    /// Number of distinct `'drgn'` iref entries sharing this item as their
+    /// `from_item_ID` (§11.3.3.1: shall not be greater than 1).
+    pub drgn_iref_count: usize,
+    /// `true` when the derived item carries a non-empty item body
+    /// (§11.3.3.2.1 requires no item body — an `'iden'` derived region
+    /// item shall have no extents).
+    pub has_item_body: bool,
+}
+
+impl DerivedRegionItem {
+    /// `true` when every §11.3.3.2.1 / §11.3.3.1 `shall` passes: exactly
+    /// one `'drgn'` input, at most one `'drgn'` iref entry, and no item
+    /// body.
+    pub fn is_compliant(&self) -> bool {
+        self.drgn_reference_count == 1 && self.drgn_iref_count == 1 && !self.has_item_body
+    }
+
+    /// Human-readable list of failed `shall`s; empty when
+    /// [`Self::is_compliant`].
+    pub fn missing(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.drgn_reference_count != 1 {
+            out.push("drgn-reference-count-eq-1");
+        }
+        if self.drgn_iref_count != 1 {
+            out.push("drgn-iref-count-eq-1");
+        }
+        if self.has_item_body {
+            out.push("no-item-body");
+        }
+        out
+    }
+}
+
+/// Resolve and audit every identity (`'iden'`) derived region item carried
+/// in `meta` (HEIF §11.3.3.2.1).
+///
+/// A derived region item is an `'iden'`-typed item with a `'drgn'` item
+/// reference to its input region item(s). This finds every `'iden'` item
+/// that has at least one outgoing `'drgn'` reference, resolves its single
+/// input region item (when the `reference_count` is the conformant `1`),
+/// and reports the §11.3.3.2.1 `shall`-level constraints in a
+/// [`DerivedRegionItem`]. Returns the records in `iinf` declaration order;
+/// empty when the file ships no derived region items.
+///
+/// Plain region items (`'rgan'`) and `'iden'` *image* derivations
+/// (`'dimg'`-referenced, §6.6.2.1) are not in scope here — a derived
+/// *region* item is distinguished by carrying a `'drgn'` reference.
+pub fn resolve_derived_region_items(meta: &Meta) -> Vec<DerivedRegionItem> {
+    let mut out = Vec::new();
+    for item in &meta.items {
+        if item.item_type != ITEM_TYPE_IDEN {
+            continue;
+        }
+        let drgn_iref_count = meta
+            .irefs
+            .iter()
+            .filter(|e| e.reference_type == REF_TYPE_DRGN && e.from_id == item.id)
+            .count();
+        if drgn_iref_count == 0 {
+            // An 'iden' item with no 'drgn' reference is an image-level
+            // identity derivation (§6.6.2.1), not a derived region item.
+            continue;
+        }
+        let inputs = meta.iref_targets_of(&REF_TYPE_DRGN, item.id);
+        let drgn_reference_count = inputs.len();
+        let source_region_item_id = if drgn_reference_count == 1 {
+            Some(inputs[0])
+        } else {
+            None
+        };
+        let has_item_body = meta
+            .location_by_id(item.id)
+            .map(|loc| loc.extents.iter().any(|x| x.length > 0))
+            .unwrap_or(false);
+        out.push(DerivedRegionItem {
+            derived_item_id: item.id,
+            source_region_item_id,
+            drgn_reference_count,
+            drgn_iref_count,
+            has_item_body,
+        });
+    }
+    out
 }
 
 /// Parse a single `RegionGeometryStruct` (§11.2.1.2) from `cur`. `large`
@@ -580,5 +691,94 @@ mod tests {
         let ri = RegionItem::parse(&body).unwrap();
         assert_eq!(ri.region_count(), 0);
         assert_eq!(ri.reference_width, 320);
+    }
+
+    // -----------------------------------------------------------------
+    // Derived region items (HEIF §11.3.3.2.1)
+    // -----------------------------------------------------------------
+
+    use crate::meta::{IrefEntry, ItemInfo, Meta};
+
+    fn iden_item(id: u32) -> ItemInfo {
+        ItemInfo {
+            id,
+            item_type: ITEM_TYPE_IDEN,
+            name: String::new(),
+            content_type: None,
+            content_encoding: None,
+            item_uri_type: None,
+            flags: 0,
+        }
+    }
+
+    fn rgan_item(id: u32) -> ItemInfo {
+        ItemInfo {
+            id,
+            item_type: ITEM_TYPE_RGAN,
+            name: String::new(),
+            content_type: None,
+            content_encoding: None,
+            item_uri_type: None,
+            flags: 0,
+        }
+    }
+
+    /// A conformant identity derived region item: `'iden'` typed, one
+    /// `'drgn'` reference to a region item, no item body.
+    #[test]
+    fn derived_region_iden_is_compliant() {
+        let meta = Meta {
+            items: vec![iden_item(2), rgan_item(3)],
+            irefs: vec![IrefEntry {
+                reference_type: REF_TYPE_DRGN,
+                from_id: 2,
+                to_ids: vec![3],
+            }],
+            ..Meta::default()
+        };
+        let derived = resolve_derived_region_items(&meta);
+        assert_eq!(derived.len(), 1);
+        assert_eq!(derived[0].derived_item_id, 2);
+        assert_eq!(derived[0].source_region_item_id, Some(3));
+        assert_eq!(derived[0].drgn_reference_count, 1);
+        assert!(derived[0].is_compliant());
+        assert!(derived[0].missing().is_empty());
+    }
+
+    /// A `'drgn'` reference_count other than 1 is a §11.3.3.2.1 violation
+    /// and leaves the source unresolved.
+    #[test]
+    fn derived_region_multi_input_is_non_compliant() {
+        let meta = Meta {
+            items: vec![iden_item(2)],
+            irefs: vec![IrefEntry {
+                reference_type: REF_TYPE_DRGN,
+                from_id: 2,
+                to_ids: vec![3, 4],
+            }],
+            ..Meta::default()
+        };
+        let d = &resolve_derived_region_items(&meta)[0];
+        assert_eq!(d.drgn_reference_count, 2);
+        assert_eq!(d.source_region_item_id, None);
+        assert!(!d.is_compliant());
+        assert!(d.missing().contains(&"drgn-reference-count-eq-1"));
+    }
+
+    /// An `'iden'` item with no `'drgn'` reference is an *image*-level
+    /// identity derivation (§6.6.2.1), NOT a derived region item — it is
+    /// skipped here.
+    #[test]
+    fn iden_without_drgn_is_not_a_derived_region() {
+        let meta = Meta {
+            items: vec![iden_item(2)],
+            irefs: vec![IrefEntry {
+                reference_type: *b"dimg",
+                from_id: 2,
+                to_ids: vec![3],
+            }],
+            ..Meta::default()
+        };
+        assert!(resolve_derived_region_items(&meta).is_empty());
     }
 }

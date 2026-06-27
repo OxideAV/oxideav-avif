@@ -156,7 +156,10 @@ pub use parser::{
     BrandClass, BRAND_AVIF, BRAND_AVIO, BRAND_AVIS, BRAND_MA1A, BRAND_MA1B, BRAND_MIAF, BRAND_MIF1,
     BRAND_MSF1, ITEM_TYPE_AV01, ITEM_TYPE_GRID,
 };
-pub use region::{RegionGeometry, RegionItem, ITEM_TYPE_MSKI, ITEM_TYPE_RGAN};
+pub use region::{
+    resolve_derived_region_items, DerivedRegionItem, RegionGeometry, RegionItem, ITEM_TYPE_MSKI,
+    ITEM_TYPE_RGAN, REF_TYPE_DRGN,
+};
 pub use sample_group::{
     parse_csgp, parse_sample_group_descriptions, parse_sample_to_groups, parse_sbgp, parse_sgpd,
     SampleGroupDescription, SampleToGroup, SampleToGroupKind, SampleToGroupRun,

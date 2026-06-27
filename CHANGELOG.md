@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Derived region items** (HEIF §11.3.3.2.1).
+  `region::resolve_derived_region_items` finds every identity (`'iden'`)
+  derived region item — an `'iden'`-typed item carrying a `'drgn'` item
+  reference to its input region item — and audits it against the
+  §11.3.3.2.1 / §11.3.3.1 `shall`s (exactly one `'drgn'` input,
+  `'drgn'`-iref-count ≤ 1, no item body), resolving the single source
+  region item id. Returns `DerivedRegionItem` records with `is_compliant`
+  / `missing` projections. An `'iden'` item *without* a `'drgn'`
+  reference is correctly treated as an image-level identity derivation
+  (§6.6.2.1), not a region derivation. New re-exports:
+  `resolve_derived_region_items`, `DerivedRegionItem`, `REF_TYPE_DRGN`.
+  3 new tests.
+
 - **`'pred'` brand file-constraint audit** (HEIF §10.2.4.2).
   `audit_pred_brand(meta, brands)` checks the two `shall`s a file claiming
   the `'pred'` brand (predictively coded image items) must satisfy:
