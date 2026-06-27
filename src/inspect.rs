@@ -744,6 +744,95 @@ pub fn region_items(file: &[u8]) -> Result<Vec<ResolvedRegionItem>> {
     region_items_for_meta(file, &hdr.meta, primary)
 }
 
+/// A text item (HEIF §6.10.1) resolved against an AVIF file, paired with
+/// the image item it annotates and the font items it references.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedTextItem {
+    /// Item id of the text item (a `'mime'` item).
+    pub text_item_id: u32,
+    /// Item id of the image item this text item annotates (the `'text'`
+    /// iref target).
+    pub image_item_id: u32,
+    /// MIME `content_type` of the text payload (e.g. `text/html`,
+    /// `text/plain`) — the §6.10.1.1 documented MIME type.
+    pub content_type: String,
+    /// Font items referenced from this text item via the `'font'` iref
+    /// (HEIF §6.10.1.1), in declaration order. Empty when the text item
+    /// references no font item.
+    pub font_item_ids: Vec<u32>,
+}
+
+/// Enumerate the text items (HEIF §6.10.1) that annotate `image_item_id`.
+///
+/// A text item is a `'mime'` item linked to the image item it annotates by
+/// a `'text'` item reference **from** the text item **to** the image item
+/// (§6.10.1.1); its `content_type` documents the payload MIME type (e.g.
+/// `text/html`, `text/plain`). Each text item may further reference one or
+/// more font items via a `'font'` iref. This walks the `'text'` sources of
+/// `image_item_id`, keeps `'mime'` sources, and for each collects its
+/// `content_type` and the `'font'` iref targets.
+///
+/// Items are returned in `iref`-source order. Resolving the text/font
+/// payload bytes is a downstream concern ([`item_payload_bytes`]); this is
+/// the structural binding surface.
+pub fn text_items_for(file: &[u8], image_item_id: u32) -> Result<Vec<ResolvedTextItem>> {
+    let hdr = parse_header(file)?;
+    Ok(text_items_for_meta(&hdr.meta, image_item_id))
+}
+
+/// Enumerate the text items annotating the file's **primary item**
+/// (resolved via `pitm`). See [`text_items_for`].
+pub fn text_items(file: &[u8]) -> Result<Vec<ResolvedTextItem>> {
+    let hdr = parse_header(file)?;
+    let primary = hdr
+        .meta
+        .primary_item_id
+        .ok_or_else(|| crate::error::AvifError::invalid("avif: no primary item (pitm)"))?;
+    Ok(text_items_for_meta(&hdr.meta, primary))
+}
+
+fn text_items_for_meta(meta: &Meta, image_item_id: u32) -> Vec<ResolvedTextItem> {
+    const TEXT: BoxType = b(b"text");
+    const FONT: BoxType = b(b"font");
+    let mut out = Vec::new();
+    for src in meta.iref_sources_of(&TEXT, image_item_id) {
+        let Some(info) = meta.item_by_id(src) else {
+            continue;
+        };
+        if info.item_type != ITEM_TYPE_MIME {
+            continue;
+        }
+        let content_type = info.content_type.clone().unwrap_or_default();
+        // Font items referenced from this text item: `'font'` iref whose
+        // from_id is the text item.
+        let font_item_ids = meta
+            .irefs
+            .iter()
+            .filter(|e| e.reference_type == FONT && e.from_id == src)
+            .flat_map(|e| e.to_ids.iter().copied())
+            .collect();
+        out.push(ResolvedTextItem {
+            text_item_id: src,
+            image_item_id,
+            content_type,
+            font_item_ids,
+        });
+    }
+    out
+}
+
+/// `true` when `item` is a font item per HEIF §6.10.3: a `'mime'` item
+/// whose `content_type` starts with `font/` (e.g. `font/ttf`,
+/// `font/woff`, RFC 8081).
+pub fn is_font_item(item: &crate::meta::ItemInfo) -> bool {
+    item.item_type == ITEM_TYPE_MIME
+        && item
+            .content_type
+            .as_deref()
+            .map(|ct| ct.to_ascii_lowercase().starts_with("font/"))
+            .unwrap_or(false)
+}
+
 fn region_items_for_meta(
     file: &[u8],
     meta: &Meta,
@@ -1872,5 +1961,88 @@ mod tests {
         };
         assert!(region_items_for_meta(&[], &meta, 1).unwrap().is_empty());
         assert_eq!(region_items_for_meta(&[], &meta, 5).unwrap().len(), 1);
+    }
+
+    // -----------------------------------------------------------------
+    // Text / font items (HEIF §6.10.1 / §6.10.3)
+    // -----------------------------------------------------------------
+
+    /// A `'mime'` text item linked via `'text'` to the primary, with a
+    /// `'font'` iref to a font item, resolves into a `ResolvedTextItem`
+    /// carrying its content_type and the font item id.
+    #[test]
+    fn text_items_resolves_text_and_font_links() {
+        let meta = Meta {
+            items: vec![
+                make_mime_item(2, "text/html"),
+                make_mime_item(3, "font/ttf"),
+            ],
+            irefs: vec![
+                IrefEntry {
+                    reference_type: *b"text",
+                    from_id: 2,
+                    to_ids: vec![1],
+                },
+                IrefEntry {
+                    reference_type: *b"font",
+                    from_id: 2,
+                    to_ids: vec![3],
+                },
+            ],
+            ..Meta::default()
+        };
+        let items = text_items_for_meta(&meta, 1);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].text_item_id, 2);
+        assert_eq!(items[0].image_item_id, 1);
+        assert_eq!(items[0].content_type, "text/html");
+        assert_eq!(items[0].font_item_ids, vec![3]);
+    }
+
+    /// A text item with no `'font'` iref resolves with an empty font list.
+    #[test]
+    fn text_items_without_font_has_empty_font_list() {
+        let meta = Meta {
+            items: vec![make_mime_item(2, "text/plain")],
+            irefs: vec![IrefEntry {
+                reference_type: *b"text",
+                from_id: 2,
+                to_ids: vec![1],
+            }],
+            ..Meta::default()
+        };
+        let items = text_items_for_meta(&meta, 1);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].content_type, "text/plain");
+        assert!(items[0].font_item_ids.is_empty());
+    }
+
+    /// Text items are target-scoped: a `'text'` describing item 9 does not
+    /// surface when querying the primary.
+    #[test]
+    fn text_items_are_target_scoped() {
+        let meta = Meta {
+            items: vec![make_mime_item(2, "text/html")],
+            irefs: vec![IrefEntry {
+                reference_type: *b"text",
+                from_id: 2,
+                to_ids: vec![9],
+            }],
+            ..Meta::default()
+        };
+        assert!(text_items_for_meta(&meta, 1).is_empty());
+        assert_eq!(text_items_for_meta(&meta, 9).len(), 1);
+    }
+
+    /// `is_font_item` recognises a `'mime'` item whose content_type starts
+    /// with `font/` (case-insensitively) and rejects non-font mime items.
+    #[test]
+    fn is_font_item_matches_font_mime_only() {
+        assert!(is_font_item(&make_mime_item(1, "font/ttf")));
+        assert!(is_font_item(&make_mime_item(1, "font/woff")));
+        assert!(is_font_item(&make_mime_item(1, "FONT/OTF"))); // case-insensitive
+        assert!(!is_font_item(&make_mime_item(1, "text/html")));
+        assert!(!is_font_item(&make_mime_item(1, "application/rdf+xml")));
+        assert!(!is_font_item(&make_item(1, b"av01")));
     }
 }

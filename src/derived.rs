@@ -181,6 +181,31 @@ impl EntityGroup {
     pub fn is_panorama(&self) -> bool {
         &self.grouping_type == b"pano"
     }
+
+    /// True when the grouping type signals a progressive rendering set
+    /// (`'prgr'`, HEIF §6.8.10): the listed image items are similar images
+    /// at different quality levels, stored — and listed in the group — in
+    /// **increasing picture quality order**, so a renderer can show a
+    /// first low-quality image quickly and refine it. A `'prgr'` group
+    /// contains only image items, never tracks (§6.8.10).
+    pub fn is_progressive(&self) -> bool {
+        &self.grouping_type == b"prgr"
+    }
+
+    /// True when the grouping type signals a burst image set (`'brst'`,
+    /// HEIF §6.8.9): a series of rapid-succession images whose `entity_id`
+    /// values are listed in temporally increasing order.
+    pub fn is_burst(&self) -> bool {
+        &self.grouping_type == b"brst"
+    }
+
+    /// True when the grouping type signals a multi-source grouping
+    /// (`'msrc'`, HEIF §9.4): tracks/items that originate from the same
+    /// source (e.g. the visual tracks for the same captured content,
+    /// alongside their associated audio).
+    pub fn is_multi_source(&self) -> bool {
+        &self.grouping_type == b"msrc"
+    }
 }
 
 /// Parse a `GroupsListBox` (`grpl`) payload into its set of entity
@@ -3614,6 +3639,39 @@ mod tests {
         assert!(!g.is_stereo_pair());
         assert!(!g.is_equivalence());
         assert_eq!(g.entity_ids, vec![21, 22, 23]);
+    }
+
+    /// `prgr` / `brst` / `msrc` groups classify via their respective
+    /// projections and are mutually exclusive with the others.
+    #[test]
+    fn grpl_classifies_prgr_brst_msrc_groups() {
+        let build = |fourcc: &[u8; 4], ids: &[u32]| {
+            let mut child = vec![0u8; 4]; // FullBox
+            child.extend_from_slice(&7u32.to_be_bytes()); // group_id
+            child.extend_from_slice(&(ids.len() as u32).to_be_bytes());
+            for &id in ids {
+                child.extend_from_slice(&id.to_be_bytes());
+            }
+            let mut buf = Vec::new();
+            let size = (8 + child.len()) as u32;
+            buf.extend_from_slice(&size.to_be_bytes());
+            buf.extend_from_slice(fourcc);
+            buf.extend_from_slice(&child);
+            buf
+        };
+
+        let prgr = &parse_grpl(&build(b"prgr", &[1, 2, 3])).unwrap()[0];
+        assert!(prgr.is_progressive());
+        assert!(!prgr.is_burst() && !prgr.is_multi_source() && !prgr.is_alternates());
+        assert_eq!(prgr.entity_ids, vec![1, 2, 3]);
+
+        let brst = &parse_grpl(&build(b"brst", &[10, 11])).unwrap()[0];
+        assert!(brst.is_burst());
+        assert!(!brst.is_progressive() && !brst.is_multi_source());
+
+        let msrc = &parse_grpl(&build(b"msrc", &[5, 6])).unwrap()[0];
+        assert!(msrc.is_multi_source());
+        assert!(!msrc.is_progressive() && !msrc.is_burst());
     }
 
     /// `ster` group convention: two entities, first is left view.

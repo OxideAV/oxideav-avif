@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Text / font item enumeration** (HEIF §6.10.1 / §6.10.3).
+  `inspect::text_items` (primary) and `text_items_for` (any image item)
+  walk the `'text'` item reference that binds a text item to the image it
+  annotates (§6.10.1.1), keep `'mime'` sources, and return
+  `ResolvedTextItem` records `{ text_item_id, image_item_id, content_type,
+  font_item_ids }` where `font_item_ids` are the `'font'`-iref-linked font
+  items. `is_font_item` recognises a §6.10.3 font item (a `'mime'` item
+  whose `content_type` starts with `font/`, RFC 8081). New re-exports:
+  `text_items`, `text_items_for`, `is_font_item`, `ResolvedTextItem`.
+
+- **Progressive / burst / multi-source entity-group projections**
+  (HEIF §6.8.9 / §6.8.10 / §9.4). `EntityGroup` gains `is_progressive`
+  (`'prgr'` — image items at increasing quality for progressive
+  rendering), `is_burst` (`'brst'` — temporal burst set), and
+  `is_multi_source` (`'msrc'`) alongside the existing `is_alternates` /
+  `is_stereo_pair` / `is_equivalence` / `is_panorama` projections.
+
 - **HEIF region items** (ISO/IEC 23008-12:2025 §11.2 / §11.3). New
   `region` module: `RegionItem::parse` decodes a `'rgan'` region item's
   data (§11.3.2.2 — `version=0`, `(flags & 1)`-selected 16/32-bit
