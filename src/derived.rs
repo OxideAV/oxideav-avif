@@ -1742,6 +1742,120 @@ fn audit_one_iden(meta: &crate::meta::Meta, dimg: &BoxType, iden_id: u32) -> Ide
 }
 
 // ---------------------------------------------------------------------------
+// 'pred' brand file-constraint audit (HEIF §10.2.4)
+// ---------------------------------------------------------------------------
+
+/// Result of a `'pred'` brand file-constraint audit (HEIF §10.2.4.2).
+///
+/// The `'pred'` brand declares a file may contain *predictively coded
+/// image items* (image items with a decoding dependency on other coded
+/// image items, expressed through `'pred'` item references, §6.4.9). When
+/// the brand is claimed the file shall satisfy two `shall`s (§10.2.4.2):
+///
+/// 1. **Dependency closure** — for every predictively coded image item,
+///    the file shall also contain every item that item depends on (each
+///    `'pred'` target shall be an item present in `iinf`).
+/// 2. **mif1 primary independence** — if `'mif1'` is *also* among the
+///    compatible brands, the primary item shall be independently coded
+///    (it shall itself have no `'pred'` reference).
+///
+/// All flags are reported even when the file makes no `'pred'` claim, so a
+/// caller can distinguish "claims pred and fails" from "no pred claim".
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PredBrandCompliance {
+    /// `'pred'` is among the file's major/compatible brands.
+    pub claims_pred: bool,
+    /// `'mif1'` is among the compatible brands (gates the §10.2.4.2
+    /// primary-independence `shall`).
+    pub claims_mif1: bool,
+    /// Number of predictively coded image items found (items with at
+    /// least one outgoing `'pred'` reference).
+    pub predictive_item_count: usize,
+    /// `'pred'` targets that name an item id absent from `iinf` — each is
+    /// a §10.2.4.2 dependency-closure violation. Empty when closure holds.
+    pub missing_dependency_ids: Vec<u32>,
+    /// `true` when `'mif1'` is claimed yet the primary item carries a
+    /// `'pred'` reference (i.e. it is not independently coded) — a
+    /// §10.2.4.2 violation. `false` when not applicable or satisfied.
+    pub primary_not_independent: bool,
+}
+
+impl PredBrandCompliance {
+    /// `true` when every applicable §10.2.4.2 `shall` passes. Trivially
+    /// `true` when the file makes no `'pred'` claim.
+    pub fn is_compliant(&self) -> bool {
+        if !self.claims_pred {
+            return true;
+        }
+        self.missing_dependency_ids.is_empty() && !self.primary_not_independent
+    }
+
+    /// Human-readable list of failed `shall`s; empty when
+    /// [`Self::is_compliant`].
+    pub fn missing(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if !self.claims_pred {
+            return out;
+        }
+        if !self.missing_dependency_ids.is_empty() {
+            out.push("pred-dependency-closure");
+        }
+        if self.primary_not_independent {
+            out.push("mif1-primary-independent");
+        }
+        out
+    }
+}
+
+/// Audit a file's `'pred'` brand file-level constraints (HEIF §10.2.4.2)
+/// against `meta` and the file's `compatible_brands` (plus `major_brand`).
+///
+/// `brands` is the brand set to test against — pass the file's
+/// `major_brand` followed by its `compatible_brands` (the audit treats the
+/// whole set uniformly; §10.2.4.1 places `'pred'` in `compatible_brands`).
+/// The audit walks every image item, collects those with an outgoing
+/// `'pred'` reference, verifies each `'pred'` target is an item present in
+/// `iinf` (dependency closure), and — when `'mif1'` is also claimed —
+/// checks the primary item carries no `'pred'` reference.
+pub fn audit_pred_brand(meta: &crate::meta::Meta, brands: &[BoxType]) -> PredBrandCompliance {
+    let pred = b(b"pred");
+    let mif1 = b(b"mif1");
+    let pred_brand = b(b"pred");
+
+    let mut out = PredBrandCompliance {
+        claims_pred: brands.contains(&pred_brand),
+        claims_mif1: brands.contains(&mif1),
+        ..PredBrandCompliance::default()
+    };
+
+    // Set of item ids present in iinf — the dependency-closure check.
+    let present: std::collections::BTreeSet<u32> = meta.items.iter().map(|i| i.id).collect();
+
+    let mut missing: Vec<u32> = Vec::new();
+    for item in &meta.items {
+        let deps = meta.iref_targets_of(&pred, item.id);
+        if deps.is_empty() {
+            continue;
+        }
+        out.predictive_item_count += 1;
+        for dep in deps {
+            if !present.contains(&dep) && !missing.contains(&dep) {
+                missing.push(dep);
+            }
+        }
+    }
+    out.missing_dependency_ids = missing;
+
+    if out.claims_mif1 {
+        if let Some(primary) = meta.primary_item_id {
+            out.primary_not_independent = !meta.iref_targets_of(&pred, primary).is_empty();
+        }
+    }
+
+    out
+}
+
+// ---------------------------------------------------------------------------
 // AV1 Alpha Image Item bit-depth match audit (av1-avif v1.2.0 §4.1)
 // ---------------------------------------------------------------------------
 
@@ -7502,5 +7616,108 @@ mod tests {
                 }
             }
         }
+    }
+
+    // -----------------------------------------------------------------
+    // 'pred' brand file-constraint audit (HEIF §10.2.4)
+    // -----------------------------------------------------------------
+
+    /// No `'pred'` claim ⇒ trivially compliant regardless of content.
+    #[test]
+    fn pred_audit_no_claim_is_compliant() {
+        let meta = Meta {
+            items: vec![make_infe(1, b"av01", 0)],
+            ..Meta::default()
+        };
+        let c = audit_pred_brand(&meta, &[b(b"avif"), b(b"mif1")]);
+        assert!(!c.claims_pred);
+        assert!(c.is_compliant());
+        assert!(c.missing().is_empty());
+    }
+
+    /// A predictively coded item whose `'pred'` dependencies are all
+    /// present passes the §10.2.4.2 closure `shall`.
+    #[test]
+    fn pred_audit_closure_satisfied() {
+        let meta = Meta {
+            primary_item_id: Some(1),
+            items: vec![
+                make_infe(1, b"av01", 0), // primary, independently coded
+                make_infe(2, b"av01", 0), // P-frame item
+                make_infe(3, b"av01", 0), // its dependency
+            ],
+            irefs: vec![IrefEntry {
+                reference_type: *b"pred",
+                from_id: 2,
+                to_ids: vec![1, 3],
+            }],
+            ..Meta::default()
+        };
+        let c = audit_pred_brand(&meta, &[b(b"avif"), b(b"pred")]);
+        assert!(c.claims_pred);
+        assert_eq!(c.predictive_item_count, 1);
+        assert!(c.missing_dependency_ids.is_empty());
+        assert!(c.is_compliant());
+    }
+
+    /// A `'pred'` dependency naming an item absent from `iinf` is a
+    /// closure violation.
+    #[test]
+    fn pred_audit_missing_dependency_flagged() {
+        let meta = Meta {
+            primary_item_id: Some(1),
+            items: vec![make_infe(1, b"av01", 0), make_infe(2, b"av01", 0)],
+            irefs: vec![IrefEntry {
+                reference_type: *b"pred",
+                from_id: 2,
+                to_ids: vec![1, 99], // 99 not present
+            }],
+            ..Meta::default()
+        };
+        let c = audit_pred_brand(&meta, &[b(b"pred")]);
+        assert_eq!(c.missing_dependency_ids, vec![99]);
+        assert!(!c.is_compliant());
+        assert!(c.missing().contains(&"pred-dependency-closure"));
+    }
+
+    /// When `'mif1'` is also claimed, a primary item carrying a `'pred'`
+    /// reference (not independently coded) violates §10.2.4.2.
+    #[test]
+    fn pred_audit_mif1_primary_must_be_independent() {
+        let meta = Meta {
+            primary_item_id: Some(1),
+            items: vec![make_infe(1, b"av01", 0), make_infe(2, b"av01", 0)],
+            irefs: vec![IrefEntry {
+                reference_type: *b"pred",
+                from_id: 1, // primary is itself predictively coded
+                to_ids: vec![2],
+            }],
+            ..Meta::default()
+        };
+        let c = audit_pred_brand(&meta, &[b(b"mif1"), b(b"pred")]);
+        assert!(c.claims_mif1 && c.claims_pred);
+        assert!(c.primary_not_independent);
+        assert!(!c.is_compliant());
+        assert!(c.missing().contains(&"mif1-primary-independent"));
+    }
+
+    /// Without the `'mif1'` claim a predictively coded primary is allowed
+    /// (§10.2.4.2 NOTE), so only the closure `shall` applies.
+    #[test]
+    fn pred_audit_no_mif1_allows_predictive_primary() {
+        let meta = Meta {
+            primary_item_id: Some(1),
+            items: vec![make_infe(1, b"av01", 0), make_infe(2, b"av01", 0)],
+            irefs: vec![IrefEntry {
+                reference_type: *b"pred",
+                from_id: 1,
+                to_ids: vec![2],
+            }],
+            ..Meta::default()
+        };
+        let c = audit_pred_brand(&meta, &[b(b"pred")]);
+        assert!(!c.claims_mif1);
+        assert!(!c.primary_not_independent);
+        assert!(c.is_compliant());
     }
 }

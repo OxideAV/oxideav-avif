@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`'pred'` brand file-constraint audit** (HEIF §10.2.4.2).
+  `audit_pred_brand(meta, brands)` checks the two `shall`s a file claiming
+  the `'pred'` brand (predictively coded image items) must satisfy:
+  dependency closure (every `'pred'` reference target is an item present in
+  `iinf`) and — when `'mif1'` is also claimed — primary-item independence
+  (the primary shall carry no `'pred'` reference). Returns a
+  `PredBrandCompliance` with `claims_pred` / `claims_mif1` /
+  `predictive_item_count` / `missing_dependency_ids` /
+  `primary_not_independent` plus `is_compliant` / `missing` projections; a
+  file making no `'pred'` claim is trivially compliant. New re-exports:
+  `audit_pred_brand`, `PredBrandCompliance`. 5 new tests.
+
 - **Coded-item dependency roles** (HEIF §6.4.7 / §6.4.8 / §6.4.9).
   `inspect::coded_item_dependencies` classifies an image item from its
   *outgoing* item references into a `CodedItemDependencies` carrying the

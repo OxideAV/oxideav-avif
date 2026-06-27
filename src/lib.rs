@@ -122,15 +122,16 @@ pub use cicp::{
     primaries_name, transfer_name, CicpTriple,
 };
 pub use derived::{
-    audit_alpha_bit_depth, audit_avif_profile_compliance, audit_iden_derivations,
+    audit_alpha_bit_depth, audit_avif_profile_compliance, audit_iden_derivations, audit_pred_brand,
     audit_sequence_header_obu, audit_tone_map, build_derivation_graph,
     output_dims_from_reconstructed, parse_grpl, reconstructed_dims, resolve_grids,
     resolve_iden_derivations, resolve_overlays, resolve_tone_maps, transform_chain,
     AlphaBitDepthAudit, AvifProfile, AvifProfileCompliance, DerivationGraph, DerivationKind,
     DerivationNode, DimTransform, EntityGroup, GainMapChannel, GainMapMetadata, GainMapRational,
     GridResolution, GridTilePlacement, IdenCompliance, IdenResolution, ImageOverlay,
-    Mif1Compliance, OverlayEntry, OverlayPlacement, OverlayResolution, SampleTransform,
-    SequenceHeaderObuAudit, Token, ToneMapCompliance, ToneMapResolution, MAX_DERIVATION_DEPTH,
+    Mif1Compliance, OverlayEntry, OverlayPlacement, OverlayResolution, PredBrandCompliance,
+    SampleTransform, SequenceHeaderObuAudit, Token, ToneMapCompliance, ToneMapResolution,
+    MAX_DERIVATION_DEPTH,
 };
 pub use error::{AvifError, Result};
 pub use grid::{composite_grid, ImageGrid};
