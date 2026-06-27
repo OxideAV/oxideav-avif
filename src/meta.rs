@@ -121,6 +121,8 @@ const TXLO: BoxType = b(b"txlo");
 const ELNG: BoxType = b(b"elng");
 /// HEIF §6.10.4.1 — Font Characteristics descriptive property.
 const FNCH: BoxType = b(b"fnch");
+/// HEIF §11.2.2.2 — Mask Configuration descriptive property.
+const MSKC: BoxType = b(b"mskC");
 
 /// HEIF §6.6.2.2 — image overlay derived-image type.
 pub const ITEM_TYPE_IOVL: BoxType = b(b"iovl");
@@ -2010,6 +2012,52 @@ pub struct Fnch {
     pub font_weight: String,
 }
 
+/// Mask Configuration descriptive property (`mskC`) — HEIF §11.2.2.2.
+///
+/// Provides the information required to generate the mask of an associated
+/// mask item (`'mski'`, §11.2.2). Exactly one `MaskConfigurationProperty`
+/// is mandatory for every mask item, and `essential` shall be `1` for it
+/// (§11.2.2.2.1). The wire layout (§11.2.2.2.2) is an
+/// `ItemFullProperty('mskC', version=0, flags=0)` carrying a single
+/// `unsigned int(8) bits_per_pixel`.
+///
+/// Per §11.2.2 the `bits_per_pixel` value drives the mask-item byte
+/// packing: values `1` / `2` / `4` pack `8` / `4` / `2` pixels per byte
+/// in big-endian order (no per-line padding), while `8` / `16` / `24`
+/// represent the mask value of a pixel with `1` / `2` / `3` bytes
+/// (most-significant byte first). Other values are reserved.
+///
+/// Spec: ISO/IEC 23008-12 §11.2.2.2.2 — ItemFullProperty(`mskC`,
+/// version=0, flags=0).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MaskC {
+    /// Number of bits per mask pixel (§11.2.2.2.3). Defined values are
+    /// `1`, `2`, `4`, `8`, `16`, `24`; others are reserved.
+    pub bits_per_pixel: u8,
+}
+
+impl MaskC {
+    /// `true` when [`Self::bits_per_pixel`] is one of the six defined
+    /// values (`1` / `2` / `4` / `8` / `16` / `24`, §11.2.2.2.3).
+    pub fn is_defined_depth(&self) -> bool {
+        matches!(self.bits_per_pixel, 1 | 2 | 4 | 8 | 16 | 24)
+    }
+
+    /// Number of mask pixels packed per byte when
+    /// [`Self::bits_per_pixel`] is a sub-byte depth (`1` / `2` / `4` →
+    /// `8` / `4` / `2`, §11.2.2). Returns `None` for byte-or-wider depths
+    /// (`8` / `16` / `24`, where a pixel spans whole bytes) and for
+    /// reserved values.
+    pub fn pixels_per_byte(&self) -> Option<u8> {
+        match self.bits_per_pixel {
+            1 => Some(8),
+            2 => Some(4),
+            4 => Some(2),
+            _ => None,
+        }
+    }
+}
+
 /// Camera Extrinsic Matrix descriptive property (`cmex`) — HEIF
 /// §6.5.39.
 ///
@@ -2736,6 +2784,8 @@ pub enum Property {
     Elng(Elng),
     /// `fnch` — Font Characteristics descriptive property (HEIF §6.10.4.1).
     Fnch(Fnch),
+    /// `mskC` — Mask Configuration descriptive property (HEIF §11.2.2.2).
+    MaskC(MaskC),
     /// Camera-extrinsic-matrix descriptive property (HEIF §6.5.39).
     Cmex(Cmex),
     /// Camera-intrinsic-matrix descriptive property (HEIF §6.5.40).
@@ -2788,6 +2838,7 @@ impl Property {
             Property::Txlo(_) => TXLO,
             Property::Elng(_) => ELNG,
             Property::Fnch(_) => FNCH,
+            Property::MaskC(_) => MSKC,
             Property::Cmex(_) => CMEX,
             Property::Cmin(_) => CMIN,
             Property::Other(t, _) => *t,
@@ -3332,6 +3383,7 @@ fn parse_ipco(payload: &[u8]) -> Result<Vec<Property>> {
             x if x == &TXLO => Property::Txlo(parse_txlo(body)?),
             x if x == &ELNG => Property::Elng(parse_elng(body)?),
             x if x == &FNCH => Property::Fnch(parse_fnch(body)?),
+            x if x == &MSKC => Property::MaskC(parse_mskc(body)?),
             x if x == &CMEX => Property::Cmex(parse_cmex(body)?),
             x if x == &CMIN => Property::Cmin(parse_cmin(body)?),
             other => Property::Other(*other, body.to_vec()),
@@ -4470,6 +4522,20 @@ fn parse_fnch(body: &[u8]) -> Result<Fnch> {
         font_style,
         font_weight,
     })
+}
+
+/// Parse `mskC` (MaskConfigurationProperty — HEIF §11.2.2.2).
+/// `ItemFullProperty('mskC', version=0, flags=0)` carrying a single
+/// `unsigned int(8) bits_per_pixel` (§11.2.2.2.2).
+fn parse_mskc(body: &[u8]) -> Result<MaskC> {
+    let (version, _flags, rest) = parse_full_box(body)?;
+    if version != 0 {
+        return Err(Error::invalid(format!("avif: mskC version {version} != 0")));
+    }
+    let bits_per_pixel = *rest
+        .first()
+        .ok_or_else(|| Error::invalid("avif: mskC missing bits_per_pixel"))?;
+    Ok(MaskC { bits_per_pixel })
 }
 
 /// Parse `cmex` (CameraExtrinsicMatrixProperty — HEIF §6.5.39).
@@ -9341,6 +9407,80 @@ mod tests {
         let mut body = vec![0u8, 0, 0, 0];
         body.extend_from_slice(b"Arial");
         assert!(parse_fnch(&body).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // HEIF §11.2.2.2 MaskConfigurationProperty (`mskC`)
+    // -----------------------------------------------------------------
+
+    fn mskc_body(version: u8, bits_per_pixel: u8) -> Vec<u8> {
+        vec![version, 0, 0, 0, bits_per_pixel]
+    }
+
+    #[test]
+    fn mskc_parses_bits_per_pixel_and_dispatches() {
+        for bpp in [1u8, 2, 4, 8, 16, 24] {
+            let body = mskc_body(0, bpp);
+            let m = parse_mskc(&body).unwrap();
+            assert_eq!(m.bits_per_pixel, bpp);
+            assert!(m.is_defined_depth());
+        }
+        // dispatch through parse_ipco
+        let body = mskc_body(0, 4);
+        let mut ipco = Vec::new();
+        let s = 8 + body.len() as u32;
+        ipco.extend_from_slice(&s.to_be_bytes());
+        ipco.extend_from_slice(b"mskC");
+        ipco.extend_from_slice(&body);
+        let props = parse_ipco(&ipco).unwrap();
+        match &props[0] {
+            Property::MaskC(m) => assert_eq!(m.bits_per_pixel, 4),
+            other => panic!("expected MaskC, got {other:?}"),
+        }
+        assert_eq!(props[0].kind(), *b"mskC");
+    }
+
+    /// Sub-byte depths pack multiple pixels per byte (§11.2.2); byte-wide
+    /// and reserved depths report `None`.
+    #[test]
+    fn mskc_pixels_per_byte_mapping() {
+        assert_eq!(
+            parse_mskc(&mskc_body(0, 1)).unwrap().pixels_per_byte(),
+            Some(8)
+        );
+        assert_eq!(
+            parse_mskc(&mskc_body(0, 2)).unwrap().pixels_per_byte(),
+            Some(4)
+        );
+        assert_eq!(
+            parse_mskc(&mskc_body(0, 4)).unwrap().pixels_per_byte(),
+            Some(2)
+        );
+        assert_eq!(
+            parse_mskc(&mskc_body(0, 8)).unwrap().pixels_per_byte(),
+            None
+        );
+        assert_eq!(
+            parse_mskc(&mskc_body(0, 24)).unwrap().pixels_per_byte(),
+            None
+        );
+    }
+
+    /// A reserved (non-{1,2,4,8,16,24}) depth still parses verbatim but is
+    /// flagged by `is_defined_depth`.
+    #[test]
+    fn mskc_reserved_depth_round_trips_but_flagged() {
+        let m = parse_mskc(&mskc_body(0, 3)).unwrap();
+        assert_eq!(m.bits_per_pixel, 3);
+        assert!(!m.is_defined_depth());
+        assert_eq!(m.pixels_per_byte(), None);
+    }
+
+    #[test]
+    fn mskc_rejects_unknown_version_and_truncation() {
+        assert!(parse_mskc(&mskc_body(1, 8)).is_err());
+        // header only, no bits_per_pixel byte
+        assert!(parse_mskc(&[0u8, 0, 0, 0]).is_err());
     }
 
     // -----------------------------------------------------------------

@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **HEIF region items** (ISO/IEC 23008-12:2025 §11.2 / §11.3). New
+  `region` module: `RegionItem::parse` decodes a `'rgan'` region item's
+  data (§11.3.2.2 — `version=0`, `(flags & 1)`-selected 16/32-bit
+  `reference_*` and per-geometry fields, `region_count`) into a typed
+  `RegionItem` whose `regions` are `RegionGeometry` variants covering all
+  seven §11.2.1 geometry types: `Point` (0), `Rectangle` (1), `Ellipse`
+  (2), `Polygon` (3), `ReferencedMask` (4, `mask_ref_idx` present only for
+  region tracks — absent in a region item), `InlineMask` (5, with
+  `mask_coding_method` / `mask_coding_parameters` and the trailing coded
+  bit `data`), and `Polyline` (6). Signed coordinates are sign-extended
+  across the selected field width; an unknown `version` or reserved
+  `geometry_type` is rejected. `inspect::region_items` (primary item) and
+  `region_items_for` (any image item) walk the `'cdsc'` iref binding a
+  region item to the image it annotates (§11.3.1), filter to `'rgan'`
+  sources, resolve each one's data through the full
+  construction-method-aware `iloc` path, and return `ResolvedRegionItem`
+  records `{ region_item_id, image_item_id, region }`. The companion
+  Mask Configuration property `'mskC'` (§11.2.2.2) is parsed into a typed
+  `MaskC { bits_per_pixel }` `Property` variant with `is_defined_depth` /
+  `pixels_per_byte` helpers (§11.2.2 byte packing). Derived region items
+  (`'drgn'`, §11.3.3) are deferred. 18 new tests. New re-exports:
+  `region` module, `RegionItem`, `RegionGeometry`, `ITEM_TYPE_RGAN`,
+  `ITEM_TYPE_MSKI`, `MaskC`, `region_items`, `region_items_for`,
+  `ResolvedRegionItem`.
+
 - **Four new HEIF item properties** (ISO/IEC 23008-12:2025 3rd ed.): the
   Single Stream property `'sstr'` (§6.5.38 — bare `ItemProperty` marker
   signalling that a derived image item's input items collectively form a

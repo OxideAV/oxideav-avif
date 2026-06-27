@@ -699,6 +699,76 @@ pub fn item_payload_bytes(file: &[u8], item_id: u32) -> Result<Vec<u8>> {
     crate::parser::item_bytes_owned_full(file, &hdr.meta, item_id)
 }
 
+/// A region item (`'rgan'`) resolved against an AVIF file, paired with the
+/// image item it annotates (HEIF §11.3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedRegionItem {
+    /// Item id of the `'rgan'` region item itself.
+    pub region_item_id: u32,
+    /// Item id of the image item this region item describes (the `'cdsc'`
+    /// iref target).
+    pub image_item_id: u32,
+    /// The parsed region-item data.
+    pub region: crate::region::RegionItem,
+}
+
+/// Enumerate the region items (`item_type == 'rgan'`, HEIF §11.3.2) that
+/// describe `image_item_id`, parsing each one's data.
+///
+/// A region item is linked to the image item it annotates by a `'cdsc'`
+/// (content-describes) item reference **from** the region item **to** the
+/// image item (§11.3.1). This walks every `'cdsc'` source of
+/// `image_item_id`, keeps those whose `infe` `item_type` is `'rgan'`,
+/// resolves each one's data through the full construction-method-aware
+/// `iloc` path, and parses it into a [`crate::region::RegionItem`]
+/// (§11.2.1 geometries). Items are returned in `iref`-source order; a
+/// region item that fails to resolve or parse is propagated as an `Err`.
+///
+/// Derived region items (`'drgn'`, §11.3.3) are out of scope here — they
+/// reference *region* items rather than carrying geometry data directly,
+/// and require applying the derivation operation; this enumerates the
+/// directly-parseable `'rgan'` region items.
+pub fn region_items_for(file: &[u8], image_item_id: u32) -> Result<Vec<ResolvedRegionItem>> {
+    let hdr = parse_header(file)?;
+    region_items_for_meta(file, &hdr.meta, image_item_id)
+}
+
+/// Enumerate the region items describing the file's **primary item**
+/// (resolved via `pitm`). See [`region_items_for`].
+pub fn region_items(file: &[u8]) -> Result<Vec<ResolvedRegionItem>> {
+    let hdr = parse_header(file)?;
+    let primary = hdr
+        .meta
+        .primary_item_id
+        .ok_or_else(|| crate::error::AvifError::invalid("avif: no primary item (pitm)"))?;
+    region_items_for_meta(file, &hdr.meta, primary)
+}
+
+fn region_items_for_meta(
+    file: &[u8],
+    meta: &Meta,
+    image_item_id: u32,
+) -> Result<Vec<ResolvedRegionItem>> {
+    const CDSC: BoxType = b(b"cdsc");
+    let mut out = Vec::new();
+    for src in meta.iref_sources_of(&CDSC, image_item_id) {
+        let Some(info) = meta.item_by_id(src) else {
+            continue;
+        };
+        if info.item_type != crate::region::ITEM_TYPE_RGAN {
+            continue;
+        }
+        let bytes = crate::parser::item_bytes_owned_full(file, meta, src)?;
+        let region = crate::region::RegionItem::parse(&bytes)?;
+        out.push(ResolvedRegionItem {
+            region_item_id: src,
+            image_item_id,
+            region,
+        });
+    }
+    Ok(out)
+}
+
 /// Walk the `'dimg'` derivation graph rooted at the file's **primary item**
 /// and return the decode-free dependency plan (HEIF §6.6). See
 /// [`crate::derived::DerivationGraph`].
@@ -1686,5 +1756,121 @@ mod tests {
             }
             other => panic!("expected InvalidData on unknown item id, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Region items (HEIF §11.3) — region_items_for_meta
+    // -----------------------------------------------------------------
+
+    use crate::meta::{IlocExtent, ItemLocation};
+    use crate::region::RegionGeometry;
+
+    /// Build a minimal 16-bit-field region-item payload with a single
+    /// rectangle, suitable for stuffing into `idat`.
+    fn one_rect_region_payload() -> Vec<u8> {
+        let mut buf = vec![0u8, 0]; // version=0, flags=0 (16-bit fields)
+        buf.extend_from_slice(&100u16.to_be_bytes()); // reference_width
+        buf.extend_from_slice(&80u16.to_be_bytes()); // reference_height
+        buf.push(1); // region_count
+        buf.push(1); // geometry_type 1 (rectangle)
+        buf.extend_from_slice(&10i16.to_be_bytes());
+        buf.extend_from_slice(&12i16.to_be_bytes());
+        buf.extend_from_slice(&30u16.to_be_bytes());
+        buf.extend_from_slice(&40u16.to_be_bytes());
+        buf
+    }
+
+    /// A `'rgan'` region item linked via `cdsc` to the primary, with its
+    /// data stored in `idat` (construction_method 1), resolves and parses
+    /// into a `ResolvedRegionItem` carrying the rectangle geometry.
+    #[test]
+    fn region_items_resolves_idat_backed_rgan() {
+        let payload = one_rect_region_payload();
+        let meta = Meta {
+            items: vec![make_item(2, b"rgan")],
+            irefs: vec![IrefEntry {
+                reference_type: *b"cdsc",
+                from_id: 2,
+                to_ids: vec![1],
+            }],
+            locations: vec![ItemLocation {
+                id: 2,
+                construction_method: 1, // idat
+                data_reference_index: 0,
+                base_offset: 0,
+                extents: vec![IlocExtent {
+                    offset: 0,
+                    length: payload.len() as u64,
+                    extent_index: 0,
+                }],
+            }],
+            idat: Some(payload),
+            ..Meta::default()
+        };
+        // file bytes are irrelevant for an idat-backed item.
+        let items = region_items_for_meta(&[], &meta, 1).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].region_item_id, 2);
+        assert_eq!(items[0].image_item_id, 1);
+        assert_eq!(items[0].region.reference_width, 100);
+        assert_eq!(items[0].region.region_count(), 1);
+        assert_eq!(
+            items[0].region.regions[0],
+            RegionGeometry::Rectangle {
+                x: 10,
+                y: 12,
+                width: 30,
+                height: 40,
+            }
+        );
+    }
+
+    /// A `cdsc` source that is NOT a region item (e.g. an Exif metadata
+    /// item) is skipped by the region-item walker even though it shares
+    /// the `cdsc` binding.
+    #[test]
+    fn region_items_skips_non_rgan_cdsc_sources() {
+        let meta = Meta {
+            items: vec![make_item(2, b"Exif")],
+            irefs: vec![IrefEntry {
+                reference_type: *b"cdsc",
+                from_id: 2,
+                to_ids: vec![1],
+            }],
+            ..Meta::default()
+        };
+        let items = region_items_for_meta(&[], &meta, 1).unwrap();
+        assert!(items.is_empty());
+    }
+
+    /// Region items are target-scoped: a `'rgan'` describing item 5 does
+    /// not surface when querying item 1.
+    #[test]
+    fn region_items_are_target_scoped() {
+        let payload = one_rect_region_payload();
+        let plen = payload.len() as u64;
+        let meta = Meta {
+            items: vec![make_item(2, b"rgan")],
+            irefs: vec![IrefEntry {
+                reference_type: *b"cdsc",
+                from_id: 2,
+                to_ids: vec![5],
+            }],
+            locations: vec![ItemLocation {
+                id: 2,
+                construction_method: 1,
+                data_reference_index: 0,
+                base_offset: 0,
+                extents: vec![IlocExtent {
+                    offset: 0,
+                    length: plen,
+                    extent_index: 0,
+                }],
+            }],
+            idat: Some(payload),
+            ..Meta::default()
+        };
+        assert!(region_items_for_meta(&[], &meta, 1).unwrap().is_empty());
+        assert_eq!(region_items_for_meta(&[], &meta, 5).unwrap().len(), 1);
     }
 }
