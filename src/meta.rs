@@ -109,10 +109,18 @@ const STPE: BoxType = b(b"stpe");
 const SSLD: BoxType = b(b"ssld");
 /// HEIF §6.5.37 — Progressive Derived Image Item Information descriptive property.
 const PRDI: BoxType = b(b"prdi");
+/// HEIF §6.5.38 — Single Stream descriptive property.
+const SSTR: BoxType = b(b"sstr");
 /// HEIF §6.5.39 — Camera Extrinsic Matrix descriptive property.
 const CMEX: BoxType = b(b"cmex");
 /// HEIF §6.5.40 — Camera Intrinsic Matrix descriptive property.
 const CMIN: BoxType = b(b"cmin");
+/// HEIF §6.10.2.1 — Text Layout descriptive property.
+const TXLO: BoxType = b(b"txlo");
+/// HEIF §6.10.2.2 — Extended Language descriptive property.
+const ELNG: BoxType = b(b"elng");
+/// HEIF §6.10.4.1 — Font Characteristics descriptive property.
+const FNCH: BoxType = b(b"fnch");
 
 /// HEIF §6.6.2.2 — image overlay derived-image type.
 pub const ITEM_TYPE_IOVL: BoxType = b(b"iovl");
@@ -1854,6 +1862,154 @@ impl Prdi {
     }
 }
 
+/// Single Stream descriptive property (`sstr`) — HEIF §6.5.38.
+///
+/// When associated with a derived image item, the `SingleStreamProperty`
+/// indicates that the item data of the input image items collectively
+/// form a single bitstream that is conformant to the coding format of the
+/// input image items and is decodable with a single decoder (§6.5.38.1).
+/// The input image items are concatenated in the order they are listed in
+/// the derived item's `'dimg'` item reference to form the *derived
+/// bitstream*, which conforms to the item type and decoder-configuration
+/// item property of the **last** input image item.
+///
+/// The box carries no payload — it is the bare `ItemProperty('sstr')`
+/// marker (§6.5.38.2), so its presence is the entire semantic. Quantity
+/// per item is zero-or-one for a derived image item. This is a
+/// *descriptive* property (it does not transform the reconstructed
+/// representation).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Sstr;
+
+/// Text Layout descriptive property (`txlo`) — HEIF §6.10.2.1.
+///
+/// Documents parameters to render the payload of an associated text item
+/// into a reference space, following the §6.10.2.1.1 layout algorithm: a
+/// 2D coordinate system with origin `(0, 0)` at the top-left and a maximum
+/// size of `reference_width` × `reference_height`, within which the text
+/// is laid out starting at `(x, y)` using `direction` / `writing_mode` /
+/// `font_size`. When this property is associated with a text item it shall
+/// precede any transformative property.
+///
+/// The wire layout (§6.10.2.1.2) is an `ItemFullProperty('txlo',
+/// version = 0, flags)` with a `(flags & 1)`-selected field size:
+///
+/// ```text
+/// field_size = ((flags & 1) + 1) * 16;   // 16 or 32 bits
+/// unsigned int(field_size) reference_width;
+/// unsigned int(field_size) reference_height;
+/// signed   int(field_size) x;
+/// signed   int(field_size) y;
+/// unsigned int(field_size) width;
+/// unsigned int(field_size) height;
+/// unsigned int(16)         font_size;     // 8.8 fixed-point percentage
+/// utf8string               direction;
+/// utf8string               writing_mode;
+/// ```
+///
+/// `(flags & 1) == 0` selects 16-bit `reference_*` / `x` / `y` / `width` /
+/// `height` fields; `(flags & 1) == 1` selects 32-bit. Values of `flags`
+/// greater than `1` are reserved. `font_size` is an 8.8 representation of
+/// the desired font size as a percentage of `reference_height`.
+/// `direction` / `writing_mode` are valid W3C TTML2 `tts:direction` /
+/// `tts:writingMode` attribute values (the spec defers their grammar to
+/// TTML2, so they are surfaced verbatim).
+///
+/// Spec: ISO/IEC 23008-12 §6.10.2.1.2 — ItemFullProperty(`txlo`,
+/// version=0, flags).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Txlo {
+    /// The full 24-bit `flags` field. Only bit 0 (the field-size
+    /// selector) is defined; the whole value is retained so a future
+    /// reserved bit round-trips. [`Self::is_large_field_size`] projects
+    /// bit 0.
+    pub flags: u32,
+    /// Width, in pixels, of the reference space (§6.10.2.1.3).
+    pub reference_width: u32,
+    /// Height, in pixels, of the reference space (§6.10.2.1.3).
+    pub reference_height: u32,
+    /// Start x position to render the text (§6.10.2.1.3); may be negative
+    /// to place a top-left corner outside the image.
+    pub x: i32,
+    /// Start y position to render the text (§6.10.2.1.3); may be negative.
+    pub y: i32,
+    /// Width, in pixels, of the text content resulting from the text item.
+    pub width: u32,
+    /// Height, in pixels, of the text content resulting from the text item.
+    pub height: u32,
+    /// 8.8 fixed-point font size as a percentage of `reference_height`.
+    /// Use [`Self::font_size_percent`] for the decoded floating value.
+    pub font_size: u16,
+    /// W3C TTML2 `tts:direction` value (e.g. `"ltr"`, `"rtl"`), verbatim.
+    pub direction: String,
+    /// W3C TTML2 `tts:writingMode` value (e.g. `"lrtb"`), verbatim.
+    pub writing_mode: String,
+}
+
+impl Txlo {
+    /// §6.10.2.1.2 `flags` bit 0 — when set the `reference_*` / `x` / `y` /
+    /// `width` / `height` fields are 32-bit (else 16-bit).
+    pub const FLAG_LARGE_FIELD_SIZE: u32 = 0x0000_0001;
+
+    /// True when the 32-bit field-size selector (`flags & 1`) is set.
+    pub fn is_large_field_size(&self) -> bool {
+        self.flags & Self::FLAG_LARGE_FIELD_SIZE != 0
+    }
+
+    /// The decoded `font_size` as a percentage of `reference_height`
+    /// (8.8 fixed-point → floating, §6.10.2.1.3).
+    pub fn font_size_percent(&self) -> f64 {
+        f64::from(self.font_size) / 256.0
+    }
+}
+
+/// Extended Language descriptive property (`elng`) — HEIF §6.10.2.2.
+///
+/// Has the same syntax and semantics as the `ExtendedLanguageBox` defined
+/// in ISO/IEC 14496-12 but applies to items: it carries the language
+/// information of the associated item (§6.10.2.2.1). The wire layout is an
+/// `ItemFullProperty('elng', version=0, flags=0)` followed by a single
+/// `utf8string extended_language` (an RFC 5646 / BCP 47 language tag).
+///
+/// Spec: ISO/IEC 23008-12 §6.10.2.2 (carrying ISO/IEC 14496-12 §8.4.6
+/// ExtendedLanguageBox semantics).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Elng {
+    /// RFC 5646 / BCP 47 language tag for the associated item. An empty
+    /// string is the documented "unspecified" shape.
+    pub extended_language: String,
+}
+
+/// Font Characteristics descriptive property (`fnch`) — HEIF §6.10.4.1.
+///
+/// Documents parameters for the font-selection algorithm used when
+/// rendering a text item (§6.10.4.1.1). It is mandatory (exactly one) for
+/// a font item and absent otherwise. The wire layout (§6.10.4.1.2) is an
+/// `ItemFullProperty('fnch', version=0, flags=0)` followed by three
+/// `utf8string` fields:
+///
+/// ```text
+/// utf8string font_family;   // e.g. "Arial", "Helvetica"
+/// utf8string font_style;    // W3C TTML2 tts:fontStyle  (e.g. "normal", "italic")
+/// utf8string font_weight;   // W3C TTML2 tts:fontWeight (e.g. "normal", "bold")
+/// ```
+///
+/// `font_style` / `font_weight` are valid W3C TTML2 `tts:fontStyle` /
+/// `tts:fontWeight` attribute values; their grammar is deferred to TTML2
+/// so they are surfaced verbatim.
+///
+/// Spec: ISO/IEC 23008-12 §6.10.4.1.2 — ItemFullProperty(`fnch`,
+/// version=0, flags=0).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Fnch {
+    /// Single font-family name (e.g. `"Arial"`, `"Helvetica"`).
+    pub font_family: String,
+    /// W3C TTML2 `tts:fontStyle` value (e.g. `"normal"`, `"italic"`).
+    pub font_style: String,
+    /// W3C TTML2 `tts:fontWeight` value (e.g. `"normal"`, `"bold"`).
+    pub font_weight: String,
+}
+
 /// Camera Extrinsic Matrix descriptive property (`cmex`) — HEIF
 /// §6.5.39.
 ///
@@ -2572,6 +2728,14 @@ pub enum Property {
     /// Progressive-derived-image-item-information descriptive property
     /// (HEIF §6.5.37).
     Prdi(Prdi),
+    /// `sstr` — Single Stream descriptive property (HEIF §6.5.38).
+    Sstr(Sstr),
+    /// `txlo` — Text Layout descriptive property (HEIF §6.10.2.1).
+    Txlo(Txlo),
+    /// `elng` — Extended Language descriptive property (HEIF §6.10.2.2).
+    Elng(Elng),
+    /// `fnch` — Font Characteristics descriptive property (HEIF §6.10.4.1).
+    Fnch(Fnch),
     /// Camera-extrinsic-matrix descriptive property (HEIF §6.5.39).
     Cmex(Cmex),
     /// Camera-intrinsic-matrix descriptive property (HEIF §6.5.40).
@@ -2620,6 +2784,10 @@ impl Property {
             Property::Stpe(_) => STPE,
             Property::Ssld(_) => SSLD,
             Property::Prdi(_) => PRDI,
+            Property::Sstr(_) => SSTR,
+            Property::Txlo(_) => TXLO,
+            Property::Elng(_) => ELNG,
+            Property::Fnch(_) => FNCH,
             Property::Cmex(_) => CMEX,
             Property::Cmin(_) => CMIN,
             Property::Other(t, _) => *t,
@@ -3160,6 +3328,10 @@ fn parse_ipco(payload: &[u8]) -> Result<Vec<Property>> {
             x if x == &STPE => Property::Stpe(parse_stpe(body)?),
             x if x == &SSLD => Property::Ssld(parse_ssld(body)?),
             x if x == &PRDI => Property::Prdi(parse_prdi(body)?),
+            x if x == &SSTR => Property::Sstr(parse_sstr(body)?),
+            x if x == &TXLO => Property::Txlo(parse_txlo(body)?),
+            x if x == &ELNG => Property::Elng(parse_elng(body)?),
+            x if x == &FNCH => Property::Fnch(parse_fnch(body)?),
             x if x == &CMEX => Property::Cmex(parse_cmex(body)?),
             x if x == &CMIN => Property::Cmin(parse_cmin(body)?),
             other => Property::Other(*other, body.to_vec()),
@@ -4182,6 +4354,121 @@ fn parse_prdi(body: &[u8]) -> Result<Prdi> {
         flags,
         step_count,
         item_counts,
+    })
+}
+
+/// Parse `sstr` (SingleStreamProperty — HEIF §6.5.38). The box is the
+/// bare `ItemProperty('sstr')` with no payload (§6.5.38.2), so its mere
+/// presence is the whole semantic. Any trailing bytes are tolerated for
+/// forward compatibility (a future revision could add fields).
+fn parse_sstr(_body: &[u8]) -> Result<Sstr> {
+    Ok(Sstr)
+}
+
+/// Parse `txlo` (TextLayoutProperty — HEIF §6.10.2.1).
+/// `ItemFullProperty('txlo', version=0, flags)` with a `(flags & 1)`
+/// field-size selector (§6.10.2.1.2):
+///
+/// ```text
+/// field_size = ((flags & 1) + 1) * 16;   // 16 or 32 bits
+/// unsigned int(field_size) reference_width;
+/// unsigned int(field_size) reference_height;
+/// signed   int(field_size) x;
+/// signed   int(field_size) y;
+/// unsigned int(field_size) width;
+/// unsigned int(field_size) height;
+/// unsigned int(16)         font_size;
+/// utf8string               direction;
+/// utf8string               writing_mode;
+/// ```
+fn parse_txlo(body: &[u8]) -> Result<Txlo> {
+    let (version, flags, rest) = parse_full_box(body)?;
+    if version != 0 {
+        return Err(Error::invalid(format!("avif: txlo version {version} != 0")));
+    }
+    let large = flags & Txlo::FLAG_LARGE_FIELD_SIZE != 0;
+    let mut off = 0usize;
+    let reference_width = read_txlo_u(rest, &mut off, large)?;
+    let reference_height = read_txlo_u(rest, &mut off, large)?;
+    let x = read_txlo_i(rest, &mut off, large)?;
+    let y = read_txlo_i(rest, &mut off, large)?;
+    let width = read_txlo_u(rest, &mut off, large)?;
+    let height = read_txlo_u(rest, &mut off, large)?;
+    let font_size = read_u16(rest, off)?;
+    off += 2;
+    let (direction, after_dir) = read_cstr(rest, off)?;
+    let (writing_mode, _after_wm) = read_cstr(rest, after_dir)?;
+    Ok(Txlo {
+        flags,
+        reference_width,
+        reference_height,
+        x,
+        y,
+        width,
+        height,
+        font_size,
+        direction,
+        writing_mode,
+    })
+}
+
+/// Read a `txlo` variable-width **unsigned** field (16- or 32-bit per the
+/// `large` selector), advancing `*off` past it.
+fn read_txlo_u(buf: &[u8], off: &mut usize, large: bool) -> Result<u32> {
+    if large {
+        let v = read_u32(buf, *off)?;
+        *off += 4;
+        Ok(v)
+    } else {
+        let v = read_u16(buf, *off)?;
+        *off += 2;
+        Ok(u32::from(v))
+    }
+}
+
+/// Read a `txlo` variable-width **signed** field (16- or 32-bit per the
+/// `large` selector), sign-extending to `i32` and advancing `*off`.
+fn read_txlo_i(buf: &[u8], off: &mut usize, large: bool) -> Result<i32> {
+    if large {
+        let v = read_u32(buf, *off)? as i32;
+        *off += 4;
+        Ok(v)
+    } else {
+        let v = read_u16(buf, *off)? as i16 as i32;
+        *off += 2;
+        Ok(v)
+    }
+}
+
+/// Parse `elng` (ExtendedLanguageProperty — HEIF §6.10.2.2).
+/// `ItemFullProperty('elng', version=0, flags=0)` followed by a single
+/// `utf8string extended_language` (carrying ISO/IEC 14496-12 §8.4.6
+/// ExtendedLanguageBox semantics applied to an item).
+fn parse_elng(body: &[u8]) -> Result<Elng> {
+    let (version, _flags, rest) = parse_full_box(body)?;
+    if version != 0 {
+        return Err(Error::invalid(format!("avif: elng version {version} != 0")));
+    }
+    let (extended_language, _after) = read_cstr(rest, 0)?;
+    Ok(Elng { extended_language })
+}
+
+/// Parse `fnch` (FontCharacteristicsProperty — HEIF §6.10.4.1).
+/// `ItemFullProperty('fnch', version=0, flags=0)` followed by three
+/// `utf8string` fields: `font_family`, `font_style`, `font_weight`
+/// (§6.10.4.1.2).
+fn parse_fnch(body: &[u8]) -> Result<Fnch> {
+    let (version, _flags, rest) = parse_full_box(body)?;
+    if version != 0 {
+        return Err(Error::invalid(format!("avif: fnch version {version} != 0")));
+    }
+    let (font_family, after_family) = read_cstr(rest, 0)?;
+    let (font_style, after_style) = read_cstr(rest, after_family)?;
+    let (font_weight, _after_weight) = read_cstr(rest, after_style)?;
+    Ok(Fnch {
+        font_family,
+        font_style,
+        font_weight,
     })
 }
 
@@ -8812,6 +9099,248 @@ mod tests {
             other => panic!("expected Prdi, got {other:?}"),
         }
         assert!(m.property_for(99, b"prdi").is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // HEIF §6.5.38 SingleStreamProperty (`sstr`)
+    // -----------------------------------------------------------------
+
+    /// `sstr` is the bare `ItemProperty('sstr')` marker (§6.5.38.2): an
+    /// empty body parses, dispatches through `parse_ipco`, and reports
+    /// the `'sstr'` kind.
+    #[test]
+    fn sstr_empty_body_parses_and_dispatches() {
+        assert_eq!(parse_sstr(&[]).unwrap(), Sstr);
+        let mut ipco = Vec::new();
+        ipco.extend_from_slice(&8u32.to_be_bytes());
+        ipco.extend_from_slice(b"sstr");
+        let props = parse_ipco(&ipco).unwrap();
+        assert_eq!(props.len(), 1);
+        assert!(matches!(props[0], Property::Sstr(_)));
+        assert_eq!(props[0].kind(), *b"sstr");
+    }
+
+    /// Trailing bytes past the empty marker are forward-compat space and
+    /// are tolerated.
+    #[test]
+    fn sstr_tolerates_trailing_bytes() {
+        assert_eq!(parse_sstr(&[0xDE, 0xAD]).unwrap(), Sstr);
+    }
+
+    // -----------------------------------------------------------------
+    // HEIF §6.10.2.1 TextLayoutProperty (`txlo`)
+    // -----------------------------------------------------------------
+
+    /// Build a `txlo` body — FullBox('txlo', version=0, flags), then the
+    /// `(flags & 1)`-selected field-size block followed by `font_size`
+    /// and the two NUL-terminated utf8strings (§6.10.2.1.2).
+    #[allow(clippy::too_many_arguments)]
+    fn txlo_body(
+        flags: u32,
+        reference_width: u32,
+        reference_height: u32,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        font_size: u16,
+        direction: &str,
+        writing_mode: &str,
+    ) -> Vec<u8> {
+        let mut buf = vec![0u8, (flags >> 16) as u8, (flags >> 8) as u8, flags as u8];
+        let large = flags & Txlo::FLAG_LARGE_FIELD_SIZE != 0;
+        let push_u = |buf: &mut Vec<u8>, v: u32| {
+            if large {
+                buf.extend_from_slice(&v.to_be_bytes());
+            } else {
+                buf.extend_from_slice(&(v as u16).to_be_bytes());
+            }
+        };
+        let push_i = |buf: &mut Vec<u8>, v: i32| {
+            if large {
+                buf.extend_from_slice(&v.to_be_bytes());
+            } else {
+                buf.extend_from_slice(&(v as i16).to_be_bytes());
+            }
+        };
+        push_u(&mut buf, reference_width);
+        push_u(&mut buf, reference_height);
+        push_i(&mut buf, x);
+        push_i(&mut buf, y);
+        push_u(&mut buf, width);
+        push_u(&mut buf, height);
+        buf.extend_from_slice(&font_size.to_be_bytes());
+        buf.extend_from_slice(direction.as_bytes());
+        buf.push(0);
+        buf.extend_from_slice(writing_mode.as_bytes());
+        buf.push(0);
+        buf
+    }
+
+    /// 16-bit field-size form (`flags & 1 == 0`): all six geometry fields
+    /// are read as 16-bit, with `x`/`y` sign-extended.
+    #[test]
+    fn txlo_16bit_fields_parse() {
+        let body = txlo_body(0, 1920, 1080, -5, -3, 640, 480, 0x0A00, "ltr", "lrtb");
+        let t = parse_txlo(&body).unwrap();
+        assert!(!t.is_large_field_size());
+        assert_eq!(t.reference_width, 1920);
+        assert_eq!(t.reference_height, 1080);
+        assert_eq!(t.x, -5);
+        assert_eq!(t.y, -3);
+        assert_eq!(t.width, 640);
+        assert_eq!(t.height, 480);
+        assert_eq!(t.font_size, 0x0A00);
+        assert_eq!(t.font_size_percent(), 10.0);
+        assert_eq!(t.direction, "ltr");
+        assert_eq!(t.writing_mode, "lrtb");
+    }
+
+    /// 32-bit field-size form (`flags & 1 == 1`): geometry fields exceed
+    /// the 16-bit range and negative `x`/`y` sign-extend across 32 bits.
+    #[test]
+    fn txlo_32bit_fields_parse() {
+        let body = txlo_body(1, 70000, 80000, -100000, 42, 65536, 1, 256, "rtl", "tblr");
+        let t = parse_txlo(&body).unwrap();
+        assert!(t.is_large_field_size());
+        assert_eq!(t.reference_width, 70000);
+        assert_eq!(t.reference_height, 80000);
+        assert_eq!(t.x, -100000);
+        assert_eq!(t.y, 42);
+        assert_eq!(t.width, 65536);
+        assert_eq!(t.font_size_percent(), 1.0);
+        assert_eq!(t.direction, "rtl");
+        assert_eq!(t.writing_mode, "tblr");
+    }
+
+    /// Defaulted (empty) `direction` / `writing_mode` strings round-trip
+    /// as empty (the spec assumes "ltr"/"lrtb" defaults at render time,
+    /// but the wire value is surfaced verbatim).
+    #[test]
+    fn txlo_empty_strings_round_trip_and_dispatch() {
+        let body = txlo_body(0, 100, 100, 0, 0, 100, 100, 0x1900, "", "");
+        let mut ipco = Vec::new();
+        let s = 8 + body.len() as u32;
+        ipco.extend_from_slice(&s.to_be_bytes());
+        ipco.extend_from_slice(b"txlo");
+        ipco.extend_from_slice(&body);
+        let props = parse_ipco(&ipco).unwrap();
+        match &props[0] {
+            Property::Txlo(t) => {
+                assert_eq!(t.direction, "");
+                assert_eq!(t.writing_mode, "");
+                assert_eq!(t.font_size_percent(), 25.0);
+            }
+            other => panic!("expected Txlo, got {other:?}"),
+        }
+        assert_eq!(props[0].kind(), *b"txlo");
+    }
+
+    #[test]
+    fn txlo_rejects_unknown_version() {
+        let mut body = txlo_body(0, 10, 10, 0, 0, 10, 10, 0, "ltr", "lrtb");
+        body[0] = 1;
+        assert!(parse_txlo(&body).is_err());
+    }
+
+    #[test]
+    fn txlo_rejects_truncated_geometry() {
+        // flags=0 ⇒ 6×2 geometry + 2 font_size = 14 bytes minimum after
+        // the FullBox header; truncate inside the geometry block.
+        let body = vec![0u8, 0, 0, 0, 0x07, 0x80, 0x04];
+        assert!(parse_txlo(&body).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // HEIF §6.10.2.2 ExtendedLanguageProperty (`elng`)
+    // -----------------------------------------------------------------
+
+    fn elng_body(version: u8, lang: &str) -> Vec<u8> {
+        let mut buf = vec![version, 0, 0, 0];
+        buf.extend_from_slice(lang.as_bytes());
+        buf.push(0);
+        buf
+    }
+
+    #[test]
+    fn elng_parses_language_tag_and_dispatches() {
+        let body = elng_body(0, "en-US");
+        let mut ipco = Vec::new();
+        let s = 8 + body.len() as u32;
+        ipco.extend_from_slice(&s.to_be_bytes());
+        ipco.extend_from_slice(b"elng");
+        ipco.extend_from_slice(&body);
+        let props = parse_ipco(&ipco).unwrap();
+        match &props[0] {
+            Property::Elng(e) => assert_eq!(e.extended_language, "en-US"),
+            other => panic!("expected Elng, got {other:?}"),
+        }
+        assert_eq!(props[0].kind(), *b"elng");
+    }
+
+    #[test]
+    fn elng_empty_tag_round_trips() {
+        let e = parse_elng(&elng_body(0, "")).unwrap();
+        assert_eq!(e.extended_language, "");
+    }
+
+    #[test]
+    fn elng_rejects_unknown_version() {
+        assert!(parse_elng(&elng_body(1, "de")).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // HEIF §6.10.4.1 FontCharacteristicsProperty (`fnch`)
+    // -----------------------------------------------------------------
+
+    fn fnch_body(version: u8, family: &str, style: &str, weight: &str) -> Vec<u8> {
+        let mut buf = vec![version, 0, 0, 0];
+        for s in [family, style, weight] {
+            buf.extend_from_slice(s.as_bytes());
+            buf.push(0);
+        }
+        buf
+    }
+
+    #[test]
+    fn fnch_parses_three_strings_and_dispatches() {
+        let body = fnch_body(0, "Helvetica", "italic", "bold");
+        let mut ipco = Vec::new();
+        let s = 8 + body.len() as u32;
+        ipco.extend_from_slice(&s.to_be_bytes());
+        ipco.extend_from_slice(b"fnch");
+        ipco.extend_from_slice(&body);
+        let props = parse_ipco(&ipco).unwrap();
+        match &props[0] {
+            Property::Fnch(f) => {
+                assert_eq!(f.font_family, "Helvetica");
+                assert_eq!(f.font_style, "italic");
+                assert_eq!(f.font_weight, "bold");
+            }
+            other => panic!("expected Fnch, got {other:?}"),
+        }
+        assert_eq!(props[0].kind(), *b"fnch");
+    }
+
+    #[test]
+    fn fnch_empty_strings_round_trip() {
+        let f = parse_fnch(&fnch_body(0, "", "", "")).unwrap();
+        assert_eq!(f.font_family, "");
+        assert_eq!(f.font_style, "");
+        assert_eq!(f.font_weight, "");
+    }
+
+    #[test]
+    fn fnch_rejects_unknown_version() {
+        assert!(parse_fnch(&fnch_body(2, "Arial", "normal", "normal")).is_err());
+    }
+
+    #[test]
+    fn fnch_rejects_unterminated_string() {
+        // Header + "Arial" with no NUL terminator → unterminated cstr.
+        let mut body = vec![0u8, 0, 0, 0];
+        body.extend_from_slice(b"Arial");
+        assert!(parse_fnch(&body).is_err());
     }
 
     // -----------------------------------------------------------------

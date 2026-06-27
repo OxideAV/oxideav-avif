@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Four new HEIF item properties** (ISO/IEC 23008-12:2025 3rd ed.): the
+  Single Stream property `'sstr'` (§6.5.38 — bare `ItemProperty` marker
+  signalling that a derived image item's input items collectively form a
+  single decodable bitstream); the Text Layout property `'txlo'`
+  (§6.10.2.1 — `(flags & 1)`-selected 16/32-bit `reference_*`/`x`/`y`/
+  `width`/`height` geometry with sign-extended `x`/`y`, an 8.8
+  fixed-point `font_size` percentage exposed via `Txlo::font_size_percent`,
+  and TTML2 `direction`/`writing_mode` utf8strings); the Extended Language
+  property `'elng'` (§6.10.2.2 — a single BCP 47 language tag carrying
+  ISO/IEC 14496-12 ExtendedLanguageBox semantics applied to an item); and
+  the Font Characteristics property `'fnch'` (§6.10.4.1 — `font_family` /
+  `font_style` / `font_weight` utf8strings for the §6.10.4.1.1 font
+  selection algorithm). All four parse into typed `Property` variants
+  (`Sstr` / `Txlo` / `Elng` / `Fnch`), dispatch through `parse_ipco`,
+  report their `kind()`, and — being recognised typed properties — no
+  longer fall into `Property::Other` (so an `ipma`-essential association
+  to one of them is recognised rather than flagged unsupported). Version
+  guards reject non-zero `version`. 15 new unit tests. New re-exports:
+  `Sstr`, `Txlo`, `Elng`, `Fnch`.
+
 - `DerivationGraph::coded_leaf_dims` (decode-buffer sizing: each leaf id
   paired with its `'ispe'` reconstructed dimensions, in decode order) and
   `DerivationGraph::nodes_at_depth` (the node ids at a given derivation
