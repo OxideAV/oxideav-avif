@@ -214,6 +214,27 @@ impl EntityGroup {
         &self.grouping_type == b"msrc"
     }
 
+    /// Check the §6.8 cardinality `shall`s that can be verified from the
+    /// group alone (without resolving whether each `entity_id` is an
+    /// image item, a track, or another group). Returns `true` when the
+    /// group's `entity_ids` count satisfies its grouping-type constraint,
+    /// and `true` (vacuously) for grouping types with no fixed-count
+    /// `shall`:
+    ///
+    /// * `'ster'` (§6.8.5) — exactly two image items.
+    /// * `'iaug'` (§6.8.4) — exactly two entities (one image item/group,
+    ///   one audio track).
+    ///
+    /// This is a necessary — not sufficient — compliance check: the
+    /// per-entity type constraints (image vs audio) require track/item
+    /// resolution the caller must perform separately.
+    pub fn cardinality_ok(&self) -> bool {
+        match &self.grouping_type {
+            b"ster" | b"iaug" => self.entity_ids.len() == 2,
+            _ => true,
+        }
+    }
+
     /// True when the grouping type signals a time-synchronized capture
     /// set (`'tsyn'`, HEIF §6.8.3): the listed entities were
     /// synchronously captured spanning the same time. A single `'tsyn'`
@@ -3960,6 +3981,35 @@ mod tests {
         // different grouping type does not report a repeat.
         let ster = &parse_grpl(&build(b"ster", 0x1, &[20, 21])).unwrap()[0];
         assert!(!ster.audio_repeats());
+    }
+
+    /// `ster` / `iaug` carry an exactly-two `shall`; `cardinality_ok`
+    /// flags a violation and passes any other grouping type (§6.8.5 /
+    /// §6.8.4).
+    #[test]
+    fn grpl_cardinality_shall() {
+        let build = |fourcc: &[u8; 4], ids: &[u32]| {
+            let mut child = vec![0u8; 4];
+            child.extend_from_slice(&1u32.to_be_bytes());
+            child.extend_from_slice(&(ids.len() as u32).to_be_bytes());
+            for &id in ids {
+                child.extend_from_slice(&id.to_be_bytes());
+            }
+            let mut buf = Vec::new();
+            let size = (8 + child.len()) as u32;
+            buf.extend_from_slice(&size.to_be_bytes());
+            buf.extend_from_slice(fourcc);
+            buf.extend_from_slice(&child);
+            buf
+        };
+
+        assert!(parse_grpl(&build(b"ster", &[1, 2])).unwrap()[0].cardinality_ok());
+        assert!(!parse_grpl(&build(b"ster", &[1])).unwrap()[0].cardinality_ok());
+        assert!(!parse_grpl(&build(b"ster", &[1, 2, 3])).unwrap()[0].cardinality_ok());
+        assert!(parse_grpl(&build(b"iaug", &[1, 2])).unwrap()[0].cardinality_ok());
+        assert!(!parse_grpl(&build(b"iaug", &[1])).unwrap()[0].cardinality_ok());
+        // A grouping type with no fixed-count shall passes for any count.
+        assert!(parse_grpl(&build(b"altr", &[1, 2, 3, 4])).unwrap()[0].cardinality_ok());
     }
 
     /// The five §6.8.6 bracketed-set grouping types classify through
