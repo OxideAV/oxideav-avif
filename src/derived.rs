@@ -150,6 +150,13 @@ pub struct EntityGroup {
     pub grouping_type: BoxType,
     pub group_id: u32,
     pub entity_ids: Vec<u32>,
+    /// The 24-bit `flags` field of the `EntityToGroupBox` FullBox header
+    /// (ISO/IEC 14496-12 §8.15.3.2). Most grouping types leave it `0`,
+    /// but some carry semantics here — e.g. the `'iaug'` audio-to-image
+    /// group (HEIF §6.8.4) uses the least-significant flag bit to signal
+    /// that the audio track should repeat for the whole viewing
+    /// duration.
+    pub flags: u32,
 }
 
 impl EntityGroup {
@@ -206,6 +213,91 @@ impl EntityGroup {
     pub fn is_multi_source(&self) -> bool {
         &self.grouping_type == b"msrc"
     }
+
+    /// True when the grouping type signals a time-synchronized capture
+    /// set (`'tsyn'`, HEIF §6.8.3): the listed entities were
+    /// synchronously captured spanning the same time. A single `'tsyn'`
+    /// group `shall` list `entity_id` values that all resolve to image
+    /// items or all to image-sequence tracks — never a mixture — and
+    /// any tracks in the group `shall` have the same duration.
+    pub fn is_time_synchronized(&self) -> bool {
+        &self.grouping_type == b"tsyn"
+    }
+
+    /// True when the grouping type signals an audio-to-image association
+    /// (`'iaug'`, HEIF §6.8.4): exactly two entities, one an image item
+    /// (or an entity group) and the other an audio track, so a reader
+    /// can play the audio while the image is displayed.
+    pub fn is_audio_to_image(&self) -> bool {
+        &self.grouping_type == b"iaug"
+    }
+
+    /// For an `'iaug'` audio-to-image group (HEIF §6.8.4): `true` when
+    /// the least-significant `flags` bit is set, requesting that the
+    /// audio track repeat for the whole viewing duration when the audio
+    /// is shorter than the display and its edit list does not already
+    /// set the repeat flag. Meaningless (always `false`-checked by the
+    /// caller) for other grouping types.
+    pub fn audio_repeats(&self) -> bool {
+        self.is_audio_to_image() && (self.flags & 0x1) != 0
+    }
+
+    /// True when the grouping type is one of the HEIF §6.8.6 bracketed
+    /// capture-time sets (`'aebr'` auto-exposure, `'wbbr'` white-balance,
+    /// `'fobr'` focus, `'afbr'` flash-exposure, `'dobr'` depth-of-field).
+    /// The listed image items were captured with a single varying
+    /// parameter; the per-item value is carried by the item property of
+    /// the same four-CC (§6.8.6.1).
+    pub fn is_bracketed_set(&self) -> bool {
+        self.bracketing_kind().is_some()
+    }
+
+    /// Classify a §6.8.6 bracketed-set grouping type, or `None` for any
+    /// other grouping type.
+    pub fn bracketing_kind(&self) -> Option<BracketingKind> {
+        match &self.grouping_type {
+            b"aebr" => Some(BracketingKind::AutoExposure),
+            b"wbbr" => Some(BracketingKind::WhiteBalance),
+            b"fobr" => Some(BracketingKind::Focus),
+            b"afbr" => Some(BracketingKind::FlashExposure),
+            b"dobr" => Some(BracketingKind::DepthOfField),
+            _ => None,
+        }
+    }
+}
+
+/// The five HEIF §6.8.6 bracketed-set capture-time grouping types. Each
+/// FourCC serves simultaneously as an `EntityToGroupBox` `grouping_type`
+/// (grouping the image items of a bracket) and as the box type of the
+/// per-item item property that carries the item-specific parameter, and
+/// — for image sequences — as a sample-group `grouping_type` whose
+/// `VisualSampleGroupEntry` subclass carries the per-sample parameter
+/// (see [`BracketingEntry`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BracketingKind {
+    /// `'aebr'` — auto-exposure bracketing (§6.8.6.2).
+    AutoExposure,
+    /// `'wbbr'` — white-balance bracketing (§6.8.6.3).
+    WhiteBalance,
+    /// `'fobr'` — focus bracketing (§6.8.6.4).
+    Focus,
+    /// `'afbr'` — flash-exposure bracketing (§6.8.6.5).
+    FlashExposure,
+    /// `'dobr'` — depth-of-field bracketing (§6.8.6.6).
+    DepthOfField,
+}
+
+impl BracketingKind {
+    /// The four-CC that identifies this bracketing kind.
+    pub fn four_cc(&self) -> &'static [u8; 4] {
+        match self {
+            BracketingKind::AutoExposure => b"aebr",
+            BracketingKind::WhiteBalance => b"wbbr",
+            BracketingKind::Focus => b"fobr",
+            BracketingKind::FlashExposure => b"afbr",
+            BracketingKind::DepthOfField => b"dobr",
+        }
+    }
 }
 
 /// Parse a `GroupsListBox` (`grpl`) payload into its set of entity
@@ -218,7 +310,7 @@ pub fn parse_grpl(payload: &[u8]) -> Result<Vec<EntityGroup>> {
     for hdr in iter_boxes(payload) {
         let hdr = hdr?;
         let child = &payload[hdr.payload_start..hdr.end()];
-        let (_version, _flags, body) = parse_full_box(child)?;
+        let (_version, flags, body) = parse_full_box(child)?;
         if body.len() < 8 {
             return Err(Error::invalid(format!(
                 "avif: EntityToGroupBox '{}' body too short ({} < 8)",
@@ -244,6 +336,7 @@ pub fn parse_grpl(payload: &[u8]) -> Result<Vec<EntityGroup>> {
             grouping_type: hdr.box_type,
             group_id,
             entity_ids,
+            flags,
         });
     }
     Ok(out)
@@ -3786,6 +3879,95 @@ mod tests {
         let msrc = &parse_grpl(&build(b"msrc", &[5, 6])).unwrap()[0];
         assert!(msrc.is_multi_source());
         assert!(!msrc.is_progressive() && !msrc.is_burst());
+    }
+
+    /// `tsyn` time-synchronized group + `iaug` audio-to-image group
+    /// classify via their projections; the `iaug` flags LSB drives the
+    /// audio-repeat semantic (HEIF §6.8.3 / §6.8.4).
+    #[test]
+    fn grpl_classifies_tsyn_and_iaug_groups() {
+        // grouping child with an explicit 24-bit flags value.
+        let build = |fourcc: &[u8; 4], flags: u32, ids: &[u32]| {
+            let mut child = Vec::new();
+            child.push(0u8); // version
+            child.extend_from_slice(&flags.to_be_bytes()[1..]); // 24-bit flags
+            child.extend_from_slice(&9u32.to_be_bytes()); // group_id
+            child.extend_from_slice(&(ids.len() as u32).to_be_bytes());
+            for &id in ids {
+                child.extend_from_slice(&id.to_be_bytes());
+            }
+            let mut buf = Vec::new();
+            let size = (8 + child.len()) as u32;
+            buf.extend_from_slice(&size.to_be_bytes());
+            buf.extend_from_slice(fourcc);
+            buf.extend_from_slice(&child);
+            buf
+        };
+
+        let tsyn = &parse_grpl(&build(b"tsyn", 0, &[1, 2, 3])).unwrap()[0];
+        assert!(tsyn.is_time_synchronized());
+        assert!(!tsyn.is_audio_to_image() && !tsyn.is_burst());
+        assert_eq!(tsyn.entity_ids, vec![1, 2, 3]);
+        assert_eq!(tsyn.flags, 0);
+
+        // iaug with the repeat flag clear.
+        let iaug = &parse_grpl(&build(b"iaug", 0, &[20, 21])).unwrap()[0];
+        assert!(iaug.is_audio_to_image());
+        assert!(!iaug.audio_repeats());
+        assert_eq!(iaug.entity_ids, vec![20, 21]);
+
+        // iaug with the repeat flag set.
+        let iaug_rep = &parse_grpl(&build(b"iaug", 0x1, &[20, 21])).unwrap()[0];
+        assert!(iaug_rep.is_audio_to_image());
+        assert!(iaug_rep.audio_repeats());
+        assert_eq!(iaug_rep.flags, 0x1);
+
+        // audio_repeats is only meaningful for iaug — a set flag on a
+        // different grouping type does not report a repeat.
+        let ster = &parse_grpl(&build(b"ster", 0x1, &[20, 21])).unwrap()[0];
+        assert!(!ster.audio_repeats());
+    }
+
+    /// The five §6.8.6 bracketed-set grouping types classify through
+    /// `bracketing_kind` / `is_bracketed_set`; non-bracket types return
+    /// `None`.
+    #[test]
+    fn grpl_classifies_bracketed_set_groups() {
+        let build = |fourcc: &[u8; 4], ids: &[u32]| {
+            let mut child = vec![0u8; 4]; // FullBox
+            child.extend_from_slice(&3u32.to_be_bytes()); // group_id
+            child.extend_from_slice(&(ids.len() as u32).to_be_bytes());
+            for &id in ids {
+                child.extend_from_slice(&id.to_be_bytes());
+            }
+            let mut buf = Vec::new();
+            let size = (8 + child.len()) as u32;
+            buf.extend_from_slice(&size.to_be_bytes());
+            buf.extend_from_slice(fourcc);
+            buf.extend_from_slice(&child);
+            buf
+        };
+
+        let cases = [
+            (&b"aebr"[..], BracketingKind::AutoExposure),
+            (&b"wbbr"[..], BracketingKind::WhiteBalance),
+            (&b"fobr"[..], BracketingKind::Focus),
+            (&b"afbr"[..], BracketingKind::FlashExposure),
+            (&b"dobr"[..], BracketingKind::DepthOfField),
+        ];
+        for (fourcc, kind) in cases {
+            let mut fc = [0u8; 4];
+            fc.copy_from_slice(fourcc);
+            let g = &parse_grpl(&build(&fc, &[1, 2])).unwrap()[0];
+            assert!(g.is_bracketed_set());
+            assert_eq!(g.bracketing_kind(), Some(kind));
+            assert_eq!(kind.four_cc(), &fc);
+        }
+
+        // altr is not a bracketed set.
+        let altr = &parse_grpl(&build(b"altr", &[1, 2])).unwrap()[0];
+        assert!(!altr.is_bracketed_set());
+        assert_eq!(altr.bracketing_kind(), None);
     }
 
     /// `ster` group convention: two entities, first is left view.
