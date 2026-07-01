@@ -733,6 +733,22 @@ pub fn region_items_for(file: &[u8], image_item_id: u32) -> Result<Vec<ResolvedR
     region_items_for_meta(file, &hdr.meta, image_item_id)
 }
 
+/// Enumerate the typed entity groups (HEIF §6.8 / §9.4) declared in the
+/// file's top-level `grpl` box, in declaration order.
+///
+/// This is a decode-free surface: every returned
+/// [`crate::derived::EntityGroup`] carries its `grouping_type` four-CC,
+/// `group_id`, `entity_id` list, and the `EntityToGroupBox` `flags`, so a
+/// caller can classify it with the typed projections
+/// (`is_stereo_pair` / `is_alternates` / `is_time_synchronized` /
+/// `is_audio_to_image` / `is_slideshow` / `is_user_collection` /
+/// `bracketing_kind` / …). Returns an empty vector for the typical AVIF
+/// file that ships no groups list.
+pub fn entity_groups(file: &[u8]) -> Result<Vec<crate::derived::EntityGroup>> {
+    let hdr = parse_header(file)?;
+    hdr.meta.groups()
+}
+
 /// Enumerate the region items describing the file's **primary item**
 /// (resolved via `pitm`). See [`region_items_for`].
 pub fn region_items(file: &[u8]) -> Result<Vec<ResolvedRegionItem>> {
@@ -1598,6 +1614,14 @@ mod tests {
         assert_eq!(info.av1c[0], 0x81);
         assert!(!info.is_grid);
         assert!(!info.has_alpha);
+    }
+
+    /// `entity_groups` resolves the file's `grpl` decode-free; the
+    /// grpl-free monochrome fixture yields an empty list without error.
+    #[test]
+    fn entity_groups_empty_for_grpl_free_fixture() {
+        let groups = entity_groups(FIXTURE).expect("entity_groups");
+        assert!(groups.is_empty());
     }
 
     /// `AvifInfo` carries `bit_depth` + `monochrome` + `chroma_subsampling`
