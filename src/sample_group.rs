@@ -29,7 +29,7 @@
 //! `grouping_type` + `default_group_description_index` header is
 //! surfaced by [`SampleGroupDescription`]).
 
-use crate::box_parser::{b, iter_boxes, parse_full_box, read_u32, BoxType};
+use crate::box_parser::{b, iter_boxes, parse_full_box, read_u16, read_u32, BoxType};
 use crate::error::{AvifError as Error, Result};
 
 const SBGP: BoxType = b(b"sbgp");
@@ -180,7 +180,7 @@ impl SampleToGroup {
 /// `default_length` (v1), and its `default_group_description_index`
 /// (v2): the latter is the index assigned to any sample not explicitly
 /// covered by an `sbgp`/`csgp` run (§8.9.3.3).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SampleGroupDescription {
     /// FullBox version (0, 1, or 2 in the staged editions).
     pub version: u8,
@@ -197,6 +197,21 @@ pub struct SampleGroupDescription {
     pub default_group_description_index: Option<u32>,
     /// `entry_count` declared by the box.
     pub entry_count: u32,
+    /// Raw per-entry `VisualSampleGroupEntry` payload bytes, in
+    /// declaration order, when the box carries enough length information
+    /// to slice them unambiguously (§8.9.3.2):
+    ///
+    /// * `version == 1`, `default_length != 0` — every entry is exactly
+    ///   `default_length` bytes.
+    /// * `version >= 1`, `default_length == 0` — every entry is prefixed
+    ///   by its own `unsigned int(32) description_length`.
+    ///
+    /// For `version == 0` the box has no length field and entries are
+    /// interpreted only by knowing the fixed size of the grouping type,
+    /// so this vector is left empty. The 1-based
+    /// `group_description_index` from an `sbgp`/`csgp` run selects
+    /// `entries[index - 1]`.
+    pub entries: Vec<Vec<u8>>,
 }
 
 /// Decode an `sbgp` (`SampleToGroupBox`) payload — the FullBox body
@@ -427,12 +442,43 @@ pub fn parse_sgpd(payload: &[u8]) -> Result<SampleGroupDescription> {
     };
     let entry_count = read_u32(body, cursor)
         .map_err(|_| Error::InvalidData("sgpd: truncated entry_count".to_string()))?;
+    cursor += 4;
+
+    // Slice the per-entry payloads when the box carries the length
+    // information to do so unambiguously. v0 has no length field, so the
+    // entry sizes are only recoverable from the fixed grouping-type
+    // layout — leave `entries` empty in that case. A truncated or
+    // malformed length simply stops the walk; the header fields are
+    // still valid and returned.
+    let mut entries = Vec::new();
+    if version >= 1 {
+        let fixed = default_length.unwrap_or(0);
+        for _ in 0..entry_count {
+            let len = if fixed != 0 {
+                fixed as usize
+            } else {
+                // default_length == 0 → each entry self-describes.
+                let Ok(dl) = read_u32(body, cursor) else {
+                    break;
+                };
+                cursor += 4;
+                dl as usize
+            };
+            if cursor + len > body.len() {
+                break;
+            }
+            entries.push(body[cursor..cursor + len].to_vec());
+            cursor += len;
+        }
+    }
+
     Ok(SampleGroupDescription {
         version,
         grouping_type,
         default_length,
         default_group_description_index,
         entry_count,
+        entries,
     })
 }
 
@@ -516,6 +562,127 @@ impl<'a> BitReader<'a> {
             self.bit_pos += 1;
         }
         Some(value)
+    }
+}
+
+/// One decoded bracketing sample-group entry — the `VisualSampleGroupEntry`
+/// subclass carried by a `sgpd` box whose `grouping_type` is one of the
+/// HEIF §6.8.6 bracketed-set four-CCs. Each variant mirrors the spec
+/// syntax exactly (§6.8.6.2.2 … §6.8.6.6.2). The per-sample parameter is
+/// selected by the 1-based `group_description_index` from an
+/// `sbgp`/`csgp` run indexing into
+/// [`SampleGroupDescription::entries`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BracketingEntry {
+    /// `'aebr'` AutoExposureBracketingEntry (§6.8.6.2.2). The exposure
+    /// variation in stops is `exposure_numerator / exposure_step`;
+    /// `exposure_step` selects full (1) / half (2) / third (3) /
+    /// quarter (4) stop increments.
+    AutoExposure {
+        exposure_step: i8,
+        exposure_numerator: i8,
+    },
+    /// `'wbbr'` WhiteBalanceBracketingEntry (§6.8.6.3.2). `blue_amber`
+    /// is the colour-temperature component in Kelvin; `green_magenta` is
+    /// the colour-deviation component in 1/100 Duv (negative = magenta
+    /// shift, positive = green shift).
+    WhiteBalance { blue_amber: u16, green_magenta: i8 },
+    /// `'fobr'` FocusBracketingEntry (§6.8.6.4.2). Focus distance in
+    /// metres is `focus_distance_numerator / focus_distance_denominator`;
+    /// a denominator of 0 signals focus at infinity (numerator should
+    /// also be 0).
+    Focus {
+        focus_distance_numerator: u16,
+        focus_distance_denominator: u16,
+    },
+    /// `'afbr'` FlashExposureBracketingEntry (§6.8.6.5.2). Flash exposure
+    /// in f-stops is `flash_exposure_numerator / flash_exposure_denominator`.
+    FlashExposure {
+        flash_exposure_numerator: i8,
+        flash_exposure_denominator: i8,
+    },
+    /// `'dobr'` DepthOfFieldBracketingEntry (§6.8.6.6.2). Aperture change
+    /// in stops is `f_stop_numerator / f_stop_denominator`.
+    DepthOfField {
+        f_stop_numerator: i8,
+        f_stop_denominator: i8,
+    },
+}
+
+impl BracketingEntry {
+    /// Decode a single bracketing entry payload for `kind` from the raw
+    /// `VisualSampleGroupEntry` bytes carried in
+    /// [`SampleGroupDescription::entries`]. Returns `InvalidData` when
+    /// the slice is shorter than the fixed layout for `kind`.
+    pub fn parse(kind: crate::derived::BracketingKind, entry: &[u8]) -> Result<BracketingEntry> {
+        use crate::derived::BracketingKind as K;
+        let need = |n: usize| -> Result<()> {
+            if entry.len() < n {
+                Err(Error::InvalidData(format!(
+                    "sgpd: bracketing entry too short ({} < {n})",
+                    entry.len()
+                )))
+            } else {
+                Ok(())
+            }
+        };
+        Ok(match kind {
+            K::AutoExposure => {
+                need(2)?;
+                BracketingEntry::AutoExposure {
+                    exposure_step: entry[0] as i8,
+                    exposure_numerator: entry[1] as i8,
+                }
+            }
+            K::WhiteBalance => {
+                need(3)?;
+                BracketingEntry::WhiteBalance {
+                    blue_amber: read_u16(entry, 0)?,
+                    green_magenta: entry[2] as i8,
+                }
+            }
+            K::Focus => {
+                need(4)?;
+                BracketingEntry::Focus {
+                    focus_distance_numerator: read_u16(entry, 0)?,
+                    focus_distance_denominator: read_u16(entry, 2)?,
+                }
+            }
+            K::FlashExposure => {
+                need(2)?;
+                BracketingEntry::FlashExposure {
+                    flash_exposure_numerator: entry[0] as i8,
+                    flash_exposure_denominator: entry[1] as i8,
+                }
+            }
+            K::DepthOfField => {
+                need(2)?;
+                BracketingEntry::DepthOfField {
+                    f_stop_numerator: entry[0] as i8,
+                    f_stop_denominator: entry[1] as i8,
+                }
+            }
+        })
+    }
+}
+
+impl SampleGroupDescription {
+    /// If this `sgpd`'s `grouping_type` is one of the §6.8.6 bracketed
+    /// sets, decode every retained per-entry payload into a typed
+    /// [`BracketingEntry`]. Returns `None` for any other grouping type,
+    /// or an error if any entry is truncated for its declared kind.
+    ///
+    /// Entries line up 1:1 with [`SampleGroupDescription::entries`], so a
+    /// sample's `group_description_index` (1-based) selects
+    /// `bracketing_entries()[index - 1]`.
+    pub fn bracketing_entries(&self) -> Option<Result<Vec<BracketingEntry>>> {
+        let kind = crate::derived::BracketingKind::from_four_cc(&self.grouping_type)?;
+        Some(
+            self.entries
+                .iter()
+                .map(|e| BracketingEntry::parse(kind, e))
+                .collect(),
+        )
     }
 }
 
@@ -730,6 +897,123 @@ mod tests {
         assert_eq!(sgpd.default_length, Some(8));
         assert_eq!(sgpd.default_group_description_index, None);
         assert_eq!(sgpd.entry_count, 1);
+    }
+
+    // ---- §6.8.6 bracketing sample-group entries ----
+
+    #[test]
+    fn sgpd_v1_fixed_length_slices_entries() {
+        // 'aebr' with default_length=2 and two entries.
+        let mut body = Vec::new();
+        body.extend_from_slice(b"aebr");
+        body.extend_from_slice(&2u32.to_be_bytes()); // default_length
+        body.extend_from_slice(&2u32.to_be_bytes()); // entry_count
+        body.extend_from_slice(&[1u8, 3u8]); // step=1 (full), num=3
+        body.extend_from_slice(&[0xFEu8, 0x02u8]); // step=-2, num=2
+        let sgpd = parse_sgpd(&full_box(1, 0, &body)).unwrap();
+        assert_eq!(sgpd.entries.len(), 2);
+        let decoded = sgpd.bracketing_entries().unwrap().unwrap();
+        assert_eq!(
+            decoded[0],
+            BracketingEntry::AutoExposure {
+                exposure_step: 1,
+                exposure_numerator: 3,
+            }
+        );
+        assert_eq!(
+            decoded[1],
+            BracketingEntry::AutoExposure {
+                exposure_step: -2,
+                exposure_numerator: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn sgpd_v1_self_describing_entries() {
+        // 'wbbr' with default_length=0 → each entry prefixed by its own
+        // description_length. WhiteBalanceBracketingEntry is 3 bytes.
+        let mut body = Vec::new();
+        body.extend_from_slice(b"wbbr");
+        body.extend_from_slice(&0u32.to_be_bytes()); // default_length = 0
+        body.extend_from_slice(&1u32.to_be_bytes()); // entry_count
+        body.extend_from_slice(&3u32.to_be_bytes()); // description_length
+        body.extend_from_slice(&5500u16.to_be_bytes()); // blue_amber (K)
+        body.push(0xF6u8); // green_magenta = -10 (1/100 Duv, magenta)
+        let sgpd = parse_sgpd(&full_box(1, 0, &body)).unwrap();
+        assert_eq!(sgpd.entries.len(), 1);
+        let decoded = sgpd.bracketing_entries().unwrap().unwrap();
+        assert_eq!(
+            decoded[0],
+            BracketingEntry::WhiteBalance {
+                blue_amber: 5500,
+                green_magenta: -10,
+            }
+        );
+    }
+
+    #[test]
+    fn bracketing_entry_focus_infinity_and_flash_and_dof() {
+        // Focus at infinity: denominator 0.
+        let focus = BracketingEntry::parse(
+            crate::derived::BracketingKind::Focus,
+            &[0x00, 0x00, 0x00, 0x00],
+        )
+        .unwrap();
+        assert_eq!(
+            focus,
+            BracketingEntry::Focus {
+                focus_distance_numerator: 0,
+                focus_distance_denominator: 0,
+            }
+        );
+
+        let flash =
+            BracketingEntry::parse(crate::derived::BracketingKind::FlashExposure, &[0x01, 0x02])
+                .unwrap();
+        assert_eq!(
+            flash,
+            BracketingEntry::FlashExposure {
+                flash_exposure_numerator: 1,
+                flash_exposure_denominator: 2,
+            }
+        );
+
+        let dof =
+            BracketingEntry::parse(crate::derived::BracketingKind::DepthOfField, &[0xFF, 0x02])
+                .unwrap();
+        assert_eq!(
+            dof,
+            BracketingEntry::DepthOfField {
+                f_stop_numerator: -1,
+                f_stop_denominator: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn bracketing_entry_rejects_truncated() {
+        // A 1-byte slice cannot hold a 2-byte aebr entry.
+        assert!(
+            BracketingEntry::parse(crate::derived::BracketingKind::AutoExposure, &[0x01]).is_err()
+        );
+        // A 2-byte slice cannot hold a 3-byte wbbr entry.
+        assert!(BracketingEntry::parse(
+            crate::derived::BracketingKind::WhiteBalance,
+            &[0x01, 0x02]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn bracketing_entries_none_for_non_bracket_grouping() {
+        let mut body = Vec::new();
+        body.extend_from_slice(b"roll");
+        body.extend_from_slice(&0u32.to_be_bytes()); // entry_count (v0)
+        let sgpd = parse_sgpd(&full_box(0, 0, &body)).unwrap();
+        assert!(sgpd.bracketing_entries().is_none());
+        // v0 boxes never slice per-entry payloads.
+        assert!(sgpd.entries.is_empty());
     }
 
     // ---- stbl walkers ----

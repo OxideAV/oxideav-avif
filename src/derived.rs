@@ -255,14 +255,7 @@ impl EntityGroup {
     /// Classify a §6.8.6 bracketed-set grouping type, or `None` for any
     /// other grouping type.
     pub fn bracketing_kind(&self) -> Option<BracketingKind> {
-        match &self.grouping_type {
-            b"aebr" => Some(BracketingKind::AutoExposure),
-            b"wbbr" => Some(BracketingKind::WhiteBalance),
-            b"fobr" => Some(BracketingKind::Focus),
-            b"afbr" => Some(BracketingKind::FlashExposure),
-            b"dobr" => Some(BracketingKind::DepthOfField),
-            _ => None,
-        }
+        BracketingKind::from_four_cc(&self.grouping_type)
     }
 }
 
@@ -288,6 +281,18 @@ pub enum BracketingKind {
 }
 
 impl BracketingKind {
+    /// Classify a four-CC as a §6.8.6 bracketed-set kind, or `None`.
+    pub fn from_four_cc(fourcc: &[u8; 4]) -> Option<BracketingKind> {
+        match fourcc {
+            b"aebr" => Some(BracketingKind::AutoExposure),
+            b"wbbr" => Some(BracketingKind::WhiteBalance),
+            b"fobr" => Some(BracketingKind::Focus),
+            b"afbr" => Some(BracketingKind::FlashExposure),
+            b"dobr" => Some(BracketingKind::DepthOfField),
+            _ => None,
+        }
+    }
+
     /// The four-CC that identifies this bracketing kind.
     pub fn four_cc(&self) -> &'static [u8; 4] {
         match self {
