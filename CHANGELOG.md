@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Entity-group family — `tsyn` / `iaug` / `slid` / `albc` / `favc` +
+  bracketed sets** (HEIF §6.8.3 / §6.8.4 / §6.8.9 / §6.8.7 / §6.8.6).
+  `EntityGroup` now retains the `EntityToGroupBox` 24-bit `flags` and
+  gains typed classifiers: `is_time_synchronized` (`'tsyn'`),
+  `is_audio_to_image` (`'iaug'`) with `audio_repeats()` decoding the
+  flags-LSB audio-repeat semantic, `is_slideshow` (`'slid'`),
+  `is_album_collection` / `is_favorites_collection` / `is_user_collection`
+  (`'albc'` / `'favc'`), and `is_bracketed_set` / `bracketing_kind`
+  classifying the five §6.8.6 capture-time sets into a new
+  `BracketingKind` (`aebr`/`wbbr`/`fobr`/`afbr`/`dobr`).
+  `inspect::entity_groups` enumerates the file's `grpl` decode-free.
+
+- **Bracketing + equivalence sample-group entries** (HEIF §6.8.6.2–.6 /
+  §6.8.1.2.2). `SampleGroupDescription` now slices and retains the raw
+  per-entry `VisualSampleGroupEntry` payloads (v1 `default_length`
+  fixed-size, or self-describing `description_length`) into `entries`.
+  `bracketing_entries()` decodes them into a typed `BracketingEntry`
+  (AutoExposure / WhiteBalance / Focus — with the denominator-0 = infinity
+  convention / FlashExposure / DepthOfField), and `equivalence_entries()`
+  decodes the `'eqiv'` `VisualEquivalenceEntry` (`time_offset` +
+  8.8-fixed `timescale_multiplier`, `timescale_multiplier_f64()`
+  returning `None` for the reserved value 0). New re-exports:
+  `BracketingEntry`, `VisualEquivalenceEntry`, `entity_groups`,
+  `BracketingKind`.
+
 - **Derived region items** (HEIF §11.3.3.2.1).
   `region::resolve_derived_region_items` finds every identity (`'iden'`)
   derived region item — an `'iden'`-typed item carrying a `'drgn'` item
