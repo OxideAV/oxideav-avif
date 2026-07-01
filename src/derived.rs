@@ -242,6 +242,35 @@ impl EntityGroup {
         self.is_audio_to_image() && (self.flags & 0x1) != 0
     }
 
+    /// True when the grouping type signals a slideshow set (`'slid'`,
+    /// HEIF §6.8.9): the listed image items form a slideshow, listed in
+    /// increasing display order, with per-item transition-effect
+    /// properties and optional `stpe`/`ssld` timing.
+    pub fn is_slideshow(&self) -> bool {
+        &self.grouping_type == b"slid"
+    }
+
+    /// True when the grouping type signals an album collection
+    /// (`'albc'`, HEIF §6.8.7.1): the listed entities form an album; an
+    /// optional `udes` user-description property may describe it.
+    pub fn is_album_collection(&self) -> bool {
+        &self.grouping_type == b"albc"
+    }
+
+    /// True when the grouping type signals a favorites collection
+    /// (`'favc'`, HEIF §6.8.7.2): the listed entities form a collection
+    /// of favorite images; an optional `udes` property may describe it.
+    pub fn is_favorites_collection(&self) -> bool {
+        &self.grouping_type == b"favc"
+    }
+
+    /// True when the grouping type is one of the HEIF §6.8.7
+    /// user-defined image collections (`'albc'` album / `'favc'`
+    /// favorites).
+    pub fn is_user_collection(&self) -> bool {
+        self.is_album_collection() || self.is_favorites_collection()
+    }
+
     /// True when the grouping type is one of the HEIF §6.8.6 bracketed
     /// capture-time sets (`'aebr'` auto-exposure, `'wbbr'` white-balance,
     /// `'fobr'` focus, `'afbr'` flash-exposure, `'dobr'` depth-of-field).
@@ -3973,6 +4002,38 @@ mod tests {
         let altr = &parse_grpl(&build(b"altr", &[1, 2])).unwrap()[0];
         assert!(!altr.is_bracketed_set());
         assert_eq!(altr.bracketing_kind(), None);
+    }
+
+    /// `slid` slideshow + `albc`/`favc` user-collection groups classify
+    /// through their projections (HEIF §6.8.9 / §6.8.7).
+    #[test]
+    fn grpl_classifies_slid_and_user_collections() {
+        let build = |fourcc: &[u8; 4], ids: &[u32]| {
+            let mut child = vec![0u8; 4]; // FullBox
+            child.extend_from_slice(&4u32.to_be_bytes()); // group_id
+            child.extend_from_slice(&(ids.len() as u32).to_be_bytes());
+            for &id in ids {
+                child.extend_from_slice(&id.to_be_bytes());
+            }
+            let mut buf = Vec::new();
+            let size = (8 + child.len()) as u32;
+            buf.extend_from_slice(&size.to_be_bytes());
+            buf.extend_from_slice(fourcc);
+            buf.extend_from_slice(&child);
+            buf
+        };
+
+        let slid = &parse_grpl(&build(b"slid", &[1, 2, 3])).unwrap()[0];
+        assert!(slid.is_slideshow());
+        assert!(!slid.is_user_collection() && !slid.is_bracketed_set());
+
+        let albc = &parse_grpl(&build(b"albc", &[4, 5])).unwrap()[0];
+        assert!(albc.is_album_collection() && albc.is_user_collection());
+        assert!(!albc.is_favorites_collection() && !albc.is_slideshow());
+
+        let favc = &parse_grpl(&build(b"favc", &[6])).unwrap()[0];
+        assert!(favc.is_favorites_collection() && favc.is_user_collection());
+        assert!(!favc.is_album_collection());
     }
 
     /// `ster` group convention: two entities, first is left view.
