@@ -684,6 +684,73 @@ impl SampleGroupDescription {
                 .collect(),
         )
     }
+
+    /// If this `sgpd`'s `grouping_type` is `'eqiv'`, decode every
+    /// retained per-entry payload into a typed [`VisualEquivalenceEntry`]
+    /// (HEIF §6.8.1.2.2). Returns `None` for any other grouping type, or
+    /// an error if any entry is truncated. Entries line up 1:1 with
+    /// [`SampleGroupDescription::entries`].
+    pub fn equivalence_entries(&self) -> Option<Result<Vec<VisualEquivalenceEntry>>> {
+        if &self.grouping_type != b"eqiv" {
+            return None;
+        }
+        Some(
+            self.entries
+                .iter()
+                .map(|e| VisualEquivalenceEntry::parse(e))
+                .collect(),
+        )
+    }
+}
+
+/// A decoded `'eqiv'` (visual equivalence) sample-group entry — the
+/// `VisualEquivalenceEntry` carried by a `sgpd` box, HEIF §6.8.1.2.2. It
+/// times a track sample to the image item(s) in the associated `'eqiv'`
+/// entity group: the image time `T = C + O/(M/256)` where `C` is the
+/// sample composition time, `O` is [`time_offset`](Self::time_offset),
+/// and `M` is [`timescale_multiplier`](Self::timescale_multiplier).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VisualEquivalenceEntry {
+    /// `signed int(16) time_offset` — the difference, expressed in the
+    /// timescale resulting from `timescale_multiplier`, between the image
+    /// item(s) in the `'eqiv'` entity group and the composition time of
+    /// the associated sample. When positive it is `shall`-bounded below
+    /// the sample duration (may equal it only for the last sample); a
+    /// negative offset `shall` only accompany the first sample.
+    pub time_offset: i16,
+    /// `unsigned int(16) timescale_multiplier` — an 8.8 fixed-point
+    /// multiplier applied to the track media timescale. The recommended
+    /// value is `1.0` (`1 << 8`); the value `0` is reserved and `shall`
+    /// not be used.
+    pub timescale_multiplier: u16,
+}
+
+impl VisualEquivalenceEntry {
+    /// Decode a single `VisualEquivalenceEntry` payload (§6.8.1.2.2) from
+    /// the raw sample-group entry bytes. Returns `InvalidData` when the
+    /// slice is shorter than the fixed 4-byte layout.
+    pub fn parse(entry: &[u8]) -> Result<VisualEquivalenceEntry> {
+        if entry.len() < 4 {
+            return Err(Error::InvalidData(format!(
+                "sgpd: eqiv entry too short ({} < 4)",
+                entry.len()
+            )));
+        }
+        Ok(VisualEquivalenceEntry {
+            time_offset: read_u16(entry, 0)? as i16,
+            timescale_multiplier: read_u16(entry, 2)?,
+        })
+    }
+
+    /// The 8.8 fixed-point `timescale_multiplier` as an `f64` multiplier
+    /// (`raw / 256.0`). Returns `None` for the reserved value `0`.
+    pub fn timescale_multiplier_f64(&self) -> Option<f64> {
+        if self.timescale_multiplier == 0 {
+            None
+        } else {
+            Some(f64::from(self.timescale_multiplier) / 256.0)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1003,6 +1070,38 @@ mod tests {
             &[0x01, 0x02]
         )
         .is_err());
+    }
+
+    #[test]
+    fn sgpd_eqiv_entries_decode() {
+        // 'eqiv' v1 default_length=4 with two VisualEquivalenceEntry.
+        let mut body = Vec::new();
+        body.extend_from_slice(b"eqiv");
+        body.extend_from_slice(&4u32.to_be_bytes()); // default_length
+        body.extend_from_slice(&2u32.to_be_bytes()); // entry_count
+        body.extend_from_slice(&5i16.to_be_bytes()); // time_offset = +5
+        body.extend_from_slice(&(1u16 << 8).to_be_bytes()); // multiplier 1.0
+        body.extend_from_slice(&(-3i16).to_be_bytes()); // time_offset = -3
+        body.extend_from_slice(&512u16.to_be_bytes()); // multiplier 2.0
+        let sgpd = parse_sgpd(&full_box(1, 0, &body)).unwrap();
+        let entries = sgpd.equivalence_entries().unwrap().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].time_offset, 5);
+        assert_eq!(entries[0].timescale_multiplier, 256);
+        assert_eq!(entries[0].timescale_multiplier_f64(), Some(1.0));
+        assert_eq!(entries[1].time_offset, -3);
+        assert_eq!(entries[1].timescale_multiplier_f64(), Some(2.0));
+        // a non-eqiv sgpd returns None.
+        assert!(sgpd.bracketing_entries().is_none());
+    }
+
+    #[test]
+    fn eqiv_entry_reserved_multiplier_and_truncation() {
+        let e = VisualEquivalenceEntry::parse(&[0x00, 0x00, 0x00, 0x00]).unwrap();
+        assert_eq!(e.timescale_multiplier, 0);
+        // 0 multiplier is reserved → no f64 value.
+        assert_eq!(e.timescale_multiplier_f64(), None);
+        assert!(VisualEquivalenceEntry::parse(&[0x00, 0x00, 0x00]).is_err());
     }
 
     #[test]

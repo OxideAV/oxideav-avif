@@ -163,6 +163,7 @@ pub use region::{
 pub use sample_group::{
     parse_csgp, parse_sample_group_descriptions, parse_sample_to_groups, parse_sbgp, parse_sgpd,
     BracketingEntry, SampleGroupDescription, SampleToGroup, SampleToGroupKind, SampleToGroupRun,
+    VisualEquivalenceEntry,
 };
 pub use transform::{apply_clap, apply_imir, apply_irot, crop_top_left};
 
