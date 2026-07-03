@@ -1,5 +1,7 @@
 # oxideav-avif
 
+[![CI](https://github.com/OxideAV/oxideav-avif/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-avif/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-avif.svg)](https://crates.io/crates/oxideav-avif) [![docs.rs](https://docs.rs/oxideav-avif/badge.svg)](https://docs.rs/oxideav-avif) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust **AVIF** (AV1 Image File Format) container parser. Walks the
 HEIF / ISOBMFF box hierarchy, resolves the primary item via `pitm` +
 `iloc`, surfaces the `av1C` configuration record and the full HEIF
