@@ -29,9 +29,23 @@ once the AV1 crate's rebuild lands a decoder usable from here. Standalone
 callers can pair this crate's container surface with their own AV1
 decoder today.
 
-The encoder is **not implemented** (an AVIF encoder requires an AV1
-encoder, which oxideav does not yet have); `make_encoder` returns
-`Error::Unsupported`.
+The **container encoder / muxer is implemented** (`mux` module). Given an
+already-coded AV1 Image Item Data payload plus its `av1C` record, the
+`AvifMuxer` / `AvifGridMuxer` / `encode_still_av1` API emit a conformant
+AVIF file — `ftyp` (`avif`/`mif1`/`miaf`/`MA1B`) + full `meta` box tree
+(`hdlr`/`pitm`/`iinf`/`infe`/`iref`/`iprp`+`ipco`+`ipma`/`iloc`) + `mdat`
+— with `ispe` / `pixi` / `colr` / `pasp` / `clap` / `irot` / `imir` item
+properties, an optional AV1-coded alpha auxiliary (`auxC` + `auxl`, plus
+`prem` when premultiplied), and optional `grid` tiling (`dimg`). The
+output round-trips through this crate's own `parse` path byte-for-byte
+(coded payload and every property) and passes `audit_mif1`. The AV1
+bitstream is taken **black-box**: this crate does no pixel coding.
+
+Turning decoded pixels *into* an AV1 bitstream still needs an AV1 encoder
+(not yet available in oxideav-av1). The registry `Encoder` surface
+(`make_encoder`) therefore returns a live `AvifEncoder` whose
+`send_frame` surfaces `Error::Unsupported` naming that gap and pointing
+at `AvifMuxer` for direct black-box muxing.
 
 ## Container coverage
 
@@ -46,6 +60,7 @@ encoder, which oxideav does not yet have); `make_encoder` returns
 | Tone Map (`tmap`) | four-CC detection + §4.2.2 compliance audit + `GainMapMetadata::parse` (ISO 21496-1:2025 Annex C.2) + **§6 application**: `unnormalize_log2_gain` (Formula 1), `weight_factor` (Formula 3), `apply_component` / `apply_rgb` / `apply_plane_rgb` reconstruct the linear alternate (HDR) rendition `(Baseline + k_base)·2^(W·G) − k_alt` (Formula 2) from a linear baseline + the decoded gain plane, with §5.2.5.1 per-component-metadata broadcast and §6.3 NOTE 2 achromatic handling |
 | AV1 layered properties | `a1op` operating-point selector + `a1lx` layered-image index (av1-avif §2.3.2) |
 | Auxiliary classification | `auxC` URN routed to `Alpha` / `DepthMap` / `HdrGainMap` / `Other` |
+| Container encoder / muxer (`mux`) | `AvifMuxer` / `AvifGridMuxer` / `encode_still_av1` emit `ftyp` + full `meta` tree (`hdlr`/`pitm`/`iinf`+`infe` v2/`iref`/`iprp`(`ipco`+`ipma`)/`iloc` v0 cm0) + `mdat` around a black-box coded AV1 payload + `av1C`; item properties `av1C`(essential)/`ispe`/`pixi`/`colr`(nclx+ICC)/`pasp`/`clap`/`irot`/`imir`; AV1-coded alpha auxiliary (`auxC`+`auxl`+`prem`); `grid` derivation (`dimg`, 16-bit form). Round-trips through `parse` byte-for-byte; passes `audit_mif1` |
 | Derived images | `iovl` overlay + `iden` identity + `tmap` tone-map derivations resolved end-to-end (HEIF §6.3 / §6.6.2, av1-avif §4.2.2) via a box-graph geometry resolver — no AV1 decode: `transform_chain` / `output_dims_from_reconstructed` apply `irot`/`imir`/`clap`/`iscl` in `ipma` order (§6.3); `reconstructed_dims` resolves grid/iovl descriptor dims + recursive `iden` inputs + `tmap` base-input extents + `sato` own/`ispe`-or-input extents + coded `ispe` (cycle-guarded, depth 16; descriptor bytes resolve through `iloc` construction methods 0/1/**2**); `resolve_overlays` clips each `OverlayPlacement` against the canvas (§6.6.2.2.3); `resolve_iden_derivations` folds the iden's own transforms over its source; `resolve_tone_maps` resolves each `tmap`'s base/gain-map input ids + rendered (base) extents + per-gain-map coded extents, flagging gain-map up-sampling. Surfaced on `AvifInfo::{overlay_resolutions, iden_resolutions, tone_map_resolutions}`; `inspect()` accepts `iovl`/`iden`/`tmap`/`sato` derived primaries. Pixel composition still pending a decoder |
 | Unified derivation graph (`build_derivation_graph` / `inspect::derivation_graph`) | one decode-free traversal (HEIF §6.6) that walks any derived primary into a `DerivationGraph` — every reachable node (`DerivationNode` { `DerivationKind` ∈ Coded/Grid/Overlay/Identity/ToneMap/SampleTransform/Unknown, reconstructed + output dims, depth }) plus the de-duplicated coded-`av01` leaf decode set in first-visit order. Handles **nested** derivations (iden-of-grid, tmap-over-grid) and **diamond** graphs (shared leaf listed once); iterative pre-order with a `MAX_DERIVATION_DEPTH` cycle guard (`truncated` flag). Accessors: `output_dims` / `root_is_coded` / `coded_leaf_dims` (decode-buffer sizing) / `nodes_at_depth` / `derived_node_count`. No pixel composition — the dependency planner a renderer feeds its AV1 decoder |
 | Entity grouping (`grpl`) | typed `EntityGroup` per `EntityToGroupBox` (retaining the 24-bit `flags`); `altr` / `ster` / `eqiv` / `pano` / `prgr` progressive-rendering (§6.8.10) / `brst` burst (§6.8.9) / `msrc` multi-source (HEIF §9.4) / `tsyn` time-synchronized capture (§6.8.3) / `iaug` audio-to-image (§6.8.4, `audio_repeats()` = flags-LSB) / `slid` slideshow (§6.8.9) / `albc` album + `favc` favorites user-collections (§6.8.7) / the five §6.8.6 bracketed capture-time sets `aebr`/`wbbr`/`fobr`/`afbr`/`dobr` (`BracketingKind` / `is_bracketed_set`). `inspect::entity_groups` enumerates the file's `grpl` decode-free for the typed projections |

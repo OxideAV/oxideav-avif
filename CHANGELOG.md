@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **AVIF container encoder / muxer** (`mux` module — av1-avif §2 / §4.1 /
+  §9.1.1, HEIF §6.6.2 / ISO-BMFF §8.11). New [`AvifMuxer`],
+  [`AvifGridMuxer`], [`GridTile`], and the [`encode_still_av1`]
+  convenience emit a conformant AVIF file (`ftyp` `avif`/`mif1`/`miaf`/
+  `MA1B` + `meta` box tree + `mdat`) around an **already-coded** AV1
+  Image Item Data payload plus its `av1C` record — the AV1 bitstream is
+  taken black-box; the muxer does no pixel coding. The `meta` tree is
+  written end-to-end: `hdlr` (`pict`), `pitm`, `iinf`/`infe` (v2, with
+  the hidden-item flag), `iref`, `iprp` (`ipco` + `ipma`, small-index
+  form with property dedup), and `iloc` (v0, single-extent file-offset
+  `construction_method == 0`; a two-pass build measures the `meta` length
+  then patches absolute `mdat` offsets). Item properties emitted: `av1C`
+  (essential), `ispe`, `pixi`, `colr` (`nclx` + ICC `prof`), `pasp`,
+  `clap` / `irot` / `imir` (essential transformative). An AV1-coded
+  **alpha** plane muxes as a hidden monochrome `av01` auxiliary carrying
+  the alpha `auxC` URN and linked to the primary via an `auxl` iref
+  (`prem` when premultiplied). **Grid** derivation emits a `grid` primary
+  (16-bit form) fed by `rows × columns` hidden `av01` tiles via a `dimg`
+  iref. Output round-trips through this crate's own `parse` /
+  `parse_header` path byte-for-byte (coded payload + every property),
+  and passes the `audit_mif1` structural-brand audit. A black-box
+  round-trip integration test lifts a real fixture's coded AV1 stream +
+  `av1C` + `ispe` + `pixi` + `colr`, re-muxes, and re-parses to prove
+  pixel-consistent re-encoding without an AV1 encoder.
+
+- **`oxideav_core::Encoder` trait wiring** (`encoder` module). The
+  registry encoder factory (`make_encoder`) now returns a live
+  [`AvifEncoder`] rather than failing at construction. Because oxideav
+  ships no AV1 pixel encoder yet, `Encoder::send_frame` surfaces a
+  precise `Unsupported` naming the missing AV1-encode dependency and
+  pointing callers at `AvifMuxer` for black-box muxing; `codec_id` /
+  `output_params` / `flush` are functional. Registered alongside the
+  decoder via `register_codecs`.
+
 - **Entity-group family — `tsyn` / `iaug` / `slid` / `albc` / `favc` +
   bracketed sets** (HEIF §6.8.3 / §6.8.4 / §6.8.9 / §6.8.7 / §6.8.6).
   `EntityGroup` now retains the `EntityToGroupBox` 24-bit `flags` and

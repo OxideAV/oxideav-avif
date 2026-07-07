@@ -61,9 +61,22 @@
 //!
 //! # Encoder
 //!
-//! Not implemented — [`make_encoder`] (registry-only) returns
-//! `Error::Unsupported`. Writing an AVIF encoder requires an AV1
-//! encoder, which oxideav does not have.
+//! The **container muxer** is implemented in [`mux`]: [`AvifMuxer`] /
+//! [`AvifGridMuxer`] / [`encode_still_av1`] emit a conformant AVIF file
+//! (`ftyp` + `meta` box tree + `mdat`) around an already-coded AV1 Image
+//! Item Data payload plus its `av1C` record, with `ispe` / `pixi` /
+//! `colr` / `pasp` / `clap` / `irot` / `imir` item properties, an
+//! optional AV1-coded alpha auxiliary (`auxC` + `auxl`), and optional
+//! `grid` tiling (`dimg`). The output round-trips through this crate's
+//! own [`parse`] path pixel-consistently (the coded AV1 stream is copied
+//! verbatim).
+//!
+//! Turning decoded pixels *into* that AV1 bitstream needs an AV1 encoder,
+//! which oxideav does not yet ship. The registry [`Encoder`](encoder)
+//! surface ([`make_encoder`]) therefore returns a live [`AvifEncoder`]
+//! whose `send_frame` surfaces a precise `Unsupported` naming the missing
+//! AV1-encode dependency; callers holding a coded payload should mux it
+//! directly with [`AvifMuxer`].
 //!
 //! # Standalone vs registry-integrated
 //!
@@ -98,6 +111,7 @@ pub mod grid;
 pub mod image;
 pub mod inspect;
 pub mod meta;
+pub mod mux;
 pub mod parser;
 pub mod region;
 pub mod sample_group;
@@ -108,6 +122,9 @@ mod av1_stub;
 
 #[cfg(feature = "registry")]
 pub mod decoder;
+
+#[cfg(feature = "registry")]
+pub mod encoder;
 
 pub use alpha::{composite_alpha, find_alpha_item_id, ALPHA_URN_PREFIX};
 pub use avis::{
@@ -150,6 +167,7 @@ pub use meta::{
     ITEM_TYPE_EXIF, ITEM_TYPE_IDEN, ITEM_TYPE_IOVL, ITEM_TYPE_MIME, ITEM_TYPE_SATO, ITEM_TYPE_TMAP,
     ITEM_TYPE_URI,
 };
+pub use mux::{encode_still_av1, AvifGridMuxer, AvifMuxer, GridTile};
 pub use parser::{
     audit_mif1, classify_brands, item_bytes, item_bytes_owned, item_bytes_owned_full,
     item_bytes_owned_with_idat, item_bytes_with_idat, parse, parse_header, AvifHeader, AvifImage,
@@ -171,6 +189,9 @@ pub use transform::{apply_clap, apply_imir, apply_irot, crop_top_left};
 pub use decoder::{make_decoder, AvifDecoder};
 
 #[cfg(feature = "registry")]
+pub use encoder::{make_encoder, AvifEncoder};
+
+#[cfg(feature = "registry")]
 pub use registry_glue::__oxideav_entry;
 
 /// Public codec id string. Matches the aggregator-crate Cargo feature `avif`.
@@ -183,11 +204,12 @@ mod registry_glue {
     //! `oxideav_core` + `oxideav_av1`.
 
     use oxideav_core::{
-        CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry, ContainerRegistry,
-        Encoder, Error, Result, RuntimeContext,
+        CodecCapabilities, CodecId, CodecInfo, CodecRegistry, ContainerRegistry, Error,
+        RuntimeContext,
     };
 
     use crate::decoder::make_decoder;
+    use crate::encoder::make_encoder;
     use crate::error::AvifError;
     use crate::CODEC_ID_STR;
 
@@ -208,7 +230,9 @@ mod registry_glue {
     /// The decoder is declared `avif_heif_av1_decode` — we parse the
     /// HEIF container end to end, hand the AV1 bitstream to
     /// oxideav-av1, and composite grid / alpha / transform properties
-    /// on the resulting frames.
+    /// on the resulting frames. The encoder factory ([`make_encoder`])
+    /// yields a live container muxer; see [`crate::encoder`] for the
+    /// AV1-encode capability boundary.
     pub fn register_codecs(reg: &mut CodecRegistry) {
         let caps = CodecCapabilities::video("avif_heif_av1_decode")
             .with_lossy(true)
@@ -242,14 +266,6 @@ mod registry_glue {
 
     oxideav_core::register!("avif", register);
 
-    /// AVIF encoder factory — always errors. Writing AVIF requires an
-    /// AV1 encoder, which oxideav does not currently ship.
-    pub fn make_encoder(_params: &CodecParameters) -> Result<Box<dyn Encoder>> {
-        Err(Error::unsupported(
-            "avif: encoder not implemented — requires an AV1 encoder (not available in oxideav)",
-        ))
-    }
-
     /// Convenience: register AVIF in one call. Previously this also
     /// pulled the underlying AV1 decoder into the registry, but the
     /// post-2026-05-20 clean-room rebuild of `oxideav-av1` does not yet
@@ -272,15 +288,13 @@ mod registry_glue {
 }
 
 #[cfg(feature = "registry")]
-pub use registry_glue::{
-    make_encoder, register, register_codecs, register_containers, register_with_av1,
-};
+pub use registry_glue::{register, register_codecs, register_containers, register_with_av1};
 
 #[cfg(all(test, feature = "registry"))]
 mod tests {
     use super::*;
     use oxideav_core::{
-        CodecId, CodecParameters, CodecRegistry, ContainerRegistry, Error, RuntimeContext,
+        CodecId, CodecParameters, CodecRegistry, ContainerRegistry, Error, Frame, RuntimeContext,
     };
 
     #[test]
@@ -289,11 +303,17 @@ mod tests {
         register_codecs(&mut reg);
         let id = CodecId::new(CODEC_ID_STR);
         let params = CodecParameters::video(id);
-        // Encoder stays Unsupported.
-        match reg.first_encoder(&params) {
-            Err(Error::Unsupported(_)) => {}
-            Err(e) => panic!("encoder factory: expected Unsupported, got {e:?}"),
-            Ok(_) => panic!("encoder factory: expected Unsupported, got live encoder"),
+        // Encoder factory now yields a live container muxer. Pixel->AV1
+        // encode is not available, so the live encoder refuses frames
+        // with an Unsupported error naming the missing AV1 encoder.
+        let mut enc = reg.first_encoder(&params).expect("encoder factory");
+        let frame = Frame::Video(oxideav_core::frame::VideoFrame {
+            pts: Some(0),
+            planes: vec![],
+        });
+        match enc.send_frame(&frame) {
+            Err(Error::Unsupported(msg)) => assert!(msg.contains("AV1 encoder")),
+            other => panic!("encoder send_frame: expected Unsupported, got {other:?}"),
         }
         // Decoder factory succeeds; `send_packet` exercises the HEIF
         // parse + AV1 decode pipeline.

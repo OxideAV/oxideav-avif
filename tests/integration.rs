@@ -4298,3 +4298,73 @@ fn inspect_resolves_iovl_primary_overlay_placements() {
 
     assert!(res.canvas_partially_filled());
 }
+
+/// **Encoder round-trip with a black-box AV1 payload.** The AV1 image
+/// bitstream is taken opaque: we parse the real Microsoft `monochrome`
+/// fixture to lift its coded primary-item bytes, `av1C` record, `ispe`,
+/// and `pixi`, feed them straight into [`oxideav_avif::AvifMuxer`], then
+/// re-parse the muxed file. Every container-level value — and the coded
+/// AV1 payload itself — must round-trip byte-for-byte, which guarantees a
+/// pixel-consistent decode without this crate ever needing an AV1
+/// encoder.
+#[test]
+fn encoder_muxes_black_box_av1_payload_round_trip() {
+    use oxideav_avif::AvifMuxer;
+
+    // 1. Lift the black-box pieces from a known-good real fixture.
+    let src = parse(MONO).expect("parse source fixture");
+    let payload = src.primary_item_data.to_vec();
+    let av1c = src.av1c.clone().expect("source av1C");
+    let ispe = src.ispe.expect("source ispe");
+    let pixi_bits = src
+        .pixi
+        .as_ref()
+        .expect("source pixi")
+        .bits_per_channel
+        .clone();
+
+    // 2. Re-mux into a fresh AVIF, taking the AV1 stream verbatim.
+    let mut muxer = AvifMuxer::new(ispe.width, ispe.height, payload.clone(), av1c.clone())
+        .with_pixi(pixi_bits.clone());
+    if let Some(colr) = src.colr.clone() {
+        muxer = muxer.with_colr(colr);
+    }
+    let file = muxer.build().expect("mux monochrome");
+
+    // 3. Re-parse and assert everything survived the trip.
+    let out = parse(&file).expect("parse muxed avif");
+    assert_eq!(&out.major_brand, b"avif");
+    assert!(out.compatible_brands.iter().any(|b| b == b"mif1"));
+    assert!(out.compatible_brands.iter().any(|b| b == b"MA1B"));
+    assert_eq!(out.primary_item_id, 1);
+    assert_eq!(&out.primary_item.item_type, b"av01");
+    // The coded AV1 Image Item Data is byte-identical to the source's.
+    assert_eq!(&*out.primary_item_data, payload.as_slice());
+    assert_eq!(out.av1c.as_deref(), Some(av1c.as_slice()));
+    let out_ispe = out.ispe.expect("muxed ispe");
+    assert_eq!((out_ispe.width, out_ispe.height), (ispe.width, ispe.height));
+    assert_eq!(out.pixi.expect("muxed pixi").bits_per_channel, pixi_bits);
+
+    // 4. The muxed file also passes the container-side inspect surface.
+    let info = inspect(&file).expect("inspect muxed avif");
+    assert_eq!((info.width, info.height), (ispe.width, ispe.height));
+    assert!(!info.is_grid);
+    assert!(!info.has_alpha);
+    assert!(!info.av1c.is_empty());
+}
+
+/// The muxed AVIF passes the crate's own `mif1` structural-brand audit —
+/// every mandatory child box (`hdlr` / `pitm` / `iinf` + `infe` / `iloc`
+/// / `iprp`) is present and the file claims the `mif1` brand.
+#[test]
+fn muxed_avif_is_mif1_compliant() {
+    use oxideav_avif::{audit_mif1, AvifMuxer};
+    let file = AvifMuxer::new(16, 16, b"coded-av1".to_vec(), vec![0x81, 0x0c, 0x0c, 0x00])
+        .with_pixi(vec![8, 8, 8])
+        .build()
+        .expect("mux");
+    let m = audit_mif1(&file).expect("audit");
+    assert!(m.claims_mif1, "ftyp lists mif1");
+    assert!(m.is_compliant(), "muxed file must be mif1-compliant: {m:?}");
+    assert!(m.missing().is_empty());
+}
