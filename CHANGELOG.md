@@ -34,6 +34,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `av1C` + `ispe` + `pixi` + `colr`, re-muxes, and re-parses to prove
   pixel-consistent re-encoding without an AV1 encoder.
 
+- **Muxer HDR / metadata / profile extensions.** `AvifMuxer` now also
+  emits HDR descriptive properties `mdcv` (ST 2086 mastering display),
+  `clli` (MaxCLL/MaxFALL) and `amve` (ambient viewing environment, AVIF
+  §6.5.36); **Exif** (`with_exif`, item type `Exif`) and **XMP**
+  (`with_xmp`, a `mime` item with content type `application/rdf+xml`)
+  metadata items, each linked to the primary via a `cdsc` iref and
+  resolvable through `inspect`; and the AVIF **Advanced Profile**
+  (`advanced_profile()` → `MA1A` brand instead of `MA1B`). `AvifGridMuxer`
+  now emits the **32-bit `grid` descriptor** form automatically when the
+  output canvas exceeds 65535 px. All new paths round-trip through the
+  crate's own reader.
+
 - **`oxideav_core::Encoder` trait wiring** (`encoder` module). The
   registry encoder factory (`make_encoder`) now returns a live
   [`AvifEncoder`] rather than failing at construction. Because oxideav
