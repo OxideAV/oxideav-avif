@@ -311,9 +311,17 @@ pub struct AvifMuxer {
     clli: Option<Clli>,
     amve: Option<Amve>,
     alpha: Option<AlphaImage>,
+    depth: Option<AuxCoded>,
     exif: Option<Vec<u8>>,
     xmp: Option<Vec<u8>>,
     advanced_profile: bool,
+}
+
+/// A generic AV1-coded auxiliary image (used for the depth map).
+struct AuxCoded {
+    payload: Vec<u8>,
+    av1c: Vec<u8>,
+    pixi: Option<Vec<u8>>,
 }
 
 /// An AV1-coded alpha plane, carried as a monochrome auxiliary image item
@@ -346,6 +354,7 @@ impl AvifMuxer {
             clli: None,
             amve: None,
             alpha: None,
+            depth: None,
             exif: None,
             xmp: None,
             advanced_profile: false,
@@ -458,6 +467,19 @@ impl AvifMuxer {
         self
     }
 
+    /// Attach an AV1-coded depth map as an auxiliary image item — a
+    /// hidden monochrome `av01` item carrying the depth `auxC` URN
+    /// (`urn:mpeg:mpegB:cicp:systems:auxiliary:depth`, HEIF §6.5.8) and
+    /// linked to the primary via an `auxl` item reference.
+    pub fn with_depth(mut self, payload: Vec<u8>, av1c: Vec<u8>) -> Self {
+        self.depth = Some(AuxCoded {
+            payload,
+            av1c,
+            pixi: Some(vec![8]),
+        });
+        self
+    }
+
     /// Build the AVIF file bytes.
     pub fn build(self) -> Result<Vec<u8>> {
         if self.av1c.len() < 4 {
@@ -548,6 +570,38 @@ impl AvifMuxer {
                     to_ids: vec![1],
                 });
             }
+        }
+
+        if let Some(depth) = self.depth {
+            if depth.av1c.len() < 4 {
+                return Err(Error::invalid(
+                    "avif mux: depth av1C configuration record must be at least 4 bytes",
+                ));
+            }
+            let depth_id = next_id;
+            next_id += 1;
+            let mut dprops = vec![
+                prop_av1c(&depth.av1c),
+                prop_ispe(self.width, self.height),
+                prop_auxc(crate::meta::AUX_URN_DEPTH_MPEG),
+            ];
+            if let Some(bits) = &depth.pixi {
+                dprops.push(prop_pixi(bits));
+            }
+            items.push(MuxItem {
+                id: depth_id,
+                item_type: *b"av01",
+                name: "Depth".to_string(),
+                hidden: true,
+                content_type: None,
+                payload: depth.payload,
+                props: dprops,
+            });
+            irefs.push(MuxIref {
+                reference_type: *b"auxl",
+                from_id: depth_id,
+                to_ids: vec![1],
+            });
         }
 
         // Exif / XMP metadata items, each linked to the primary via a
@@ -1206,6 +1260,22 @@ mod tests {
         assert_eq!(got_exif, exif);
         let got_xmp = crate::inspect::item_payload_bytes(&bytes, xmp_id).expect("xmp");
         assert_eq!(got_xmp, xmp);
+    }
+
+    #[test]
+    fn depth_auxiliary_round_trips() {
+        let bytes = AvifMuxer::new(24, 24, b"color".to_vec(), synth_av1c())
+            .with_pixi(vec![8, 8, 8])
+            .with_depth(b"depth-obu".to_vec(), synth_av1c())
+            .build()
+            .expect("mux depth");
+        let info = crate::inspect::inspect(&bytes).expect("inspect");
+        assert!(info.has_depth_map());
+        let depth_id = info.depth_map_item_id.expect("depth id");
+        let hdr = parse_header(&bytes).expect("parse");
+        assert!(hdr.meta.item_by_id(depth_id).unwrap().is_hidden());
+        let auxc = hdr.meta.property_for(depth_id, b"auxC").expect("auxC");
+        assert!(matches!(auxc, crate::meta::Property::AuxC(a) if a.is_depth_map()));
     }
 
     #[test]

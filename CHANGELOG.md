@@ -46,6 +46,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   output canvas exceeds 65535 px. All new paths round-trip through the
   crate's own reader.
 
+- **Muxer depth-map auxiliary + profile-audit validation.**
+  `AvifMuxer::with_depth` emits an AV1-coded depth map as a hidden
+  monochrome `av01` auxiliary carrying the depth `auxC` URN
+  (`urn:mpeg:mpegB:cicp:systems:auxiliary:depth`, HEIF §6.5.8) + an
+  `auxl` iref to the primary; surfaced by `inspect` as
+  `depth_map_item_id`. A validation test confirms a muxed baseline file
+  (built from a real fixture's black-box AV1 stream) passes the crate's
+  own av1-avif §8.2 Baseline (`MA1B`) profile-compliance audit.
+
 - **`oxideav_core::Encoder` trait wiring** (`encoder` module). The
   registry encoder factory (`make_encoder`) now returns a live
   [`AvifEncoder`] rather than failing at construction. Because oxideav

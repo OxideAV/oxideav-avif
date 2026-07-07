@@ -4368,3 +4368,39 @@ fn muxed_avif_is_mif1_compliant() {
     assert!(m.is_compliant(), "muxed file must be mif1-compliant: {m:?}");
     assert!(m.missing().is_empty());
 }
+
+/// A muxed baseline AVIF (built from a real fixture's black-box AV1
+/// stream + `av1C`) passes the crate's own av1-avif §8.2 Baseline
+/// (`MA1B`) profile audit: the emitted brand set declares `MA1B`, and the
+/// `av1C` seq_profile / seq_level_idx_0 decoded back out of `ipco`
+/// satisfies Main Profile at level ≤ 5.1. Proves the muxer emits a
+/// spec-conformant baseline file, not just something that re-parses.
+#[test]
+fn muxed_baseline_avif_passes_profile_compliance_audit() {
+    use oxideav_avif::{audit_avif_profile_compliance, classify_brands, AvifMuxer, AvifProfile};
+
+    let src = parse(MONO).expect("parse source");
+    let payload = src.primary_item_data.to_vec();
+    let av1c = src.av1c.clone().expect("av1C");
+    let ispe = src.ispe.expect("ispe");
+    let file = AvifMuxer::new(ispe.width, ispe.height, payload, av1c)
+        .with_pixi(src.pixi.as_ref().unwrap().bits_per_channel.clone())
+        .build()
+        .expect("mux");
+
+    let hdr = parse_header(&file).expect("parse_header");
+    let brands = classify_brands(&hdr.major_brand, &hdr.compatible_brands).expect("brands");
+    assert!(brands.is_baseline_profile, "muxed ftyp declares MA1B");
+    assert!(!brands.is_advanced_profile);
+
+    let audit = audit_avif_profile_compliance(&hdr.meta, &brands);
+    assert_eq!(audit.len(), 1, "one Baseline record");
+    assert_eq!(audit[0].profile, AvifProfile::Baseline);
+    assert!(
+        audit[0].is_compliant(),
+        "muxed baseline AVIF must pass §8.2 audit: {:?}",
+        audit[0]
+    );
+    assert!(audit[0].missing().is_empty());
+    assert!(!audit[0].missing_av1c, "av1C present on the primary item");
+}
