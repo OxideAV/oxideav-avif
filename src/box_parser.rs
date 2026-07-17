@@ -161,6 +161,11 @@ pub fn find_box<'a>(buf: &'a [u8], target: &BoxType) -> Result<Option<(&'a [u8],
     Ok(None)
 }
 
+// Internal byte-cursor plumbing behind the box walker — not part of the
+// crate's stable API surface (the walker itself — `iter_boxes` / `find_box`
+// / `parse_box_header` / `parse_full_box` — stays public per the lib.rs
+// standalone-surface contract).
+#[doc(hidden)]
 pub fn read_u16(buf: &[u8], at: usize) -> Result<u16> {
     let end = at
         .checked_add(2)
@@ -171,6 +176,8 @@ pub fn read_u16(buf: &[u8], at: usize) -> Result<u16> {
     Ok(u16::from_be_bytes([buf[at], buf[at + 1]]))
 }
 
+// Internal byte-cursor plumbing — see `read_u16`.
+#[doc(hidden)]
 pub fn read_u32(buf: &[u8], at: usize) -> Result<u32> {
     let end = at
         .checked_add(4)
@@ -186,6 +193,8 @@ pub fn read_u32(buf: &[u8], at: usize) -> Result<u32> {
     ]))
 }
 
+// Internal byte-cursor plumbing — see `read_u16`.
+#[doc(hidden)]
 pub fn read_u64(buf: &[u8], at: usize) -> Result<u64> {
     let end = at
         .checked_add(8)
@@ -201,6 +210,8 @@ pub fn read_u64(buf: &[u8], at: usize) -> Result<u64> {
 /// Read a variable-width big-endian unsigned integer of `width_bytes`
 /// bytes starting at `at`. `width_bytes` may be 0, 4, or 8 per
 /// ISO/IEC 14496-12 §8.11.3 (`iloc`).
+// Internal byte-cursor plumbing — see `read_u16`.
+#[doc(hidden)]
 pub fn read_var_uint(buf: &[u8], at: usize, width_bytes: usize) -> Result<u64> {
     match width_bytes {
         0 => Ok(0),
@@ -214,6 +225,8 @@ pub fn read_var_uint(buf: &[u8], at: usize, width_bytes: usize) -> Result<u64> {
 
 /// Null-terminated ASCII string starting at `at`, advancing the caller's
 /// cursor past the terminator. Returns `(string, new_offset)`.
+// Internal byte-cursor plumbing — see `read_u16`.
+#[doc(hidden)]
 pub fn read_cstr(buf: &[u8], at: usize) -> Result<(String, usize)> {
     let mut i = at;
     while i < buf.len() && buf[i] != 0 {

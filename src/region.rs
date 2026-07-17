@@ -28,6 +28,9 @@ pub const ITEM_TYPE_MSKI: [u8; 4] = *b"mski";
 pub const REF_TYPE_DRGN: [u8; 4] = *b"drgn";
 /// HEIF §6.6.2.1 — identity derivation item type (`'iden'`), reused by
 /// §11.3.3.2.1 for the identity derived-region item.
+// Internal module-local duplicate — the public constant is the crate-root
+// re-export of `crate::meta::ITEM_TYPE_IDEN`.
+#[doc(hidden)]
 pub const ITEM_TYPE_IDEN: [u8; 4] = *b"iden";
 
 /// One region geometry inside a [`RegionItem`] (HEIF §11.2.1).

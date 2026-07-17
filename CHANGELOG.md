@@ -332,6 +332,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Marked internal plumbing `#[doc(hidden)]` so semver tooling tracks only
+  the stable surface: the `box_parser` byte-cursor helpers (`read_u16` /
+  `read_u32` / `read_u64` / `read_var_uint` / `read_cstr`) and the
+  module-local `region::ITEM_TYPE_IDEN` duplicate (the public constant is
+  the crate-root re-export from `meta`). No signature or behaviour change.
+
 - The `inspect` path now reuses the `idat` (ItemDataBox) payload captured
   by `Meta::parse` instead of re-walking the file with a private
   `extract_idat` helper (now removed). Single source of truth for the
