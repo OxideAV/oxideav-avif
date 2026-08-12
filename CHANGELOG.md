@@ -32,6 +32,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `register_with_av1` restored to its historical contract: registers
   both the AVIF factories and `oxideav-av1`'s own codec registration
   in one call.
+- **`no_profile_brand()`** on both `AvifMuxer` and `AvifGridMuxer`
+  (which also gains `advanced_profile()`): `ftyp` lists only the
+  general brands (`avif` / `mif1` / `miaf`) — the av1-avif §8.1 shape
+  for payloads whose AV1 characteristics match neither defined
+  profile, e.g. AV1 Professional-profile streams (4:2:2 at any depth,
+  12-bit at any subsampling), which fail both the `MA1B` Main-profile
+  `shall` (§8.2) and the `MA1A` High-profile `shall` (§8.3).
 
 - **AVIF container encoder / muxer** (`mux` module — av1-avif §2 / §4.1 /
   §9.1.1, HEIF §6.6.2 / ISO-BMFF §8.11). New [`AvifMuxer`],

@@ -291,6 +291,24 @@ struct MuxIref {
     to_ids: Vec<u32>,
 }
 
+/// Which AVIF profile brand `ftyp` declares (av1-avif §8.2 / §8.3).
+///
+/// `Bare` emits only the general brands (`avif` / `mif1` / `miaf`) —
+/// the shape §8.1 prescribes when "the corresponding AV1 encoding
+/// characteristics do not match any of the defined profiles" (e.g. an
+/// AV1 Professional-profile 4:2:2 or 12-bit payload, which satisfies
+/// neither the `MA1B` Main-profile nor the `MA1A` High-profile
+/// constraint).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProfileBrand {
+    /// `MA1B` — requires AV1 Main Profile, level <= 5.1 (§8.2).
+    Baseline,
+    /// `MA1A` — requires AV1 High Profile, level <= 6.0 (§8.3).
+    Advanced,
+    /// No profile brand — general AVIF brands only (§8.1).
+    Bare,
+}
+
 // ───────────────────────────── public API ─────────────────────────────
 
 /// Builder for a single-image AVIF file wrapping one coded AV1 primary
@@ -314,7 +332,7 @@ pub struct AvifMuxer {
     depth: Option<AuxCoded>,
     exif: Option<Vec<u8>>,
     xmp: Option<Vec<u8>>,
-    advanced_profile: bool,
+    profile_brand: ProfileBrand,
 }
 
 /// A generic AV1-coded auxiliary image (used for the depth map).
@@ -357,7 +375,7 @@ impl AvifMuxer {
             depth: None,
             exif: None,
             xmp: None,
-            advanced_profile: false,
+            profile_brand: ProfileBrand::Baseline,
         }
     }
 
@@ -440,7 +458,19 @@ impl AvifMuxer {
     /// muxer does not itself validate that the AV1 bitstream meets the
     /// profile constraints — that is the encoder's responsibility.
     pub fn advanced_profile(mut self) -> Self {
-        self.advanced_profile = true;
+        self.profile_brand = ProfileBrand::Advanced;
+        self
+    }
+
+    /// Declare **no** AVIF profile brand: `ftyp` lists only the general
+    /// brands (`avif` / `mif1` / `miaf`). av1-avif §8.1 prescribes this
+    /// shape when the coded AV1 characteristics match neither defined
+    /// profile — e.g. an AV1 Professional-profile payload (4:2:2 at any
+    /// depth, or 12-bit at any subsampling), which fails both the
+    /// `MA1B` Main-profile `shall` (§8.2) and the `MA1A` High-profile
+    /// `shall` (§8.3).
+    pub fn no_profile_brand(mut self) -> Self {
+        self.profile_brand = ProfileBrand::Bare;
         self
     }
 
@@ -642,7 +672,7 @@ impl AvifMuxer {
             });
         }
 
-        assemble(&items, 1, &irefs, self.advanced_profile)
+        assemble(&items, 1, &irefs, self.profile_brand)
     }
 }
 
@@ -685,6 +715,7 @@ pub struct AvifGridMuxer {
     tiles: Vec<GridTile>,
     pixi: Option<Vec<u8>>,
     colr: Option<Colr>,
+    profile_brand: ProfileBrand,
 }
 
 impl AvifGridMuxer {
@@ -700,6 +731,7 @@ impl AvifGridMuxer {
             tiles: Vec::new(),
             pixi: None,
             colr: None,
+            profile_brand: ProfileBrand::Baseline,
         }
     }
 
@@ -718,6 +750,20 @@ impl AvifGridMuxer {
     /// Attach a `colr` property to the grid item.
     pub fn with_colr(mut self, colr: Colr) -> Self {
         self.colr = Some(colr);
+        self
+    }
+
+    /// Declare the AVIF Advanced Profile (`MA1A`) in `ftyp` (av1-avif
+    /// §8.3) — see [`AvifMuxer::advanced_profile`].
+    pub fn advanced_profile(mut self) -> Self {
+        self.profile_brand = ProfileBrand::Advanced;
+        self
+    }
+
+    /// Declare no AVIF profile brand in `ftyp` (av1-avif §8.1) — see
+    /// [`AvifMuxer::no_profile_brand`].
+    pub fn no_profile_brand(mut self) -> Self {
+        self.profile_brand = ProfileBrand::Bare;
         self
     }
 
@@ -785,7 +831,7 @@ impl AvifGridMuxer {
             from_id: 1,
             to_ids: tile_ids,
         }];
-        assemble(&items, 1, &irefs, false)
+        assemble(&items, 1, &irefs, self.profile_brand)
     }
 }
 
@@ -817,13 +863,13 @@ fn build_grid_descriptor(
 // ───────────────────────────── assembly ───────────────────────────────
 
 /// Assemble the full AVIF file from an item list, the primary item id,
-/// and the item-reference list. `advanced_profile` selects the `MA1A`
-/// brand instead of `MA1B` in `ftyp`.
+/// and the item-reference list. `profile_brand` selects which (if any)
+/// AVIF profile brand `ftyp` declares.
 fn assemble(
     items: &[MuxItem],
     primary_id: u32,
     irefs: &[MuxIref],
-    advanced_profile: bool,
+    profile_brand: ProfileBrand,
 ) -> Result<Vec<u8>> {
     if items.len() > u16::MAX as usize {
         return Err(Error::unsupported("avif mux: too many items for v0 boxes"));
@@ -862,7 +908,7 @@ fn assemble(
         item_assocs.push(assocs);
     }
 
-    let ftyp = build_ftyp(advanced_profile);
+    let ftyp = build_ftyp(profile_brand);
     // 3. Measure the meta box length with placeholder offsets, then
     //    rebuild with absolute offsets. Offset field width is fixed, so
     //    the length is stable across the two builds.
@@ -894,16 +940,21 @@ fn assemble(
     Ok(out)
 }
 
-/// `ftyp`: AVIF brand set (av1-avif §6.2 / §8.2 / §8.3). Baseline
-/// (`MA1B`) by default; `advanced_profile` selects `MA1A`.
-fn build_ftyp(advanced_profile: bool) -> Vec<u8> {
+/// `ftyp`: AVIF brand set (av1-avif §6.2 / §8.1 / §8.2 / §8.3).
+/// Baseline (`MA1B`) by default; `Advanced` selects `MA1A`; `Bare`
+/// lists only the general brands.
+fn build_ftyp(profile_brand: ProfileBrand) -> Vec<u8> {
     let mut w = W::default();
     w.fourcc(b"avif"); // major_brand
     w.u32(0); // minor_version
     w.fourcc(b"avif");
     w.fourcc(b"mif1");
     w.fourcc(b"miaf");
-    w.fourcc(if advanced_profile { b"MA1A" } else { b"MA1B" });
+    match profile_brand {
+        ProfileBrand::Baseline => w.fourcc(b"MA1B"),
+        ProfileBrand::Advanced => w.fourcc(b"MA1A"),
+        ProfileBrand::Bare => {}
+    }
     boxed(b"ftyp", &w.into_vec())
 }
 
@@ -1286,6 +1337,52 @@ mod tests {
             .expect("mux");
         let img = parse(&bytes).expect("parse");
         assert!(img.compatible_brands.iter().any(|b| b == b"MA1A"));
+        assert!(!img.compatible_brands.iter().any(|b| b == b"MA1B"));
+    }
+
+    #[test]
+    fn no_profile_brand_omits_ma1a_and_ma1b() {
+        let bytes = AvifMuxer::new(8, 8, b"obu".to_vec(), synth_av1c())
+            .no_profile_brand()
+            .build()
+            .expect("mux");
+        let img = parse(&bytes).expect("parse");
+        assert!(!img.compatible_brands.iter().any(|b| b == b"MA1A"));
+        assert!(!img.compatible_brands.iter().any(|b| b == b"MA1B"));
+        // The general brands stay (av1-avif §8.1 / §6.2).
+        assert!(img.compatible_brands.iter().any(|b| b == b"mif1"));
+        assert!(img.compatible_brands.iter().any(|b| b == b"miaf"));
+        // Still a conformant mif1 file.
+        assert!(crate::parser::audit_mif1(&bytes)
+            .expect("audit")
+            .is_compliant());
+    }
+
+    #[test]
+    fn grid_muxer_profile_brand_controls() {
+        let av1c = synth_av1c();
+        let mk = |n: u8| GridTile {
+            width: 16,
+            height: 16,
+            payload: vec![n; 5],
+            av1c: av1c.clone(),
+        };
+        let adv = AvifGridMuxer::new(1, 2, 32, 16)
+            .tile(mk(1))
+            .tile(mk(2))
+            .advanced_profile()
+            .build()
+            .expect("mux adv grid");
+        let img = parse_header(&adv).expect("parse");
+        assert!(img.compatible_brands.iter().any(|b| b == b"MA1A"));
+        let bare = AvifGridMuxer::new(1, 2, 32, 16)
+            .tile(mk(1))
+            .tile(mk(2))
+            .no_profile_brand()
+            .build()
+            .expect("mux bare grid");
+        let img = parse_header(&bare).expect("parse");
+        assert!(!img.compatible_brands.iter().any(|b| b == b"MA1A"));
         assert!(!img.compatible_brands.iter().any(|b| b == b"MA1B"));
     }
 
