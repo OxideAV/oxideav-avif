@@ -30,14 +30,13 @@ members = ["."]
 [profile.release]
 debug = 1
 
-# Cross-decode harnesses. The oxideav-avif encoder is a stub
-# (lib.rs::make_encoder returns Error::Unsupported because we lack an
-# AV1 encoder), so the literal "oxideav encode" and self-roundtrip
-# directions of #304 round 2 can't be wired up. The two libavif-driven
-# round-2 harnesses below test the strongest properties the existing
-# decoder surface supports — pixel cross-validation against libavif's
-# decoder on the same input bitstream, and round-trip stability across
-# a libavif re-encode.
+# Cross-decode + self-roundtrip harnesses. oxideav-avif now ships a
+# real pixel encoder (the `still` module driving oxideav-av1's
+# KEY-frame encoder), so the literal #304 self-roundtrip runs in-tree
+# (oxideav_encode_oxideav_decode_roundtrip, byte-exact lossless). The
+# libavif-driven harnesses keep the cross-implementation legs: pixel
+# cross-validation against libavif's decoder on the same bitstream,
+# and round-trip stability across a libavif re-encode.
 
 # Round 1 (#345) — encode with libavif, decode with oxideav-avif,
 # tolerate decoder errors but assert dimensions on success.
@@ -56,14 +55,20 @@ path = "fuzz_targets/libavif_encode_oxideav_libavif_decode_match.rs"
 test = false
 doc = false
 
-# Round 2 #304 (a) — closest realisable approximation of the literal
-# self-roundtrip task: oxideav decode → libavif re-encode → oxideav
-# decode → assert the two oxideav-decoded planes match. The literal
-# "oxideav-encode → oxideav-decode" path is blocked on the missing AV1
-# encoder; this harness validates oxideav-avif's decoder is bit-stable
-# under a re-encode by libavif.
+# Round 2 #304 (a) — oxideav decode → libavif re-encode → oxideav
+# decode → assert the two oxideav-decoded planes match: validates
+# oxideav-avif's decoder is bit-stable under a re-encode by libavif.
 [[bin]]
 name = "libavif_oxideav_reencode_roundtrip"
 path = "fuzz_targets/libavif_oxideav_reencode_roundtrip.rs"
+test = false
+doc = false
+
+# #304 literal self-roundtrip — oxideav encode (lossless identity RGBA
+# + alpha auxiliary) → oxideav decode → assert byte-exact pixels.
+# Fully in-tree; never skips.
+[[bin]]
+name = "oxideav_encode_oxideav_decode_roundtrip"
+path = "fuzz_targets/oxideav_encode_oxideav_decode_roundtrip.rs"
 test = false
 doc = false

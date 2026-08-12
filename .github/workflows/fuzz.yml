@@ -1,8 +1,11 @@
 name: Fuzz
 
-# Daily fuzz run for the cargo-fuzz harnesses under fuzz/. Three
-# libavif-driven cross-decode harnesses ship today:
+# Daily fuzz run for the cargo-fuzz harnesses under fuzz/. Four
+# harnesses ship today:
 #
+#   * oxideav_encode_oxideav_decode_roundtrip (#304 literal) —
+#     oxideav encode (lossless identity RGBA + alpha auxiliary) →
+#     oxideav decode → assert byte-exact pixels. Fully in-tree.
 #   * libavif_encode_oxideav_decode (#345) — encode with libavif,
 #     decode with oxideav-avif, tolerate decoder errors but assert
 #     dimensions on success.
@@ -13,14 +16,9 @@ name: Fuzz
 #     decode → libavif re-encode → oxideav decode → assert pixel
 #     stability across the round-trip.
 #
-# The literal "oxideav encode → oxideav decode → ..." self-roundtrip
-# of #304 is blocked on oxideav-avif growing a real encoder
-# (today `make_encoder` returns Error::Unsupported because we lack an
-# AV1 encoder).
-#
-# Every harness dlopens libavif at runtime via libloading; the CI
-# runner needs `libavif-dev` so it actually validates instead of
-# silently skipping.
+# The libavif harnesses dlopen libavif at runtime via libloading; the
+# CI runner needs `libavif-dev` so they actually validate instead of
+# silently skipping. The self-roundtrip harness never skips.
 
 on:
   schedule:

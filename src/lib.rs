@@ -70,12 +70,18 @@
 //! own [`parse`] path pixel-consistently (the coded AV1 stream is copied
 //! verbatim).
 //!
-//! Turning decoded pixels *into* that AV1 bitstream needs an AV1 encoder,
-//! which oxideav does not yet ship. The registry [`Encoder`](encoder)
-//! surface ([`make_encoder`]) therefore returns a live [`AvifEncoder`]
-//! whose `send_frame` surfaces a precise `Unsupported` naming the missing
-//! AV1-encode dependency; callers holding a coded payload should mux it
-//! directly with [`AvifMuxer`].
+//! Turning raw pixels *into* that AV1 bitstream is the job of the
+//! [`still`] module ([`StillImage`] + [`encode_still`] /
+//! [`encode_still_grid`]): it drives `oxideav_av1`'s conformance-grade
+//! KEY-frame encoder across the full (bit depth × chroma format)
+//! matrix — including RGB(A) via the H.273 identity matrix, alpha
+//! auxiliaries, arbitrary extents (pad + `clap`), and grid tiling —
+//! then wraps the coded payload through the muxer. The registry
+//! [`Encoder`](encoder) surface ([`make_encoder`] / [`AvifEncoder`])
+//! rides the same pipeline: every video frame sent through
+//! `send_frame` yields one complete AVIF file packet. Callers holding
+//! an already-coded payload keep muxing it directly with
+//! [`AvifMuxer`].
 //!
 //! # Standalone vs registry-integrated
 //!
@@ -239,8 +245,8 @@ mod registry_glue {
     /// HEIF container end to end, hand the AV1 bitstream to
     /// oxideav-av1, and composite grid / alpha / transform properties
     /// on the resulting frames. The encoder factory ([`make_encoder`])
-    /// yields a live container muxer; see [`crate::encoder`] for the
-    /// AV1-encode capability boundary.
+    /// yields the pixel-in AVIF encoder (one complete AVIF file per
+    /// frame; see [`crate::encoder`] for the format/option surface).
     pub fn register_codecs(reg: &mut CodecRegistry) {
         let caps = CodecCapabilities::video("avif_heif_av1_decode")
             .with_lossy(true)
@@ -309,21 +315,41 @@ mod tests {
         let mut reg = CodecRegistry::new();
         register_codecs(&mut reg);
         let id = CodecId::new(CODEC_ID_STR);
-        let params = CodecParameters::video(id);
-        // Encoder factory now yields a live container muxer. Pixel->AV1
-        // encode is not available, so the live encoder refuses frames
-        // with an Unsupported error naming the missing AV1 encoder.
+        // The encoder factory yields the real pixel-in AVIF encoder:
+        // a registry-resolved encode of an 8x8 gray frame produces a
+        // parseable AVIF file.
+        let mut params = CodecParameters::video(id.clone());
+        params.width = Some(8);
+        params.height = Some(8);
+        params.pixel_format = Some(oxideav_core::PixelFormat::Gray8);
         let mut enc = reg.first_encoder(&params).expect("encoder factory");
         let frame = Frame::Video(oxideav_core::frame::VideoFrame {
             pts: Some(0),
+            planes: vec![oxideav_core::frame::VideoPlane {
+                stride: 8,
+                data: (0..64u8).collect(),
+            }],
+        });
+        enc.send_frame(&frame).expect("send_frame");
+        let pkt = enc.receive_packet().expect("receive_packet");
+        crate::parser::parse(&pkt.data).expect("emitted packet is a parseable AVIF file");
+        // A frame without the required parameters is refused with a
+        // precise error, not a panic.
+        let bare = reg
+            .first_encoder(&CodecParameters::video(id))
+            .expect("encoder factory");
+        let mut bare = bare;
+        let empty = Frame::Video(oxideav_core::frame::VideoFrame {
+            pts: Some(0),
             planes: vec![],
         });
-        match enc.send_frame(&frame) {
-            Err(Error::Unsupported(msg)) => assert!(msg.contains("AV1 encoder")),
-            other => panic!("encoder send_frame: expected Unsupported, got {other:?}"),
+        match bare.send_frame(&empty) {
+            Err(Error::InvalidData(msg)) => assert!(msg.contains("width"), "{msg}"),
+            other => panic!("encoder send_frame: expected InvalidData, got {other:?}"),
         }
         // Decoder factory succeeds; `send_packet` exercises the HEIF
         // parse + AV1 decode pipeline.
+        let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
         let _ = reg.first_decoder(&params).expect("decoder factory");
     }
 

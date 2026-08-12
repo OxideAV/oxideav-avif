@@ -32,6 +32,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `register_with_av1` restored to its historical contract: registers
   both the AVIF factories and `oxideav-av1`'s own codec registration
   in one call.
+- **Registry `Encoder` goes live** — `make_encoder` / `AvifEncoder`
+  now encode: every video frame sent through `Encoder::send_frame`
+  becomes one complete AVIF file packet (keyframe-flagged, `pts`
+  carried through) via the `still` pipeline. Input formats: planar
+  YUV 8-bit (`Yuv420P`/`Yuv422P`/`Yuv444P`/`Gray8` + the full-range
+  `YuvJ*` variants, which attach a full-range `nclx` and signal
+  §5.5.2 `color_range = 1` in-stream), 10/12-bit `*P10Le`/`*P12Le` +
+  `Gray10Le`/`Gray12Le`, packed `Rgb24`/`Rgba`/`Bgr24`/`Bgra`
+  (identity-matrix 4:4:4, alpha → auxiliary item), `Yuva420P`, and
+  `Ya8`. Codec options: `q` (colour `base_q_idx`, default 0 =
+  lossless), `alpha_q`, `premultiplied`. The former
+  "missing AV1 encoder" `Unsupported` stub is gone.
+- Fuzz: new in-tree self-roundtrip harness
+  (`oxideav_encode_oxideav_decode_roundtrip`) — fuzz-shaped RGBA →
+  lossless `encode_still` → own-decoder decode → byte-exact pixel
+  assert; never skips (89k executions clean on the bring-up run).
+  The fuzz manifest's stale oxideav-av1 0.1.7 pin is re-resolved to
+  the current release line so the harnesses build against the same
+  producer the library uses.
 - **Pixel → AVIF still encoder** (`still` module, registry-gated):
   [`StillImage`] + [`encode_still`] / [`encode_still_grid`] turn raw
   pixels into a complete AVIF file by driving `oxideav-av1`'s

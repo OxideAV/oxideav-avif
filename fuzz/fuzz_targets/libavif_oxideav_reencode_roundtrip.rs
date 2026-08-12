@@ -5,19 +5,14 @@
 //! through oxideav-avif again, and assert pixels are stable across
 //! the round-trip.
 //!
-//! ## Why this and not "oxideav encode + oxideav decode"
+//! ## Relationship to the self-roundtrip harness
 //!
-//! The literal task spec for #304 round 2 calls for a self-roundtrip
-//! (`fuzz-generated AVIF → decode → re-encode → decode again`). That
-//! would require an oxideav AVIF encoder, which doesn't exist —
-//! `oxideav_avif::make_encoder` returns `Error::Unsupported` because
-//! writing AVIF needs an AV1 encoder and oxideav doesn't ship one
-//! (see `lib.rs::make_encoder` and the round-2 README note).
-//!
-//! In its place this harness exercises the strongest property the
-//! existing surface supports: oxideav-avif's decoder must produce
-//! pixels that are stable under a re-encode by a different (libavif)
-//! encoder. Concretely:
+//! The literal #304 self-roundtrip (oxideav encode → oxideav decode,
+//! byte-exact) lives in `oxideav_encode_oxideav_decode_roundtrip` now
+//! that the crate ships a real pixel encoder. This harness keeps the
+//! complementary cross-implementation property: oxideav-avif's
+//! decoder must produce pixels that are stable under a re-encode by a
+//! different (libavif) encoder. Concretely:
 //!
 //!   1. libavif encodes a fuzz-generated RGBA → AVIF₁ (lossless).
 //!   2. oxideav-avif decodes AVIF₁ → YUV444 planes P₁.
