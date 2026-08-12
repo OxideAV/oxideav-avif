@@ -731,17 +731,17 @@ pub fn encode_still(img: &StillImage, opts: &StillEncodeOptions) -> Result<Vec<u
     if let Some(xmp) = &props.xmp {
         mux = mux.with_xmp(xmp.clone());
     }
-    if let Some(mdcv) = &props.mdcv {
-        mux = mux.with_mdcv(mdcv.clone());
+    if let Some(mdcv) = props.mdcv {
+        mux = mux.with_mdcv(mdcv);
     }
-    if let Some(clli) = &props.clli {
-        mux = mux.with_clli(clli.clone());
+    if let Some(clli) = props.clli {
+        mux = mux.with_clli(clli);
     }
-    if let Some(amve) = &props.amve {
-        mux = mux.with_amve(amve.clone());
+    if let Some(amve) = props.amve {
+        mux = mux.with_amve(amve);
     }
-    if let Some(pasp) = &props.pasp {
-        mux = mux.with_pasp(pasp.clone());
+    if let Some(pasp) = props.pasp {
+        mux = mux.with_pasp(pasp);
     }
     if let Some(angle) = props.irot {
         mux = mux.with_irot(angle);
