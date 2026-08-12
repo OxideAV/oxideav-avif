@@ -11,13 +11,15 @@
 //!
 //! The helpers here locate the alpha item id, verify the URN match,
 //! and composite a decoded alpha plane onto a decoded colour frame.
-//! The composite path supports the two colour layouts the underlying
-//! AV1 decoder emits today:
+//! The composite path supports every 8-bit colour layout the
+//! underlying AV1 decoder emits:
 //!
 //!   * `PixelFormat::Yuv420P` + 8-bit Gray alpha  -> `PixelFormat::Yuva420P`
+//!   * `PixelFormat::Yuv422P` + 8-bit Gray alpha  -> `PixelFormat::Yuva422P`
+//!   * `PixelFormat::Yuv444P` + 8-bit Gray alpha  -> `PixelFormat::Yuva444P`
 //!   * `PixelFormat::Gray8`   + 8-bit Gray alpha  -> `PixelFormat::Ya8`
 //!
-//! Other layouts return `Error::Unsupported`.
+//! Other layouts (high bit depth) return `Error::Unsupported`.
 
 use crate::error::{AvifError as Error, Result};
 use crate::image::{
@@ -50,15 +52,18 @@ pub fn find_alpha_item_id(meta: &Meta, primary_id: u32) -> Option<u32> {
 
 /// Composite a decoded alpha frame onto a decoded colour frame. Both
 /// frames must share `(width, height)`. The alpha frame must be
-/// `Gray8`; the colour frame must be `Yuv420P` or `Gray8`.
+/// `Gray8`; the colour frame must be planar YUV (any subsampling) or
+/// `Gray8`.
 ///
 /// `color_format` / `alpha_format` and the shared `(width, height)`
 /// describe the per-stream metadata that no longer rides on
 /// [`VideoFrame`]. The returned `(VideoFrame, PixelFormat)` carries the
 /// composited pixels and the new packed format:
 ///
-///   * `Yuva420P` when the colour frame is `Yuv420P`.
-///   * `Ya8`     when the colour frame is `Gray8`.
+///   * `Yuva420P` / `Yuva422P` / `Yuva444P` when the colour frame is
+///     the matching `Yuv*P` layout (alpha appended as a fourth
+///     full-resolution plane).
+///   * `Ya8` when the colour frame is `Gray8`.
 pub fn composite_alpha(
     color: &VideoFrame,
     color_format: PixelFormat,
@@ -77,15 +82,26 @@ pub fn composite_alpha(
     let alpha_packed = pack_plane(&alpha.planes[0], width as usize, height as usize)?;
 
     match color_format {
-        PixelFormat::Yuv420P => {
+        PixelFormat::Yuv420P | PixelFormat::Yuv422P | PixelFormat::Yuv444P => {
             if color.planes.len() != 3 {
                 return Err(Error::invalid(format!(
-                    "avif alpha: Yuv420P frame has {} planes",
+                    "avif alpha: {color_format:?} frame has {} planes",
                     color.planes.len()
                 )));
             }
-            let cw = width.div_ceil(2) as usize;
-            let ch = height.div_ceil(2) as usize;
+            let (cw, ch, out_format) = match color_format {
+                PixelFormat::Yuv420P => (
+                    width.div_ceil(2) as usize,
+                    height.div_ceil(2) as usize,
+                    PixelFormat::Yuva420P,
+                ),
+                PixelFormat::Yuv422P => (
+                    width.div_ceil(2) as usize,
+                    height as usize,
+                    PixelFormat::Yuva422P,
+                ),
+                _ => (width as usize, height as usize, PixelFormat::Yuva444P),
+            };
             let y = pack_plane(&color.planes[0], width as usize, height as usize)?;
             let u = pack_plane(&color.planes[1], cw, ch)?;
             let v = pack_plane(&color.planes[2], cw, ch)?;
@@ -111,7 +127,7 @@ pub fn composite_alpha(
                         },
                     ],
                 },
-                PixelFormat::Yuva420P,
+                out_format,
             ))
         }
         PixelFormat::Gray8 => {
@@ -228,6 +244,70 @@ mod tests {
         assert_eq!(fmt, PixelFormat::Ya8);
         // Interleaved Y A Y A …
         assert_eq!(out.planes[0].data, vec![50, 150, 50, 150, 50, 150, 50, 150]);
+    }
+
+    #[test]
+    fn composite_yuv444_with_alpha() {
+        let color = VideoFrame {
+            pts: None,
+            planes: (0..3)
+                .map(|i| VideoPlane {
+                    stride: 4,
+                    data: vec![(i * 40) as u8; 16],
+                })
+                .collect(),
+        };
+        let alpha = make_gray(4, 4, 77);
+        let (out, fmt) = composite_alpha(
+            &color,
+            PixelFormat::Yuv444P,
+            4,
+            4,
+            &alpha,
+            PixelFormat::Gray8,
+        )
+        .unwrap();
+        assert_eq!(fmt, PixelFormat::Yuva444P);
+        assert_eq!(out.planes.len(), 4);
+        // 4:4:4 chroma stays full extent.
+        assert_eq!(out.planes[1].data.len(), 16);
+        assert!(out.planes[3].data.iter().all(|&v| v == 77));
+    }
+
+    #[test]
+    fn composite_yuv422_with_alpha() {
+        let color = VideoFrame {
+            pts: None,
+            planes: vec![
+                VideoPlane {
+                    stride: 4,
+                    data: vec![10u8; 16],
+                },
+                VideoPlane {
+                    stride: 2,
+                    data: vec![20u8; 8],
+                },
+                VideoPlane {
+                    stride: 2,
+                    data: vec![30u8; 8],
+                },
+            ],
+        };
+        let alpha = make_gray(4, 4, 200);
+        let (out, fmt) = composite_alpha(
+            &color,
+            PixelFormat::Yuv422P,
+            4,
+            4,
+            &alpha,
+            PixelFormat::Gray8,
+        )
+        .unwrap();
+        assert_eq!(fmt, PixelFormat::Yuva422P);
+        assert_eq!(out.planes.len(), 4);
+        // 4:2:2 chroma: half width, full height.
+        assert_eq!(out.planes[1].data.len(), 8);
+        assert_eq!(out.planes[3].data.len(), 16);
     }
 
     #[test]

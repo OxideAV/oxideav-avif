@@ -55,6 +55,12 @@ pub enum AvifPixelFormat {
     /// A). Produced by [`crate::alpha::composite_alpha`] when the
     /// primary item carries an alpha auxiliary.
     Yuva420P,
+    /// 8-bit planar 4:2:2 with a full-resolution alpha plane.
+    Yuva422P,
+    /// 8-bit planar 4:4:4 with a full-resolution alpha plane. The
+    /// identity-matrix (`colr` `nclx` `matrix_coefficients = 0`) RGBA
+    /// encode path decodes back to this layout.
+    Yuva444P,
     /// 8-bit packed Y A interleaved. Produced by
     /// [`crate::alpha::composite_alpha`] when the colour primary is
     /// already monochrome and an alpha auxiliary is attached.
@@ -69,7 +75,7 @@ impl AvifPixelFormat {
         match self {
             Self::Gray8 | Self::Ya8 => 1,
             Self::Yuv420P | Self::Yuv422P | Self::Yuv444P => 3,
-            Self::Yuva420P => 4,
+            Self::Yuva420P | Self::Yuva422P | Self::Yuva444P => 4,
         }
     }
 }
@@ -132,6 +138,8 @@ impl From<AvifPixelFormat> for oxideav_core::PixelFormat {
             AvifPixelFormat::Yuv444P => oxideav_core::PixelFormat::Yuv444P,
             AvifPixelFormat::Gray8 => oxideav_core::PixelFormat::Gray8,
             AvifPixelFormat::Yuva420P => oxideav_core::PixelFormat::Yuva420P,
+            AvifPixelFormat::Yuva422P => oxideav_core::PixelFormat::Yuva422P,
+            AvifPixelFormat::Yuva444P => oxideav_core::PixelFormat::Yuva444P,
             AvifPixelFormat::Ya8 => oxideav_core::PixelFormat::Ya8,
         }
     }
@@ -152,6 +160,8 @@ impl TryFrom<oxideav_core::PixelFormat> for AvifPixelFormat {
             oxideav_core::PixelFormat::Yuv444P => Ok(AvifPixelFormat::Yuv444P),
             oxideav_core::PixelFormat::Gray8 => Ok(AvifPixelFormat::Gray8),
             oxideav_core::PixelFormat::Yuva420P => Ok(AvifPixelFormat::Yuva420P),
+            oxideav_core::PixelFormat::Yuva422P => Ok(AvifPixelFormat::Yuva422P),
+            oxideav_core::PixelFormat::Yuva444P => Ok(AvifPixelFormat::Yuva444P),
             oxideav_core::PixelFormat::Ya8 => Ok(AvifPixelFormat::Ya8),
             other => Err(crate::error::AvifError::unsupported(format!(
                 "avif: unsupported PixelFormat {other:?}"

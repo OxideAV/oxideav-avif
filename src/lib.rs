@@ -125,6 +125,9 @@ pub mod decoder;
 #[cfg(feature = "registry")]
 pub mod encoder;
 
+#[cfg(feature = "registry")]
+pub mod still;
+
 pub use alpha::{composite_alpha, find_alpha_item_id, ALPHA_URN_PREFIX};
 pub use avis::{
     audit_avis_profile_compliance, audit_avis_sequence, audit_edit_list, inspect_avis, parse_avis,
@@ -189,6 +192,12 @@ pub use decoder::{make_decoder, AvifDecoder};
 
 #[cfg(feature = "registry")]
 pub use encoder::{make_encoder, AvifEncoder};
+
+#[cfg(feature = "registry")]
+pub use still::{
+    encode_still, encode_still_grid, StillChroma, StillEncodeOptions, StillImage,
+    STILL_MAX_CODED_DIM,
+};
 
 #[cfg(feature = "registry")]
 pub use registry_glue::__oxideav_entry;

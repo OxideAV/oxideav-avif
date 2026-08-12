@@ -36,9 +36,9 @@ use crate::meta::{Clap, Imir, Irot};
 /// the AV1 decoder does not produce.
 fn subsampling(format: PixelFormat) -> Result<(u8, u8)> {
     match format {
-        PixelFormat::Yuv420P => Ok((1, 1)),
-        PixelFormat::Yuv422P => Ok((1, 0)),
-        PixelFormat::Yuv444P => Ok((0, 0)),
+        PixelFormat::Yuv420P | PixelFormat::Yuva420P => Ok((1, 1)),
+        PixelFormat::Yuv422P | PixelFormat::Yuva422P => Ok((1, 0)),
+        PixelFormat::Yuv444P | PixelFormat::Yuva444P => Ok((0, 0)),
         PixelFormat::Gray8 => Ok((0, 0)),
         other => Err(Error::unsupported(format!(
             "avif transform: unsupported pixel format {other:?}"
@@ -46,19 +46,29 @@ fn subsampling(format: PixelFormat) -> Result<(u8, u8)> {
     }
 }
 
-/// Return the number of planes that ride on this pixel format — one for
-/// gray, three for the planar YUV variants the AV1 decoder emits.
+/// Return the number of planes that ride on this pixel format — one
+/// for gray, three for the planar YUV variants the AV1 decoder emits,
+/// four for the alpha-composited `Yuva*` layouts.
 fn plane_count(format: PixelFormat) -> usize {
     match format {
         PixelFormat::Gray8 => 1,
+        PixelFormat::Yuva420P | PixelFormat::Yuva422P | PixelFormat::Yuva444P => 4,
         _ => 3,
     }
+}
+
+/// True when `plane` carries full-resolution samples for this format:
+/// the luma plane (0) always, and the alpha plane (3) of the `Yuva*`
+/// layouts (alpha rides at luma resolution — av1-avif §4.1 codes it as
+/// a monochrome AV1 stream at the master's extents).
+fn plane_is_full_res(plane: usize) -> bool {
+    plane == 0 || plane == 3
 }
 
 /// Per-plane pixel dimensions for a frame of the given format and dims.
 fn plane_dims(format: PixelFormat, width: u32, height: u32, plane: usize) -> Result<(u32, u32)> {
     let (sx, sy) = subsampling(format)?;
-    if plane == 0 {
+    if plane_is_full_res(plane) {
         Ok((width, height))
     } else {
         let w = (width + (1 << sx) - 1) >> sx;
@@ -122,7 +132,7 @@ fn crop_rect(
     }
     let mut out = Vec::with_capacity(planes);
     for p in 0..planes {
-        let (px, py, pw, ph) = if p == 0 {
+        let (px, py, pw, ph) = if plane_is_full_res(p) {
             (x, y, w, h)
         } else {
             (x >> sx, y >> sy, (w >> sx).max(1), (h >> sy).max(1))

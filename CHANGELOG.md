@@ -32,6 +32,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `register_with_av1` restored to its historical contract: registers
   both the AVIF factories and `oxideav-av1`'s own codec registration
   in one call.
+- **Pixel → AVIF still encoder** (`still` module, registry-gated):
+  [`StillImage`] + [`encode_still`] / [`encode_still_grid`] turn raw
+  pixels into a complete AVIF file by driving `oxideav-av1`'s
+  conformance-grade KEY-frame encoder and wrapping the coded payload
+  through the crate's own muxer. Coverage: the full (bit depth ×
+  chroma format) matrix — 8/10/12-bit × 4:2:0 / 4:2:2 / 4:4:4 /
+  monochrome (§6.4.1 `seq_profile` elected per pairing; the emitted
+  4-byte `av1C` mirrors the sequence header per the av1-avif §2.2.1
+  `shall`); **RGB(A)** via the H.273 identity matrix in 4:4:4
+  (Y = G, Cb = B, Cr = R — byte-exact lossless round-trips, `colr`
+  `nclx` identity triple signalled full-range); **alpha** as a hidden
+  monochrome auxiliary (§4.1: same bit depth as the master, `auxC`
+  URN + `auxl` iref, `prem` on request); **arbitrary extents** via
+  edge-replicated padding to the coded 8-pixel grid + an essential
+  top-left-anchored `clap` (§2.2.3) with `ispe` documenting the coded
+  extents (§2.2.2 `shall`); **grid encode** (HEIF §6.6.2) splitting
+  the canvas into equal coded tiles with right/bottom trim. The
+  `ftyp` profile brand follows the elected profile (§8): Main →
+  `MA1B`, High → `MA1A`, Professional (4:2:2 / 12-bit) → general
+  brands only (§8.1). Because av1-avif §4.1 has readers ignore any
+  `colr` on the alpha item, the alpha stream's own §5.5.2
+  `color_range` flag is re-signalled to full range by re-encoding the
+  Sequence Header OBU (a fixed-width display-metadata bit — decode
+  math unaffected); the same consistency splice applies to colour
+  streams paired with a full-range `nclx`. Validation: lossless
+  round-trips are sample-exact through the crate's own decoder for
+  every 8-bit pairing (10/12-bit payloads sample-exact through the
+  AV1 registry decoder pending the high-bit-depth composition layer),
+  lossy encodes are PSNR-gated, grid seams are pixel-exact, and a
+  black-box acceptance leg decodes the emitted files through an
+  external AVIF decoder binary (Y4M plane compare — exact) when one
+  is installed.
+- Alpha composition now covers every 8-bit chroma layout: new
+  `AvifPixelFormat::Yuva422P` / `Yuva444P` variants (mapped to the
+  matching `oxideav-core` formats), `composite_alpha` arms for
+  4:2:2 / 4:4:4 colour frames, and full-resolution alpha-plane
+  handling in the `clap` / `irot` / `imir` transform geometry (the
+  alpha plane of a `Yuva*` frame rides at luma resolution).
 - **`no_profile_brand()`** on both `AvifMuxer` and `AvifGridMuxer`
   (which also gains `advanced_profile()`): `ftyp` lists only the
   general brands (`avif` / `mif1` / `miaf`) — the av1-avif §8.1 shape

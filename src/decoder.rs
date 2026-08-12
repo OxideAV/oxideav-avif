@@ -55,6 +55,8 @@ fn to_core_pix(fmt: AvifPixelFormat) -> PixelFormat {
         AvifPixelFormat::Yuv444P => PixelFormat::Yuv444P,
         AvifPixelFormat::Gray8 => PixelFormat::Gray8,
         AvifPixelFormat::Yuva420P => PixelFormat::Yuva420P,
+        AvifPixelFormat::Yuva422P => PixelFormat::Yuva422P,
+        AvifPixelFormat::Yuva444P => PixelFormat::Yuva444P,
         AvifPixelFormat::Ya8 => PixelFormat::Ya8,
     }
 }
@@ -69,6 +71,8 @@ fn from_core_pix(fmt: PixelFormat) -> Result<AvifPixelFormat> {
         PixelFormat::Yuv444P => Ok(AvifPixelFormat::Yuv444P),
         PixelFormat::Gray8 => Ok(AvifPixelFormat::Gray8),
         PixelFormat::Yuva420P => Ok(AvifPixelFormat::Yuva420P),
+        PixelFormat::Yuva422P => Ok(AvifPixelFormat::Yuva422P),
+        PixelFormat::Yuva444P => Ok(AvifPixelFormat::Yuva444P),
         PixelFormat::Ya8 => Ok(AvifPixelFormat::Ya8),
         other => Err(Error::unsupported(format!(
             "avif: AV1 decoder emitted unsupported PixelFormat {other:?}"
