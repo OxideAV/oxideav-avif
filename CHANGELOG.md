@@ -77,11 +77,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ftyp` profile brand follows the elected profile (§8): Main →
   `MA1B`, High → `MA1A`, Professional (4:2:2 / 12-bit) → general
   brands only (§8.1). Because av1-avif §4.1 has readers ignore any
-  `colr` on the alpha item, the alpha stream's own §5.5.2
-  `color_range` flag is re-signalled to full range by re-encoding the
-  Sequence Header OBU (a fixed-width display-metadata bit — decode
-  math unaffected); the same consistency splice applies to colour
-  streams paired with a full-range `nclx`. Validation: lossless
+  `colr` on the alpha item and makes `color_range = 1` (and
+  `mono_chrome = 1`) an explicit `shall` on every AV1 Auxiliary Image
+  Item, the alpha stream's §5.5.2 `color_range` flag is re-signalled
+  to full range by re-encoding the Sequence Header OBU (a fixed-width
+  display-metadata bit — decode math unaffected); the same
+  consistency splice applies to colour streams paired with a
+  full-range `nclx`. Validation: lossless
   round-trips are sample-exact through the crate's own decoder for
   every 8-bit pairing (10/12-bit payloads sample-exact through the
   AV1 registry decoder pending the high-bit-depth composition layer),

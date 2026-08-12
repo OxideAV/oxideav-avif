@@ -365,13 +365,14 @@ fn yuv420_alpha_premultiplied_round_trips() {
     assert_eq!(vf.planes[0].data, narrow(&img.y), "Y exact");
 }
 
-/// The alpha stream must signal §5.5.2 `color_range = 1` (full range):
-/// av1-avif §4.1 has readers ignore any `colr` on the alpha item, so
-/// the bitstream flag is the only range signal — a studio-range flag
-/// would make conformant readers rescale the plane. Walk the alpha
-/// item's payload to its Sequence Header OBU and check the parsed
-/// flag; same for the identity-RGB colour item (which pairs with a
-/// full-range `colr`).
+/// The alpha stream must signal §5.5.2 `color_range = 1`: av1-avif
+/// §4.1 is explicit — "The color_range field in the Sequence Header
+/// OBU shall be set to 1" (and `mono_chrome` shall be 1) for every
+/// AV1 Auxiliary Image Item; readers also ignore any `colr` on the
+/// alpha item, so the bitstream flag is the only range signal. Walk
+/// the alpha item's payload to its Sequence Header OBU and check both
+/// parsed fields; the identity-RGB colour item (paired with a
+/// full-range `colr`) checks `color_range` too.
 #[test]
 fn full_range_flag_signalled_where_it_matters() {
     let img = StillImage::rgba8(
@@ -398,8 +399,14 @@ fn full_range_flag_signalled_where_it_matters() {
                 let seq = oxideav_av1::parse_sequence_header(desc.payload).expect("sh");
                 assert!(
                     seq.color_config.color_range,
-                    "{label}: sequence header must signal full range"
+                    "{label}: sequence header must signal full range (av1-avif §4.1 shall)"
                 );
+                if label == "alpha" {
+                    assert!(
+                        seq.color_config.mono_chrome,
+                        "alpha: mono_chrome shall be 1 (av1-avif §4.1)"
+                    );
+                }
                 found = true;
             }
             off += consumed;

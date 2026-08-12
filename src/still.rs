@@ -545,13 +545,14 @@ struct CodedItem {
 /// no reconstruction step reads — so the spliced stream decodes to
 /// identical samples; only the signalled interpretation changes. The
 /// samples this module codes are always full-range (they come in as
-/// raw pixel values), and conformant readers honour the flag in two
-/// places this matters:
+/// raw pixel values), and the flag matters in two places:
 ///
-/// * the **alpha** auxiliary — av1-avif §4.1 has readers ignore any
-///   `colr` on the alpha item, so the alpha stream's own range flag is
-///   the only signal (a studio-range flag would make readers rescale
-///   the plane);
+/// * the **alpha** auxiliary — av1-avif §4.1 makes it a `shall`: "The
+///   color_range field in the Sequence Header OBU shall be set to 1"
+///   for every AV1 Auxiliary Image Item (readers also ignore any
+///   `colr` on the alpha item per §4.1, so the stream flag is the
+///   only range signal — a studio-range flag would make conformant
+///   readers rescale the plane);
 /// * a full-range `colr` `nclx` on the colour item (e.g. the identity
 ///   RGB path) — MIAF gives the container property precedence, but a
 ///   matching in-stream flag keeps both signals consistent.
@@ -671,9 +672,10 @@ fn encode_primary(img: &StillImage, pw: u32, ph: u32, q: u8) -> Result<CodedItem
 fn encode_alpha(img: &StillImage, alpha: &[u16], pw: u32, ph: u32, q: u8) -> Result<CodedItem> {
     let (w, h) = (img.width as usize, img.height as usize);
     let a = pad_plane(alpha, w, h, pw as usize, ph as usize);
-    // Alpha samples are raw full-range coverage values, and av1-avif
-    // §4.1 has readers ignore any `colr` on the alpha item — the
-    // stream's own range flag is the only signal, so it must say full.
+    // av1-avif §4.1 `shall`s on the auxiliary stream: `mono_chrome = 1`
+    // (satisfied by the Monochrome encode below) and `color_range = 1`
+    // (the full-range splice — alpha samples are raw coverage values
+    // and readers ignore any `colr` on the alpha item).
     encode_coded_item(
         pw,
         ph,
