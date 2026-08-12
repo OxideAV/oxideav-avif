@@ -19,33 +19,48 @@ resolution, item-property extraction, metadata items, image sequences
 (AVIS), and the grid/alpha/transform composition logic all work and
 are heavily tested.
 
-**Pixel decode is currently stubbed.** Following the 2026-05-20
-clean-room orphan rebuild of [`oxideav-av1`](https://github.com/OxideAV/oxideav-av1),
-this crate no longer depends on it; the local `av1_stub` module parses
-the `av1C` box structurally but returns `Error::Unsupported` for the
-actual AV1 bitstream. `AvifDecoder::receive_frame` therefore surfaces
-`Error::Unsupported` for real images. The hand-off will be re-wired
-once the AV1 crate's rebuild lands a decoder usable from here. Standalone
-callers can pair this crate's container surface with their own AV1
-decoder today.
+**Pixel decode is live.** The primary item's AV1 OBU stream (and every
+AVIS sample) is handed to
+[`oxideav-av1`](https://github.com/OxideAV/oxideav-av1)'s
+conformance-grade spec-driver decoder; the composition layer then
+stitches grid tiles, composites the alpha auxiliary (4:2:0 / 4:2:2 /
+4:4:4 / monochrome masters), and applies `clap` / `irot` / `imir`.
+Every committed fixture decodes end to end — including the 3840×2160
+alpha composite and the multi-sample AVIS sequence. 10/12-bit
+primaries decode at the AV1 layer but the 8-bit composition layer
+rejects them with a precise `Unsupported` (pair `parse()` with
+oxideav-av1 directly for raw high-bit-depth planes).
 
-The **container encoder / muxer is implemented** (`mux` module). Given an
-already-coded AV1 Image Item Data payload plus its `av1C` record, the
-`AvifMuxer` / `AvifGridMuxer` / `encode_still_av1` API emit a conformant
-AVIF file — `ftyp` (`avif`/`mif1`/`miaf`/`MA1B`) + full `meta` box tree
+**Pixel encode is live** (`still` module). `StillImage` +
+`encode_still` / `encode_still_grid` drive oxideav-av1's KEY-frame
+encoder across the full (bit depth × chroma format) matrix — 8/10/12
+bit × 4:2:0 / 4:2:2 / 4:4:4 / monochrome — plus RGB(A) via the H.273
+identity matrix in 4:4:4 (byte-exact lossless round-trips), alpha as
+a same-depth monochrome auxiliary (av1-avif §4.1, full-range
+signalled in-stream), arbitrary extents (edge-replicated pad to the
+coded 8-grid + top-left `clap`, `ispe` = coded extents per §2.2.2),
+and grid tiling with right/bottom trim. The `ftyp` profile brand
+follows the elected AV1 profile (§8: Main → `MA1B`, High → `MA1A`,
+Professional → general brands only). Lossless encodes decode back
+sample-exact through this crate's own decoder; lossy encodes are
+PSNR-gated in the test suite; black-box acceptance decodes the
+emitted files through an external AVIF decoder binary where one is
+installed. The registry `Encoder` (`make_encoder` / `AvifEncoder`)
+rides the same pipeline: one video frame in, one complete AVIF file
+packet out (`q` / `alpha_q` / `premultiplied` codec options).
+
+The **container muxer** (`mux` module) remains available standalone:
+given an already-coded AV1 Image Item Data payload plus its `av1C`
+record, `AvifMuxer` / `AvifGridMuxer` / `encode_still_av1` emit a
+conformant AVIF file — `ftyp` (`avif`/`mif1`/`miaf` + `MA1B`/`MA1A`/
+no profile brand) + full `meta` box tree
 (`hdlr`/`pitm`/`iinf`/`infe`/`iref`/`iprp`+`ipco`+`ipma`/`iloc`) + `mdat`
 — with `ispe` / `pixi` / `colr` / `pasp` / `clap` / `irot` / `imir` item
 properties, an optional AV1-coded alpha auxiliary (`auxC` + `auxl`, plus
 `prem` when premultiplied), and optional `grid` tiling (`dimg`). The
 output round-trips through this crate's own `parse` path byte-for-byte
-(coded payload and every property) and passes `audit_mif1`. The AV1
-bitstream is taken **black-box**: this crate does no pixel coding.
-
-Turning decoded pixels *into* an AV1 bitstream still needs an AV1 encoder
-(not yet available in oxideav-av1). The registry `Encoder` surface
-(`make_encoder`) therefore returns a live `AvifEncoder` whose
-`send_frame` surfaces `Error::Unsupported` naming that gap and pointing
-at `AvifMuxer` for direct black-box muxing.
+(coded payload and every property) and passes `audit_mif1`. At this
+layer the AV1 bitstream is taken **black-box**.
 
 ## Container coverage
 
@@ -60,7 +75,9 @@ at `AvifMuxer` for direct black-box muxing.
 | Tone Map (`tmap`) | four-CC detection + §4.2.2 compliance audit + `GainMapMetadata::parse` (ISO 21496-1:2025 Annex C.2) + **§6 application**: `unnormalize_log2_gain` (Formula 1), `weight_factor` (Formula 3), `apply_component` / `apply_rgb` / `apply_plane_rgb` reconstruct the linear alternate (HDR) rendition `(Baseline + k_base)·2^(W·G) − k_alt` (Formula 2) from a linear baseline + the decoded gain plane, with §5.2.5.1 per-component-metadata broadcast and §6.3 NOTE 2 achromatic handling |
 | AV1 layered properties | `a1op` operating-point selector + `a1lx` layered-image index (av1-avif §2.3.2) |
 | Auxiliary classification | `auxC` URN routed to `Alpha` / `DepthMap` / `HdrGainMap` / `Other` |
-| Container encoder / muxer (`mux`) | `AvifMuxer` / `AvifGridMuxer` / `encode_still_av1` emit `ftyp` + full `meta` tree (`hdlr`/`pitm`/`iinf`+`infe` v2/`iref`/`iprp`(`ipco`+`ipma`)/`iloc` v0 cm0) + `mdat` around a black-box coded AV1 payload + `av1C`; item properties `av1C`(essential)/`ispe`/`pixi`/`colr`(nclx+ICC)/`pasp`/`clap`/`irot`/`imir`; AV1-coded alpha auxiliary (`auxC`+`auxl`+`prem`); `grid` derivation (`dimg`, 16-bit form). Round-trips through `parse` byte-for-byte; passes `audit_mif1` |
+| Container encoder / muxer (`mux`) | `AvifMuxer` / `AvifGridMuxer` / `encode_still_av1` emit `ftyp` + full `meta` tree (`hdlr`/`pitm`/`iinf`+`infe` v2/`iref`/`iprp`(`ipco`+`ipma`)/`iloc` v0 cm0) + `mdat` around a black-box coded AV1 payload + `av1C`; item properties `av1C`(essential)/`ispe`/`pixi`/`colr`(nclx+ICC)/`pasp`/`clap`/`irot`/`imir`; AV1-coded alpha auxiliary (`auxC`+`auxl`+`prem`); `grid` derivation (`dimg`, 16-bit form); profile brand tri-state (`MA1B` default / `MA1A` / general-brands-only per av1-avif §8.1). Round-trips through `parse` byte-for-byte; passes `audit_mif1` |
+| Pixel → AVIF still encoder (`still`) | `StillImage` + `encode_still` / `encode_still_grid` drive oxideav-av1's conformance-grade KEY-frame encoder: 8/10/12-bit × 4:2:0/4:2:2/4:4:4/monochrome; RGB(A) via the H.273 identity matrix in 4:4:4 (byte-exact lossless); alpha as a same-depth monochrome auxiliary with in-stream full-range signalling (the §5.5.2 `color_range` bit re-signalled by re-encoding the Sequence Header OBU — av1-avif §4.1 readers ignore `colr` on alpha); arbitrary extents via edge-replicated pad + top-left `clap` (§2.2.3) with `ispe` = coded extents (§2.2.2 `shall`); grid tiling (HEIF §6.6.2) with right/bottom trim; `ftyp` profile brand elected from `seq_profile` (§8). Lossless round-trips sample-exact through the crate's own decoder; lossy PSNR-gated; black-box-accepted by an external AVIF decoder binary |
+| Registry `Encoder` | one video frame → one complete AVIF file packet: planar YUV 8-bit (+ `YuvJ*` full-range), 10/12-bit LE planar, `Gray8/10/12`, packed `Rgb24`/`Rgba`/`Bgr24`/`Bgra` (identity 4:4:4, alpha auxiliary), `Yuva420P`, `Ya8`; codec options `q`/`alpha_q`/`premultiplied` |
 | Derived images | `iovl` overlay + `iden` identity + `tmap` tone-map derivations resolved end-to-end (HEIF §6.3 / §6.6.2, av1-avif §4.2.2) via a box-graph geometry resolver — no AV1 decode: `transform_chain` / `output_dims_from_reconstructed` apply `irot`/`imir`/`clap`/`iscl` in `ipma` order (§6.3); `reconstructed_dims` resolves grid/iovl descriptor dims + recursive `iden` inputs + `tmap` base-input extents + `sato` own/`ispe`-or-input extents + coded `ispe` (cycle-guarded, depth 16; descriptor bytes resolve through `iloc` construction methods 0/1/**2**); `resolve_overlays` clips each `OverlayPlacement` against the canvas (§6.6.2.2.3); `resolve_iden_derivations` folds the iden's own transforms over its source; `resolve_tone_maps` resolves each `tmap`'s base/gain-map input ids + rendered (base) extents + per-gain-map coded extents, flagging gain-map up-sampling. Surfaced on `AvifInfo::{overlay_resolutions, iden_resolutions, tone_map_resolutions}`; `inspect()` accepts `iovl`/`iden`/`tmap`/`sato` derived primaries. Pixel composition still pending a decoder |
 | Unified derivation graph (`build_derivation_graph` / `inspect::derivation_graph`) | one decode-free traversal (HEIF §6.6) that walks any derived primary into a `DerivationGraph` — every reachable node (`DerivationNode` { `DerivationKind` ∈ Coded/Grid/Overlay/Identity/ToneMap/SampleTransform/Unknown, reconstructed + output dims, depth }) plus the de-duplicated coded-`av01` leaf decode set in first-visit order. Handles **nested** derivations (iden-of-grid, tmap-over-grid) and **diamond** graphs (shared leaf listed once); iterative pre-order with a `MAX_DERIVATION_DEPTH` cycle guard (`truncated` flag). Accessors: `output_dims` / `root_is_coded` / `coded_leaf_dims` (decode-buffer sizing) / `nodes_at_depth` / `derived_node_count`. No pixel composition — the dependency planner a renderer feeds its AV1 decoder |
 | Entity grouping (`grpl`) | typed `EntityGroup` per `EntityToGroupBox` (retaining the 24-bit `flags`); `altr` / `ster` / `eqiv` / `pano` / `prgr` progressive-rendering (§6.8.10) / `brst` burst (§6.8.9) / `msrc` multi-source (HEIF §9.4) / `tsyn` time-synchronized capture (§6.8.3) / `iaug` audio-to-image (§6.8.4, `audio_repeats()` = flags-LSB) / `slid` slideshow (§6.8.9) / `albc` album + `favc` favorites user-collections (§6.8.7) / the five §6.8.6 bracketed capture-time sets `aebr`/`wbbr`/`fobr`/`afbr`/`dobr` (`BracketingKind` / `is_bracketed_set`). `inspect::entity_groups` enumerates the file's `grpl` decode-free for the typed projections |
@@ -140,9 +157,9 @@ for item in &img.meta.items {
 [AOMediaCodec/av1-avif](https://github.com/AOMediaCodec/av1-avif/tree/main/testFiles/Microsoft)
 (1280×720, monochrome). `tests/fixtures/{gray32,midgray,white16,red,black420}.avif`
 are tiny reference-encoder-produced AVIFs covering each colour-plane
-layout. Container-layer integration tests walk the full HEIF hierarchy
-and extract the primary item; pixel-decode tests are gated on the AV1
-rebuild.
+layout. Integration tests walk the full HEIF hierarchy, extract the
+primary item, and decode every fixture to pixels end to end (the flat
+lossless fixtures assert exact constant planes).
 
 ## License
 

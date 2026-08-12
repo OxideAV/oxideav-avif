@@ -408,6 +408,46 @@ fn full_range_flag_signalled_where_it_matters() {
     }
 }
 
+/// 10-bit master + 10-bit alpha: the av1-avif §4.1 same-bit-depth
+/// `shall` holds at high bit depth too. The 8-bit composition layer
+/// doesn't cover HBD yet, so both items validate sample-exact through
+/// the AV1 registry decoder on the extracted payloads.
+#[test]
+fn ten_bit_alpha_matches_master_depth_and_round_trips() {
+    let (w, h) = (16u32, 16u32);
+    let img = build_image(w, h, 10, StillChroma::Yuv420);
+    let alpha = plane(w, h, 10, 11);
+    let img = img.with_alpha(alpha.clone()).expect("alpha");
+    let avif = encode_still(&img, &StillEncodeOptions::default()).expect("encode");
+
+    let info = inspect(&avif).expect("inspect");
+    assert!(info.has_alpha);
+    for rec in &info.alpha_bit_depth_compliance {
+        assert!(rec.is_compliant(), "§4.1 same-depth: {rec:?}");
+    }
+
+    // Primary payload sample-exact at 10 bits.
+    let vf = decode_payload_av1("10-bit master", &avif);
+    assert_eq!(le_u16(&vf.planes[0].data), img.y, "Y");
+
+    // Alpha payload sample-exact at 10 bits (resolved via auxl iref).
+    let hdr = parse_header(&avif).expect("parse_header");
+    let primary = hdr.meta.primary_item_id.expect("pitm");
+    let alpha_id = oxideav_avif::find_alpha_item_id(&hdr.meta, primary).expect("alpha id");
+    let loc = hdr.meta.location_by_id(alpha_id).expect("iloc");
+    let payload = oxideav_avif::item_bytes(&avif, loc).expect("alpha payload");
+    let params = CodecParameters::video(CodecId::new("av1"));
+    let mut d = oxideav_av1::registry::make_decoder(&params).expect("av1 decoder");
+    d.send_packet(&Packet::new(0, TimeBase::new(1, 90_000), payload.to_vec()))
+        .expect("alpha decode");
+    let af = match d.receive_frame().expect("alpha frame") {
+        Frame::Video(v) => v,
+        other => panic!("expected VideoFrame, got {other:?}"),
+    };
+    assert_eq!(af.planes.len(), 1, "monochrome alpha");
+    assert_eq!(le_u16(&af.planes[0].data), alpha, "alpha samples exact");
+}
+
 // ───────────────────────── lossy leg ─────────────────────────
 
 /// Lossy encode: strictly smaller than the lossless sibling on smooth
