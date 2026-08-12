@@ -11,7 +11,7 @@
 use oxideav_avif::{
     audit_avif_profile_compliance, audit_mif1, audit_sequence_header_obu, classify_brands,
     encode_still, encode_still_grid, inspect, parse, parse_header, AvifDecoder, Colr, StillChroma,
-    StillEncodeOptions, StillImage,
+    StillEncodeOptions, StillImage, StillProperties,
 };
 use oxideav_core::{CodecId, CodecParameters, Decoder, Frame, Packet, TimeBase};
 
@@ -446,6 +446,56 @@ fn ten_bit_alpha_matches_master_depth_and_round_trips() {
     };
     assert_eq!(af.planes.len(), 1, "monochrome alpha");
     assert_eq!(le_u16(&af.planes[0].data), alpha, "alpha samples exact");
+}
+
+/// Pass-through container properties: Exif + XMP metadata items land
+/// `cdsc`-linked and byte-exact, HDR properties and orientation
+/// round-trip through the parser, and the orientation composes with
+/// the decode path (irot=1 swaps the displayed extents).
+#[test]
+fn pass_through_properties_round_trip() {
+    let (w, h) = (24u32, 16u32);
+    let exif = b"\x00\x00\x00\x00II*\x00still-exif".to_vec();
+    let xmp = br#"<?xpacket?><x:xmpmeta/>"#.to_vec();
+    let img = build_image(w, h, 8, StillChroma::Yuv444).with_props(StillProperties {
+        exif: Some(exif.clone()),
+        xmp: Some(xmp.clone()),
+        clli: Some(oxideav_avif::Clli {
+            max_content_light_level: 1000,
+            max_pic_average_light_level: 400,
+        }),
+        irot: Some(1),
+        ..Default::default()
+    });
+    let avif = encode_still(&img, &StillEncodeOptions::default()).expect("encode");
+
+    let info = inspect(&avif).expect("inspect");
+    assert!(info.has_descriptive_metadata(), "Exif/XMP present");
+    let exif_id = info.exif_item_id.expect("exif item");
+    let xmp_id = info.xmp_item_id.expect("xmp item");
+    assert_eq!(
+        oxideav_avif::item_payload_bytes(&avif, exif_id).expect("exif bytes"),
+        exif
+    );
+    assert_eq!(
+        oxideav_avif::item_payload_bytes(&avif, xmp_id).expect("xmp bytes"),
+        xmp
+    );
+    let parsed = parse(&avif).expect("parse");
+    let clli = parsed.clli.expect("clli");
+    assert_eq!(clli.max_content_light_level, 1000);
+
+    // irot=1 rotates on decode: displayed extents swap.
+    let vf = decode_own("props irot", &avif);
+    assert_eq!(vf.planes[0].stride as u32, h, "rotated width = h");
+    assert_eq!(
+        vf.planes[0].data.len() as u32,
+        w * h,
+        "rotated plane extent"
+    );
+
+    // The grid path rejects pass-through props until it grows them.
+    assert!(encode_still_grid(&img, &StillEncodeOptions::default(), 2, 1).is_err());
 }
 
 // ───────────────────────── lossy leg ─────────────────────────

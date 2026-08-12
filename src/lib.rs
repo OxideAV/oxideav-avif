@@ -201,7 +201,7 @@ pub use encoder::{make_encoder, AvifEncoder};
 
 #[cfg(feature = "registry")]
 pub use still::{
-    encode_still, encode_still_grid, StillChroma, StillEncodeOptions, StillImage,
+    encode_still, encode_still_grid, StillChroma, StillEncodeOptions, StillImage, StillProperties,
     STILL_MAX_CODED_DIM,
 };
 

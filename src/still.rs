@@ -126,6 +126,41 @@ pub struct StillImage {
     /// item. The RGB(A) constructors pre-fill the identity-matrix
     /// `nclx` triple; YUV constructors leave it `None`.
     pub colr: Option<Colr>,
+    /// Optional pass-through container properties (Exif / XMP /
+    /// HDR metadata / orientation), muxed alongside the coded item.
+    pub props: StillProperties,
+}
+
+/// Pass-through container properties for [`encode_still`] — carried
+/// straight to the muxer, no pixel-path involvement.
+///
+/// * `exif` — an `ExifDataBlock` (4-byte `exif_tiff_header_offset` +
+///   TIFF-structured bytes), linked via a `cdsc` iref (av1-avif §5.2).
+/// * `xmp` — an XMP packet as a `mime` item (`application/rdf+xml`),
+///   linked via `cdsc` (av1-avif §5.3).
+/// * `mdcv` / `clli` / `amve` — HDR descriptive properties.
+/// * `irot` / `imir` — essential transformative orientation
+///   properties (HEIF §6.5.10 application order `clap` → `irot` →
+///   `imir`; the encoder's own padding `clap` composes with them).
+/// * `pasp` — pixel aspect ratio.
+#[derive(Clone, Debug, Default)]
+pub struct StillProperties {
+    /// Exif payload (av1-avif §5.2).
+    pub exif: Option<Vec<u8>>,
+    /// XMP payload (av1-avif §5.3).
+    pub xmp: Option<Vec<u8>>,
+    /// Mastering display colour volume (ISO/IEC 14496-12 §12.1.5.3).
+    pub mdcv: Option<crate::meta::Mdcv>,
+    /// Content light level (ISO/IEC 14496-12 §12.1.5.4).
+    pub clli: Option<crate::meta::Clli>,
+    /// Ambient viewing environment (AVIF §6.5.36).
+    pub amve: Option<crate::meta::Amve>,
+    /// Rotation, anti-clockwise quarter turns 0..=3.
+    pub irot: Option<u8>,
+    /// Mirror axis (0 = vertical flip, 1 = horizontal flip).
+    pub imir: Option<u8>,
+    /// Pixel aspect ratio.
+    pub pasp: Option<crate::meta::Pasp>,
 }
 
 impl StillImage {
@@ -150,6 +185,7 @@ impl StillImage {
             v,
             alpha: None,
             colr: None,
+            props: StillProperties::default(),
         };
         img.validate()?;
         Ok(img)
@@ -275,6 +311,13 @@ impl StillImage {
     /// constructor-provided value).
     pub fn with_colr(mut self, colr: Colr) -> Self {
         self.colr = Some(colr);
+        self
+    }
+
+    /// Attach pass-through container properties (Exif / XMP / HDR /
+    /// orientation / aspect); see [`StillProperties`].
+    pub fn with_props(mut self, props: StillProperties) -> Self {
+        self.props = props;
         self
     }
 
@@ -679,6 +722,31 @@ pub fn encode_still(img: &StillImage, opts: &StillEncodeOptions) -> Result<Vec<u
     if let Some(colr) = &img.colr {
         mux = mux.with_colr(colr.clone());
     }
+    let props = &img.props;
+    if let Some(exif) = &props.exif {
+        mux = mux.with_exif(exif.clone());
+    }
+    if let Some(xmp) = &props.xmp {
+        mux = mux.with_xmp(xmp.clone());
+    }
+    if let Some(mdcv) = &props.mdcv {
+        mux = mux.with_mdcv(mdcv.clone());
+    }
+    if let Some(clli) = &props.clli {
+        mux = mux.with_clli(clli.clone());
+    }
+    if let Some(amve) = &props.amve {
+        mux = mux.with_amve(amve.clone());
+    }
+    if let Some(pasp) = &props.pasp {
+        mux = mux.with_pasp(pasp.clone());
+    }
+    if let Some(angle) = props.irot {
+        mux = mux.with_irot(angle);
+    }
+    if let Some(axis) = props.imir {
+        mux = mux.with_imir(axis);
+    }
     if let Some(alpha) = &img.alpha {
         let coded_alpha = encode_alpha(img, alpha, pw, ph, opts.alpha_q_idx)?;
         max_profile = max_profile.max(coded_alpha.seq_profile);
@@ -721,6 +789,19 @@ pub fn encode_still_grid(
     if img.alpha.is_some() {
         return Err(Error::unsupported(
             "avif still: alpha on the grid encode path is not yet supported",
+        ));
+    }
+    if img.props.exif.is_some()
+        || img.props.xmp.is_some()
+        || img.props.mdcv.is_some()
+        || img.props.clli.is_some()
+        || img.props.amve.is_some()
+        || img.props.irot.is_some()
+        || img.props.imir.is_some()
+        || img.props.pasp.is_some()
+    {
+        return Err(Error::unsupported(
+            "avif still: pass-through properties on the grid encode path are not yet supported",
         ));
     }
     if columns == 0 || rows == 0 {

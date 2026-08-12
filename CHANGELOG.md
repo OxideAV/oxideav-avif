@@ -32,6 +32,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `register_with_av1` restored to its historical contract: registers
   both the AVIF factories and `oxideav-av1`'s own codec registration
   in one call.
+- `StillProperties` pass-through on `encode_still`: Exif (`cdsc`,
+  av1-avif §5.2), XMP (`mime` + `cdsc`, §5.3), HDR descriptive
+  properties (`mdcv` / `clli` / `amve`), orientation (`irot` /
+  `imir` — composing with the encoder's own padding `clap` under the
+  HEIF §6.5.10 order), and `pasp` — muxed alongside the coded item;
+  the grid path rejects them until it grows the same surface.
 - **Registry `Encoder` goes live** — `make_encoder` / `AvifEncoder`
   now encode: every video frame sent through `Encoder::send_frame`
   becomes one complete AVIF file packet (keyframe-flagged, `pts`
