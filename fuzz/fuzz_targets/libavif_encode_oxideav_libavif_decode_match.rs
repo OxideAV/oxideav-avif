@@ -67,6 +67,15 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
 
+    // The Y=G/U=B/V=R comparison below is only valid when the encoder
+    // actually coded through the H.273 identity matrix and declared it
+    // (recent libavif does; the 1.0.x line converts through BT.601, so
+    // its raw planes legitimately differ from the RGB channels). Skip
+    // when the declaration is absent.
+    if !oxideav_avif_fuzz::declares_identity_matrix(&encoded) {
+        return;
+    }
+
     // Decode with oxideav-avif. Errors are tolerated.
     let mut d = AvifDecoder::new(CodecId::new(oxideav_avif::CODEC_ID_STR));
     let pkt = Packet::new(0, TimeBase::new(1, 1), encoded.clone());

@@ -497,3 +497,30 @@ pub mod libavif {
         }
     }
 }
+
+/// True when `avif` declares the H.273 identity matrix on its primary
+/// item (`colr` `nclx` with `matrix_coefficients == 0`).
+///
+/// The lossless cross-decode harnesses compare oxideav-avif's raw
+/// decoded planes against the reference decoder's RGBA output under
+/// the identity mapping `Y = G, U = B, V = R`. That contract only
+/// holds when the encoder actually coded the RGB samples through the
+/// identity matrix and said so: recent libavif releases do exactly
+/// that for `lossless` RGBA input, but older ones (e.g. the 1.0.x
+/// line some distro runners ship) run a real BT.601 RGB→YCbCr
+/// conversion instead — their "lossless" is matrix-roundtrip
+/// lossless, not plane-identity lossless, so the raw planes are
+/// legitimately different from the RGB channels. Harnesses gate their
+/// plane comparisons on this declaration and skip otherwise.
+pub fn declares_identity_matrix(avif: &[u8]) -> bool {
+    matches!(
+        oxideav_avif::parse(avif),
+        Ok(img) if matches!(
+            img.colr,
+            Some(oxideav_avif::Colr::Nclx {
+                matrix_coefficients: 0,
+                ..
+            })
+        )
+    )
+}

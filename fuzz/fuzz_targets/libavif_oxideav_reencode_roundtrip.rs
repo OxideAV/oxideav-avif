@@ -62,6 +62,15 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
 
+    // The R=V/G=Y/B=U remap in step 3 presumes the identity matrix —
+    // see `declares_identity_matrix`. A non-identity (e.g. BT.601)
+    // lossless encode would feed matrix-converted planes back through
+    // a second matrix conversion and the round-trip would legitimately
+    // differ. Skip when the encoder didn't declare identity.
+    if !oxideav_avif_fuzz::declares_identity_matrix(&avif1) {
+        return;
+    }
+
     // Step 2: oxideav decode → YUV444 planes P₁.
     let Some(p1) = oxideav_decode_yuv444(&avif1) else {
         return;
