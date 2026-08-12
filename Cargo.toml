@@ -14,32 +14,23 @@ keywords = ["multimedia", "image", "avif", "av1", "codec"]
 categories = ["multimedia::encoding", "multimedia::images"]
 
 [dependencies]
-# Framework dep is gated behind the default-on `registry` feature.
-# With the feature off the crate exposes the standalone container
-# parser + composition layer (operating on crate-local `AvifFrame` /
-# `AvifPixelFormat` / `AvifError`) and never references the framework.
+# Framework + AV1 deps are gated behind the default-on `registry`
+# feature. With the feature off the crate exposes the standalone
+# container parser + composition layer (operating on crate-local
+# `AvifFrame` / `AvifPixelFormat` / `AvifError`) and never references
+# the framework or the AV1 codec.
 # See `src/lib.rs` for the standalone-vs-registry split.
-#
-# The `oxideav-av1` dependency was removed after the 2026-05-20
-# clean-room orphan rebuild stripped the old `Av1CodecConfig` /
-# `Av1Decoder` / `register_codecs` API. AVIF now carries a local
-# `av1_stub` module that parses the `av1C` ISO BMFF box (structural,
-# not av1-bitstream) and stubs the decoder to `Error::Unsupported`
-# until the av1 crate's clean-room rebuild lands a real decoder.
 oxideav-core = { version = "0.1", optional = true }
+oxideav-av1 = { version = "0.1", optional = true }
 
 [features]
 default = ["registry"]
-# Pulls in `oxideav-core` and exposes the `oxideav_core::Decoder`
-# trait surface (`AvifDecoder`, `make_decoder`, `register`,
-# `register_with_av1`, `make_encoder`). Disable for an
-# `oxideav-core`-free build; the standalone container parser +
+# Pulls in `oxideav-core` + `oxideav-av1` and exposes the
+# `oxideav_core::Decoder` / `Encoder` trait surface (`AvifDecoder`,
+# `make_decoder`, `register`, `register_with_av1`, `make_encoder`,
+# `AvifEncoder`) plus the pixel-in still encoder (`still` module).
+# Disable for a framework-free build; the standalone container parser +
 # grid/alpha/transform composition layer (operating on
 # `crate::image::AvifFrame`) plus `inspect` / `parse` /
 # `parse_header` / `parse_avis` are still exposed.
-registry = ["dep:oxideav-core"]
-
-# Diagnostic example removed when the post-2026-05-20 clean-room
-# orphan rebuild of `oxideav-av1` stripped `iter_obus` /
-# `Av1CodecConfig` / `ObuType` from its public surface. Re-introduce
-# a diagnostic once a real AV1 decoder lands.
+registry = ["dep:oxideav-core", "dep:oxideav-av1"]

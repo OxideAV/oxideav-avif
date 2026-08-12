@@ -3,13 +3,11 @@
 //!
 //! These tests validate the container-side surfaces (meta walk, grid
 //! descriptor parse, alpha auxiliary location, AVIS sample-table walk)
-//! and assert that `AvifDecoder::send_packet` either reaches the AV1
-//! decode stage successfully or surfaces an unwrapped `Unsupported`
-//! error — the Phase 8.1 contract.
-//!
-//! Where the published `oxideav-av1` crate cannot yet emit pixels for
-//! a given bitstream, the decode-stage assertions gracefully accept
-//! `Error::Unsupported` without masking the underlying cause.
+//! and drive `AvifDecoder::send_packet` end to end: the AV1 pixel
+//! decode is delegated to `oxideav_av1`'s conformance-grade
+//! spec-driver decoder, so every committed fixture is required to
+//! decode to real pixels — the historical "accept `Unsupported` when
+//! the AV1 decoder declines" tolerance is retired.
 //!
 //! The whole file is gated on the default-on `registry` feature
 //! because every test exercises `AvifDecoder` (which lives behind
@@ -42,55 +40,22 @@ const WHITE16: &[u8] = include_bytes!("fixtures/white16.avif"); // 16x16 white, 
 const RED64: &[u8] = include_bytes!("fixtures/red.avif"); // 64x64 red, 4:4:4 lossless profile 1
 const BLACK32_420: &[u8] = include_bytes!("fixtures/black420.avif"); // 32x32 black, 4:2:0 q60
 
-/// Return `true` when the given error is `Error::Unsupported(s)` whose
-/// payload looks like an AV1-decoder limitation we accept as a skip
-/// signal in integration tests:
-///
-/// * coded_lossless / WHT / §7.7.4 — the legacy IWHT-path block from
-///   when oxideav-av1 had a partial decoder (workspace task #765).
-/// * "AV1 decoder unavailable" — the post-2026-05-20 orphan-rebuild
-///   stub. Every end-to-end test hits this until the av1 clean-room
-///   rebuild ships a real decoder.
-///
-/// The AVIF container-side tests (parse / inspect / audit_mif1 /
-/// transforms) are unaffected because they don't drive the decoder.
-fn is_av1_unavailable_or_lossless(err: &Error) -> bool {
-    if let Error::Unsupported(msg) = err {
-        msg.contains("coded_lossless")
-            || msg.contains("WHT")
-            || msg.contains("§7.7.4")
-            || msg.contains("AV1 decoder unavailable")
-    } else {
-        false
-    }
-}
-
 /// Drive `AvifDecoder::send_packet` + `receive_frame` on a fixture and
-/// return `Some(VideoFrame)` on success. Returns `None` when the
-/// underlying AV1 decoder reports an unavailable / limitation error —
-/// callers should `continue` on `None` to skip the affected fixture.
-/// Any other error is panicked with the supplied label so genuine
-/// regressions still surface loudly.
-fn decode_or_skip_lossless(label: &str, bytes: &[u8]) -> Option<oxideav_core::frame::VideoFrame> {
+/// return the decoded `VideoFrame`. The AV1 pixel decode is delegated
+/// to `oxideav_av1`'s conformance-grade registry decoder, so every
+/// committed fixture is REQUIRED to decode — the historical
+/// "skip on AV1-decoder limitation" tolerance (workspace task #765 /
+/// the 2026-05-20 orphan-rebuild stub window) is retired: any decode
+/// error is a regression and panics with the supplied label.
+fn decode_video(label: &str, bytes: &[u8]) -> oxideav_core::frame::VideoFrame {
     let mut d = AvifDecoder::new(CodecId::new(oxideav_avif::CODEC_ID_STR));
     let pkt = Packet::new(0, TimeBase::new(1, 1), bytes.to_vec());
-    match d.send_packet(&pkt) {
-        Ok(()) => match d.receive_frame() {
-            Ok(oxideav_core::Frame::Video(v)) => Some(v),
-            Ok(other) => panic!("{label}: expected VideoFrame, got {other:?}"),
-            Err(e) if is_av1_unavailable_or_lossless(&e) => {
-                eprintln!(
-                    "{label}: skipping av1 decode — av1 decoder unavailable / limited. Err: {e}"
-                );
-                None
-            }
-            Err(e) => panic!("{label}: receive_frame failed: {e}"),
-        },
-        Err(e) if is_av1_unavailable_or_lossless(&e) => {
-            eprintln!("{label}: skipping av1 decode — av1 decoder unavailable / limited. Err: {e}");
-            None
-        }
-        Err(e) => panic!("{label}: send_packet failed: {e}"),
+    d.send_packet(&pkt)
+        .unwrap_or_else(|e| panic!("{label}: send_packet failed: {e}"));
+    match d.receive_frame() {
+        Ok(oxideav_core::Frame::Video(v)) => v,
+        Ok(other) => panic!("{label}: expected VideoFrame, got {other:?}"),
+        Err(e) => panic!("{label}: receive_frame failed: {e}"),
     }
 }
 
@@ -477,50 +442,31 @@ fn inspect_avis_resolves_media_timescale_for_alpha_video_fixture() {
 }
 
 /// End-to-end AVIS decode dispatch: feeding an AVIS file through the
-/// `Decoder::send_packet` trait must take the sequence path, surface
-/// every successfully-decoded sample as a `Frame::Video` on the
-/// `pending` queue, and either succeed or surface an unwrapped AV1
-/// error (the Phase 8.1 contract — no "blocked by av1 limitations"
-/// wrapper). The Netflix `alpha_video.avif` fixture has 30 samples
-/// so a successful decode produces ≥1 video frame.
+/// `Decoder::send_packet` trait must take the sequence path and
+/// surface every decoded sample as a `Frame::Video` on the `pending`
+/// queue. The `alpha_video.avif` fixture's sequence track decodes
+/// fully through the `oxideav_av1` spec driver (inter frames
+/// included), so every sample must come back as a video frame.
 #[test]
 fn avis_decode_dispatches_to_sequence_path() {
     let mut d = AvifDecoder::new(CodecId::new(oxideav_avif::CODEC_ID_STR));
     let pkt = Packet::new(0, TimeBase::new(1, 1), ALPHA_VIDEO_AVIS.to_vec());
-    match d.send_packet(&pkt) {
-        Ok(()) => {
-            // At least one frame must have landed on the queue. The
-            // exact count depends on the av1 crate's current capability
-            // surface — we only assert a single decoded frame here so
-            // the test stays robust to partial decodes.
-            let first = d.receive_frame().expect("at least one frame");
-            match first {
-                oxideav_core::Frame::Video(v) => {
-                    assert!(!v.planes.is_empty(), "decoded frame must have planes");
-                }
-                other => panic!("expected VideoFrame, got {other:?}"),
+    d.send_packet(&pkt).expect("AVIS sequence decode");
+    let mut frames = 0usize;
+    loop {
+        match d.receive_frame() {
+            Ok(oxideav_core::Frame::Video(v)) => {
+                assert!(!v.planes.is_empty(), "decoded frame must have planes");
+                frames += 1;
             }
+            Ok(other) => panic!("expected VideoFrame, got {other:?}"),
+            Err(Error::NeedMore) => break,
+            Err(e) => panic!("receive_frame failed after {frames} frames: {e}"),
         }
-        Err(Error::Unsupported(s)) | Err(Error::InvalidData(s)) => {
-            // Acceptable when the av1 crate cannot decode the
-            // sequence (e.g. coded_lossless limitation, or a feature
-            // gap in the inter-frame path). What is not acceptable:
-            // a generic "blocked" wrapper that hides the underlying
-            // cause, or a panic.
-            assert!(
-                !s.contains("blocked by av1 decoder limitations"),
-                "AVIS errors must pass through raw, got: {s}"
-            );
-            // The error must mention `avis:` to confirm we took the
-            // sequence dispatch (rather than falling back to
-            // still-image with a misleading "missing pitm").
-            assert!(
-                s.contains("avis") || s.contains("av1"),
-                "AVIS error must mention `avis` or `av1`, got: {s}"
-            );
-        }
-        Err(other) => panic!("unexpected error from AVIS dispatch: {other:?}"),
     }
+    // The track's sample table drives the count; the fixture carries
+    // dozens of samples and every one must decode.
+    assert!(frames >= 30, "expected the full sequence, got {frames}");
 }
 
 /// Direct call to `AvifDecoder::decode_avis_file` — bypass the brand
@@ -528,27 +474,16 @@ fn avis_decode_dispatches_to_sequence_path() {
 /// point is part of the public surface (some consumers know up-front
 /// they have a sequence and want to skip the parse_header call).
 #[test]
-fn decode_avis_file_returns_frame_count_or_propagates_av1_error() {
+fn decode_avis_file_returns_full_frame_count() {
     let mut d = AvifDecoder::new(CodecId::new(oxideav_avif::CODEC_ID_STR));
-    match d.decode_avis_file(ALPHA_VIDEO_AVIS) {
-        Ok(n) => {
-            // We don't pin the exact frame count; the av1 crate may
-            // currently emit a subset of the 30 samples. Any positive
-            // count proves the sample-table walk + av1C seeding wired
-            // up correctly.
-            assert!(n > 0, "expected at least one decoded frame, got {n}");
-            // The first frame must be retrievable via the trait
-            // `receive_frame` — `decode_avis_file` queues onto the same
-            // `pending` buffer used by the still-image path.
-            let _frame = d.receive_frame().expect("first decoded frame");
-        }
-        Err(Error::Unsupported(_)) | Err(Error::InvalidData(_)) => {
-            // Same graceful-skip contract as the still-image lossless
-            // path: when av1 declines, surface the error verbatim and
-            // do not panic.
-        }
-        Err(other) => panic!("unexpected error from decode_avis_file: {other:?}"),
-    }
+    let n = d
+        .decode_avis_file(ALPHA_VIDEO_AVIS)
+        .expect("decode_avis_file");
+    assert!(n >= 30, "expected the full sequence, got {n}");
+    // The first frame must be retrievable via the trait
+    // `receive_frame` — `decode_avis_file` queues onto the same
+    // `pending` buffer used by the still-image path.
+    let _frame = d.receive_frame().expect("first decoded frame");
 }
 
 /// Build a minimal AVIF container:
@@ -1038,78 +973,70 @@ fn build_synthetic_grid_avif_oversized_output() -> Vec<u8> {
     })
 }
 
-/// Decoder `send_packet` on each fixture either decodes cleanly or
-/// surfaces `Error::Unsupported` without the pre-Phase-8 "blocked by
-/// av1 limitations" wrap.
-///
-/// Round 17 notes: the previously-reported `bbb_alpha` panic
-/// (subtract-with-overflow in `symbol.rs:105`) is no longer
-/// reproducible — the underlying `oxideav-av1` crate now surfaces a
-/// clean `Unsupported` for the irregular-TX shape it can't decode
-/// (`TX 64×56` on this 3840×2160 4:2:0 file). Same for
-/// `kimono_rotate90` — `Unsupported` on `TX 32×41` for the 1024×722
-/// 4:2:0 frame. We still accept either Ok-with-frame or
-/// `Unsupported` so a future av1-side improvement that actually
-/// decodes these doesn't break the test.
+/// Every real-world fixture — the 1280×720 monochrome still, the
+/// 3840×2160 4:2:0 + alpha `bbb_alpha`, and the irot-carrying
+/// 1024×722 `kimono_rotate90` — decodes END TO END through the
+/// `oxideav_av1` spec-driver hand-off, and the emitted frame's
+/// geometry matches the `ispe` dims rotated by the file's `irot`.
+/// (The historical "accept `Unsupported`" tolerance from the
+/// partial-decoder era is retired: these fixtures decoding is now the
+/// regression gate.)
 #[test]
-fn decoder_pipes_through_av1_errors_cleanly() {
-    for (name, bytes) in [
-        ("monochrome", MONO),
-        ("bbb_alpha", BBB_ALPHA),
-        ("kimono_rotate90", KIMONO_ROT90),
+fn real_world_fixtures_decode_end_to_end() {
+    for (name, bytes, expect_alpha) in [
+        ("monochrome", MONO, false),
+        ("bbb_alpha", BBB_ALPHA, true),
+        ("kimono_rotate90", KIMONO_ROT90, false),
     ] {
         let mut d = AvifDecoder::new(CodecId::new(oxideav_avif::CODEC_ID_STR));
         let pkt = Packet::new(0, TimeBase::new(1, 1), bytes.to_vec());
-        match d.send_packet(&pkt) {
-            Ok(()) => {
-                // If decode succeeded, frame must match the inspect dims
-                // post-irot. `info.width` / `info.height` come from the
-                // primary item's `ispe` box, which records the
-                // pre-transform extent (HEIF §6.5.3). The decoder
-                // applies any associated `irot` before emitting the
-                // frame, so on a 90° / 270° rotation the displayed
-                // width/height swap relative to ispe.
-                let info = d.info().cloned().expect("info after send");
-                let frame = d.receive_frame().expect("frame after send");
-                let vf = match frame {
-                    oxideav_core::Frame::Video(v) => v,
-                    other => panic!("{name}: expected VideoFrame, got {other:?}"),
-                };
-                // Slim VideoFrame no longer carries width/height — derive
-                // from the Y plane stride/data and compare to inspect's
-                // ispe-driven dims rotated by the file's irot angle.
-                assert!(!vf.planes.is_empty(), "{name}: no planes");
-                let hdr = parse_header(bytes)
-                    .unwrap_or_else(|e| panic!("{name}: parse_header failed: {e}"));
-                let primary = hdr.meta.primary_item_id.expect("pitm");
-                let irot_angle = match hdr.meta.property_for(primary, b"irot") {
-                    Some(oxideav_avif::Property::Irot(i)) => i.angle & 0x3,
-                    _ => 0,
-                };
-                let (expected_w, expected_h) = if irot_angle % 2 == 1 {
-                    // 90° / 270° rotations swap the displayed extents.
-                    (info.height, info.width)
-                } else {
-                    (info.width, info.height)
-                };
-                let y = &vf.planes[0];
-                assert_eq!(y.stride as u32, expected_w, "{name}: width mismatch");
-                let inferred_h = y.data.len().checked_div(y.stride).unwrap_or(0) as u32;
-                assert_eq!(inferred_h, expected_h, "{name}: height mismatch");
-                for (pi, p) in vf.planes.iter().enumerate() {
-                    assert!(
-                        p.data.len() >= p.stride,
-                        "{name}: plane {pi} data shorter than one row"
-                    );
-                }
-            }
-            Err(Error::Unsupported(msg)) => {
-                assert!(
-                    !msg.contains("blocked by av1 decoder limitations"),
-                    "{name}: error should not carry legacy wrap, got: {msg}"
-                );
-            }
-            Err(other) => panic!("{name}: unexpected error: {other:?}"),
+        d.send_packet(&pkt)
+            .unwrap_or_else(|e| panic!("{name}: send_packet failed: {e}"));
+        // Frame must match the inspect dims post-irot. `info.width` /
+        // `info.height` come from the primary item's `ispe` box, which
+        // records the pre-transform extent (HEIF §6.5.3). The decoder
+        // applies any associated `irot` before emitting the frame, so
+        // on a 90° / 270° rotation the displayed width/height swap
+        // relative to ispe.
+        let info = d.info().cloned().expect("info after send");
+        let frame = d.receive_frame().expect("frame after send");
+        let vf = match frame {
+            oxideav_core::Frame::Video(v) => v,
+            other => panic!("{name}: expected VideoFrame, got {other:?}"),
+        };
+        // Slim VideoFrame no longer carries width/height — derive
+        // from the Y plane stride/data and compare to inspect's
+        // ispe-driven dims rotated by the file's irot angle.
+        assert!(!vf.planes.is_empty(), "{name}: no planes");
+        if expect_alpha {
+            assert_eq!(
+                vf.planes.len(),
+                4,
+                "{name}: alpha auxiliary must composite to a 4-plane frame"
+            );
+        }
+        let hdr =
+            parse_header(bytes).unwrap_or_else(|e| panic!("{name}: parse_header failed: {e}"));
+        let primary = hdr.meta.primary_item_id.expect("pitm");
+        let irot_angle = match hdr.meta.property_for(primary, b"irot") {
+            Some(oxideav_avif::Property::Irot(i)) => i.angle & 0x3,
+            _ => 0,
+        };
+        let (expected_w, expected_h) = if irot_angle % 2 == 1 {
+            // 90° / 270° rotations swap the displayed extents.
+            (info.height, info.width)
+        } else {
+            (info.width, info.height)
+        };
+        let y = &vf.planes[0];
+        assert_eq!(y.stride as u32, expected_w, "{name}: width mismatch");
+        let inferred_h = y.data.len().checked_div(y.stride).unwrap_or(0) as u32;
+        assert_eq!(inferred_h, expected_h, "{name}: height mismatch");
+        for (pi, p) in vf.planes.iter().enumerate() {
+            assert!(
+                p.data.len() >= p.stride,
+                "{name}: plane {pi} data shorter than one row"
+            );
         }
     }
 }
@@ -1139,13 +1066,7 @@ fn decodes_small_fixtures_end_to_end() {
         assert_eq!(info.width, *w, "{name}: ispe width");
         assert_eq!(info.height, *h, "{name}: ispe height");
 
-        // Skip the av1-decode portion when the underlying av1 crate
-        // reports the coded_lossless limitation (#765). Container-side
-        // assertions above still run for every fixture.
-        let vf = match decode_or_skip_lossless(name, bytes) {
-            Some(v) => v,
-            None => continue,
-        };
+        let vf = decode_video(name, bytes);
         // Slim VideoFrame: derive width from Y plane stride, height
         // from data length / stride.
         let y = &vf.planes[0];
@@ -1171,12 +1092,9 @@ fn decodes_small_fixtures_end_to_end() {
 /// offset, and no residual decode is required for flat content).
 /// Failing this regression would mean we broke either the HEIF
 /// container handoff or the AV1 sequence-header + frame-header parse.
-// TODO: re-enable once oxideav-av1 intra-prediction precision is
-// restored. As of 2026-04 the flat-gray plane decodes with range=9
-// (expected ≤4); the mean is still ~128 so the container handoff and
-// frame-header parse are fine — the drift is in oxideav-av1's intra
-// path. Follow-up belongs in oxideav-av1, not here.
-#[ignore]
+// Re-enabled with `oxideav-av1`'s conformance-grade spec-driver
+// decoder: the lossless flat-gray fixture now decodes to an exactly
+// constant Y=128 plane (the pre-rebuild range-9 intra drift is gone).
 #[test]
 fn decodes_flat_gray_to_mid_value() {
     let mut d = AvifDecoder::new(CodecId::new(oxideav_avif::CODEC_ID_STR));
@@ -1196,12 +1114,13 @@ fn decodes_flat_gray_to_mid_value() {
         *p.data.iter().max().unwrap() as i32,
     );
     assert!(
-        (mean - 128.0).abs() < 2.0,
-        "flat gray should decode near Y=128, got mean={mean:.2} range={mn}..{mx}"
+        (mean - 128.0).abs() < f64::EPSILON,
+        "lossless flat gray must decode to exactly Y=128, got mean={mean:.2} range={mn}..{mx}"
     );
-    assert!(
-        mx - mn <= 4,
-        "flat gray should be quasi-constant, got range={mn}..{mx}"
+    assert_eq!(
+        (mn, mx),
+        (128, 128),
+        "lossless flat gray must be exactly constant"
     );
 }
 
@@ -1217,47 +1136,46 @@ fn end_to_end_decode_then_irot_roundtrips() {
     use oxideav_avif::apply_irot;
     use oxideav_avif::{AvifFrame, AvifPixelFormat, Irot};
 
-    // The decode is via av1; if av1 declines on the lossless RED64
-    // bitstream we exercise the pipeline against a synthetic 64×64
-    // 4:4:4 frame instead — the irot round-trip property is a
-    // pure-pixel-permutation invariant that holds for any frame, so
-    // the test still guards against regressions in apply_irot.
-    let vf_or_synth: AvifFrame = match decode_or_skip_lossless("red64 (irot)", RED64) {
-        Some(vf) => {
-            assert_eq!(vf.planes.len(), 3, "red64 expects 3 planes");
-            assert_eq!(vf.planes[0].stride, 64, "Y stride");
-            assert_eq!(vf.planes[1].stride, 64, "U stride (4:4:4)");
-            vf.into()
-        }
-        None => synthetic_yuv444_frame(64, 64),
+    let decoded: AvifFrame = {
+        let vf = decode_video("red64 (irot)", RED64);
+        assert_eq!(vf.planes.len(), 3, "red64 expects 3 planes");
+        assert_eq!(vf.planes[0].stride, 64, "Y stride");
+        assert_eq!(vf.planes[1].stride, 64, "U stride (4:4:4)");
+        vf.into()
     };
-    let original_y = vf_or_synth.planes[0].data.clone();
-    let mut frame: AvifFrame = vf_or_synth;
-    let (mut w, mut h) = (64u32, 64u32);
-    for turn in 0..4 {
-        let (next, nw, nh) =
-            apply_irot(&frame, AvifPixelFormat::Yuv444P, w, h, &Irot { angle: 1 }).unwrap();
-        // Odd turn parity swaps dims; for a square 64x64 the swap is
-        // a no-op, but the property still holds.
-        assert_eq!(nw, h, "turn {turn}: width swap");
-        assert_eq!(nh, w, "turn {turn}: height swap");
-        frame = next;
-        w = nw;
-        h = nh;
+    // Run the round-trip on BOTH the real decode (uniform red — a
+    // regression gate on the decode pipeline) and a position-hashed
+    // synthetic frame (non-uniform — the strong permutation check;
+    // a rotation bug can't hide behind uniform content).
+    for (subject, start) in [
+        ("red64", decoded),
+        ("synthetic", synthetic_yuv444_frame(64, 64)),
+    ] {
+        let original_y = start.planes[0].data.clone();
+        let mut frame: AvifFrame = start;
+        let (mut w, mut h) = (64u32, 64u32);
+        for turn in 0..4 {
+            let (next, nw, nh) =
+                apply_irot(&frame, AvifPixelFormat::Yuv444P, w, h, &Irot { angle: 1 }).unwrap();
+            // Odd turn parity swaps dims; for a square 64x64 the swap
+            // is a no-op, but the property still holds.
+            assert_eq!(nw, h, "{subject} turn {turn}: width swap");
+            assert_eq!(nh, w, "{subject} turn {turn}: height swap");
+            frame = next;
+            w = nw;
+            h = nh;
+        }
+        assert_eq!(
+            frame.planes[0].data, original_y,
+            "{subject}: four 90° turns must round-trip Y plane byte-for-byte"
+        );
     }
-    assert_eq!(
-        frame.planes[0].data, original_y,
-        "four 90° turns must round-trip Y plane byte-for-byte"
-    );
     // 180° rotation should equal angle=1 applied twice (covered by the
     // round-trip above). Spot-check it explicitly so a regression in
     // the angle-2 path can't slip past the round-trip alone. Reuse the
     // same source frame so the assertion is independent of av1's
     // current capability surface.
-    let vf2: AvifFrame = match decode_or_skip_lossless("red64 (irot 180)", RED64) {
-        Some(vf) => vf.into(),
-        None => synthetic_yuv444_frame(64, 64),
-    };
+    let vf2: AvifFrame = decode_video("red64 (irot 180)", RED64).into();
     let (rot180, _, _) =
         apply_irot(&vf2, AvifPixelFormat::Yuv444P, 64, 64, &Irot { angle: 2 }).unwrap();
     // For a flat-color fixture (red), every pixel is identical, so
@@ -1545,17 +1463,11 @@ fn end_to_end_decode_then_imir_roundtrips() {
     use oxideav_avif::{AvifFrame, AvifPixelFormat, Imir};
 
     for axis in 0u8..=1 {
-        // Run on a real RED64 decode when av1 succeeds; fall back to a
-        // synthetic 4:4:4 frame when av1 reports the coded_lossless
-        // limitation. The double-flip round-trip property is a pixel
-        // permutation invariant — valid for any 3-plane frame.
-        let vf: AvifFrame = match decode_or_skip_lossless("red64 (imir)", RED64) {
-            Some(vf) => {
-                assert_eq!(vf.planes.len(), 3, "red64 4:4:4 expects 3 planes");
-                vf.into()
-            }
-            None => synthetic_yuv444_frame(64, 64),
-        };
+        // The double-flip round-trip property is a pixel permutation
+        // invariant — exercised on a non-uniform position-hashed
+        // synthetic frame (the real-decode pipeline is covered by the
+        // irot sibling test; uniform red would mask axis bugs here).
+        let vf: AvifFrame = synthetic_yuv444_frame(64, 64);
         let original_y = vf.planes[0].data.clone();
         let original_u = vf.planes[1].data.clone();
         let original_v = vf.planes[2].data.clone();
@@ -1776,12 +1688,10 @@ fn end_to_end_decode_then_clap_centre_crop() {
     use oxideav_avif::apply_clap;
     use oxideav_avif::{AvifFrame, AvifPixelFormat, Clap};
 
-    let vf: AvifFrame = match decode_or_skip_lossless("red64 (clap)", RED64) {
-        Some(vf) => {
-            assert_eq!(vf.planes.len(), 3);
-            vf.into()
-        }
-        None => synthetic_yuv444_frame(64, 64),
+    let vf: AvifFrame = {
+        let vf = decode_video("red64 (clap)", RED64);
+        assert_eq!(vf.planes.len(), 3);
+        vf.into()
     };
 
     // Pull a 32x32 centre crop from the 64x64 source. clap uses
@@ -1832,10 +1742,7 @@ fn clap_with_zero_denominator_is_passthrough() {
     use oxideav_avif::apply_clap;
     use oxideav_avif::{AvifFrame, AvifPixelFormat, Clap};
 
-    let vf: AvifFrame = match decode_or_skip_lossless("red64 (clap zero-denom)", RED64) {
-        Some(v) => v.into(),
-        None => synthetic_yuv444_frame(64, 64),
-    };
+    let vf: AvifFrame = decode_video("red64 (clap zero-denom)", RED64).into();
     let degenerate = Clap {
         clean_aperture_width_n: 32,
         clean_aperture_width_d: 0, // <-- forces no-op

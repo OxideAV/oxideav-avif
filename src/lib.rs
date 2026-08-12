@@ -23,11 +23,10 @@
 //! * Primary item resolution via `pitm`, file-offset extent reads via
 //!   `iloc`, brand check accepting `avif` / `avis` / `mif1` / `msf1` /
 //!   `miaf`.
-//! * Primary item's AV1 OBU bitstream is handed to
-//!   [`oxideav_av1::Av1Decoder`] (when the default-on `registry` feature
-//!   is enabled), which now returns real frames for every intra still
-//!   plus single-reference inter clips. [`AvifDecoder::receive_frame`]
-//!   composites the result:
+//! * Primary item's AV1 OBU bitstream is handed to `oxideav_av1`'s
+//!   registry decoder (when the default-on `registry` feature is
+//!   enabled) — the conformance-grade spec-driver decode path.
+//!   [`AvifDecoder::receive_frame`] composites the result:
 //!   * Grid items (HEIF §6.6.2) — decode each tile via `dimg` iref
 //!     and paste into the declared output rectangle (see [`grid`]).
 //!   * Alpha auxiliary — AV1-coded monochrome item referenced via
@@ -46,7 +45,7 @@
 //!   ([`decoder::AvifDecoder::decode_avis_file`]) walks the table end
 //!   to end, lifts the `AV1CodecConfigurationRecord` from `stsd` →
 //!   `av01` → `av1C`, and fans every sample through a shared
-//!   [`oxideav_av1::Av1Decoder`] so inter-frame state is preserved.
+//!   `oxideav_av1` registry decoder so inter-frame state is preserved.
 //!   `Decoder::send_packet` dispatches to this path automatically
 //!   when the file's brand classification flags it as a sequence. The
 //!   av1-avif v1.2.0 §3 `shall`s on an AV1 Image Sequence track
@@ -118,7 +117,7 @@ pub mod sample_group;
 pub mod transform;
 
 #[cfg(feature = "registry")]
-mod av1_stub;
+mod av1_config;
 
 #[cfg(feature = "registry")]
 pub mod decoder;
@@ -266,15 +265,14 @@ mod registry_glue {
 
     oxideav_core::register!("avif", register);
 
-    /// Convenience: register AVIF in one call. Previously this also
-    /// pulled the underlying AV1 decoder into the registry, but the
-    /// post-2026-05-20 clean-room rebuild of `oxideav-av1` does not yet
-    /// expose `register_codecs` — the AV1 pixel-decode path is stubbed
-    /// (`av1_stub::Av1Decoder`) and returns `Error::Unsupported`. The
-    /// AVIF container + grid + alpha composition layers remain fully
-    /// functional; only the actual AV1 OBU decode is gated off.
+    /// Convenience: register AVIF **and** the underlying AV1 codec in
+    /// one call — the historical contract of this entry point,
+    /// restored now that `oxideav-av1`'s clean-room rebuild ships its
+    /// own registry surface again. Callers that only want the AVIF
+    /// factories keep using [`register_codecs`].
     pub fn register_with_av1(reg: &mut CodecRegistry) {
         register_codecs(reg);
+        oxideav_av1::registry::register_codecs(reg);
     }
 
     /// Register the `.avif` / `.avifs` extensions against the codec id

@@ -78,7 +78,7 @@ fn fuzz_y_plane_roundtrip_avif2_does_not_panic() {
 // `malformed_av1c_high_profile_is_rejected` integration test removed
 // after the 2026-05-20 clean-room orphan rebuild of `oxideav-av1`
 // stripped `Av1CodecConfig` from its public surface. The av1C
-// structural parser now lives locally in `oxideav_avif::av1_stub`
+// structural parser now lives locally in `oxideav_avif::av1_config`
 // (crate-private); its rejection-path coverage is exercised by the
 // unit tests in that module (`av1c_parses_minimal_record` /
 // `av1c_rejects_wrong_marker` / `av1c_rejects_wrong_version` /

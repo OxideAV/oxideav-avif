@@ -2,8 +2,10 @@
 //!
 //! The decoder does the full container-side composition pass: it parses
 //! HEIF box hierarchy, decodes the primary item's AV1 OBU stream via
-//! [`oxideav_av1::Av1Decoder`], then stitches grid tiles (HEIF §6.6.2),
-//! applies `clap` / `irot` / `imir` post-transforms, and composites an
+//! `oxideav_av1`'s registry decoder (each AV1 Image Item Data payload
+//! is one §7.5 temporal-unit body, exactly the packet shape that
+//! decoder accepts), then stitches grid tiles (HEIF §6.6.2), applies
+//! `clap` / `irot` / `imir` post-transforms, and composites an
 //! auxiliary alpha plane when one is present. Decode errors from the
 //! underlying AV1 crate bubble up unchanged.
 //!
@@ -20,7 +22,7 @@ use oxideav_core::frame::{VideoFrame, VideoPlane};
 use oxideav_core::Decoder;
 use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Result, TimeBase};
 
-use crate::av1_stub::{Av1CodecConfig, Av1Decoder};
+use crate::av1_config::Av1CodecConfig;
 
 use crate::alpha::{composite_alpha, find_alpha_item_id};
 use crate::avis::{parse_avis, sample_bytes};
@@ -299,7 +301,7 @@ impl AvifDecoder {
     /// Walks the track's `stbl` to recover the sample byte ranges and
     /// `(duration, is_sync)` per sample, lifts the
     /// `AV1CodecConfigurationRecord` from `stsd` → `av01` → `av1C`, and
-    /// fans every sample through a single shared [`Av1Decoder`]
+    /// fans every sample through a single shared AV1 registry decoder
     /// instance so inter-prediction across samples is preserved (when
     /// the underlying av1 crate supports it).
     ///
@@ -330,6 +332,13 @@ impl AvifDecoder {
         // still-image path uses for the av1C item property.
         let cfg = Av1CodecConfig::parse(&av1c)?;
         validate_av1_config(&cfg)?;
+        if cfg.high_bitdepth {
+            return Err(Error::unsupported(format!(
+                "avis: {}-bit sequence decode composition is pending — the track's \
+                 av1C record declares high_bitdepth",
+                cfg.bit_depth()
+            )));
+        }
 
         let timescale = if meta.timescale == 0 {
             1
@@ -343,7 +352,7 @@ impl AvifDecoder {
         }
         params.extradata = av1c.clone();
 
-        let mut av1 = Av1Decoder::new(params);
+        let mut av1 = oxideav_av1::registry::make_decoder(&params)?;
         let mut frames_queued = 0usize;
         let mut cumulative_pts: u64 = 0;
         for (i, s) in meta.samples.iter().enumerate() {
@@ -493,13 +502,26 @@ fn decode_av01_item(
     }
     let cfg = Av1CodecConfig::parse(av1c)?; // eagerly validate
     validate_av1_config(&cfg)?;
+    // The composition layer (grid / alpha / transform on `AvifFrame`)
+    // is 8-bit-per-sample; 10/12-bit primaries decode fine at the AV1
+    // layer (`oxideav_av1` emits 2-byte little-endian samples) but the
+    // container-side composition for them is still pending, so surface
+    // the honest capability boundary from the `av1C` flags up front.
+    if cfg.high_bitdepth {
+        return Err(Error::unsupported(format!(
+            "avif: {}-bit primary decode composition is pending — the av1C record \
+             declares high_bitdepth; pair `parse()` with oxideav-av1 directly for \
+             raw high-bit-depth planes",
+            cfg.bit_depth()
+        )));
+    }
     let mut params = CodecParameters::video(CodecId::new("av1"));
     if let Some((w, h)) = ispe {
         params.width = Some(w);
         params.height = Some(h);
     }
     params.extradata = av1c.to_vec();
-    let mut av1 = Av1Decoder::new(params);
+    let mut av1 = oxideav_av1::registry::make_decoder(&params)?;
     let pkt = Packet::new(0, TimeBase::new(1, 90_000), obu_bytes.to_vec());
     av1.send_packet(&pkt)?;
     let frame = match av1.receive_frame()? {
@@ -782,41 +804,24 @@ mod tests {
     }
 
     #[test]
-    fn decoder_surfaces_av1_errors_unwrapped() {
-        // When the underlying av1 crate can't decode the bitstream the
-        // decoder must surface its error verbatim — no "blocked by av1
-        // limitations" wrapping. Whether the fixture decodes cleanly
-        // depends on the av1 crate version on crates.io; both outcomes
-        // are legitimate.
+    fn decoder_decodes_monochrome_fixture_end_to_end() {
+        // The AV1 hand-off is the conformance-grade `oxideav_av1`
+        // spec-driver decoder, so this real-world 1280×720 monochrome
+        // still must decode to pixels — a decode error here is a
+        // regression in the container hand-off or the AV1 crate.
         let mut d = AvifDecoder::new(CodecId::new(crate::CODEC_ID_STR));
         let pkt = Packet::new(0, TimeBase::new(1, 1), FIXTURE.to_vec());
-        match d.send_packet(&pkt) {
-            Ok(()) => {
-                let frame = d
-                    .receive_frame()
-                    .expect("receive_frame after send_packet success");
-                let vf = match frame {
-                    Frame::Video(v) => v,
-                    other => panic!("expected VideoFrame, got {other:?}"),
-                };
-                assert!(!vf.planes.is_empty());
-                // Width inferred from the Y plane stride; height from
-                // the plane data length.
-                let y = &vf.planes[0];
-                assert!(y.stride > 0);
-                let inferred_h = y.data.len() / y.stride;
-                assert!(inferred_h > 0);
-            }
-            Err(Error::Unsupported(s)) => {
-                // Must NOT contain the old "blocked by av1 decoder
-                // limitations" wrapper — the whole point of Phase 8.1 is
-                // that avif surfaces av1's native error verbatim.
-                assert!(
-                    !s.contains("blocked by av1 decoder limitations"),
-                    "error should pass through raw, got: {s}"
-                );
-            }
-            Err(other) => panic!("unexpected error: {other:?}"),
-        }
+        d.send_packet(&pkt).expect("send_packet");
+        let frame = d.receive_frame().expect("receive_frame");
+        let vf = match frame {
+            Frame::Video(v) => v,
+            other => panic!("expected VideoFrame, got {other:?}"),
+        };
+        // Monochrome primary, no alpha auxiliary → exactly one plane
+        // at the fixture's 1280×720 extent.
+        assert_eq!(vf.planes.len(), 1);
+        let y = &vf.planes[0];
+        assert_eq!(y.stride, 1280);
+        assert_eq!(y.data.len() / y.stride, 720);
     }
 }

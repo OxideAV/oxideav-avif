@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Real AV1 pixel decode restored** — the crate depends on
+  `oxideav-av1` again (behind the default-on `registry` feature) and
+  hands every AV1 Image Item Data payload / AVIS sample to its
+  conformance-grade spec-driver registry decoder. The post-2026-05-20
+  `av1_stub` window is closed: the stub `Av1Decoder` (which surfaced
+  `Error::Unsupported` for every packet) is deleted, and the module is
+  renamed `av1_config` — it keeps only the `av1C`
+  (AV1CodecConfigurationRecord, av1-isobmff §2.3) parser plus a new
+  §5.5.2 `bit_depth()` derivation. Every committed fixture now decodes
+  END TO END: the 1280×720 monochrome still, the 3840×2160 4:2:0 +
+  alpha composite (4-plane output), the irot-carrying 1024×722 still,
+  the full multi-sample AVIS sequence (inter frames included), and all
+  five reference-encoder-produced flat fixtures (lossless flat gray
+  decodes to an exactly constant Y=128 plane — the historical
+  `#[ignore]` on that regression test is lifted). The integration
+  suite's "accept `Unsupported` when the AV1 decoder declines"
+  tolerance is retired; fixture decode success is now the gate.
+  10/12-bit primaries are rejected with a precise `Unsupported` naming
+  the pending high-bit-depth composition (the 8-bit `AvifFrame`
+  composition layer is the remaining gap, not the AV1 decode).
+- `register_with_av1` restored to its historical contract: registers
+  both the AVIF factories and `oxideav-av1`'s own codec registration
+  in one call.
+
 - **AVIF container encoder / muxer** (`mux` module — av1-avif §2 / §4.1 /
   §9.1.1, HEIF §6.6.2 / ISO-BMFF §8.11). New [`AvifMuxer`],
   [`AvifGridMuxer`], [`GridTile`], and the [`encode_still_av1`]

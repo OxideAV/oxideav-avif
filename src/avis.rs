@@ -10,7 +10,7 @@
 //! This module's job is strictly container-side: it does not feed the
 //! AV1 decoder, it just produces a flat [`Sample`] table + presentation
 //! metadata. The caller pairs the table with a standard
-//! [`oxideav_av1::Av1Decoder`] to decode frames end-to-end. The
+//! `oxideav_av1`'s registry decoder to decode frames end-to-end. The
 //! decoder needs the track's `AV1CodecConfigurationRecord` to seed its
 //! sequence header — that record is extracted from `stsd` → `av01` →
 //! `av1C` and surfaced as [`AvisMeta::av1_codec_config`].

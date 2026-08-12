@@ -1,22 +1,16 @@
-//! Local stubs for the `oxideav-av1` API surface that AVIF historically
-//! pulled in. After `oxideav-av1`'s 2026-05-20 clean-room orphan rebuild,
-//! the old decoder API (`Av1CodecConfig`, `Av1Decoder`, `register_codecs`)
-//! is gone pending re-implementation across many rounds. AVIF's container
-//! parse / grid composition / alpha compositing all still work; only the
-//! actual AV1 pixel decode path is gated off.
+//! `av1C` (AV1CodecConfigurationRecord) parsing — the ISO BMFF binding
+//! record every `av01` item property carries.
 //!
 //! `Av1CodecConfig` lives here legitimately — it's a parser for the
 //! ISO BMFF `av1C` configuration box, an ISO 14496-12 binding concern,
 //! not the AV1 bitstream itself. The byte layout is documented in the
 //! "AV1 Codec ISO Media File Format Binding" (av1-isobmff §2.3).
 //!
-//! `Av1Decoder` is a stub that always surfaces `Error::Unsupported` so the
-//! `Decoder::send_packet` / `receive_frame` trait contract is honoured —
-//! the framework consumer gets a clear "pixel decode pending" signal
-//! rather than a hard build failure on a workspace-wide compile.
+//! The actual pixel decode is delegated to `oxideav_av1`'s registry
+//! decoder (see [`crate::decoder`]); this module only validates and
+//! surfaces the configuration record's fields.
 
-use oxideav_core::frame::VideoFrame;
-use oxideav_core::{CodecParameters, Error, Frame, Packet, Result};
+use oxideav_core::{Error, Result};
 
 /// AV1 Codec Configuration Box (`av1C`) per av1-isobmff §2.3.
 ///
@@ -34,7 +28,7 @@ use oxideav_core::{CodecParameters, Error, Frame, Packet, Result};
 /// configOBUs: byte 4..
 /// ```
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // fields surfaced for a future AV1 decoder consumer
+#[allow(dead_code)] // fields surfaced for future container-side audits
 pub(crate) struct Av1CodecConfig {
     pub seq_profile: u8,
     pub seq_level_idx_0: u8,
@@ -105,48 +99,15 @@ impl Av1CodecConfig {
             config_obus: bytes[4..].to_vec(),
         })
     }
-}
 
-/// Stub `Av1Decoder` — keeps `oxideav-avif`'s registry surface alive
-/// during the period the clean-room rebuild of `oxideav-av1` has no
-/// pixel-decode path. Every packet/frame call returns
-/// `Error::Unsupported`; consumers can detect this and fall back to a
-/// different AV1 backend (a future HW-accel bridge or external bind).
-#[derive(Debug)]
-pub(crate) struct Av1Decoder {
-    _params: CodecParameters,
-}
-
-impl Av1Decoder {
-    pub fn new(params: CodecParameters) -> Self {
-        Self { _params: params }
-    }
-
-    pub fn send_packet(&mut self, _pkt: &Packet) -> Result<()> {
-        Err(Error::unsupported(
-            "avif: AV1 decoder unavailable — oxideav-av1 clean-room rebuild pending pixel-decode implementation",
-        ))
-    }
-
-    pub fn receive_frame(&mut self) -> Result<Frame> {
-        Err(Error::unsupported(
-            "avif: AV1 decoder unavailable — oxideav-av1 clean-room rebuild pending pixel-decode implementation",
-        ))
-    }
-
-    #[allow(dead_code)]
-    pub fn flush(&mut self) -> Result<()> {
-        Ok(())
-    }
-}
-
-#[allow(dead_code)]
-pub(crate) fn frame_as_video(f: Frame) -> Result<VideoFrame> {
-    match f {
-        Frame::Video(v) => Ok(v),
-        other => Err(Error::unsupported(format!(
-            "avif: AV1 decoder returned non-video frame: {other:?}"
-        ))),
+    /// §5.5.2-derived bit depth (8 / 10 / 12) from the
+    /// `high_bitdepth` / `twelve_bit` flag pair.
+    pub fn bit_depth(&self) -> u8 {
+        match (self.high_bitdepth, self.twelve_bit) {
+            (false, _) => 8,
+            (true, false) => 10,
+            (true, true) => 12,
+        }
     }
 }
 
@@ -168,6 +129,7 @@ mod tests {
         assert!(cfg.chroma_subsampling_y);
         assert!(!cfg.high_bitdepth);
         assert!(!cfg.monochrome);
+        assert_eq!(cfg.bit_depth(), 8);
         assert_eq!(cfg.config_obus.len(), 0);
     }
 
@@ -193,11 +155,12 @@ mod tests {
     }
 
     #[test]
-    fn decoder_stub_returns_unsupported() {
-        let params = CodecParameters::video(oxideav_core::CodecId::new("av1"));
-        let mut dec = Av1Decoder::new(params);
-        let pkt = Packet::new(0, oxideav_core::TimeBase::new(1, 1), vec![]);
-        assert!(dec.send_packet(&pkt).is_err());
-        assert!(dec.receive_frame().is_err());
+    fn av1c_bit_depth_derivation_covers_all_pairs() {
+        let mut cfg = Av1CodecConfig::parse(&[0x81, 0x00, 0x0c, 0x00]).unwrap();
+        assert_eq!(cfg.bit_depth(), 8);
+        cfg.high_bitdepth = true;
+        assert_eq!(cfg.bit_depth(), 10);
+        cfg.twelve_bit = true;
+        assert_eq!(cfg.bit_depth(), 12);
     }
 }
