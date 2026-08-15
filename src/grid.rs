@@ -152,13 +152,14 @@ pub fn composite_grid(
         )));
     }
     let (sx, sy) = subsampling_shifts(format)?;
+    let bps = format.bytes_per_sample();
     // Build planar output buffers at the output grid's final size.
     let mut out_planes: Vec<VideoPlane> = Vec::with_capacity(planes);
     for p in 0..planes {
         let (pw, ph) = plane_dims(out_w, out_h, p, sx, sy);
         out_planes.push(VideoPlane {
-            stride: pw as usize,
-            data: vec![0u8; (pw as usize) * (ph as usize)],
+            stride: (pw as usize) * bps,
+            data: vec![0u8; (pw as usize) * (ph as usize) * bps],
         });
     }
     for (i, tile) in tiles.iter().enumerate() {
@@ -225,9 +226,9 @@ pub fn composite_grid(
             );
             for row_i in 0..plane_copy_h as usize {
                 let dst_row_start =
-                    (plane_dst_y as usize + row_i) * dst.stride + plane_dst_x as usize;
+                    (plane_dst_y as usize + row_i) * dst.stride + (plane_dst_x as usize) * bps;
                 let src_row_start = row_i * src.stride;
-                let cw = plane_copy_w as usize;
+                let cw = (plane_copy_w as usize) * bps;
                 if dst_row_start + cw > dst.data.len() || src_row_start + cw > src.data.len() {
                     return Err(Error::InvalidData(format!(
                         "avif grid: tile {i} plane {p} row {row_i} out of range (src_w={}, dst_w={})",
@@ -246,14 +247,16 @@ pub fn composite_grid(
 }
 
 fn subsampling_shifts(format: PixelFormat) -> Result<(u32, u32)> {
-    match format {
-        PixelFormat::Yuv420P => Ok((1, 1)),
-        PixelFormat::Yuv422P => Ok((1, 0)),
-        PixelFormat::Yuv444P | PixelFormat::Gray8 => Ok((0, 0)),
-        other => Err(Error::unsupported(format!(
-            "avif grid: pixel format {other:?} not supported"
-        ))),
+    // Grid tiles are decoded `av01` items — alpha-composited / packed
+    // layouts never appear as tile formats (alpha rides as its own
+    // auxiliary and is composited after the grid stitch).
+    if format.has_alpha() {
+        return Err(Error::unsupported(format!(
+            "avif grid: pixel format {format:?} not supported as a tile layout"
+        )));
     }
+    let (sx, sy) = format.chroma_subsampling();
+    Ok((sx as u32, sy as u32))
 }
 
 fn plane_dims(w: u32, h: u32, plane: usize, sx: u32, sy: u32) -> (u32, u32) {
@@ -911,6 +914,57 @@ mod tests {
         assert_eq!(u.data.len(), 4);
         assert_eq!(&u.data[0..2], &[100, 100]);
         assert_eq!(&u.data[2..4], &[0, 0]);
+    }
+
+    /// HBD grid stitch: 2×2 grid of 10-bit 4:2:0 tiles (16-bit LE
+    /// words) pastes whole words at byte-doubled offsets — luma and
+    /// chroma planes both land at the right canvas positions.
+    #[test]
+    fn composite_2x2_grid_yuv420_10bit() {
+        let mk_plane = |w: u32, h: u32, fill: u16| {
+            let mut data = Vec::with_capacity((w * h) as usize * 2);
+            for _ in 0..w * h {
+                data.extend_from_slice(&fill.to_le_bytes());
+            }
+            VideoPlane {
+                stride: (w as usize) * 2,
+                data,
+            }
+        };
+        let make_tile = |y: u16, u: u16, v: u16| VideoFrame {
+            pts: None,
+            planes: vec![mk_plane(2, 2, y), mk_plane(1, 1, u), mk_plane(1, 1, v)],
+        };
+        let grid = ImageGrid {
+            version: 0,
+            flags: 0,
+            rows: 2,
+            columns: 2,
+            output_width: 4,
+            output_height: 4,
+        };
+        let tiles = [
+            make_tile(600, 100, 200),
+            make_tile(700, 110, 210),
+            make_tile(800, 120, 220),
+            make_tile(900, 130, 230),
+        ];
+        let out = composite_grid(&grid, &tiles, PixelFormat::Yuv420P10Le, 2, 2).unwrap();
+        let words = |p: &VideoPlane| -> Vec<u16> {
+            p.data
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect()
+        };
+        let y = &out.planes[0];
+        assert_eq!(y.stride, 8, "byte stride = 2 × canvas width");
+        let yw = words(y);
+        assert_eq!(&yw[0..4], &[600, 600, 700, 700]);
+        assert_eq!(&yw[8..12], &[800, 800, 900, 900]);
+        let u = words(&out.planes[1]);
+        assert_eq!(u, vec![100, 110, 120, 130]);
+        let v = words(&out.planes[2]);
+        assert_eq!(v, vec![200, 210, 220, 230]);
     }
 
     /// `ceil_shift` matches `ceil(v / 2^shift)` for the practical
