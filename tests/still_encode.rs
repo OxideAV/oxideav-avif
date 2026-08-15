@@ -989,3 +989,88 @@ fn black_box_external_decoder_accepts_our_encodes() {
     }
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// Reverse black-box direction: an independent AVIF **encoder** binary
+/// (`avifenc`), when installed, produces lossless 8/10/12-bit files
+/// from Y4M sources — and this crate's own decoder must recover the
+/// exact source planes through the (HBD) composition layer. Skips
+/// silently when the binary is not on PATH.
+#[test]
+fn black_box_external_encoder_files_decode_exact() {
+    let tmp = std::env::temp_dir().join(format!("oxideav-avif-bbe-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).expect("tmp dir");
+
+    /// Serialize one frame as Y4M at the given depth/chroma tag.
+    fn write_y4m(
+        path: &std::path::Path,
+        w: u32,
+        h: u32,
+        tag: &str,
+        depth: u8,
+        planes: [&[u16]; 3],
+    ) {
+        let mut out = format!("YUV4MPEG2 W{w} H{h} F25:1 Ip A1:1 C{tag}\nFRAME\n").into_bytes();
+        let two_byte = depth > 8;
+        for p in planes {
+            for &s in p {
+                if two_byte {
+                    out.extend_from_slice(&s.to_le_bytes());
+                } else {
+                    out.push(s as u8);
+                }
+            }
+        }
+        std::fs::write(path, out).expect("write y4m");
+    }
+
+    let cases = [
+        (StillChroma::Yuv420, 8u8, "420jpeg"),
+        (StillChroma::Yuv420, 10, "420p10"),
+        (StillChroma::Yuv444, 12, "444p12"),
+    ];
+    for (chroma, depth, tag) in cases {
+        let label = format!("black-box encode {depth}-bit {chroma:?}");
+        let (w, h) = (32u32, 32u32);
+        let img = build_image(w, h, depth, chroma);
+        let y4m_path = tmp.join(format!("bbe_{tag}.y4m"));
+        let avif_path = tmp.join(format!("bbe_{tag}.avif"));
+        write_y4m(&y4m_path, w, h, tag, depth, [&img.y, &img.u, &img.v]);
+
+        // Quality 100 = quantizer 0 = a lossless YUV encode without
+        // the identity-matrix implication (which is illegal with
+        // chroma subsampling).
+        let run = std::process::Command::new("avifenc")
+            .arg("-q")
+            .arg("100")
+            .arg(&y4m_path)
+            .arg(&avif_path)
+            .output();
+        let out = match run {
+            Ok(o) => o,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("{label}: external encoder not installed — leg skipped");
+                return;
+            }
+            Err(e) => panic!("{label}: spawning external encoder failed: {e}"),
+        };
+        assert!(
+            out.status.success(),
+            "{label}: external encoder failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let avif = std::fs::read(&avif_path).expect("read avif");
+
+        let vf = decode_own(&label, &avif);
+        assert_eq!(vf.planes.len(), 3, "{label}: planes");
+        if depth == 8 {
+            assert_eq!(vf.planes[0].data, narrow(&img.y), "{label}: Y exact");
+            assert_eq!(vf.planes[1].data, narrow(&img.u), "{label}: U exact");
+            assert_eq!(vf.planes[2].data, narrow(&img.v), "{label}: V exact");
+        } else {
+            assert_eq!(le_u16(&vf.planes[0].data), img.y, "{label}: Y exact");
+            assert_eq!(le_u16(&vf.planes[1].data), img.u, "{label}: U exact");
+            assert_eq!(le_u16(&vf.planes[2].data), img.v, "{label}: V exact");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}
