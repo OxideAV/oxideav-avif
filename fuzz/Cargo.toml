@@ -72,3 +72,13 @@ name = "oxideav_encode_oxideav_decode_roundtrip"
 path = "fuzz_targets/oxideav_encode_oxideav_decode_roundtrip.rs"
 test = false
 doc = false
+
+# HBD-matrix self-roundtrip — fuzz-shaped (8/10/12-bit × 4:2:0/4:2:2/
+# 4:4:4/monochrome × alpha) planes → oxideav lossless encode → oxideav
+# decode → assert sample-exact through the high-bit-depth composition
+# layer (word planes / packed Ya16Le). Fully in-tree; never skips.
+[[bin]]
+name = "oxideav_hbd_matrix_roundtrip"
+path = "fuzz_targets/oxideav_hbd_matrix_roundtrip.rs"
+test = false
+doc = false
