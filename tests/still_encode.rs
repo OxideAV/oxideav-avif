@@ -159,10 +159,11 @@ fn yuv420_8bit_lossless_round_trips_exact() {
 
 /// Arc 2: the full (bit depth × chroma format) matrix — 8/10/12-bit ×
 /// 4:2:0 / 4:2:2 / 4:4:4 / monochrome, all lossless, all validated
-/// sample-exact. 8-bit legs decode through this crate's own decoder;
-/// 10/12-bit legs decode the extracted payload through the AV1
-/// registry decoder (little-endian 2-byte planes). Also pins the
-/// av1C field mapping and the §8 profile-brand election per pairing.
+/// sample-exact. Every leg decodes through this crate's own decoder
+/// (the HBD composition layer emits little-endian 2-byte planes); the
+/// 10/12-bit legs additionally cross-check the extracted payload
+/// through the AV1 registry decoder. Also pins the av1C field mapping
+/// and the §8 profile-brand election per pairing.
 #[test]
 fn depth_format_matrix_round_trips_exact() {
     let chromas = [
@@ -209,23 +210,26 @@ fn depth_format_matrix_round_trips_exact() {
                 assert!(rec.is_compliant(), "{label}: {rec:?}");
             }
 
-            // Sample-exact decode-back.
+            // Sample-exact decode-back through this crate's own
+            // decoder + composition layer, at every depth.
+            let vf = decode_own(&label, &avif);
+            assert_eq!(vf.planes.len(), nplanes, "{label}: planes");
             if bit_depth == 8 {
-                let vf = decode_own(&label, &avif);
-                assert_eq!(vf.planes.len(), nplanes, "{label}: planes");
                 assert_eq!(vf.planes[0].data, narrow(&img.y), "{label}: Y");
                 if nplanes == 3 {
                     assert_eq!(vf.planes[1].data, narrow(&img.u), "{label}: U");
                     assert_eq!(vf.planes[2].data, narrow(&img.v), "{label}: V");
                 }
             } else {
-                let vf = decode_payload_av1(&label, &avif);
-                assert_eq!(vf.planes.len(), nplanes, "{label}: planes");
                 assert_eq!(le_u16(&vf.planes[0].data), img.y, "{label}: Y");
                 if nplanes == 3 {
                     assert_eq!(le_u16(&vf.planes[1].data), img.u, "{label}: U");
                     assert_eq!(le_u16(&vf.planes[2].data), img.v, "{label}: V");
                 }
+                // Cross-check: the raw payload through the AV1
+                // registry decoder agrees with the composed output.
+                let raw = decode_payload_av1(&label, &avif);
+                assert_eq!(le_u16(&raw.planes[0].data), img.y, "{label}: raw Y");
             }
         }
     }
@@ -416,9 +420,10 @@ fn full_range_flag_signalled_where_it_matters() {
 }
 
 /// 10-bit master + 10-bit alpha: the av1-avif §4.1 same-bit-depth
-/// `shall` holds at high bit depth too. The 8-bit composition layer
-/// doesn't cover HBD yet, so both items validate sample-exact through
-/// the AV1 registry decoder on the extracted payloads.
+/// `shall` holds at high bit depth too. The composition layer now
+/// covers HBD end to end, so the composited 4-plane frame validates
+/// sample-exact through this crate's own decoder; the raw alpha
+/// payload additionally cross-checks through the AV1 registry decoder.
 #[test]
 fn ten_bit_alpha_matches_master_depth_and_round_trips() {
     let (w, h) = (16u32, 16u32);
@@ -433,11 +438,16 @@ fn ten_bit_alpha_matches_master_depth_and_round_trips() {
         assert!(rec.is_compliant(), "§4.1 same-depth: {rec:?}");
     }
 
-    // Primary payload sample-exact at 10 bits.
-    let vf = decode_payload_av1("10-bit master", &avif);
+    // Composited decode: Y U V A planes, all sample-exact at 10 bits.
+    let vf = decode_own("10-bit 420 + alpha", &avif);
+    assert_eq!(vf.planes.len(), 4, "YUV + A");
     assert_eq!(le_u16(&vf.planes[0].data), img.y, "Y");
+    assert_eq!(le_u16(&vf.planes[1].data), img.u, "U");
+    assert_eq!(le_u16(&vf.planes[2].data), img.v, "V");
+    assert_eq!(le_u16(&vf.planes[3].data), alpha, "alpha");
 
-    // Alpha payload sample-exact at 10 bits (resolved via auxl iref).
+    // Alpha payload sample-exact at 10 bits (resolved via auxl iref)
+    // through the raw AV1 registry decoder too.
     let hdr = parse_header(&avif).expect("parse_header");
     let primary = hdr.meta.primary_item_id.expect("pitm");
     let alpha_id = oxideav_avif::find_alpha_item_id(&hdr.meta, primary).expect("alpha id");
@@ -453,6 +463,135 @@ fn ten_bit_alpha_matches_master_depth_and_round_trips() {
     };
     assert_eq!(af.planes.len(), 1, "monochrome alpha");
     assert_eq!(le_u16(&af.planes[0].data), alpha, "alpha samples exact");
+}
+
+/// 12-bit 4:4:4 master + 12-bit alpha, with the premultiplied signal:
+/// the `prem` iref lands on the wire and the HBD composite still
+/// round-trips sample-exact.
+#[test]
+fn twelve_bit_alpha_premultiplied_round_trips() {
+    let (w, h) = (16u32, 16u32);
+    let img = build_image(w, h, 12, StillChroma::Yuv444);
+    let alpha = plane(w, h, 12, 21);
+    let img = img.with_alpha(alpha.clone()).expect("alpha");
+    let opts = StillEncodeOptions {
+        premultiplied_alpha: true,
+        ..Default::default()
+    };
+    let avif = encode_still(&img, &opts).expect("encode");
+
+    let hdr = parse_header(&avif).expect("parse_header");
+    let primary = hdr.meta.primary_item_id.expect("pitm");
+    assert!(
+        hdr.meta.is_alpha_premultiplied_for(primary),
+        "prem iref present"
+    );
+    let vf = decode_own("12-bit 444 + prem alpha", &avif);
+    assert_eq!(vf.planes.len(), 4);
+    assert_eq!(le_u16(&vf.planes[0].data), img.y, "Y exact");
+    assert_eq!(le_u16(&vf.planes[3].data), alpha, "alpha exact");
+}
+
+/// 10/12-bit monochrome master + same-depth alpha → packed `Ya16Le`
+/// output: interleaved 16-bit LE Y A words with the raw coded values,
+/// plus the core significant-bits side channel reporting the
+/// effective depth on the single packed image plane.
+#[test]
+fn hbd_monochrome_alpha_composites_packed_ya16le() {
+    for depth in [10u8, 12] {
+        let label = format!("{depth}-bit mono + alpha");
+        let (w, h) = (16u32, 8u32);
+        let img = build_image(w, h, depth, StillChroma::Monochrome);
+        let alpha = plane(w, h, depth, 33);
+        let img = img.with_alpha(alpha.clone()).expect("alpha");
+        let avif = encode_still(&img, &StillEncodeOptions::default()).expect("encode");
+
+        let vf = decode_own(&label, &avif);
+        assert_eq!(vf.image_plane_count(), 1, "{label}: one packed plane");
+        assert_eq!(
+            vf.plane_significant_bits(0),
+            Some(depth),
+            "{label}: significant-bits side channel"
+        );
+        let plane0 = &vf.planes[0];
+        assert_eq!(plane0.stride, (w as usize) * 4, "{label}: 4 bytes/px");
+        let words = le_u16(&plane0.data);
+        let n = (w * h) as usize;
+        assert_eq!(words.len(), n * 2, "{label}: interleaved words");
+        for i in 0..n {
+            assert_eq!(words[i * 2], img.y[i], "{label}: Y[{i}]");
+            assert_eq!(words[i * 2 + 1], alpha[i], "{label}: A[{i}]");
+        }
+    }
+}
+
+/// HBD grid encode: a 10-bit 4:2:0 canvas split into 2×2 tiles with
+/// right/bottom trim reassembles sample-exact through the crate's own
+/// HBD grid stitch.
+#[test]
+fn hbd_grid_encode_round_trips_exact_with_trim() {
+    let (w, h) = (70u32, 50u32);
+    let img = build_image(w, h, 10, StillChroma::Yuv420);
+    let avif = encode_still_grid(&img, &StillEncodeOptions::default(), 2, 2).expect("grid encode");
+
+    let info = inspect(&avif).expect("inspect");
+    assert!(info.is_grid, "grid primary");
+    assert_eq!(info.max_bit_depth(), 10, "10-bit grid");
+    assert_eq!((info.width, info.height), (w, h), "canvas extents");
+    assert!(audit_mif1(&avif).expect("audit").is_compliant());
+
+    let vf = decode_own("10-bit grid 2x2", &avif);
+    assert_eq!(vf.planes[0].stride as u32, w * 2, "byte stride");
+    assert_eq!(le_u16(&vf.planes[0].data), img.y, "Y exact across seams");
+    assert_eq!(le_u16(&vf.planes[1].data), img.u, "U exact across seams");
+    assert_eq!(le_u16(&vf.planes[2].data), img.v, "V exact across seams");
+}
+
+/// HBD arbitrary extents: the coded frame pads, `clap` crops the
+/// decode back to the requested pixels — sample-exact at 10 and 12
+/// bits (the HBD crop path).
+#[test]
+fn hbd_odd_dimensions_pad_and_clap_back_exact() {
+    let cases = [
+        (17u32, 11u32, 10u8, StillChroma::Yuv444),
+        (9, 9, 12, StillChroma::Monochrome),
+        (18, 10, 12, StillChroma::Yuv420),
+    ];
+    for (w, h, depth, chroma) in cases {
+        let label = format!("{w}x{h} {depth}-bit {chroma:?}");
+        let img = build_image(w, h, depth, chroma);
+        let avif = encode_still(&img, &StillEncodeOptions::default())
+            .unwrap_or_else(|e| panic!("{label}: encode failed: {e}"));
+        let vf = decode_own(&label, &avif);
+        assert_eq!(vf.planes[0].stride as u32, w * 2, "{label}: byte stride");
+        assert_eq!(le_u16(&vf.planes[0].data), img.y, "{label}: Y exact");
+    }
+}
+
+/// HBD orientation: a 10-bit encode carrying `irot` = 1 decodes with
+/// swapped extents and exactly the 90°-CCW-rotated samples (the HBD
+/// rotation path moves 2-byte words).
+#[test]
+fn hbd_orientation_irot_rotates_samples_exact() {
+    let (w, h) = (24u32, 16u32);
+    let img = build_image(w, h, 10, StillChroma::Yuv444).with_props(StillProperties {
+        irot: Some(1),
+        ..Default::default()
+    });
+    let avif = encode_still(&img, &StillEncodeOptions::default()).expect("encode");
+
+    let vf = decode_own("10-bit irot", &avif);
+    assert_eq!(vf.planes[0].stride as u32, h * 2, "rotated byte stride");
+    let got = le_u16(&vf.planes[0].data);
+    // Expected: 90° CCW — output pixel (ox, oy) on the rotated h×w
+    // canvas sources input (w-1-oy, ox).
+    let mut expect = Vec::with_capacity((w * h) as usize);
+    for oy in 0..w as usize {
+        for ox in 0..h as usize {
+            expect.push(img.y[ox * w as usize + (w as usize - 1 - oy)]);
+        }
+    }
+    assert_eq!(got, expect, "rotated samples exact");
 }
 
 /// Pass-through container properties: Exif + XMP metadata items land
@@ -584,7 +723,10 @@ fn grid_encode_guards() {
 // ─────────────────── black-box acceptance ───────────────────
 
 /// Minimal Y4M reader for the black-box leg: returns
-/// `(width, height, chroma_tag, planes)` of the first frame.
+/// `(width, height, chroma_tag, planes)` of the first frame. A
+/// `p10` / `p12` suffix on the chroma tag selects 2-byte-LE samples
+/// (depth is retained in the Y4M output); plane byte lengths scale
+/// accordingly.
 fn parse_y4m(bytes: &[u8]) -> Option<(u32, u32, String, Vec<Vec<u8>>)> {
     let nl = bytes.iter().position(|&b| b == b'\n')?;
     let header = std::str::from_utf8(&bytes[..nl]).ok()?;
@@ -620,8 +762,13 @@ fn parse_y4m(bytes: &[u8]) -> Option<(u32, u32, String, Vec<Vec<u8>>)> {
     } else {
         return None;
     };
-    let ylen = (w * h) as usize;
-    let clen = (cw * ch) as usize;
+    let bps: usize = if chroma.contains("p10") || chroma.contains("p12") || chroma.contains("p16") {
+        2
+    } else {
+        1
+    };
+    let ylen = (w * h) as usize * bps;
+    let clen = (cw * ch) as usize * bps;
     if data.len() < ylen + 2 * clen {
         return None;
     }
@@ -646,13 +793,16 @@ fn black_box_external_decoder_accepts_our_encodes() {
     std::fs::create_dir_all(&tmp).expect("tmp dir");
 
     let cases = [
-        (StillChroma::Yuv420, "420"),
-        (StillChroma::Yuv444, "444"),
-        (StillChroma::Monochrome, "mono"),
+        (StillChroma::Yuv420, 8u8, "420"),
+        (StillChroma::Yuv444, 8, "444"),
+        (StillChroma::Monochrome, 8, "mono"),
+        (StillChroma::Yuv420, 10, "420p10"),
+        (StillChroma::Yuv422, 10, "422p10"),
+        (StillChroma::Yuv444, 12, "444p12"),
     ];
-    for (chroma, tag) in cases {
-        let label = format!("black-box {chroma:?}");
-        let img = build_image(32, 32, 8, chroma);
+    for (chroma, depth, tag) in cases {
+        let label = format!("black-box {depth}-bit {chroma:?}");
+        let img = build_image(32, 32, depth, chroma);
         let avif = encode_still(&img, &StillEncodeOptions::default()).expect("encode");
         let in_path = tmp.join(format!("bb_{tag}.avif"));
         let out_path = tmp.join(format!("bb_{tag}.y4m"));
@@ -679,10 +829,18 @@ fn black_box_external_decoder_accepts_our_encodes() {
         let (w, h, ctag, planes) = parse_y4m(&y4m).expect("parse y4m");
         assert_eq!((w, h), (32, 32), "{label}: dims");
         assert!(ctag.starts_with(tag), "{label}: chroma tag {ctag}");
-        assert_eq!(planes[0], narrow(&img.y), "{label}: Y exact");
-        if chroma != StillChroma::Monochrome {
-            assert_eq!(planes[1], narrow(&img.u), "{label}: U exact");
-            assert_eq!(planes[2], narrow(&img.v), "{label}: V exact");
+        if depth == 8 {
+            assert_eq!(planes[0], narrow(&img.y), "{label}: Y exact");
+            if chroma != StillChroma::Monochrome {
+                assert_eq!(planes[1], narrow(&img.u), "{label}: U exact");
+                assert_eq!(planes[2], narrow(&img.v), "{label}: V exact");
+            }
+        } else {
+            assert_eq!(le_u16(&planes[0]), img.y, "{label}: Y exact");
+            if chroma != StillChroma::Monochrome {
+                assert_eq!(le_u16(&planes[1]), img.u, "{label}: U exact");
+                assert_eq!(le_u16(&planes[2]), img.v, "{label}: V exact");
+            }
         }
     }
     let _ = std::fs::remove_dir_all(&tmp);

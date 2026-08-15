@@ -49,35 +49,14 @@ pub use crate::inspect::{inspect, transforms_for};
 /// [`PixelFormat`]. The mapping is total because every variant of
 /// `AvifPixelFormat` corresponds to one variant of `PixelFormat`.
 fn to_core_pix(fmt: AvifPixelFormat) -> PixelFormat {
-    match fmt {
-        AvifPixelFormat::Yuv420P => PixelFormat::Yuv420P,
-        AvifPixelFormat::Yuv422P => PixelFormat::Yuv422P,
-        AvifPixelFormat::Yuv444P => PixelFormat::Yuv444P,
-        AvifPixelFormat::Gray8 => PixelFormat::Gray8,
-        AvifPixelFormat::Yuva420P => PixelFormat::Yuva420P,
-        AvifPixelFormat::Yuva422P => PixelFormat::Yuva422P,
-        AvifPixelFormat::Yuva444P => PixelFormat::Yuva444P,
-        AvifPixelFormat::Ya8 => PixelFormat::Ya8,
-    }
+    fmt.into()
 }
 
-/// Inverse of [`to_core_pix`] for the small set of formats the AV1
-/// decoder actually emits. The composition path only ever feeds frames
-/// through its own [`AvifPixelFormat`] variants.
+/// Inverse of [`to_core_pix`] for the set of formats the AV1 decoder
+/// actually emits. The composition path only ever feeds frames through
+/// its own [`AvifPixelFormat`] variants.
 fn from_core_pix(fmt: PixelFormat) -> Result<AvifPixelFormat> {
-    match fmt {
-        PixelFormat::Yuv420P => Ok(AvifPixelFormat::Yuv420P),
-        PixelFormat::Yuv422P => Ok(AvifPixelFormat::Yuv422P),
-        PixelFormat::Yuv444P => Ok(AvifPixelFormat::Yuv444P),
-        PixelFormat::Gray8 => Ok(AvifPixelFormat::Gray8),
-        PixelFormat::Yuva420P => Ok(AvifPixelFormat::Yuva420P),
-        PixelFormat::Yuva422P => Ok(AvifPixelFormat::Yuva422P),
-        PixelFormat::Yuva444P => Ok(AvifPixelFormat::Yuva444P),
-        PixelFormat::Ya8 => Ok(AvifPixelFormat::Ya8),
-        other => Err(Error::unsupported(format!(
-            "avif: AV1 decoder emitted unsupported PixelFormat {other:?}"
-        ))),
-    }
+    AvifPixelFormat::try_from(fmt).map_err(core_err)
 }
 
 /// Convert a framework [`VideoFrame`] (returned by `oxideav_av1`) into
@@ -113,29 +92,43 @@ fn avif_to_core_frame(af: AvifFrame) -> VideoFrame {
     }
 }
 
-/// Infer `(format, width, height)` from a decoded AV1 [`VideoFrame`].
-/// `oxideav-av1` emits 8-bit planar Y/U/V with `stride == width` per
-/// plane and `data.len() == stride * height`, so we can reverse the
-/// mapping from plane geometry back to a `PixelFormat`.
-fn infer_av1_pixmap(frame: &VideoFrame) -> Result<(PixelFormat, u32, u32)> {
+/// Infer `(format, width, height)` from a decoded AV1 [`VideoFrame`]
+/// plus the item's `av1C` record. `oxideav-av1` emits planar Y/U/V
+/// with a tight byte stride per plane — one byte per sample for an
+/// 8-bit stream, a little-endian 16-bit word per sample when the
+/// record declares `high_bitdepth` (§5.5.2 flag pair) — so plane
+/// geometry (scaled by the record's storage width) reverses back to a
+/// `PixelFormat` at the record's bit depth.
+fn infer_av1_pixmap(frame: &VideoFrame, cfg: &Av1CodecConfig) -> Result<(PixelFormat, u32, u32)> {
     if frame.planes.is_empty() {
         return Err(Error::invalid("avif: AV1 frame has no planes"));
     }
+    let depth = cfg.bit_depth();
+    let bps = if cfg.high_bitdepth { 2usize } else { 1 };
     let y = &frame.planes[0];
-    let width = y.stride as u32;
-    if width == 0 {
-        return Err(Error::invalid("avif: AV1 frame Y plane has zero stride"));
+    if y.stride == 0 || y.stride % bps != 0 {
+        return Err(Error::invalid(format!(
+            "avif: AV1 frame Y plane stride {} incompatible with {depth}-bit storage",
+            y.stride
+        )));
     }
+    let width = (y.stride / bps) as u32;
     let height = (y.data.len() / y.stride) as u32;
     let format = match frame.planes.len() {
-        1 => PixelFormat::Gray8,
+        1 => match depth {
+            8 => PixelFormat::Gray8,
+            10 => PixelFormat::Gray10Le,
+            _ => PixelFormat::Gray12Le,
+        },
         3 => {
             let u = &frame.planes[1];
             if u.stride == 0 {
                 return Err(Error::invalid("avif: AV1 frame U plane has zero stride"));
             }
             // 4:2:0 — chroma stride is half luma; chroma data len is
-            // chroma_stride * (height / 2 ceil).
+            // chroma_stride * (height / 2 ceil). The byte-stride ratio
+            // is depth-independent (both planes scale by the same
+            // storage width).
             let chroma_h = u.data.len() / u.stride;
             // Use checked / saturating arithmetic here so a corrupt AV1
             // decoder output (e.g. a stride that overflows when doubled)
@@ -143,19 +136,30 @@ fn infer_av1_pixmap(frame: &VideoFrame) -> Result<(PixelFormat, u32, u32)> {
             // mismatch as an InvalidData error.
             let u_stride_doubled = u.stride.saturating_mul(2);
             let chroma_h_doubled = chroma_h.saturating_mul(2);
-            if u_stride_doubled == y.stride && chroma_h_doubled >= height as usize {
+            let sub = if u_stride_doubled == y.stride && chroma_h_doubled >= height as usize {
                 if chroma_h as u32 == height.div_ceil(2) {
-                    PixelFormat::Yuv420P
+                    (1u8, 1u8)
                 } else {
-                    PixelFormat::Yuv422P
+                    (1, 0)
                 }
             } else if u.stride == y.stride {
-                PixelFormat::Yuv444P
+                (0, 0)
             } else {
                 return Err(Error::unsupported(format!(
                     "avif: cannot infer AV1 frame format (Y stride {}, U stride {}, U rows {})",
                     y.stride, u.stride, chroma_h
                 )));
+            };
+            match (sub, depth) {
+                ((1, 1), 8) => PixelFormat::Yuv420P,
+                ((1, 1), 10) => PixelFormat::Yuv420P10Le,
+                ((1, 1), _) => PixelFormat::Yuv420P12Le,
+                ((1, 0), 8) => PixelFormat::Yuv422P,
+                ((1, 0), 10) => PixelFormat::Yuv422P10Le,
+                ((1, 0), _) => PixelFormat::Yuv422P12Le,
+                ((_, _), 8) => PixelFormat::Yuv444P,
+                ((_, _), 10) => PixelFormat::Yuv444P10Le,
+                ((_, _), _) => PixelFormat::Yuv444P12Le,
             }
         }
         n => {
@@ -289,8 +293,22 @@ impl AvifDecoder {
             height = h;
         }
 
-        let _ = (width, height, &mut format);
-        self.pending.push(Frame::Video(avif_to_core_frame(frame)));
+        let _ = (width, height);
+        let mut out = avif_to_core_frame(frame);
+        // A composited 10/12-bit monochrome + alpha frame rides the
+        // 16-bit `Ya16Le` storage with the coded values in the low
+        // bits; surface the effective depth through the core per-plane
+        // significant-bits side channel (one packed image plane, both
+        // components at the master depth per the av1-avif §4.1
+        // same-depth `shall`).
+        if format == AvifPixelFormat::Ya16Le {
+            if let Some(depth) = info.bits_per_channel.first().copied() {
+                if depth < 16 {
+                    out.set_significant_bits(vec![depth]);
+                }
+            }
+        }
+        self.pending.push(Frame::Video(out));
         self.info = Some(info.clone());
         Ok(info)
     }
@@ -333,16 +351,13 @@ impl AvifDecoder {
             )
         })?;
         // Eagerly validate the codec config — same shape as the
-        // still-image path uses for the av1C item property.
+        // still-image path uses for the av1C item property. 10/12-bit
+        // tracks pass straight through: AVIS sample frames are handed
+        // out exactly as the AV1 decoder emits them (little-endian
+        // 16-bit words for a `high_bitdepth` track), no composition
+        // step involved.
         let cfg = Av1CodecConfig::parse(&av1c)?;
         validate_av1_config(&cfg)?;
-        if cfg.high_bitdepth {
-            return Err(Error::unsupported(format!(
-                "avis: {}-bit sequence decode composition is pending — the track's \
-                 av1C record declares high_bitdepth",
-                cfg.bit_depth()
-            )));
-        }
 
         let timescale = if meta.timescale == 0 {
             1
@@ -506,19 +521,6 @@ fn decode_av01_item(
     }
     let cfg = Av1CodecConfig::parse(av1c)?; // eagerly validate
     validate_av1_config(&cfg)?;
-    // The composition layer (grid / alpha / transform on `AvifFrame`)
-    // is 8-bit-per-sample; 10/12-bit primaries decode fine at the AV1
-    // layer (`oxideav_av1` emits 2-byte little-endian samples) but the
-    // container-side composition for them is still pending, so surface
-    // the honest capability boundary from the `av1C` flags up front.
-    if cfg.high_bitdepth {
-        return Err(Error::unsupported(format!(
-            "avif: {}-bit primary decode composition is pending — the av1C record \
-             declares high_bitdepth; pair `parse()` with oxideav-av1 directly for \
-             raw high-bit-depth planes",
-            cfg.bit_depth()
-        )));
-    }
     let mut params = CodecParameters::video(CodecId::new("av1"));
     if let Some((w, h)) = ispe {
         params.width = Some(w);
@@ -536,7 +538,7 @@ fn decode_av01_item(
             )))
         }
     };
-    let (format, width, height) = infer_av1_pixmap(&frame)?;
+    let (format, width, height) = infer_av1_pixmap(&frame, &cfg)?;
     Ok((frame, format, width, height))
 }
 
