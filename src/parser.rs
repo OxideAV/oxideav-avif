@@ -343,7 +343,7 @@ pub fn parse(file: &[u8]) -> Result<AvifImage<'_>> {
     })
 }
 
-fn parse_ftyp(payload: &[u8]) -> Result<(BoxType, u32, Vec<BoxType>)> {
+pub(crate) fn parse_ftyp(payload: &[u8]) -> Result<(BoxType, u32, Vec<BoxType>)> {
     if payload.len() < 8 {
         return Err(Error::invalid("avif: ftyp too short"));
     }

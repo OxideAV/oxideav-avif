@@ -679,8 +679,18 @@ impl Decoder for AvifDecoder {
         // but lacks a `moov` (rare malformed-encoder output) — that
         // way we don't lose access to a valid `meta`-only image just
         // because the brand label was wrong.
-        let hdr = parse_header(&packet.data).map_err(core_err)?;
-        let brands = classify_brands(&hdr.major_brand, &hdr.compatible_brands).map_err(core_err)?;
+        //
+        // Classification reads only the `ftyp` box: a pure
+        // image-sequence file legally carries just `ftyp` + `moov` +
+        // `mdat` with no `meta` (the MetaBox belongs to image *items*),
+        // so the still-image header walk must not gate the sequence
+        // route.
+        let (ftyp_payload, _) = crate::box_parser::find_box(&packet.data, &b(b"ftyp"))
+            .map_err(core_err)?
+            .ok_or_else(|| Error::invalid("avif: missing ftyp"))?;
+        let (major_brand, _minor, compatible_brands) =
+            crate::parser::parse_ftyp(ftyp_payload).map_err(core_err)?;
+        let brands = classify_brands(&major_brand, &compatible_brands).map_err(core_err)?;
         if brands.is_sequence || brands.has_msf1 {
             // Probe for moov; fall back to still-image path when the
             // sequence claim is bogus.

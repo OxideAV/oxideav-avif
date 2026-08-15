@@ -77,8 +77,9 @@ fn decode_own(label: &str, avif: &[u8]) -> oxideav_core::frame::VideoFrame {
 }
 
 /// Decode the primary item's raw AV1 payload through the `oxideav_av1`
-/// registry decoder — the high-bit-depth validation path (this crate's
-/// composition layer is 8-bit; the payload itself decodes fine).
+/// registry decoder — the raw-payload cross-check leg that validates
+/// the composed output against an independent decode of the same
+/// bitstream.
 fn decode_payload_av1(label: &str, avif: &[u8]) -> oxideav_core::frame::VideoFrame {
     let img = parse(avif).unwrap_or_else(|e| panic!("{label}: parse failed: {e}"));
     let params = CodecParameters::video(CodecId::new("av1"));
@@ -718,6 +719,149 @@ fn grid_encode_guards() {
     // 16 wide split into 3 columns → 8-wide tiles → column 2 starts at
     // x=16, past the canvas: rejected.
     assert!(encode_still_grid(&img, &StillEncodeOptions::default(), 3, 1).is_err());
+}
+
+// ───────────────── HBD AVIS sequence decode ─────────────────
+
+/// 10-bit AVIS image sequence decodes end to end: two 10-bit KEY
+/// frames coded by the still encoder are re-wrapped into a synthetic
+/// `avis` file (ftyp + moov/trak/mdia/minf/stbl + mdat), and the
+/// registry decoder's sequence path hands both frames out as
+/// little-endian 16-bit word planes, sample-exact. Pins the removal
+/// of the sequence-track `high_bitdepth` rejection.
+#[test]
+fn hbd_avis_sequence_decodes_sample_exact() {
+    fn bx(t: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut out = ((8 + payload.len()) as u32).to_be_bytes().to_vec();
+        out.extend_from_slice(t);
+        out.extend_from_slice(payload);
+        out
+    }
+    fn full(body: &[u8]) -> Vec<u8> {
+        let mut out = vec![0u8, 0, 0, 0]; // version 0, flags 0
+        out.extend_from_slice(body);
+        out
+    }
+
+    // Two distinct 10-bit 4:2:0 frames at coded-grid extents (16×16 —
+    // no padding, no clap) coded losslessly; lift each coded payload +
+    // av1C from the still-encoder output black-box.
+    let (w, h) = (16u32, 16u32);
+    let img0 = build_image(w, h, 10, StillChroma::Yuv420);
+    let img1 = {
+        let y = plane(w, h, 10, 51);
+        let u = plane(w / 2, h / 2, 10, 52);
+        let v = plane(w / 2, h / 2, 10, 53);
+        StillImage::yuv(w, h, 10, StillChroma::Yuv420, y, u, v).expect("img1")
+    };
+    let lift = |img: &StillImage| -> (Vec<u8>, Vec<u8>) {
+        let avif = encode_still(img, &StillEncodeOptions::default()).expect("encode");
+        let parsed = parse(&avif).expect("parse");
+        (
+            parsed.primary_item_data.to_vec(),
+            parsed.av1c.expect("av1C").to_vec(),
+        )
+    };
+    let (pay0, av1c) = lift(&img0);
+    let (pay1, _) = lift(&img1);
+
+    // stsd → av01 sample entry (78-byte VisualSampleEntry header, then
+    // the av1C child box).
+    let av01_entry = {
+        let mut p = vec![0u8; 78];
+        p[7] = 1; // data_reference_index = 1
+        p.extend_from_slice(&bx(b"av1C", &av1c));
+        bx(b"av01", &p)
+    };
+    let stsd = bx(b"stsd", &{
+        let mut b = full(&1u32.to_be_bytes());
+        b.extend_from_slice(&av01_entry);
+        b
+    });
+    let stts = bx(b"stts", &{
+        let mut b = full(&1u32.to_be_bytes());
+        b.extend_from_slice(&2u32.to_be_bytes()); // sample_count = 2
+        b.extend_from_slice(&1u32.to_be_bytes()); // sample_delta = 1
+        b
+    });
+    let stsc = bx(b"stsc", &{
+        let mut b = full(&1u32.to_be_bytes());
+        b.extend_from_slice(&1u32.to_be_bytes()); // first_chunk
+        b.extend_from_slice(&2u32.to_be_bytes()); // samples_per_chunk
+        b.extend_from_slice(&1u32.to_be_bytes()); // sample_description_index
+        b
+    });
+    let stsz = bx(b"stsz", &{
+        let mut b = full(&0u32.to_be_bytes()); // sample_size = 0 (per-sample)
+        b.extend_from_slice(&2u32.to_be_bytes());
+        b.extend_from_slice(&(pay0.len() as u32).to_be_bytes());
+        b.extend_from_slice(&(pay1.len() as u32).to_be_bytes());
+        b
+    });
+    let stss = bx(b"stss", &{
+        let mut b = full(&2u32.to_be_bytes());
+        b.extend_from_slice(&1u32.to_be_bytes());
+        b.extend_from_slice(&2u32.to_be_bytes());
+        b
+    });
+    let ftyp = bx(b"ftyp", &{
+        let mut b = b"avis".to_vec();
+        b.extend_from_slice(&0u32.to_be_bytes());
+        b.extend_from_slice(b"avismsf1miafmif1");
+        b
+    });
+
+    // The chunk offset is absolute in the file; the stco payload is
+    // fixed-size, so build the file once with a placeholder to measure
+    // it, then again with the real offset.
+    let build = |chunk_offset: u32| -> (Vec<u8>, usize) {
+        let stco = bx(b"stco", &{
+            let mut b = full(&1u32.to_be_bytes());
+            b.extend_from_slice(&chunk_offset.to_be_bytes());
+            b
+        });
+        let mut stbl_children = Vec::new();
+        stbl_children.extend_from_slice(&stsd);
+        stbl_children.extend_from_slice(&stts);
+        stbl_children.extend_from_slice(&stsc);
+        stbl_children.extend_from_slice(&stsz);
+        stbl_children.extend_from_slice(&stco);
+        stbl_children.extend_from_slice(&stss);
+        let stbl = bx(b"stbl", &stbl_children);
+        let minf = bx(b"minf", &stbl);
+        let mdia = bx(b"mdia", &minf);
+        let trak = bx(b"trak", &mdia);
+        let moov = bx(b"moov", &trak);
+        let mut file = ftyp.clone();
+        file.extend_from_slice(&moov);
+        let mdat_payload_at = file.len() + 8;
+        let mut mdat_payload = pay0.clone();
+        mdat_payload.extend_from_slice(&pay1);
+        file.extend_from_slice(&bx(b"mdat", &mdat_payload));
+        (file, mdat_payload_at)
+    };
+    let (_, offset) = build(0);
+    let (file, offset2) = build(offset as u32);
+    assert_eq!(offset, offset2, "fixed-size stco keeps the layout stable");
+
+    // Decode through the registry decoder — the `avis` brand + moov
+    // routes to the sequence path.
+    let mut d = AvifDecoder::new(CodecId::new(oxideav_avif::CODEC_ID_STR));
+    d.send_packet(&Packet::new(0, TimeBase::new(1, 1), file))
+        .expect("avis send_packet");
+    for (i, img) in [&img0, &img1].into_iter().enumerate() {
+        let vf = match d
+            .receive_frame()
+            .unwrap_or_else(|e| panic!("frame {i}: {e}"))
+        {
+            Frame::Video(v) => v,
+            other => panic!("frame {i}: expected VideoFrame, got {other:?}"),
+        };
+        assert_eq!(vf.planes.len(), 3, "frame {i}: planes");
+        assert_eq!(le_u16(&vf.planes[0].data), img.y, "frame {i}: Y");
+        assert_eq!(le_u16(&vf.planes[1].data), img.u, "frame {i}: U");
+        assert_eq!(le_u16(&vf.planes[2].data), img.v, "frame {i}: V");
+    }
 }
 
 // ─────────────────── black-box acceptance ───────────────────
