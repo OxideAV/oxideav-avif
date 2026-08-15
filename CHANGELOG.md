@@ -9,6 +9,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **High-bit-depth decode COMPOSITION layer** — the 10/12-bit gap the
+  pixel-decode restoration left open is closed end to end. The whole
+  container-side composition pipeline (grid stitch — HEIF §6.6.2.3,
+  alpha composite — av1-avif §4.1, `clap` / `irot` / `imir`
+  post-transforms — HEIF §6.5.10, the `ispe` padded-frame clamp) now
+  operates at 8, 10 and 12 bits: geometry stays in pixels and the byte
+  maths scales by the format's storage width (one byte per sample at
+  8-bit, a little-endian 16-bit word per sample — low bits significant
+  — at 10/12). New crate-local `AvifPixelFormat` output surfaces (with
+  `oxideav-core` `PixelFormat` conversions both ways):
+  `Yuv420P10Le`/`Yuv422P10Le`/`Yuv444P10Le` + the `*12Le` trio,
+  `Gray10Le`/`Gray12Le`, the alpha-composited
+  `Yuva420P10Le`…`Yuva444P12Le` family, and packed `Ya16Le` for a
+  10/12-bit monochrome master + same-depth alpha (raw coded values
+  interleaved in the low bits of 16-bit LE words; the registry decoder
+  reports the effective depth via the core per-plane significant-bits
+  side channel). Format helpers `bytes_per_sample` / `bit_depth` /
+  `chroma_subsampling` / `is_packed_ya` / `has_alpha` / `with_alpha`
+  back the plumbing. `composite_alpha` now **enforces** the av1-avif
+  §4.1 same-bit-depth `shall` (master depth ↔ alpha depth; mismatch is
+  `InvalidData`), and the packed-YA layouts ride through
+  `irot`/`imir`/`clap` (previously even 8-bit `Ya8` was rejected by
+  the transform geometry). The AV1-frame format inference is now
+  driven by the item's `av1C` record (`high_bitdepth`/`twelve_bit` →
+  storage width + depth) instead of assuming one byte per sample. The
+  two `high_bitdepth` `Unsupported` guards (still primary + AVIS
+  sequence) are deleted. Validation: the encode→decode
+  (8/10/12 × 4:2:0/4:2:2/4:4:4/mono) matrix round-trips sample-exact
+  through the crate's own decoder where lossless (plus AV1-registry
+  raw-payload cross-checks); 10/12-bit alpha (incl. premultiplied
+  signalling) composites exactly; 10-bit grid with right/bottom trim
+  stitches exactly; HBD odd-extent `clap`-back and `irot` rotation are
+  word-exact; the black-box acceptance leg now also cross-decodes
+  10/12-bit encodes (420p10 / 422p10 / 444p12) through the external
+  AVIF decoder binary's depth-retaining Y4M output. New fuzz harness
+  `oxideav_hbd_matrix_roundtrip` drives fuzz-shaped
+  (depth × chroma × alpha) planes through lossless encode → own decode
+  → sample-exact assert (88k executions clean on the bring-up run).
+- **Gain-map application at coded depth** (ISO 21496-1 §6 surface):
+  `GainMapMetadata::apply_plane_rgb_coded` applies the gain map from a
+  plane still in its coded integer form at 8/10/12/16 bits — the shape
+  an AV1 decode of the `'tmap'` gain-map input emits — via the new
+  `normalize_full_range_plane` helper (full-range code-value scaling
+  `x / (2^depth − 1)`, the AV1 §5.5.2 `color_range = 1` convention,
+  with out-of-range samples rejected), then the existing §6.3
+  application unchanged.
+
 - **Real AV1 pixel decode restored** — the crate depends on
   `oxideav-av1` again (behind the default-on `registry` feature) and
   hands every AV1 Image Item Data payload / AVIS sample to its
@@ -26,9 +73,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `#[ignore]` on that regression test is lifted). The integration
   suite's "accept `Unsupported` when the AV1 decoder declines"
   tolerance is retired; fixture decode success is now the gate.
-  10/12-bit primaries are rejected with a precise `Unsupported` naming
-  the pending high-bit-depth composition (the 8-bit `AvifFrame`
-  composition layer is the remaining gap, not the AV1 decode).
+  (10/12-bit primaries were initially rejected with a precise
+  `Unsupported` naming the then-pending high-bit-depth composition;
+  that gap is closed by the HBD composition entry above.)
 - `register_with_av1` restored to its historical contract: registers
   both the AVIF factories and `oxideav-av1`'s own codec registration
   in one call.
@@ -85,8 +132,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   consistency splice applies to colour streams paired with a
   full-range `nclx`. Validation: lossless
   round-trips are sample-exact through the crate's own decoder for
-  every 8-bit pairing (10/12-bit payloads sample-exact through the
-  AV1 registry decoder pending the high-bit-depth composition layer),
+  every pairing (initially 8-bit only; the 10/12-bit legs joined with
+  the HBD composition entry above),
   lossy encodes are PSNR-gated, grid seams are pixel-exact, and a
   black-box acceptance leg decodes the emitted files through an
   external AVIF decoder binary (Y4M plane compare — exact) when one

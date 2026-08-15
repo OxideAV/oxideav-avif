@@ -19,17 +19,20 @@ resolution, item-property extraction, metadata items, image sequences
 (AVIS), and the grid/alpha/transform composition logic all work and
 are heavily tested.
 
-**Pixel decode is live.** The primary item's AV1 OBU stream (and every
-AVIS sample) is handed to
+**Pixel decode is live at every AV1 bit depth.** The primary item's
+AV1 OBU stream (and every AVIS sample) is handed to
 [`oxideav-av1`](https://github.com/OxideAV/oxideav-av1)'s
 conformance-grade spec-driver decoder; the composition layer then
 stitches grid tiles, composites the alpha auxiliary (4:2:0 / 4:2:2 /
-4:4:4 / monochrome masters), and applies `clap` / `irot` / `imir`.
-Every committed fixture decodes end to end — including the 3840×2160
-alpha composite and the multi-sample AVIS sequence. 10/12-bit
-primaries decode at the AV1 layer but the 8-bit composition layer
-rejects them with a precise `Unsupported` (pair `parse()` with
-oxideav-av1 directly for raw high-bit-depth planes).
+4:4:4 / monochrome masters), and applies `clap` / `irot` / `imir` —
+at 8, 10 and 12 bits end to end. 10/12-bit output rides little-endian
+16-bit word planes (`Yuv*P10Le` / `*P12Le`, `Gray10Le` / `Gray12Le`,
+alpha-composited `Yuva*P1xLe`, and packed `Ya16Le` for HBD
+monochrome + alpha with the effective depth on the core
+significant-bits side channel). Every committed fixture decodes end
+to end — including the 3840×2160 alpha composite and the multi-sample
+AVIS sequence — and the encode→decode HBD matrix round-trips
+sample-exact where lossless.
 
 **Pixel encode is live** (`still` module). `StillImage` +
 `encode_still` / `encode_still_grid` drive oxideav-av1's KEY-frame
@@ -72,7 +75,7 @@ layer the AV1 bitstream is taken **black-box**.
 | Region items (`rgan`) | `region::RegionItem::parse` decodes a `'rgan'` region item's data into typed `RegionGeometry` variants — point / rectangle / ellipse / polygon / polyline / referenced-mask / inline-mask (HEIF §11.2.1, `(flags&1)` 16/32-bit fields, sign-extended coords); `inspect::region_items` / `region_items_for` enumerate the region items attached to the primary (or any image item) via the `'cdsc'` iref, resolving each one's data through the construction-method-aware `iloc` path into a `ResolvedRegionItem`. Derived region items (`drgn` §11.3.3) resolved by `region::resolve_derived_region_items` — every `'iden'` item carrying a `'drgn'` reference to its input region item, audited against the §11.3.3.2.1 `shall`s (single `'drgn'` input + `'drgn'`-iref-count ≤ 1 + no item body) as a `DerivedRegionItem` |
 | Essential-property enforcement | `Meta::{unsupported_essential_properties, has_unsupported_essential_property}` flag any `ipma`-essential property that lands in `Property::Other` (av1-avif §2.3.2.1.2 + MIAF §7.3.5) |
 | Sample Transform (`sato`) | descriptor parser + per-sample evaluator (av1-avif §4.2.3); image composition deferred until a real AV1 decoder lands |
-| Tone Map (`tmap`) | four-CC detection + §4.2.2 compliance audit + `GainMapMetadata::parse` (ISO 21496-1:2025 Annex C.2) + **§6 application**: `unnormalize_log2_gain` (Formula 1), `weight_factor` (Formula 3), `apply_component` / `apply_rgb` / `apply_plane_rgb` reconstruct the linear alternate (HDR) rendition `(Baseline + k_base)·2^(W·G) − k_alt` (Formula 2) from a linear baseline + the decoded gain plane, with §5.2.5.1 per-component-metadata broadcast and §6.3 NOTE 2 achromatic handling |
+| Tone Map (`tmap`) | four-CC detection + §4.2.2 compliance audit + `GainMapMetadata::parse` (ISO 21496-1:2025 Annex C.2) + **§6 application**: `unnormalize_log2_gain` (Formula 1), `weight_factor` (Formula 3), `apply_component` / `apply_rgb` / `apply_plane_rgb` reconstruct the linear alternate (HDR) rendition `(Baseline + k_base)·2^(W·G) − k_alt` (Formula 2) from a linear baseline + the decoded gain plane, with §5.2.5.1 per-component-metadata broadcast and §6.3 NOTE 2 achromatic handling; `apply_plane_rgb_coded` + `normalize_full_range_plane` accept the gain plane in its coded integer form at 8/10/12/16 bits (full-range scaling at the coded depth) |
 | AV1 layered properties | `a1op` operating-point selector + `a1lx` layered-image index (av1-avif §2.3.2) |
 | Auxiliary classification | `auxC` URN routed to `Alpha` / `DepthMap` / `HdrGainMap` / `Other` |
 | Container encoder / muxer (`mux`) | `AvifMuxer` / `AvifGridMuxer` / `encode_still_av1` emit `ftyp` + full `meta` tree (`hdlr`/`pitm`/`iinf`+`infe` v2/`iref`/`iprp`(`ipco`+`ipma`)/`iloc` v0 cm0) + `mdat` around a black-box coded AV1 payload + `av1C`; item properties `av1C`(essential)/`ispe`/`pixi`/`colr`(nclx+ICC)/`pasp`/`clap`/`irot`/`imir`; AV1-coded alpha auxiliary (`auxC`+`auxl`+`prem`); `grid` derivation (`dimg`, 16-bit form); profile brand tri-state (`MA1B` default / `MA1A` / general-brands-only per av1-avif §8.1). Round-trips through `parse` byte-for-byte; passes `audit_mif1` |
@@ -92,9 +95,9 @@ layer the AV1 bitstream is taken **black-box**.
 | `av1C` introspection | bit depth (8/10/12), monochrome flag, chroma subsampling decoded into `AvifInfo` |
 | Sequence Header OBU audit | av1-avif §2.1 "exactly one Sequence Header OBU" container-layer audit |
 | Primary item data | resolved via `iloc` construction_method 0 (file-offset), **1** (idat-offset — bytes in the `meta` box's `idat` / ItemDataBox, ISO/IEC 14496-12 §8.11.3) **and 2** (item-offset — bytes are a range of another item's data, named via the `'iloc'` item reference; `extent_index` 1-based, 0 implies 1; `extent_length` 0 = whole referenced item, §8.11.3.3); single-extent cm=0 is a zero-copy slice, idat-backed or multi-extent items are concatenated, cm=2 resolves recursively (depth-capped, self-/cycle-rejecting). `item_bytes_with_idat` / `item_bytes_owned_with_idat` cover methods 0/1; `item_bytes_owned_full` (and `item_payload_bytes`) additionally follow cm=2. Grid tiles, the alpha auxiliary, and metadata items (`item_payload_bytes`: Exif / XMP / mime / `tmap`) are all construction-method-aware |
-| Grid primary items | grid descriptor parse + `dimg` tile composition + av1-avif §7 derivation-chain audit + **decode-free tile-geometry resolution** (`resolve_grids` → `GridResolution`: common tile dims + per-tile row-major canvas placement, `GridTilePlacement::visible` right/bottom trim §6.6.2.3.1, `covers_canvas` / `trimmed_tile_count`); surfaced on `AvifInfo::{grid_resolutions, has_grid, grid_resolution_for}` |
-| Alpha auxiliary | `auxl` + `auxC` detection + composition (`Gray8→YA8`, `Yuv→YuvA`) + av1-avif §4.1 bit-depth audit |
-| Post-transforms | `clap` → `irot` → `imir`, applied in that order (HEIF §6.5.10) |
+| Grid primary items | grid descriptor parse + `dimg` tile composition (8/10/12-bit tiles) + av1-avif §7 derivation-chain audit + **decode-free tile-geometry resolution** (`resolve_grids` → `GridResolution`: common tile dims + per-tile row-major canvas placement, `GridTilePlacement::visible` right/bottom trim §6.6.2.3.1, `covers_canvas` / `trimmed_tile_count`); surfaced on `AvifInfo::{grid_resolutions, has_grid, grid_resolution_for}` |
+| Alpha auxiliary | `auxl` + `auxC` detection + composition at every depth (`Gray8→Ya8`, `Gray10/12→Ya16Le`, `Yuv→YuvA` incl. `*10Le`/`*12Le`) + av1-avif §4.1 same-bit-depth `shall` enforced at composite time and audited at the container layer |
+| Post-transforms | `clap` → `irot` → `imir`, applied in that order (HEIF §6.5.10), at 8/10/12-bit and on the packed `Ya8`/`Ya16Le` layouts |
 | AVIS image sequences | sample-table walk (`parse_avis` / `sample_table`) + `inspect_avis` aggregator + §3 / §8.2 / §8.3 audits + `edts/elst` edit list (ISO/IEC 14496-12 §8.6.6) + `mdhd` media-timescale plumb + `prft` ProducerReferenceTimeBox (§8.16.5, v0/v1 NTP→Unix, top-level walk) on `AvisMeta::producer_reference_times` + `ssix` SubsegmentIndexBox (§8.16.4, v0; per-subsegment `(level: u8, range_size: u24)` leva-level byte-range partitions for partial-subsegment access, top-level walk) on `AvisMeta::subsegment_indexes` |
 | Sample grouping | `sbgp` (SampleToGroupBox, ISO/IEC 14496-12:2015 §8.9.2, v0/v1) + `csgp` (CompactSampleToGroupBox, :2020 §8.9.5 — 4/8/16/32-bit packed field widths, pattern expansion, `traf` fragment-local msb) + `sgpd` (§8.9.3, v0/v1/v2 default index) which now also **retains + slices per-entry `VisualSampleGroupEntry` payloads** (v1 `default_length` fixed-size or self-describing `description_length`) into `SampleGroupDescription::entries`; typed decoders for the HEIF §6.8.6 bracketing entries (`BracketingEntry`: `aebr` auto-exposure / `wbbr` white-balance / `fobr` focus incl. infinity / `afbr` flash-exposure / `dobr` depth-of-field via `bracketing_entries()`) and the §6.8.1.2.2 `eqiv` `VisualEquivalenceEntry` (`time_offset` + 8.8 `timescale_multiplier`, `equivalence_entries()`); per-sample group-index lookup via `SampleToGroup::group_index_for_sample`, surfaced on `AvisMeta::{sample_to_groups, sample_group_descriptions}` |
 
