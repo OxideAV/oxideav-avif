@@ -148,7 +148,7 @@ pub use cicp::{
 };
 pub use derived::{
     audit_alpha_bit_depth, audit_avif_profile_compliance, audit_iden_derivations, audit_pred_brand,
-    audit_sequence_header_obu, audit_tone_map, build_derivation_graph,
+    audit_sequence_header_obu, audit_tone_map, build_derivation_graph, normalize_full_range_plane,
     output_dims_from_reconstructed, parse_grpl, reconstructed_dims, resolve_grids,
     resolve_iden_derivations, resolve_overlays, resolve_tone_maps, transform_chain,
     AlphaBitDepthAudit, AvifProfile, AvifProfileCompliance, BracketingKind, DerivationGraph,

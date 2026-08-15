@@ -1569,6 +1569,59 @@ impl GainMapMetadata {
         }
         Ok(out)
     }
+
+    /// [`Self::apply_plane_rgb`] over a gain-map plane still in its
+    /// **coded integer** form at `gain_bit_depth` bits — the shape the
+    /// AV1 decode of a 8/10/12-bit `'tmap'` gain-map input item emits
+    /// (av1-avif §4.2.2 codes the gain map as an ordinary AV1 image
+    /// item). Each coded sample is first mapped to the normalized
+    /// `[0, 1]` domain [`Self::apply_plane_rgb`] consumes via
+    /// [`normalize_full_range_plane`] (full-range scaling at the coded
+    /// depth), then the §6.3 application runs unchanged. `gain_coded`
+    /// follows the same layout contract as `gain` there: `width ×
+    /// height` samples for an achromatic gain map, `width × height × 3`
+    /// interleaved for an RGB one.
+    pub fn apply_plane_rgb_coded(
+        &self,
+        baseline: &[f64],
+        gain_coded: &[u16],
+        gain_bit_depth: u8,
+        width: u32,
+        height: u32,
+        target_headroom: f64,
+    ) -> Result<Vec<f64>> {
+        let gain = normalize_full_range_plane(gain_coded, gain_bit_depth)?;
+        self.apply_plane_rgb(baseline, &gain, width, height, target_headroom)
+    }
+}
+
+/// Map a plane of full-range coded samples at `bit_depth` bits into the
+/// normalized `[0, 1]` domain: `x / (2^bit_depth − 1)`.
+///
+/// This is the AV1 full-range sample convention (§5.5.2
+/// `color_range = 1`: code values span the whole `[0, 2^depth − 1]`
+/// interval) applied in reverse — the shape a decoded 8/10/12-bit
+/// gain-map or alpha plane arrives in before any normalized-domain
+/// math. Accepts `bit_depth` ∈ {8, 10, 12, 16} and rejects samples
+/// that exceed the declared depth's code range.
+pub fn normalize_full_range_plane(samples: &[u16], bit_depth: u8) -> Result<Vec<f64>> {
+    if !matches!(bit_depth, 8 | 10 | 12 | 16) {
+        return Err(Error::invalid(format!(
+            "avif: bit depth {bit_depth} is not one of 8/10/12/16"
+        )));
+    }
+    let max = ((1u32 << bit_depth) - 1) as f64;
+    let ceil = 1u32 << bit_depth;
+    let mut out = Vec::with_capacity(samples.len());
+    for (i, &s) in samples.iter().enumerate() {
+        if (s as u32) >= ceil && bit_depth < 16 {
+            return Err(Error::invalid(format!(
+                "avif: sample {i} = {s} exceeds the {bit_depth}-bit code range"
+            )));
+        }
+        out.push(s as f64 / max);
+    }
+    Ok(out)
 }
 
 /// Read a `numerator(int32) / denominator(uint32)` rational and reject a
@@ -6415,6 +6468,49 @@ mod tests {
         let m = GainMapMetadata::parse(&build_singlechannel_gain_map()).unwrap();
         let out = m.apply_plane_rgb(&[], &[], 0, 4, 8.0).unwrap();
         assert!(out.is_empty());
+    }
+
+    /// `normalize_full_range_plane` maps the code-range endpoints of
+    /// each supported depth to exactly 0.0 / 1.0 and mid values
+    /// proportionally; out-of-range samples and unknown depths reject.
+    #[test]
+    fn normalize_full_range_plane_endpoints_and_guards() {
+        for depth in [8u8, 10, 12, 16] {
+            let max = ((1u32 << depth) - 1) as u16;
+            let out = normalize_full_range_plane(&[0, max, max / 2], depth).unwrap();
+            approx(out[0], 0.0);
+            approx(out[1], 1.0);
+            approx(out[2], (max / 2) as f64 / max as f64);
+        }
+        // 1024 exceeds the 10-bit code range.
+        assert!(matches!(
+            normalize_full_range_plane(&[1024], 10).unwrap_err(),
+            Error::InvalidData(_)
+        ));
+        assert!(matches!(
+            normalize_full_range_plane(&[0], 9).unwrap_err(),
+            Error::InvalidData(_)
+        ));
+    }
+
+    /// `apply_plane_rgb_coded` over a 10-bit coded achromatic gain
+    /// plane equals `apply_plane_rgb` fed the same samples normalized
+    /// by hand — the coded path is exactly the full-range scaling plus
+    /// the §6.3 application.
+    #[test]
+    fn apply_plane_rgb_coded_matches_manual_normalization() {
+        let m = GainMapMetadata::parse(&build_singlechannel_gain_map()).unwrap();
+        let baseline = [0.25, 0.5, 0.75, 1.0, 0.125, 0.6]; // 2×1×3
+        let coded: [u16; 2] = [307, 921]; // 10-bit samples
+        let manual: Vec<f64> = coded.iter().map(|&s| s as f64 / 1023.0).collect();
+        let want = m.apply_plane_rgb(&baseline, &manual, 2, 1, 6.0).unwrap();
+        let got = m
+            .apply_plane_rgb_coded(&baseline, &coded, 10, 2, 1, 6.0)
+            .unwrap();
+        assert_eq!(got.len(), want.len());
+        for (g, w) in got.iter().zip(&want) {
+            approx(*g, *w);
+        }
     }
 
     // -------------------------------------------------------------------
