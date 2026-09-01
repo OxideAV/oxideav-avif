@@ -7,6 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/OxideAV/oxideav-avif/compare/v0.0.10...v0.0.11) - 2026-08-15
+
+### Other
+
+- avif tests: reverse black-box leg — external encodes decode exact at depth
+- avif decoder: route metadata-less image-sequence files to the AVIS path
+- avif docs: HBD decode composition is live — status + coverage refresh
+- avif fuzz: HBD-matrix self-roundtrip harness
+- avif tmap: gain-map application from coded integer planes at any depth
+- avif decoder: 10/12-bit primaries, grids, alpha and AVIS decode end to end
+- avif composition: grid / alpha / transforms at 8, 10 and 12 bits
+- avif image: high-bit-depth + packed-YA pixel-format surface
+- gate identity-matrix plane comparisons on the stream's colr declaration
+- drop accidentally-committed local corpus; ignore fuzz scratch dirs
+- avif still: deref Copy property types instead of clone (clippy clone_on_copy)
+- avif still: cite the av1-avif §4.1 aux-stream shalls precisely (color_range=1, mono_chrome=1)
+- avif still: StillProperties pass-through — Exif/XMP, HDR (mdcv/clli/amve), irot/imir, pasp
+- README truth-up (decode + pixel-encode live) + 10-bit alpha same-depth leg
+- avif encoder: registry Encoder goes live — one AVIF file per frame + self-roundtrip fuzz harness
+- avif still: pixel->AVIF encode — full (depth,format) matrix + RGB(A) identity + alpha + clap padding + grid
+- avif mux: tri-state profile brand — no_profile_brand() for Professional-profile payloads
+- restore real AV1 pixel decode via oxideav-av1's registry decoder
+- doc(hidden) internal plumbing for semver tooling
+- avif mux: depth-map auxiliary + baseline profile-compliance validation
+- avif mux: HDR (mdcv/clli/amve) + Exif/XMP items + advanced profile + wide grid
+- implement the AVIF container encoder/muxer + wire the Encoder trait
+- add CI / crates.io / docs.rs / MIT-license badges
+- EntityGroup::cardinality_ok — ster/iaug exactly-two shall (HEIF §6.8.5/§6.8.4)
+- README + CHANGELOG — entity-group family + bracketing/eqiv sample-group entries
+- inspect::entity_groups decode-free typed-group enumeration
+- slid/albc/favc entity groups (HEIF §6.8.9 + §6.8.7)
+- eqiv VisualEquivalenceEntry sample-group entry (HEIF §6.8.1.2.2)
+- bracketing sample-group entries (HEIF §6.8.6.2-6.8.6.6)
+- tsyn/iaug + bracketed-set entity groups (HEIF §6.8.3-6.8.6)
+- derived region items — 'drgn' iden derivation (HEIF §11.3.3.2.1)
+- 'pred' brand file-constraint audit (HEIF §10.2.4.2)
+- coded-item dependency roles — pred/base/exbl/tbas (§6.4.7-6.4.9)
+- text/font item enumeration + prgr/brst/msrc entity groups (§6.10/§6.8)
+- HEIF region items + mskC mask-config property (§11.2/§11.3)
+- sstr/txlo/elng/fnch HEIF item properties (§6.5.38 + §6.10)
+- README — document unified derivation graph + cm=2 descriptor row
+- derivation-graph decode-buffer accessors + totality sweep
+- resolve cm=2 (item-offset) derived-image descriptors (§8.11.3.3)
+- unified derivation-graph resolution (HEIF §6.6)
+- grid tile-derivation geometry resolution (ISO/IEC 23008-12 §6.6.2.3)
+- sato Sample-Transform derivation dimension resolution (av1-avif §4.2.3.1)
+- tmap tone-map derivation geometry resolution (av1-avif §4.2.2)
+- README — document §6 gain-map application surface on the tmap row
+- buffer-level gain-map application — apply_plane_rgb (ISO 21496-1 §6.3)
+- gain-map application (ISO 21496-1 §6) — unnormalize + weight + apply
+- end-to-end cm=2 fixture tests + export item_bytes_owned_full
+- resolve construction_method==2 (item_offset) iloc items
+- capture iloc extent_index for construction_method==2
+- reuse Meta::idat in inspect; drop redundant extract_idat re-walk
+- idat-aware grid / alpha / metadata item resolution
+- idat-backed item byte resolution (ISO/IEC 14496-12 §8.11.3 cm=1)
+- derived-image geometry resolution for iovl/iden (HEIF §6.3/§6.6.2)
+- AVIS ssix SubsegmentIndexBox parser (ISO/IEC 14496-12 §8.16.4)
+- add amve AmbientViewingEnvironmentBox item property (AVIF §6.5.36)
+- prft ProducerReferenceTimeBox parser (ISO/IEC 14496-12 §8.16.5)
+- ISOBMFF sample-grouping family (sbgp / csgp / sgpd)
+
 ### Added
 
 - **High-bit-depth decode COMPOSITION layer** — the 10/12-bit gap the
