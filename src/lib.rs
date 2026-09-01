@@ -206,6 +206,7 @@ pub use still::{
 };
 
 #[cfg(feature = "registry")]
+#[doc(hidden)]
 pub use registry_glue::__oxideav_entry;
 
 /// Public codec id string. Matches the aggregator-crate Cargo feature `avif`.
