@@ -89,6 +89,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   groups decode sample-exact at 8 and 10 bits through this crate's
   sequence path, the external AVIF decoder (`--index all`) and ffmpeg
   (track stream) recover every frame exactly.
+- **Derived-image graph fuzz target** (`fuzz/fuzz_targets/derived_graph_decode`):
+  structure-aware `meta` synthesis — `av01` / `grid` / `iovl` / `iden` /
+  alpha-aux items with fuzz-chosen `dimg` / `auxl` / `prem` edges
+  (cycles, self references, count mismatches, off-canvas / overlapping
+  placements, oversize descriptors, `lsel` / `a1op`, `clap` / `irot` /
+  `imir` chains) around one pre-encoded AV1 tile — decoded end to end
+  plus `inspect` + the derivation-graph walk. Canvas bounds:
+  `MAX_GRID_CANVAS_PIXELS` (2^28) on grid descriptors and
+  `MAX_OVERLAY_CANVAS_PIXELS` (2^26) on overlays, both checked before any
+  tile is decoded. The fuzz sub-crate's lock now resolves the published
+  `oxideav-av1` that carries the spatial-layer / operating-point API.
+- Two findings from the new fuzz target, fixed with regression tests:
+  the coded-leaf search behind `inspect` on a derived primary expanded
+  every `dimg` entry recursively without a visited set (a self-referencing
+  overlay listing itself three times cost `3^17` visits — a 20 s hang on
+  an 8-byte file), and `crop_rect` sized chroma planes with a floor
+  while every consumer uses the ceiling, so an odd-width 4:2:0 crop
+  followed by `imir` read past the plane (panic). Derived-image decode
+  is now memoised per item with a `MAX_ITEM_DECODES` budget, so shared
+  or hostile fan-out never repeats work.
 - Derived-image test suite (`tests/derived_images.rs`): overlay
   8-bit 4:2:0 / 10-bit 4:2:2 (clipped negative offset) / identity-matrix
   RGBA alpha-over with transparent fill / 12-bit monochrome odd offset +

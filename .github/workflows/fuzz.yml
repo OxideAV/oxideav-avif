@@ -16,6 +16,12 @@ name: Fuzz
 #     decode → libavif re-encode → oxideav decode → assert pixel
 #     stability across the round-trip.
 #
+#   * oxideav_hbd_matrix_roundtrip — (bit depth × chroma × alpha)
+#     lossless self-roundtrip through the HBD composition layer.
+#   * derived_graph_decode — structure-aware derived-image graphs
+#     (grid / iovl / iden / alpha aux with hostile dimg / auxl edges)
+#     decoded end to end; never panics, memory-bounded.
+#
 # The libavif harnesses dlopen libavif at runtime via libloading; the
 # CI runner needs `libavif-dev` so they actually validate instead of
 # silently skipping. The self-roundtrip harness never skips.

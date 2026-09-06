@@ -201,7 +201,7 @@ pub use sample_group::{
 pub use transform::{apply_clap, apply_imir, apply_irot, crop_top_left};
 
 #[cfg(feature = "registry")]
-pub use decoder::{make_decoder, AvifDecoder};
+pub use decoder::{make_decoder, AvifDecoder, MAX_GRID_CANVAS_PIXELS, MAX_ITEM_DECODES};
 
 #[cfg(feature = "registry")]
 pub use encoder::{make_encoder, AvifEncoder};

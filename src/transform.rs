@@ -127,10 +127,20 @@ fn crop_rect(
     }
     let mut out = Vec::with_capacity(planes);
     for p in 0..planes {
+        // Chroma extents round **up** (a 3-pixel-wide 4:2:0 crop keeps
+        // 2 chroma columns), matching `plane_dims` — every downstream
+        // consumer sizes chroma planes with the same ceiling, so a
+        // floor here would leave the last chroma column/row missing and
+        // the next transform reading past the plane.
         let (px, py, pw, ph) = if plane_is_full_res(p) {
             (x, y, w, h)
         } else {
-            (x >> sx, y >> sy, (w >> sx).max(1), (h >> sy).max(1))
+            (
+                x >> sx,
+                y >> sy,
+                ((w + (1 << sx) - 1) >> sx).max(1),
+                ((h + (1 << sy) - 1) >> sy).max(1),
+            )
         };
         let src = &frame.planes[p];
         let src_stride = src.stride;
@@ -682,5 +692,43 @@ mod tests {
         };
         let (out, _, _) = apply_imir(&f, PixelFormat::Ya16Le, 2, 1, &Imir { axis: 1 }).unwrap();
         assert_eq!(words(&out.planes[0]), vec![2000, 2, 1000, 1]);
+    }
+
+    /// Fuzz regression (derived_graph_decode crash): cropping an odd
+    /// luma extent out of a 4:2:0 frame must keep the ceiling chroma
+    /// extent (3 luma columns → 2 chroma columns), so the following
+    /// mirror reads inside the plane instead of panicking.
+    #[test]
+    fn odd_crop_keeps_ceiling_chroma_then_mirrors() {
+        let frame = VideoFrame {
+            pts: None,
+            planes: vec![
+                VideoPlane {
+                    stride: 8,
+                    data: (0..64).map(|v| v as u8).collect(),
+                },
+                VideoPlane {
+                    stride: 4,
+                    data: vec![1; 16],
+                },
+                VideoPlane {
+                    stride: 4,
+                    data: vec![2; 16],
+                },
+            ],
+        };
+        let cropped = crop_top_left(&frame, PixelFormat::Yuv420P, 8, 8, 3, 1).expect("crop");
+        assert_eq!(cropped.planes[0].data.len(), 3);
+        assert_eq!(
+            cropped.planes[1].data.len(),
+            2,
+            "ceil(3 / 2) chroma columns"
+        );
+        assert_eq!(cropped.planes[1].stride, 2);
+        let (mirrored, w, h) =
+            apply_imir(&cropped, PixelFormat::Yuv420P, 3, 1, &Imir { axis: 1 }).expect("imir");
+        assert_eq!((w, h), (3, 1));
+        assert_eq!(mirrored.planes[0].data, vec![2, 1, 0]);
+        assert_eq!(mirrored.planes[1].data.len(), 2);
     }
 }

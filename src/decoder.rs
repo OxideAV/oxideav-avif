@@ -227,8 +227,8 @@ impl AvifDecoder {
             )));
         };
 
-        let mut stack = Vec::new();
-        let image = decode_item_output(&hdr, primary_id, 0, &mut stack, true)?;
+        let mut ctx = DecodeCtx::default();
+        let image = decode_item_output(&hdr, primary_id, 0, &mut ctx, true)?;
         let format = image.format;
         let mut out = avif_to_core_frame(image.frame);
         // A composited 10/12-bit monochrome + alpha frame rides the
@@ -577,8 +577,33 @@ fn decode_at_operating_point(
         .collect()
 }
 
+/// Upper bound on a grid canvas (`output_width × output_height`) in
+/// pixels — 16384 × 16384, the largest coded extent an AV1
+/// Professional-profile image reaches. Rejected before any tile is
+/// decoded, so a hostile descriptor cannot drive a multi-gigabyte
+/// allocation.
+pub const MAX_GRID_CANVAS_PIXELS: u64 = 1 << 28;
+
+/// Upper bound on the number of item decodes one file may trigger.
+/// A derivation graph is a DAG in which an item may be referenced by
+/// many derived items (diamonds are legal); outputs are memoised per
+/// item, so this bounds the distinct items decoded, not the fan-out —
+/// a hostile graph of nested grids referencing each other cannot go
+/// exponential.
+pub const MAX_ITEM_DECODES: u32 = 4096;
+
+/// Per-file decode state: the `dimg` recursion stack (cycle guard),
+/// memoised item output images, and the decode budget.
+#[derive(Default)]
+struct DecodeCtx {
+    stack: Vec<u32>,
+    cache: std::collections::HashMap<(u32, bool), ItemImage>,
+    decodes: u32,
+}
+
 /// An image item's output image (HEIF §6.3) in the crate-local
 /// composition representation.
+#[derive(Clone)]
 struct ItemImage {
     frame: AvifFrame,
     format: AvifPixelFormat,
@@ -602,14 +627,16 @@ struct ItemImage {
 /// 3. the item's transformative properties (`clap` / `irot` /
 ///    `imir`) applied in `ipma` order (§6.3).
 ///
-/// `depth` + `stack` guard the walk against hostile graphs: chains
-/// deeper than [`MAX_DERIVATION_DEPTH`] and `dimg` cycles are rejected
-/// before any decode.
+/// `depth` + the context's stack guard the walk against hostile
+/// graphs: chains deeper than [`MAX_DERIVATION_DEPTH`] and `dimg`
+/// cycles are rejected before any decode; outputs are memoised per
+/// `(item, with_alpha)` so shared inputs decode once, and the total
+/// number of item decodes is capped by [`MAX_ITEM_DECODES`].
 fn decode_item_output(
     hdr: &AvifHeader<'_>,
     item_id: u32,
     depth: u32,
-    stack: &mut Vec<u32>,
+    ctx: &mut DecodeCtx,
     with_alpha: bool,
 ) -> Result<ItemImage> {
     if depth > MAX_DERIVATION_DEPTH {
@@ -617,14 +644,26 @@ fn decode_item_output(
             "avif: derivation chain deeper than {MAX_DERIVATION_DEPTH} at item {item_id}"
         )));
     }
-    if stack.contains(&item_id) {
+    if ctx.stack.contains(&item_id) {
         return Err(Error::invalid(format!(
             "avif: derivation cycle through item {item_id}"
         )));
     }
-    stack.push(item_id);
-    let result = decode_item_output_inner(hdr, item_id, depth, stack, with_alpha);
-    stack.pop();
+    if let Some(cached) = ctx.cache.get(&(item_id, with_alpha)) {
+        return Ok(cached.clone());
+    }
+    if ctx.decodes >= MAX_ITEM_DECODES {
+        return Err(Error::invalid(format!(
+            "avif: derivation graph needs more than {MAX_ITEM_DECODES} item decodes"
+        )));
+    }
+    ctx.decodes += 1;
+    ctx.stack.push(item_id);
+    let result = decode_item_output_inner(hdr, item_id, depth, ctx, with_alpha);
+    ctx.stack.pop();
+    if let Ok(image) = &result {
+        ctx.cache.insert((item_id, with_alpha), image.clone());
+    }
     result
 }
 
@@ -632,7 +671,7 @@ fn decode_item_output_inner(
     hdr: &AvifHeader<'_>,
     item_id: u32,
     depth: u32,
-    stack: &mut Vec<u32>,
+    ctx: &mut DecodeCtx,
     with_alpha: bool,
 ) -> Result<ItemImage> {
     let info = hdr
@@ -643,9 +682,9 @@ fn decode_item_output_inner(
     let mut image = if item_type == ITEM_TYPE_AV01 {
         decode_coded_item(hdr, item_id)?
     } else if item_type == ITEM_TYPE_GRID {
-        decode_grid_item(hdr, item_id, depth, stack)?
+        decode_grid_item(hdr, item_id, depth, ctx)?
     } else if item_type == ITEM_TYPE_IOVL {
-        decode_overlay_item(hdr, item_id, depth, stack)?
+        decode_overlay_item(hdr, item_id, depth, ctx)?
     } else if item_type == ITEM_TYPE_IDEN {
         let inputs = hdr.meta.iref_targets(&DIMG, item_id);
         if inputs.len() != 1 {
@@ -657,7 +696,7 @@ fn decode_item_output_inner(
         // The identity derivation's reconstructed image is its input's
         // output image (§6.6.1) — alpha included, so a `clap` on the
         // iden crops colour and alpha together.
-        decode_item_output(hdr, inputs[0], depth + 1, stack, with_alpha)?
+        decode_item_output(hdr, inputs[0], depth + 1, ctx, with_alpha)?
     } else {
         return Err(Error::unsupported(format!(
             "avif: item {item_id} type '{}' cannot be decoded to pixels",
@@ -672,7 +711,7 @@ fn decode_item_output_inner(
                     "avif: item {item_id} already carries alpha and has an alpha auxiliary {alpha_id}"
                 )));
             }
-            let alpha = decode_item_output(hdr, alpha_id, depth + 1, stack, false)?;
+            let alpha = decode_item_output(hdr, alpha_id, depth + 1, ctx, false)?;
             let alpha = alpha_as_gray(alpha, image.width, image.height)?;
             let (composited, fmt) = composite_alpha(
                 &image.frame,
@@ -771,7 +810,7 @@ fn decode_grid_item(
     hdr: &AvifHeader<'_>,
     grid_id: u32,
     depth: u32,
-    stack: &mut Vec<u32>,
+    ctx: &mut DecodeCtx,
 ) -> Result<ItemImage> {
     let loc = hdr
         .meta
@@ -794,12 +833,18 @@ fn decode_grid_item(
     if grid.output_width == 0 || grid.output_height == 0 {
         return Err(Error::invalid("avif: grid output dimensions zero"));
     }
+    if u64::from(grid.output_width) * u64::from(grid.output_height) > MAX_GRID_CANVAS_PIXELS {
+        return Err(Error::invalid(format!(
+            "avif: grid canvas {}x{} exceeds {MAX_GRID_CANVAS_PIXELS} pixels",
+            grid.output_width, grid.output_height
+        )));
+    }
     let mut tiles: Vec<AvifFrame> = Vec::with_capacity(tile_ids.len());
     let mut tile_format: Option<AvifPixelFormat> = None;
     let mut tile_dims: Option<(u32, u32)> = None;
     let mut bit_depth = 8u8;
     for (i, tid) in tile_ids.iter().enumerate() {
-        let tile = decode_item_output(hdr, *tid, depth + 1, stack, false)?;
+        let tile = decode_item_output(hdr, *tid, depth + 1, ctx, false)?;
         if let Some(want_fmt) = tile_format {
             if want_fmt != tile.format {
                 return Err(Error::invalid(format!(
@@ -856,7 +901,7 @@ fn decode_overlay_item(
     hdr: &AvifHeader<'_>,
     iovl_id: u32,
     depth: u32,
-    stack: &mut Vec<u32>,
+    ctx: &mut DecodeCtx,
 ) -> Result<ItemImage> {
     let loc = hdr
         .meta
@@ -884,7 +929,7 @@ fn decode_overlay_item(
     let mut inputs = Vec::with_capacity(sources.len());
     for &src in &sources {
         inputs.push((
-            decode_item_output(hdr, src, depth + 1, stack, true)?,
+            decode_item_output(hdr, src, depth + 1, ctx, true)?,
             is_premultiplied(hdr, src),
         ));
     }

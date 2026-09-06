@@ -1376,17 +1376,32 @@ pub(crate) fn build_info_grid(
 /// required to share colour/format information (av1-avif §4.2.3.1), so the
 /// first leaf is representative.
 fn first_coded_leaf(meta: &Meta, item_id: u32, depth: u32) -> Option<u32> {
-    if depth > crate::derived::MAX_DERIVATION_DEPTH {
+    let mut visited = Vec::new();
+    first_coded_leaf_visited(meta, item_id, depth, &mut visited)
+}
+
+/// [`first_coded_leaf`] with a visited set: every item is expanded at
+/// most once, so a `dimg` graph whose entries repeat or loop back on
+/// themselves (a self-referencing overlay listing itself three times)
+/// costs linear work instead of `fan_out ^ MAX_DERIVATION_DEPTH`.
+fn first_coded_leaf_visited(
+    meta: &Meta,
+    item_id: u32,
+    depth: u32,
+    visited: &mut Vec<u32>,
+) -> Option<u32> {
+    if depth > crate::derived::MAX_DERIVATION_DEPTH || visited.contains(&item_id) {
         return None;
     }
+    visited.push(item_id);
     let item = meta.item_by_id(item_id)?;
     if item.item_type == crate::parser::ITEM_TYPE_AV01 {
         return Some(item_id);
     }
-    // Any derived item: descend into its first `dimg` input.
+    // Any derived item: descend into its `dimg` inputs in order.
     let inputs = meta.iref_targets(b"dimg", item_id);
     for src in inputs {
-        if let Some(leaf) = first_coded_leaf(meta, src, depth + 1) {
+        if let Some(leaf) = first_coded_leaf_visited(meta, src, depth + 1, visited) {
             return Some(leaf);
         }
     }
@@ -2229,5 +2244,68 @@ mod tests {
         let d = coded_item_dependencies_from_meta(&meta, 1);
         assert_eq!(d, CodedItemDependencies::default());
         assert!(!d.has_dependencies());
+    }
+
+    /// Fuzz regression (derived_graph_decode timeout): an `iovl`
+    /// whose `dimg` lists itself three times must not cost
+    /// `3 ^ MAX_DERIVATION_DEPTH` in the coded-leaf search — `inspect`
+    /// returns (with an error) immediately.
+    #[test]
+    fn self_referencing_overlay_with_repeated_inputs_inspects_fast() {
+        fn bx(t: &[u8; 4], body: &[u8]) -> Vec<u8> {
+            let mut o = ((8 + body.len()) as u32).to_be_bytes().to_vec();
+            o.extend_from_slice(t);
+            o.extend_from_slice(body);
+            o
+        }
+        fn fb(t: &[u8; 4], v: u8, flags: u32, body: &[u8]) -> Vec<u8> {
+            let mut i = vec![v, (flags >> 16) as u8, (flags >> 8) as u8, flags as u8];
+            i.extend_from_slice(body);
+            bx(t, &i)
+        }
+        // iovl descriptor: version 0, flags 0, fill, 1x0 canvas, 3 offsets.
+        let mut desc = vec![0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0];
+        desc.extend_from_slice(&[0u8; 12]);
+        let mut hdlr = vec![0u8; 4];
+        hdlr.extend_from_slice(b"pict");
+        hdlr.extend_from_slice(&[0u8; 13]);
+        let mut infe = vec![0, 1, 0, 0];
+        infe.extend_from_slice(b"iovl");
+        infe.push(0);
+        let mut iinf = vec![0, 1];
+        iinf.extend_from_slice(&fb(b"infe", 2, 0, &infe));
+        let dimg = bx(b"dimg", &[0, 1, 0, 3, 0, 1, 0, 1, 0, 1]);
+        let ispe = fb(b"ispe", 0, 0, &[0, 0, 0, 1, 0, 0, 0, 0]);
+        let mut iprp = bx(b"ipco", &ispe);
+        iprp.extend_from_slice(&fb(b"ipma", 0, 0, &[0, 0, 0, 1, 0, 1, 1, 1]));
+        let build = |start: u32| {
+            let mut iloc = vec![0x44, 0, 0, 1, 0, 1, 0, 0, 0, 1];
+            iloc.extend_from_slice(&start.to_be_bytes());
+            iloc.extend_from_slice(&(desc.len() as u32).to_be_bytes());
+            let mut body = Vec::new();
+            body.extend_from_slice(&fb(b"hdlr", 0, 0, &hdlr));
+            body.extend_from_slice(&fb(b"pitm", 0, 0, &[0, 1]));
+            body.extend_from_slice(&fb(b"iinf", 0, 0, &iinf));
+            body.extend_from_slice(&fb(b"iref", 0, 0, &dimg));
+            body.extend_from_slice(&bx(b"iprp", &iprp));
+            body.extend_from_slice(&fb(b"iloc", 0, 0, &iloc));
+            fb(b"meta", 0, 0, &body)
+        };
+        let mut ftyp = b"avif".to_vec();
+        ftyp.extend_from_slice(&[0, 0, 0, 0]);
+        ftyp.extend_from_slice(b"avifmif1miaf");
+        let ftyp = bx(b"ftyp", &ftyp);
+        let probe = build(0);
+        let meta = build((ftyp.len() + probe.len() + 8) as u32);
+        let mut file = ftyp;
+        file.extend_from_slice(&meta);
+        file.extend_from_slice(&bx(b"mdat", &desc));
+        let started = std::time::Instant::now();
+        let _ = inspect(&file);
+        assert!(
+            started.elapsed().as_secs() < 5,
+            "inspect took {:?}",
+            started.elapsed()
+        );
     }
 }

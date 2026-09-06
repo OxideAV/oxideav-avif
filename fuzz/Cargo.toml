@@ -82,3 +82,16 @@ name = "oxideav_hbd_matrix_roundtrip"
 path = "fuzz_targets/oxideav_hbd_matrix_roundtrip.rs"
 test = false
 doc = false
+
+# Derived-image graph — structure-aware `meta` synthesis from the
+# fuzz bytes: av01 / grid / iovl / iden / alpha-aux items with
+# fuzz-chosen dimg / auxl / prem edges (cycles, self references,
+# hostile counts, off-canvas and overlapping placements, oversize
+# descriptors, lsel / a1op selectors) around one valid pre-encoded AV1
+# tile, then the full decode + inspect + derivation-graph walk. Fully
+# in-tree; never skips. Must never panic or blow the memory bound.
+[[bin]]
+name = "derived_graph_decode"
+path = "fuzz_targets/derived_graph_decode.rs"
+test = false
+doc = false

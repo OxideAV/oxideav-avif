@@ -63,10 +63,11 @@ use crate::error::{AvifError as Error, Result};
 use crate::image::{AvifFrame, AvifPixelFormat, AvifPlane};
 
 /// Upper bound on an overlay canvas (`output_width × output_height`),
-/// in pixels — the same 16384 × 16384 ceiling a Professional-profile
-/// AV1 coded image reaches. Larger descriptors are rejected before
-/// any allocation.
-pub const MAX_OVERLAY_CANVAS_PIXELS: u64 = 1 << 28;
+/// in pixels — 8192 × 8192. The compositor keeps a pre-multiplied
+/// 32-bit colour + 16-bit opacity per canvas sample, so the bound
+/// keeps a hostile descriptor from claiming gigabytes; larger
+/// descriptors are rejected before any allocation.
+pub const MAX_OVERLAY_CANVAS_PIXELS: u64 = 1 << 26;
 
 /// One input image of an overlay, in `dimg` order (bottom-most first).
 #[derive(Clone, Copy, Debug)]
