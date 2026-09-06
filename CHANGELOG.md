@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.12](https://github.com/OxideAV/oxideav-avif/compare/v0.0.11...v0.0.12) - 2026-09-06
+
+### Other
+
+- avif CHANGELOG: state the published oxideav-av1 floor the layered path needs
+- derived-image graph fuzz target + decode memoisation/budget + canvas caps; two fuzz findings fixed
+- avif mux: keep the standalone (no-registry) build warning-free — W::u64 is sequence-only
+- avif sequence: avis image-sequence encode — moov/trak/stbl writer, all-intra or KEY+P groups, still primary aliasing sample 0
+- layered (progressive) image items — encode_still_layered with a1lx/lsel, decoder lsel/a1op layer selection
+- avif still/mux: grid alpha (hidden alpha grid of mono tiles) + grid pass-through props + depth-map aux + 64-px tile floor with tiling election
+- avif mux/still: overlay (iovl) + identity (iden) encode — AvifOverlayMuxer, encode_still_overlay, with_identity_derivation
+- avif decoder: iovl overlay + iden identity pixel composition, recursive derived-image output path
+- hide internal pub surface from rustdoc/semver (fleet rule 2026-09-01)
+
 ### Added
 
 - **`iovl` overlay + `iden` identity pixel composition** (HEIF §6.6.2.2 /
