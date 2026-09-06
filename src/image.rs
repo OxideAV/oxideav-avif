@@ -218,6 +218,62 @@ impl AvifPixelFormat {
         self.is_packed_ya() || self.plane_count() == 4
     }
 
+    /// Build the layout for a `(bit_depth, subsampling, monochrome,
+    /// alpha)` tuple — the inverse of [`Self::bit_depth`] /
+    /// [`Self::chroma_subsampling`] / [`Self::plane_count`] /
+    /// [`Self::has_alpha`]. `gray` ignores `sx` / `sy`. Returns `None`
+    /// for pairings this crate has no layout for (depths other than
+    /// 8 / 10 / 12, 4:4:0-style `(0, 1)` subsampling).
+    pub fn from_layout(bit_depth: u8, sx: u8, sy: u8, gray: bool, alpha: bool) -> Option<Self> {
+        let base = match (gray, bit_depth, sx, sy) {
+            (true, 8, _, _) => Self::Gray8,
+            (true, 10, _, _) => Self::Gray10Le,
+            (true, 12, _, _) => Self::Gray12Le,
+            (false, 8, 1, 1) => Self::Yuv420P,
+            (false, 8, 1, 0) => Self::Yuv422P,
+            (false, 8, 0, 0) => Self::Yuv444P,
+            (false, 10, 1, 1) => Self::Yuv420P10Le,
+            (false, 10, 1, 0) => Self::Yuv422P10Le,
+            (false, 10, 0, 0) => Self::Yuv444P10Le,
+            (false, 12, 1, 1) => Self::Yuv420P12Le,
+            (false, 12, 1, 0) => Self::Yuv422P12Le,
+            (false, 12, 0, 0) => Self::Yuv444P12Le,
+            _ => return None,
+        };
+        if alpha {
+            base.with_alpha()
+        } else {
+            Some(base)
+        }
+    }
+
+    /// The alpha-less companion of any layout: `Yuva* → Yuv*`,
+    /// `Ya8 → Gray8`, `Ya16Le → Gray10Le / Gray12Le` (picked by
+    /// `bit_depth`, since the packed 16-bit layout does not encode
+    /// it). Alpha-less layouts return themselves.
+    pub fn without_alpha(&self, bit_depth: u8) -> Self {
+        match self {
+            Self::Yuva420P => Self::Yuv420P,
+            Self::Yuva422P => Self::Yuv422P,
+            Self::Yuva444P => Self::Yuv444P,
+            Self::Ya8 => Self::Gray8,
+            Self::Yuva420P10Le => Self::Yuv420P10Le,
+            Self::Yuva422P10Le => Self::Yuv422P10Le,
+            Self::Yuva444P10Le => Self::Yuv444P10Le,
+            Self::Yuva420P12Le => Self::Yuv420P12Le,
+            Self::Yuva422P12Le => Self::Yuv422P12Le,
+            Self::Yuva444P12Le => Self::Yuv444P12Le,
+            Self::Ya16Le => {
+                if bit_depth == 12 {
+                    Self::Gray12Le
+                } else {
+                    Self::Gray10Le
+                }
+            }
+            other => *other,
+        }
+    }
+
     /// The alpha-composited companion of an alpha-less colour layout:
     /// `Yuv* → Yuva*` (same depth / subsampling) and `Gray8 → Ya8` /
     /// `Gray10Le`/`Gray12Le → Ya16Le`. Returns `None` for layouts that

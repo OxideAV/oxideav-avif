@@ -27,10 +27,13 @@ use crate::av1_config::Av1CodecConfig;
 use crate::alpha::{composite_alpha, find_alpha_item_id};
 use crate::avis::{parse_avis, sample_bytes};
 use crate::box_parser::{b, BoxType};
+use crate::cicp::effective_cicp;
+use crate::derived::{ImageOverlay, MAX_DERIVATION_DEPTH};
 use crate::grid::{composite_grid, ImageGrid};
 use crate::image::{AvifFrame, AvifPixelFormat, AvifPlane};
-use crate::inspect::{build_info, build_info_grid, AvifInfo};
-use crate::meta::{ItemLocation, Property};
+use crate::inspect::{build_info, build_info_derived, build_info_grid, AvifInfo};
+use crate::meta::{Property, ITEM_TYPE_IDEN, ITEM_TYPE_IOVL};
+use crate::overlay::{composite_overlay, pack_planes, unpack_planes, OverlayInput, SamplePlanes};
 use crate::parser::{
     classify_brands, item_bytes_with_idat, parse, parse_header, AvifHeader, ITEM_TYPE_AV01,
     ITEM_TYPE_GRID,
@@ -44,13 +47,6 @@ pub use crate::inspect::{inspect, transforms_for};
 // `inspect`, `transforms_for`, and `AvifInfo` live in [`crate::inspect`]
 // — they don't need the `oxideav-core`/`oxideav-av1` dependency tree.
 // The decoder simply re-exports them from there.
-
-/// Map an [`AvifPixelFormat`] (crate-local) to the framework
-/// [`PixelFormat`]. The mapping is total because every variant of
-/// `AvifPixelFormat` corresponds to one variant of `PixelFormat`.
-fn to_core_pix(fmt: AvifPixelFormat) -> PixelFormat {
-    fmt.into()
-}
 
 /// Inverse of [`to_core_pix`] for the set of formats the AV1 decoder
 /// actually emits. The composition path only ever feeds frames through
@@ -173,9 +169,6 @@ fn infer_av1_pixmap(frame: &VideoFrame, cfg: &Av1CodecConfig) -> Result<(PixelFo
 
 const AV1C: BoxType = b(b"av1C");
 const ISPE: BoxType = b(b"ispe");
-const IROT: BoxType = b(b"irot");
-const IMIR: BoxType = b(b"imir");
-const CLAP: BoxType = b(b"clap");
 const DIMG: BoxType = b(b"dimg");
 
 /// `Decoder` trait impl registered under codec id `avif`.
@@ -196,9 +189,13 @@ impl AvifDecoder {
         }
     }
 
-    /// Parse an AVIF file and decode the primary item. Grid + alpha +
-    /// transform post-processing is applied before the frame is queued.
-    /// Returns the resolved `AvifInfo` on success.
+    /// Parse an AVIF file and decode the primary item's **output
+    /// image** (HEIF §6.3): the reconstructed image of a coded `av01`
+    /// item or of a derived item (`grid` tile stitch, `iovl` overlay
+    /// composition, `iden` identity — recursively over their inputs),
+    /// with the alpha auxiliary composited and the item's
+    /// transformative properties applied in `ipma` order. Returns the
+    /// resolved `AvifInfo` on success.
     pub fn decode_file(&mut self, file: &[u8]) -> Result<AvifInfo> {
         let hdr = parse_header(file).map_err(core_err)?;
         let primary_id = hdr
@@ -211,28 +208,18 @@ impl AvifDecoder {
             .ok_or_else(|| Error::invalid("avif: pitm references unknown item"))?
             .clone();
 
-        // Decode the primary frame, either via the grid path or the
-        // single-item path.
         let brands = classify_brands(&hdr.major_brand, &hdr.compatible_brands).map_err(core_err)?;
         let mif1 = crate::parser::audit_mif1(file).map_err(core_err)?;
-        let (color_frame, color_format, mut width, mut height, info) = if primary_info.item_type
-            == ITEM_TYPE_GRID
-        {
-            let (f, fmt, w, h) = decode_grid_primary(&hdr, primary_id)?;
-            let info = build_info_grid(&hdr, primary_id, brands, mif1.clone()).map_err(core_err)?;
-            (f, fmt, w, h, info)
+        let info = if primary_info.item_type == ITEM_TYPE_GRID {
+            build_info_grid(&hdr, primary_id, brands, mif1).map_err(core_err)?
         } else if primary_info.item_type == ITEM_TYPE_AV01 {
             let img = parse(file).map_err(core_err)?;
-            let (f, fmt, w, h) = decode_av01_item(
-                &img.primary_item_data,
-                img.av1c
-                    .as_deref()
-                    .ok_or_else(|| Error::invalid("avif: primary item missing av1C"))?,
-                img.ispe.map(|e| (e.width, e.height)),
-            )?;
             let has_alpha = find_alpha_item_id(&hdr.meta, primary_id).is_some();
-            let info = build_info(&img, has_alpha, brands, mif1.clone(), file).map_err(core_err)?;
-            (f, fmt, w, h, info)
+            build_info(&img, has_alpha, brands, mif1, file).map_err(core_err)?
+        } else if primary_info.item_type == ITEM_TYPE_IOVL
+            || primary_info.item_type == ITEM_TYPE_IDEN
+        {
+            build_info_derived(&hdr, primary_id, brands, mif1).map_err(core_err)?
         } else {
             return Err(Error::unsupported(format!(
                 "avif: primary item type '{}' not supported",
@@ -240,73 +227,18 @@ impl AvifDecoder {
             )));
         };
 
-        // Move into crate-local AvifFrame for the composition layer.
-        let mut frame = core_to_avif_frame(color_frame);
-        let mut format = from_core_pix(color_format)?;
-
-        // Alpha composite, if an alpha auxiliary item is present.
-        if let Some(alpha_id) = find_alpha_item_id(&hdr.meta, primary_id) {
-            let (alpha_frame, alpha_format, _aw, _ah) = decode_alpha_item(&hdr, alpha_id)?;
-            let alpha_avif = core_to_avif_frame(alpha_frame);
-            let alpha_avif_fmt = from_core_pix(alpha_format)?;
-            let (composited, fmt) =
-                composite_alpha(&frame, format, width, height, &alpha_avif, alpha_avif_fmt)
-                    .map_err(core_err)?;
-            frame = composited;
-            format = fmt;
-        }
-
-        // Post-transforms: clap -> irot -> imir, per §6.5.10 application
-        // order.
-        // ispe-based crop against coded dimensions: if the AV1 decoder
-        // emitted a padded frame the ispe width/height clamps it back
-        // to the declared display rect.
-        if let Some(Property::Ispe(ispe)) = hdr.meta.property_for(primary_id, &ISPE) {
-            if (ispe.width, ispe.height) != (width, height)
-                && ispe.width <= width
-                && ispe.height <= height
-                && ispe.width > 0
-                && ispe.height > 0
-            {
-                frame = crop_top_left(&frame, format, width, height, ispe.width, ispe.height)
-                    .map_err(core_err)?;
-                width = ispe.width;
-                height = ispe.height;
-            }
-        }
-        if let Some(Property::Clap(clap)) = hdr.meta.property_for(primary_id, &CLAP) {
-            let (f, w, h) = apply_clap(&frame, format, width, height, clap).map_err(core_err)?;
-            frame = f;
-            width = w;
-            height = h;
-        }
-        if let Some(Property::Irot(irot)) = hdr.meta.property_for(primary_id, &IROT) {
-            let (f, w, h) = apply_irot(&frame, format, width, height, irot).map_err(core_err)?;
-            frame = f;
-            width = w;
-            height = h;
-        }
-        if let Some(Property::Imir(imir)) = hdr.meta.property_for(primary_id, &IMIR) {
-            let (f, w, h) = apply_imir(&frame, format, width, height, imir).map_err(core_err)?;
-            frame = f;
-            width = w;
-            height = h;
-        }
-
-        let _ = (width, height);
-        let mut out = avif_to_core_frame(frame);
+        let mut stack = Vec::new();
+        let image = decode_item_output(&hdr, primary_id, 0, &mut stack, true)?;
+        let format = image.format;
+        let mut out = avif_to_core_frame(image.frame);
         // A composited 10/12-bit monochrome + alpha frame rides the
         // 16-bit `Ya16Le` storage with the coded values in the low
         // bits; surface the effective depth through the core per-plane
         // significant-bits side channel (one packed image plane, both
         // components at the master depth per the av1-avif §4.1
         // same-depth `shall`).
-        if format == AvifPixelFormat::Ya16Le {
-            if let Some(depth) = info.bits_per_channel.first().copied() {
-                if depth < 16 {
-                    out.set_significant_bits(vec![depth]);
-                }
-            }
+        if format == AvifPixelFormat::Ya16Le && image.bit_depth < 16 {
+            out.set_significant_bits(vec![image.bit_depth]);
         }
         self.pending.push(Frame::Video(out));
         self.info = Some(info.clone());
@@ -542,13 +474,192 @@ fn decode_av01_item(
     Ok((frame, format, width, height))
 }
 
-/// Decode a grid-type primary item: decode each tile through the av01
-/// path, then composite into the declared output rectangle. Returns
-/// the composited frame plus its `(format, width, height)` triple.
-fn decode_grid_primary(
+/// An image item's output image (HEIF §6.3) in the crate-local
+/// composition representation.
+struct ItemImage {
+    frame: AvifFrame,
+    format: AvifPixelFormat,
+    /// Coded bit depth of the leaf `av01` items (8 / 10 / 12) — the
+    /// packed `Ya16Le` layout does not encode it.
+    bit_depth: u8,
+    width: u32,
+    height: u32,
+}
+
+/// Decode the output image of any image item — coded or derived —
+/// recursively over its `dimg` inputs (HEIF §6.3 / §6.6.1):
+///
+/// 1. the **reconstructed image**: the AV1 decode of an `av01` item,
+///    the tile stitch of a `grid`, the canvas composition of an
+///    `iovl`, or the single input of an `iden`;
+/// 2. the alpha auxiliary (`auxl` + alpha `auxC`) composited into the
+///    frame when `with_alpha` is set — the caller's rendering context
+///    decides: the primary and overlay inputs carry their alpha, grid
+///    tiles and auxiliaries themselves do not;
+/// 3. the item's transformative properties (`clap` / `irot` /
+///    `imir`) applied in `ipma` order (§6.3).
+///
+/// `depth` + `stack` guard the walk against hostile graphs: chains
+/// deeper than [`MAX_DERIVATION_DEPTH`] and `dimg` cycles are rejected
+/// before any decode.
+fn decode_item_output(
+    hdr: &AvifHeader<'_>,
+    item_id: u32,
+    depth: u32,
+    stack: &mut Vec<u32>,
+    with_alpha: bool,
+) -> Result<ItemImage> {
+    if depth > MAX_DERIVATION_DEPTH {
+        return Err(Error::invalid(format!(
+            "avif: derivation chain deeper than {MAX_DERIVATION_DEPTH} at item {item_id}"
+        )));
+    }
+    if stack.contains(&item_id) {
+        return Err(Error::invalid(format!(
+            "avif: derivation cycle through item {item_id}"
+        )));
+    }
+    stack.push(item_id);
+    let result = decode_item_output_inner(hdr, item_id, depth, stack, with_alpha);
+    stack.pop();
+    result
+}
+
+fn decode_item_output_inner(
+    hdr: &AvifHeader<'_>,
+    item_id: u32,
+    depth: u32,
+    stack: &mut Vec<u32>,
+    with_alpha: bool,
+) -> Result<ItemImage> {
+    let info = hdr
+        .meta
+        .item_by_id(item_id)
+        .ok_or_else(|| Error::invalid(format!("avif: item {item_id} unknown")))?;
+    let item_type = info.item_type;
+    let mut image = if item_type == ITEM_TYPE_AV01 {
+        decode_coded_item(hdr, item_id)?
+    } else if item_type == ITEM_TYPE_GRID {
+        decode_grid_item(hdr, item_id, depth, stack)?
+    } else if item_type == ITEM_TYPE_IOVL {
+        decode_overlay_item(hdr, item_id, depth, stack)?
+    } else if item_type == ITEM_TYPE_IDEN {
+        let inputs = hdr.meta.iref_targets(&DIMG, item_id);
+        if inputs.len() != 1 {
+            return Err(Error::invalid(format!(
+                "avif: iden item {item_id} has {} dimg inputs, expected exactly 1 (HEIF §6.6.2.1)",
+                inputs.len()
+            )));
+        }
+        // The identity derivation's reconstructed image is its input's
+        // output image (§6.6.1) — alpha included, so a `clap` on the
+        // iden crops colour and alpha together.
+        decode_item_output(hdr, inputs[0], depth + 1, stack, with_alpha)?
+    } else {
+        return Err(Error::unsupported(format!(
+            "avif: item {item_id} type '{}' cannot be decoded to pixels",
+            String::from_utf8_lossy(&item_type)
+        )));
+    };
+
+    if with_alpha {
+        if let Some(alpha_id) = find_alpha_item_id(&hdr.meta, item_id) {
+            if image.format.has_alpha() {
+                return Err(Error::unsupported(format!(
+                    "avif: item {item_id} already carries alpha and has an alpha auxiliary {alpha_id}"
+                )));
+            }
+            let alpha = decode_item_output(hdr, alpha_id, depth + 1, stack, false)?;
+            let alpha = alpha_as_gray(alpha, image.width, image.height)?;
+            let (composited, fmt) = composite_alpha(
+                &image.frame,
+                image.format,
+                image.width,
+                image.height,
+                &alpha.frame,
+                alpha.format,
+            )
+            .map_err(core_err)?;
+            image.frame = composited;
+            image.format = fmt;
+        }
+    }
+
+    // Transformative properties, in ipma order (§6.3).
+    for prop in transforms_for(&hdr.meta, item_id) {
+        let (f, w, h) = match prop {
+            Property::Clap(clap) => {
+                apply_clap(&image.frame, image.format, image.width, image.height, clap)
+            }
+            Property::Irot(irot) => {
+                apply_irot(&image.frame, image.format, image.width, image.height, irot)
+            }
+            Property::Imir(imir) => {
+                apply_imir(&image.frame, image.format, image.width, image.height, imir)
+            }
+            _ => continue,
+        }
+        .map_err(core_err)?;
+        image.frame = f;
+        image.width = w;
+        image.height = h;
+    }
+    Ok(image)
+}
+
+/// Decode one coded `av01` item: AV1 decode + the `ispe` clamp against
+/// a padded coded frame.
+fn decode_coded_item(hdr: &AvifHeader<'_>, item_id: u32) -> Result<ItemImage> {
+    let loc = hdr
+        .meta
+        .location_by_id(item_id)
+        .ok_or_else(|| Error::invalid(format!("avif: item {item_id} missing in iloc")))?;
+    let bytes = item_bytes_with_idat(hdr.file, hdr.meta.idat.as_deref(), loc).map_err(core_err)?;
+    let av1c = match hdr.meta.property_for(item_id, &AV1C) {
+        Some(Property::Av1C(b)) => b.clone(),
+        _ => {
+            return Err(Error::invalid(format!(
+                "avif: item {item_id} missing av1C property"
+            )))
+        }
+    };
+    let ispe = match hdr.meta.property_for(item_id, &ISPE) {
+        Some(Property::Ispe(e)) => Some((e.width, e.height)),
+        _ => None,
+    };
+    let (core_frame, fmt_core, mut w, mut h) = decode_av01_item(&bytes, &av1c, ispe)?;
+    let bit_depth = Av1CodecConfig::parse(&av1c)?.bit_depth();
+    let mut frame = core_to_avif_frame(core_frame);
+    let format = from_core_pix(fmt_core)?;
+    // ispe-based crop against coded dimensions: if the AV1 decoder
+    // emitted a padded frame the ispe width/height clamps it back to
+    // the declared extents.
+    if let Some((iw, ih)) = ispe {
+        if iw > 0 && ih > 0 && iw <= w && ih <= h && (iw != w || ih != h) {
+            frame = crop_top_left(&frame, format, w, h, iw, ih).map_err(core_err)?;
+            w = iw;
+            h = ih;
+        }
+    }
+    Ok(ItemImage {
+        frame,
+        format,
+        bit_depth,
+        width: w,
+        height: h,
+    })
+}
+
+/// Decode a `grid` derived item: decode each `dimg` input (its output
+/// image, alpha-less — av1-avif §7 forbids transforms in a grid's
+/// input chain, and a grid's alpha is an auxiliary of the grid item
+/// itself), then stitch into the declared canvas (HEIF §6.6.2.3).
+fn decode_grid_item(
     hdr: &AvifHeader<'_>,
     grid_id: u32,
-) -> Result<(VideoFrame, PixelFormat, u32, u32)> {
+    depth: u32,
+    stack: &mut Vec<u32>,
+) -> Result<ItemImage> {
     let loc = hdr
         .meta
         .location_by_id(grid_id)
@@ -567,103 +678,183 @@ fn decode_grid_primary(
             tile_ids.len()
         )));
     }
+    if grid.output_width == 0 || grid.output_height == 0 {
+        return Err(Error::invalid("avif: grid output dimensions zero"));
+    }
     let mut tiles: Vec<AvifFrame> = Vec::with_capacity(tile_ids.len());
     let mut tile_format: Option<AvifPixelFormat> = None;
     let mut tile_dims: Option<(u32, u32)> = None;
+    let mut bit_depth = 8u8;
     for (i, tid) in tile_ids.iter().enumerate() {
-        let tile_info = hdr
-            .meta
-            .item_by_id(*tid)
-            .ok_or_else(|| Error::invalid(format!("avif: grid tile {i} id {tid} unknown")))?;
-        if tile_info.item_type != ITEM_TYPE_AV01 {
-            return Err(Error::unsupported(format!(
-                "avif: grid tile {i} item_type '{}' != 'av01'",
-                String::from_utf8_lossy(&tile_info.item_type)
-            )));
-        }
-        let tile_loc = hdr
-            .meta
-            .location_by_id(*tid)
-            .ok_or_else(|| Error::invalid(format!("avif: grid tile {i} missing iloc")))?;
-        let tile_bytes =
-            item_bytes_with_idat(hdr.file, hdr.meta.idat.as_deref(), tile_loc).map_err(core_err)?;
-        let av1c = match hdr.meta.property_for(*tid, &AV1C) {
-            Some(Property::Av1C(bytes)) => bytes.clone(),
-            _ => {
-                return Err(Error::invalid(format!(
-                    "avif: grid tile {i} missing av1C property"
-                )))
-            }
-        };
-        let ispe_dims = match hdr.meta.property_for(*tid, &ISPE) {
-            Some(Property::Ispe(e)) => Some((e.width, e.height)),
-            _ => None,
-        };
-        let (tile_core, fmt_core, mut fw, mut fh) =
-            decode_av01_item(&tile_bytes, &av1c, ispe_dims)?;
-        let mut tile = core_to_avif_frame(tile_core);
-        let fmt = from_core_pix(fmt_core)?;
-        // Clamp tile to ispe dims if the AV1 decoder emitted a padded
-        // output.
-        if let Some((iw, ih)) = ispe_dims {
-            if iw > 0 && ih > 0 && iw <= fw && ih <= fh && (iw != fw || ih != fh) {
-                tile = crop_top_left(&tile, fmt, fw, fh, iw, ih).map_err(core_err)?;
-                fw = iw;
-                fh = ih;
-            }
-        }
+        let tile = decode_item_output(hdr, *tid, depth + 1, stack, false)?;
         if let Some(want_fmt) = tile_format {
-            if want_fmt != fmt {
+            if want_fmt != tile.format {
                 return Err(Error::invalid(format!(
-                    "avif: grid tile {i} format {fmt:?} differs from tile 0 {want_fmt:?}"
+                    "avif: grid tile {i} format {:?} differs from tile 0 {want_fmt:?}",
+                    tile.format
                 )));
             }
         } else {
-            tile_format = Some(fmt);
+            tile_format = Some(tile.format);
+            bit_depth = tile.bit_depth;
         }
         if let Some((tw, th)) = tile_dims {
-            if (tw, th) != (fw, fh) {
+            if (tw, th) != (tile.width, tile.height) {
                 return Err(Error::invalid(format!(
-                    "avif: grid tile {i} dims {fw}x{fh} differ from tile 0 {tw}x{th}"
+                    "avif: grid tile {i} dims {}x{} differ from tile 0 {tw}x{th}",
+                    tile.width, tile.height
                 )));
             }
         } else {
-            tile_dims = Some((fw, fh));
+            tile_dims = Some((tile.width, tile.height));
         }
-        tiles.push(tile);
+        tiles.push(tile.frame);
     }
     let format = tile_format.expect("at least one tile present");
     let (tile_w, tile_h) = tile_dims.expect("at least one tile present");
     let composited = composite_grid(&grid, &tiles, format, tile_w, tile_h).map_err(core_err)?;
-    Ok((
-        avif_to_core_frame(composited),
-        to_core_pix(format),
-        grid.output_width,
-        grid.output_height,
-    ))
+    Ok(ItemImage {
+        frame: composited,
+        format,
+        bit_depth,
+        width: grid.output_width,
+        height: grid.output_height,
+    })
 }
 
-/// Decode the alpha auxiliary item into a `VideoFrame`. The item must
-/// be an AV1-coded monochrome image; the returned frame's format is
-/// `PixelFormat::Gray8`.
-fn decode_alpha_item(
+const COLR: BoxType = b(b"colr");
+const PREM: BoxType = b(b"prem");
+
+/// True when `item_id`'s colour samples are signalled pre-multiplied
+/// by its alpha auxiliary — a `prem` item reference in either
+/// direction (HEIF 2017 §6.10.1.1 alpha → master; HEIF 2025 §6.9.1
+/// master → auxiliary).
+fn is_premultiplied(hdr: &AvifHeader<'_>, item_id: u32) -> bool {
+    hdr.meta
+        .irefs
+        .iter()
+        .any(|e| e.reference_type == PREM && (e.from_id == item_id || e.to_ids.contains(&item_id)))
+}
+
+/// Decode an `iovl` derived item: parse the descriptor, decode every
+/// input's output image (alpha included), and composite onto the
+/// canvas (HEIF §6.6.2.2 + §6.9.1).
+fn decode_overlay_item(
     hdr: &AvifHeader<'_>,
-    alpha_id: u32,
-) -> Result<(VideoFrame, PixelFormat, u32, u32)> {
-    let loc: &ItemLocation = hdr
+    iovl_id: u32,
+    depth: u32,
+    stack: &mut Vec<u32>,
+) -> Result<ItemImage> {
+    let loc = hdr
         .meta
-        .location_by_id(alpha_id)
-        .ok_or_else(|| Error::invalid("avif: alpha item missing in iloc"))?;
+        .location_by_id(iovl_id)
+        .ok_or_else(|| Error::invalid("avif: iovl item missing in iloc"))?;
     let bytes = item_bytes_with_idat(hdr.file, hdr.meta.idat.as_deref(), loc).map_err(core_err)?;
-    let av1c = match hdr.meta.property_for(alpha_id, &AV1C) {
-        Some(Property::Av1C(b)) => b.clone(),
-        _ => return Err(Error::invalid("avif: alpha item missing av1C property")),
+    let sources = hdr.meta.iref_targets(&DIMG, iovl_id);
+    if sources.is_empty() {
+        return Err(Error::invalid("avif: iovl item has no dimg iref"));
+    }
+    let desc = ImageOverlay::parse(&bytes, sources.len()).map_err(core_err)?;
+    // Reject an oversized canvas before decoding a single input.
+    let area = u64::from(desc.output_width) * u64::from(desc.output_height);
+    if desc.output_width == 0 || desc.output_height == 0 {
+        return Err(Error::invalid("avif: iovl canvas dimensions zero"));
+    }
+    if area > crate::overlay::MAX_OVERLAY_CANVAS_PIXELS {
+        return Err(Error::invalid(format!(
+            "avif: iovl canvas {}x{} exceeds {} pixels",
+            desc.output_width,
+            desc.output_height,
+            crate::overlay::MAX_OVERLAY_CANVAS_PIXELS
+        )));
+    }
+    let mut inputs = Vec::with_capacity(sources.len());
+    for &src in &sources {
+        inputs.push((
+            decode_item_output(hdr, src, depth + 1, stack, true)?,
+            is_premultiplied(hdr, src),
+        ));
+    }
+    let colr = match hdr.meta.property_for(iovl_id, &COLR) {
+        Some(Property::Colr(c)) => Some(c.clone()),
+        _ => match hdr.meta.property_for(sources[0], &COLR) {
+            Some(Property::Colr(c)) => Some(c.clone()),
+            _ => None,
+        },
     };
-    let ispe = match hdr.meta.property_for(alpha_id, &ISPE) {
-        Some(Property::Ispe(e)) => Some((e.width, e.height)),
-        _ => None,
+    let cicp = effective_cicp(colr.as_ref());
+    let overlay_inputs: Vec<OverlayInput<'_>> = inputs
+        .iter()
+        .zip(&desc.entries)
+        .map(|((img, prem), entry)| OverlayInput {
+            frame: &img.frame,
+            format: img.format,
+            bit_depth: img.bit_depth,
+            width: img.width,
+            height: img.height,
+            offset_x: i64::from(entry.horizontal_offset),
+            offset_y: i64::from(entry.vertical_offset),
+            premultiplied: *prem,
+        })
+        .collect();
+    let (frame, format, w, h) =
+        composite_overlay(&desc, &overlay_inputs, &cicp).map_err(core_err)?;
+    Ok(ItemImage {
+        frame,
+        format,
+        bit_depth: inputs[0].0.bit_depth,
+        width: w,
+        height: h,
+    })
+}
+
+/// Reduce a decoded alpha auxiliary to the single-plane gray layout
+/// [`composite_alpha`] consumes: only the luma plane of a colour-coded
+/// alpha is relevant (HEIF §6.9.1), and an alpha plane whose extents
+/// differ from the master's is resized to them (§6.9.1;
+/// nearest-neighbour).
+fn alpha_as_gray(alpha: ItemImage, master_w: u32, master_h: u32) -> Result<ItemImage> {
+    let planes = unpack_planes(
+        &alpha.frame,
+        alpha.format,
+        alpha.bit_depth,
+        alpha.width,
+        alpha.height,
+    )
+    .map_err(core_err)?;
+    let mut y = planes.y;
+    let (aw, ah) = (planes.width, planes.height);
+    if (aw, ah) != (master_w, master_h) {
+        let mut resized = Vec::with_capacity(master_w as usize * master_h as usize);
+        for r in 0..master_h {
+            let sr = (u64::from(r) * u64::from(ah) / u64::from(master_h)) as usize;
+            for c in 0..master_w {
+                let sc = (u64::from(c) * u64::from(aw) / u64::from(master_w)) as usize;
+                resized.push(y[sr * aw as usize + sc]);
+            }
+        }
+        y = resized;
+    }
+    let gray = SamplePlanes {
+        width: master_w,
+        height: master_h,
+        bit_depth: planes.bit_depth,
+        sx: 0,
+        sy: 0,
+        gray: true,
+        y,
+        u: Vec::new(),
+        v: Vec::new(),
+        alpha: None,
     };
-    decode_av01_item(&bytes, &av1c, ispe)
+    let (frame, format) = pack_planes(&gray).map_err(core_err)?;
+    Ok(ItemImage {
+        frame,
+        format,
+        bit_depth: planes.bit_depth,
+        width: master_w,
+        height: master_h,
+    })
 }
 
 impl Decoder for AvifDecoder {

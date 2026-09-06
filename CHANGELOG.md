@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`iovl` overlay + `iden` identity pixel composition** (HEIF §6.6.2.2 /
+  §6.6.2.1 / §6.3). New framework-free `overlay` module:
+  `composite_overlay` paints every input onto the
+  `output_width × output_height` canvas in `dimg` order (bottom-most
+  first) at its signed offset, clipped against the canvas (§6.6.2.2.3),
+  with the §6.9.1 alpha-plane rendering (`vu = m·α + vi·(1−α)` straight,
+  `vu = m + vi·(1−α)` pre-multiplied via `prem`) at 8/10/12 bits; a
+  translucent or transparent `canvas_fill_value` yields the matching
+  `Yuva*` / `Ya*` layout carrying the canvas opacity. The fill colour is
+  converted exactly for the H.273 identity matrix (Y=G, Cb=B, Cr=R) and
+  neutral fills on monochrome masters; other pairings are only accepted
+  when the fill never shows (fully covered by opaque inputs, or `A = 0`).
+  Canvases are bounded by `MAX_OVERLAY_CANVAS_PIXELS` before allocation.
+- **Recursive derived-image decode**: `AvifDecoder::decode_file` now
+  resolves the primary's *output image* per §6.3 for any item type —
+  `av01`, `grid`, `iovl`, `iden` — recursively over `dimg` inputs
+  (cycle- and depth-guarded by `MAX_DERIVATION_DEPTH`), compositing each
+  overlay input's own alpha auxiliary and applying every item's
+  `clap`/`irot`/`imir` in `ipma` order. The alpha auxiliary of a **grid**
+  primary may itself be a coded `av01` item or a `grid` of monochrome
+  tiles; colour-coded alpha uses its luma plane only and an alpha plane
+  whose extents differ from the master's is resized (§6.9.1,
+  nearest-neighbour).
+- `AvifPixelFormat::from_layout` / `without_alpha` layout helpers.
+
 ## [0.0.11](https://github.com/OxideAV/oxideav-avif/compare/v0.0.10...v0.0.11) - 2026-08-15
 
 ### Other

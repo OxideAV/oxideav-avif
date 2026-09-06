@@ -117,6 +117,7 @@ pub mod image;
 pub mod inspect;
 pub mod meta;
 pub mod mux;
+pub mod overlay;
 pub mod parser;
 pub mod region;
 pub mod sample_group;
@@ -176,6 +177,7 @@ pub use meta::{
     ITEM_TYPE_URI,
 };
 pub use mux::{encode_still_av1, AvifGridMuxer, AvifMuxer, GridTile};
+pub use overlay::{composite_overlay, OverlayInput, MAX_OVERLAY_CANVAS_PIXELS};
 pub use parser::{
     audit_mif1, classify_brands, item_bytes, item_bytes_owned, item_bytes_owned_full,
     item_bytes_owned_with_idat, item_bytes_with_idat, parse, parse_header, AvifHeader, AvifImage,
