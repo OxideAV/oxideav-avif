@@ -58,6 +58,7 @@ impl W {
     pub(crate) fn u32(&mut self, v: u32) {
         self.0.extend_from_slice(&v.to_be_bytes());
     }
+    #[cfg_attr(not(feature = "registry"), allow(dead_code))]
     pub(crate) fn u64(&mut self, v: u64) {
         self.0.extend_from_slice(&v.to_be_bytes());
     }
