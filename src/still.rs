@@ -124,6 +124,10 @@ pub struct StillImage {
     /// Optional full-resolution alpha plane (`width × height`, same
     /// bit depth as the colour planes — the av1-avif §4.1 `shall`).
     pub alpha: Option<Vec<u16>>,
+    /// Optional full-resolution depth map (`width × height`, coded as a
+    /// monochrome auxiliary at the master's bit depth — av1-avif §4.1 /
+    /// HEIF §6.9.2 `urn:mpeg:mpegB:cicp:systems:auxiliary:depth`).
+    pub depth_map: Option<Vec<u16>>,
     /// Optional `colr` colour-information property for the primary
     /// item. The RGB(A) constructors pre-fill the identity-matrix
     /// `nclx` triple; YUV constructors leave it `None`.
@@ -191,6 +195,7 @@ impl StillImage {
             u,
             v,
             alpha: None,
+            depth_map: None,
             colr: None,
             props: StillProperties::default(),
         };
@@ -308,6 +313,21 @@ impl StillImage {
 
     /// Attach a full-resolution alpha plane (`width × height` samples
     /// at the image's bit depth).
+    /// Attach a depth map (`width × height` samples at the image's
+    /// bit depth), encoded as a hidden monochrome auxiliary item.
+    pub fn with_depth_map(mut self, depth_map: Vec<u16>) -> Result<Self> {
+        if depth_map.len() != self.width as usize * self.height as usize {
+            return Err(Error::invalid(format!(
+                "avif still: depth map has {} samples, expected {}x{}",
+                depth_map.len(),
+                self.width,
+                self.height
+            )));
+        }
+        self.depth_map = Some(depth_map);
+        Ok(self)
+    }
+
     pub fn with_alpha(mut self, alpha: Vec<u16>) -> Result<Self> {
         self.alpha = Some(alpha);
         self.validate()?;
@@ -393,6 +413,7 @@ impl StillImage {
             || !in_range(&self.u)
             || !in_range(&self.v)
             || !self.alpha.as_deref().map(in_range).unwrap_or(true)
+            || !self.depth_map.as_deref().map(in_range).unwrap_or(true)
         {
             return Err(Error::invalid(format!(
                 "avif still: sample exceeds bit_depth {} range",
@@ -425,6 +446,63 @@ pub struct StillEncodeOptions {
 /// AV1 KEY-frame encoder's bound). Larger canvases go through
 /// [`encode_still_grid`].
 pub const STILL_MAX_CODED_DIM: u32 = 4096;
+
+/// Per-axis floor on a grid tile's coded extents. External AVIF readers
+/// reject grids whose tiles are narrower or shorter than 64 pixels
+/// (the MIAF grid-tile constraint their diagnostics cite as ISO/IEC
+/// 23000-22 §7.3.11.4.2), so the tile election never goes below it.
+pub const GRID_MIN_TILE_DIM: u32 = 64;
+
+/// Elect a `(columns, rows)` grid tiling for a `width × height` image
+/// whose tiles must fit `max_tile` coded pixels per axis (and stay at
+/// least [`GRID_MIN_TILE_DIM`]): the fewest tiles per axis that bring
+/// the coded tile extent under the bound. Returns `None` when no
+/// tiling satisfies both bounds (an axis shorter than the floor that
+/// still needs splitting cannot happen for `max_tile ≥ 64`, so this
+/// is only `None` for a zero extent or a bound below the floor).
+pub fn elect_grid_tiling(width: u32, height: u32, max_tile: u32) -> Option<(u16, u16)> {
+    if width == 0 || height == 0 || max_tile < GRID_MIN_TILE_DIM {
+        return None;
+    }
+    let per_axis = |extent: u32| -> Option<u16> {
+        let mut count = 1u32;
+        loop {
+            let tile = coded_extent(extent.div_ceil(count));
+            if tile <= max_tile {
+                // Never leave a fully-trimmed tile and never go below
+                // the floor.
+                if (count - 1) * tile >= extent || (count > 1 && tile < GRID_MIN_TILE_DIM) {
+                    return None;
+                }
+                return u16::try_from(count).ok();
+            }
+            count += 1;
+            if count > 256 {
+                return None;
+            }
+        }
+    };
+    Some((per_axis(width)?, per_axis(height)?))
+}
+
+/// Encode `img` as a single coded item when its coded extents fit
+/// [`STILL_MAX_CODED_DIM`], otherwise as a grid with the tiling from
+/// [`elect_grid_tiling`]. The one-call entry point for arbitrary
+/// canvases.
+pub fn encode_still_auto(img: &StillImage, opts: &StillEncodeOptions) -> Result<Vec<u8>> {
+    let (pw, ph) = (coded_extent(img.width), coded_extent(img.height));
+    if pw <= STILL_MAX_CODED_DIM && ph <= STILL_MAX_CODED_DIM {
+        return encode_still(img, opts);
+    }
+    let (columns, rows) = elect_grid_tiling(img.width, img.height, STILL_MAX_CODED_DIM)
+        .ok_or_else(|| {
+            Error::unsupported(format!(
+                "avif still: no grid tiling for {}x{} within {STILL_MAX_CODED_DIM}-pixel tiles",
+                img.width, img.height
+            ))
+        })?;
+    encode_still_grid(img, opts, columns, rows)
+}
 
 fn widen(p: &[u8]) -> Vec<u16> {
     p.iter().map(|&s| s as u16).collect()
@@ -770,6 +848,11 @@ pub fn encode_still(img: &StillImage, opts: &StillEncodeOptions) -> Result<Vec<u
             )
             .with_alpha_pixi(vec![img.bit_depth]);
     }
+    if let Some(depth) = &img.depth_map {
+        let coded_depth = encode_alpha(img, depth, pw, ph, opts.alpha_q_idx)?;
+        max_profile = max_profile.max(coded_depth.seq_profile);
+        mux = mux.with_depth(coded_depth.payload, coded_depth.av1c);
+    }
     mux = apply_profile_brand_mux(mux, max_profile);
     mux.build()
 }
@@ -790,7 +873,8 @@ fn apply_profile_brand_mux(mux: AvifMuxer, seq_profile: u8) -> AvifMuxer {
 /// overflow, so no `clap` is needed (per av1-avif §4.2.1 / MIAF,
 /// transformative properties may only sit on the grid item anyway).
 ///
-/// Alpha is not yet supported on the grid path.
+/// Alpha rides as a hidden alpha `grid` of monochrome tiles (`auxl` →
+/// the colour grid); pass-through properties land on the grid item.
 pub fn encode_still_grid(
     img: &StillImage,
     opts: &StillEncodeOptions,
@@ -798,23 +882,14 @@ pub fn encode_still_grid(
     rows: u16,
 ) -> Result<Vec<u8>> {
     img.validate()?;
-    if img.alpha.is_some() {
+    if img.props.identity_derivation.is_some() {
         return Err(Error::unsupported(
-            "avif still: alpha on the grid encode path is not yet supported",
+            "avif still: an identity derivation over a grid primary is not supported",
         ));
     }
-    if img.props.exif.is_some()
-        || img.props.xmp.is_some()
-        || img.props.mdcv.is_some()
-        || img.props.clli.is_some()
-        || img.props.amve.is_some()
-        || img.props.irot.is_some()
-        || img.props.imir.is_some()
-        || img.props.pasp.is_some()
-        || img.props.identity_derivation.is_some()
-    {
+    if img.depth_map.is_some() {
         return Err(Error::unsupported(
-            "avif still: pass-through properties on the grid encode path are not yet supported",
+            "avif still: a depth map on the grid encode path is not supported",
         ));
     }
     if columns == 0 || rows == 0 {
@@ -826,6 +901,13 @@ pub fn encode_still_grid(
         return Err(Error::unsupported(format!(
             "avif still: {columns}x{rows} tiling of {}x{} needs {tile_w}x{tile_h} tiles, \
              beyond the per-tile bound {STILL_MAX_CODED_DIM}",
+            img.width, img.height
+        )));
+    }
+    if tile_w < GRID_MIN_TILE_DIM || tile_h < GRID_MIN_TILE_DIM {
+        return Err(Error::invalid(format!(
+            "avif still: {columns}x{rows} tiling of {}x{} yields {tile_w}x{tile_h} tiles, \
+             below the {GRID_MIN_TILE_DIM}-pixel grid-tile floor external readers enforce",
             img.width, img.height
         )));
     }
@@ -847,6 +929,31 @@ pub fn encode_still_grid(
         AvifGridMuxer::new(rows, columns, img.width, img.height).with_pixi(pixi_bits(img));
     if let Some(colr) = &img.colr {
         muxer = muxer.with_colr(colr.clone());
+    }
+    let props = &img.props;
+    if let Some(exif) = &props.exif {
+        muxer = muxer.with_exif(exif.clone());
+    }
+    if let Some(xmp) = &props.xmp {
+        muxer = muxer.with_xmp(xmp.clone());
+    }
+    if let Some(mdcv) = props.mdcv {
+        muxer = muxer.with_mdcv(mdcv);
+    }
+    if let Some(clli) = props.clli {
+        muxer = muxer.with_clli(clli);
+    }
+    if let Some(amve) = props.amve {
+        muxer = muxer.with_amve(amve);
+    }
+    if let Some(pasp) = props.pasp {
+        muxer = muxer.with_pasp(pasp);
+    }
+    if let Some(angle) = props.irot {
+        muxer = muxer.with_irot(angle);
+    }
+    if let Some(axis) = props.imir {
+        muxer = muxer.with_imir(axis);
     }
     let mut max_profile = 0u8;
     for r in 0..rows as usize {
@@ -883,7 +990,36 @@ pub fn encode_still_grid(
                 payload: coded.payload,
                 av1c: coded.av1c,
             });
+            if let Some(alpha) = &img.alpha {
+                // Alpha tiles: same geometry, monochrome, full range
+                // (av1-avif §4.1) — stitched by a hidden alpha `grid`.
+                let ta = extract_rect(alpha, w, h, x0, y0, tile_w as usize, tile_h as usize);
+                let coded_alpha = encode_coded_item(
+                    tile_w,
+                    tile_h,
+                    img.bit_depth,
+                    ChromaFormat::Monochrome,
+                    ta,
+                    Vec::new(),
+                    Vec::new(),
+                    opts.alpha_q_idx,
+                    true,
+                    "grid alpha tile",
+                )?;
+                max_profile = max_profile.max(coded_alpha.seq_profile);
+                muxer = muxer.alpha_tile(GridTile {
+                    width: tile_w,
+                    height: tile_h,
+                    payload: coded_alpha.payload,
+                    av1c: coded_alpha.av1c,
+                });
+            }
         }
+    }
+    if img.alpha.is_some() {
+        muxer = muxer
+            .with_alpha_pixi(vec![img.bit_depth])
+            .premultiplied_alpha(opts.premultiplied_alpha);
     }
     muxer = match max_profile {
         0 => muxer,

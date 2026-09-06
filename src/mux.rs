@@ -797,6 +797,17 @@ pub struct AvifGridMuxer {
     tiles: Vec<GridTile>,
     pixi: Option<Vec<u8>>,
     colr: Option<Colr>,
+    pasp: Option<Pasp>,
+    irot: Option<Irot>,
+    imir: Option<Imir>,
+    mdcv: Option<Mdcv>,
+    clli: Option<Clli>,
+    amve: Option<Amve>,
+    exif: Option<Vec<u8>>,
+    xmp: Option<Vec<u8>>,
+    alpha_tiles: Vec<GridTile>,
+    alpha_pixi: Option<Vec<u8>>,
+    premultiplied: bool,
     profile_brand: ProfileBrand,
 }
 
@@ -813,6 +824,17 @@ impl AvifGridMuxer {
             tiles: Vec::new(),
             pixi: None,
             colr: None,
+            pasp: None,
+            irot: None,
+            imir: None,
+            mdcv: None,
+            clli: None,
+            amve: None,
+            exif: None,
+            xmp: None,
+            alpha_tiles: Vec::new(),
+            alpha_pixi: None,
+            premultiplied: false,
             profile_brand: ProfileBrand::Baseline,
         }
     }
@@ -820,6 +842,80 @@ impl AvifGridMuxer {
     /// Append a tile (row-major order).
     pub fn tile(mut self, tile: GridTile) -> Self {
         self.tiles.push(tile);
+        self
+    }
+
+    /// Append an **alpha** tile (row-major order, same `rows ×
+    /// columns` as the colour tiles). The alpha auxiliary of a grid
+    /// primary is itself a `grid` derived item (HEIF §6.4.1: roles are
+    /// independent of coded-vs-derived representation) of hidden
+    /// monochrome `av01` tiles, carrying `auxC` and an `auxl` reference
+    /// to the colour grid.
+    pub fn alpha_tile(mut self, tile: GridTile) -> Self {
+        self.alpha_tiles.push(tile);
+        self
+    }
+
+    /// `pixi` for the alpha grid item.
+    pub fn with_alpha_pixi(mut self, bits: Vec<u8>) -> Self {
+        self.alpha_pixi = Some(bits);
+        self
+    }
+
+    /// Emit `prem` (colour pre-multiplied by alpha) from the alpha grid.
+    pub fn premultiplied_alpha(mut self, premultiplied: bool) -> Self {
+        self.premultiplied = premultiplied;
+        self
+    }
+
+    /// Attach a `pasp` property to the grid item.
+    pub fn with_pasp(mut self, pasp: Pasp) -> Self {
+        self.pasp = Some(pasp);
+        self
+    }
+
+    /// Rotate the composed grid (`irot`) — transformative properties
+    /// are only permitted on the grid item itself (av1-avif §7).
+    pub fn with_irot(mut self, angle: u8) -> Self {
+        self.irot = Some(Irot {
+            angle: angle & 0x03,
+        });
+        self
+    }
+
+    /// Mirror the composed grid (`imir`).
+    pub fn with_imir(mut self, axis: u8) -> Self {
+        self.imir = Some(Imir { axis: axis & 0x01 });
+        self
+    }
+
+    /// Mastering display colour volume on the grid item.
+    pub fn with_mdcv(mut self, mdcv: Mdcv) -> Self {
+        self.mdcv = Some(mdcv);
+        self
+    }
+
+    /// Content light level on the grid item.
+    pub fn with_clli(mut self, clli: Clli) -> Self {
+        self.clli = Some(clli);
+        self
+    }
+
+    /// Ambient viewing environment on the grid item.
+    pub fn with_amve(mut self, amve: Amve) -> Self {
+        self.amve = Some(amve);
+        self
+    }
+
+    /// Exif item (`cdsc` → the grid item).
+    pub fn with_exif(mut self, payload: Vec<u8>) -> Self {
+        self.exif = Some(payload);
+        self
+    }
+
+    /// XMP item (`cdsc` → the grid item).
+    pub fn with_xmp(mut self, payload: Vec<u8>) -> Self {
+        self.xmp = Some(payload);
         self
     }
 
@@ -878,6 +974,24 @@ impl AvifGridMuxer {
         if let Some(colr) = &self.colr {
             grid_props.push(prop_colr(colr)?);
         }
+        if let Some(pasp) = &self.pasp {
+            grid_props.push(prop_pasp(pasp));
+        }
+        if let Some(mdcv) = &self.mdcv {
+            grid_props.push(prop_mdcv(mdcv));
+        }
+        if let Some(clli) = &self.clli {
+            grid_props.push(prop_clli(clli));
+        }
+        if let Some(amve) = &self.amve {
+            grid_props.push(prop_amve(amve));
+        }
+        if let Some(irot) = &self.irot {
+            grid_props.push(prop_irot(irot));
+        }
+        if let Some(imir) = &self.imir {
+            grid_props.push(prop_imir(imir));
+        }
         let mut items = vec![MuxItem {
             id: 1,
             item_type: *b"grid",
@@ -908,11 +1022,119 @@ impl AvifGridMuxer {
             });
         }
 
-        let irefs = vec![MuxIref {
+        let mut irefs = vec![MuxIref {
             reference_type: *b"dimg",
             from_id: 1,
             to_ids: tile_ids,
         }];
+        let mut next_id = 2 + items.len() as u32 - 1;
+
+        if !self.alpha_tiles.is_empty() {
+            if self.alpha_tiles.len() != expected {
+                return Err(Error::invalid(format!(
+                    "avif mux: {}×{} alpha grid needs {expected} tiles, got {}",
+                    self.rows,
+                    self.columns,
+                    self.alpha_tiles.len()
+                )));
+            }
+            let alpha_grid_id = next_id;
+            next_id += 1;
+            let mut aprops = vec![
+                prop_ispe(self.output_width, self.output_height),
+                prop_auxc(crate::alpha::ALPHA_URN_PREFIX),
+            ];
+            if let Some(bits) = &self.alpha_pixi {
+                aprops.push(prop_pixi(bits));
+            }
+            items.push(MuxItem {
+                id: alpha_grid_id,
+                item_type: *b"grid",
+                name: "Alpha".to_string(),
+                hidden: true,
+                content_type: None,
+                payload: build_grid_descriptor(
+                    self.rows,
+                    self.columns,
+                    self.output_width,
+                    self.output_height,
+                ),
+                props: aprops,
+            });
+            let mut alpha_tile_ids = Vec::with_capacity(expected);
+            for (i, tile) in self.alpha_tiles.into_iter().enumerate() {
+                if tile.av1c.len() < 4 {
+                    return Err(Error::invalid(format!(
+                        "avif mux: alpha grid tile {i} av1C must be at least 4 bytes"
+                    )));
+                }
+                let id = next_id;
+                next_id += 1;
+                alpha_tile_ids.push(id);
+                items.push(MuxItem {
+                    id,
+                    item_type: *b"av01",
+                    name: String::new(),
+                    hidden: true,
+                    content_type: None,
+                    payload: tile.payload,
+                    props: vec![prop_av1c(&tile.av1c), prop_ispe(tile.width, tile.height)],
+                });
+            }
+            irefs.push(MuxIref {
+                reference_type: *b"dimg",
+                from_id: alpha_grid_id,
+                to_ids: alpha_tile_ids,
+            });
+            irefs.push(MuxIref {
+                reference_type: *b"auxl",
+                from_id: alpha_grid_id,
+                to_ids: vec![1],
+            });
+            if self.premultiplied {
+                irefs.push(MuxIref {
+                    reference_type: *b"prem",
+                    from_id: alpha_grid_id,
+                    to_ids: vec![1],
+                });
+            }
+        }
+
+        if let Some(exif) = self.exif {
+            let id = next_id;
+            next_id += 1;
+            items.push(MuxItem {
+                id,
+                item_type: *b"Exif",
+                name: String::new(),
+                hidden: false,
+                content_type: None,
+                payload: exif,
+                props: Vec::new(),
+            });
+            irefs.push(MuxIref {
+                reference_type: *b"cdsc",
+                from_id: id,
+                to_ids: vec![1],
+            });
+        }
+        if let Some(xmp) = self.xmp {
+            let id = next_id;
+            items.push(MuxItem {
+                id,
+                item_type: *b"mime",
+                name: String::new(),
+                hidden: false,
+                content_type: Some("application/rdf+xml".to_string()),
+                payload: xmp,
+                props: Vec::new(),
+            });
+            irefs.push(MuxIref {
+                reference_type: *b"cdsc",
+                from_id: id,
+                to_ids: vec![1],
+            });
+        }
         assemble(&items, 1, &irefs, self.profile_brand)
     }
 }

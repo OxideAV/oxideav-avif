@@ -2193,10 +2193,16 @@ impl AlphaBitDepthAudit {
 /// an AV1 Alpha Image Sequence) shall be encoded with the same bit
 /// depth as the associated master AV1 Image Item (respectively AV1
 /// Image Sequence)."
+///
+/// Either side may be a **derived** item (HEIF §6.4.1: an auxiliary
+/// image may be a `grid` of coded tiles, and a grid primary's alpha is
+/// such a grid): its `av1C` is then resolved through the first `dimg`
+/// input of the derivation chain — the coded leaf whose configuration
+/// record governs the whole derived image (all tiles share one
+/// depth, av1-avif §7 / HEIF §6.6.2.3).
 pub fn audit_alpha_bit_depth(meta: &crate::meta::Meta) -> Vec<AlphaBitDepthAudit> {
     let auxl = b(b"auxl");
     let auxc = b(b"auxC");
-    let av1c = b(b"av1C");
     let mut out = Vec::new();
     for entry in &meta.irefs {
         if entry.reference_type != auxl {
@@ -2216,15 +2222,14 @@ pub fn audit_alpha_bit_depth(meta: &crate::meta::Meta) -> Vec<AlphaBitDepthAudit
         if !is_alpha {
             continue;
         }
-        let (alpha_bit_depth, alpha_missing_av1c) = match meta.property_for(alpha_id, &av1c) {
-            Some(crate::meta::Property::Av1C(bytes)) => (decode_av1c_bit_depth(bytes), false),
-            _ => (None, true),
+        let (alpha_bit_depth, alpha_missing_av1c) = match effective_av1c(meta, alpha_id, 0) {
+            Some(bytes) => (decode_av1c_bit_depth(bytes), false),
+            None => (None, true),
         };
         for &master_id in &entry.to_ids {
-            let (master_bit_depth, master_missing_av1c) = match meta.property_for(master_id, &av1c)
-            {
-                Some(crate::meta::Property::Av1C(bytes)) => (decode_av1c_bit_depth(bytes), false),
-                _ => (None, true),
+            let (master_bit_depth, master_missing_av1c) = match effective_av1c(meta, master_id, 0) {
+                Some(bytes) => (decode_av1c_bit_depth(bytes), false),
+                None => (None, true),
             };
             out.push(AlphaBitDepthAudit {
                 alpha_item_id: alpha_id,
@@ -2237,6 +2242,24 @@ pub fn audit_alpha_bit_depth(meta: &crate::meta::Meta) -> Vec<AlphaBitDepthAudit
         }
     }
     out
+}
+
+/// The `av1C` governing `item_id`: its own property, or — for a derived
+/// item without one — the record of its first `dimg` input, recursively
+/// (depth-guarded by [`MAX_DERIVATION_DEPTH`]).
+fn effective_av1c(meta: &crate::meta::Meta, item_id: u32, depth: u32) -> Option<&[u8]> {
+    if depth > MAX_DERIVATION_DEPTH {
+        return None;
+    }
+    if let Some(crate::meta::Property::Av1C(bytes)) = meta.property_for(item_id, &b(b"av1C")) {
+        return Some(bytes);
+    }
+    let inputs = meta.iref_targets(&b(b"dimg"), item_id);
+    let &first = inputs.first()?;
+    if first == item_id {
+        return None;
+    }
+    effective_av1c(meta, first, depth + 1)
 }
 
 /// Outcome of walking a single AV1 Image Item's OBU stream to count

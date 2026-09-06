@@ -44,6 +44,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `StillProperties::identity_derivation` make the primary an `iden` item
   (§6.6.2.1: no extents — absent from `iloc` — single `dimg` input, the
   coded item left exposed) carrying `clap` / `irot` / `imir`.
+- **Grid + alpha encode** (`encode_still_grid` / `AvifGridMuxer::alpha_tile`):
+  the alpha of a grid primary is a hidden alpha `grid` of same-geometry
+  monochrome tiles (`auxC` alpha URN, `auxl` → the colour grid, `prem`
+  optional) — HEIF §6.4.1 roles are independent of the coded-vs-derived
+  representation. The grid path also carries the pass-through properties
+  (`irot` / `imir` / `pasp` / `mdcv` / `clli` / `amve` / Exif / XMP) on the
+  grid item (av1-avif §7: transforms only on the grid item).
+- **Grid tile election**: `GRID_MIN_TILE_DIM` (64) floor on coded tile
+  extents — external AVIF readers reject smaller tiles (their diagnostics
+  cite the MIAF grid-tile constraint, ISO/IEC 23000-22 §7.3.11.4.2) —
+  `elect_grid_tiling` (fewest tiles per axis within a bound, never
+  below the floor, never a fully-trimmed tile) and `encode_still_auto`
+  (single item when it fits `STILL_MAX_CODED_DIM`, elected grid
+  otherwise). Grid encodes are now accepted by the external AVIF decoder
+  binary, planes exact (previously every grid it saw was refused).
+- **Depth-map auxiliary** on the pixel encoder: `StillImage::with_depth_map`
+  → hidden monochrome `av01` at the master's depth with the HEIF §6.9.2
+  depth URN (`AvifMuxer::with_depth`).
+- `audit_alpha_bit_depth` resolves `av1C` through the derivation chain,
+  so an alpha grid / grid master audits by its coded tiles.
 - Derived-image test suite (`tests/derived_images.rs`): overlay
   8-bit 4:2:0 / 10-bit 4:2:2 (clipped negative offset) / identity-matrix
   RGBA alpha-over with transparent fill / 12-bit monochrome odd offset +

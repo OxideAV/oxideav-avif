@@ -531,7 +531,7 @@ fn hbd_monochrome_alpha_composites_packed_ya16le() {
 /// HBD grid stitch.
 #[test]
 fn hbd_grid_encode_round_trips_exact_with_trim() {
-    let (w, h) = (70u32, 50u32);
+    let (w, h) = (150u32, 130u32);
     let img = build_image(w, h, 10, StillChroma::Yuv420);
     let avif = encode_still_grid(&img, &StillEncodeOptions::default(), 2, 2).expect("grid encode");
 
@@ -640,9 +640,69 @@ fn pass_through_properties_round_trip() {
         w * h,
         "rotated plane extent"
     );
+}
 
-    // The grid path rejects pass-through props until it grows them.
-    assert!(encode_still_grid(&img, &StillEncodeOptions::default(), 2, 1).is_err());
+/// Tile election: the fewest tiles per axis that fit the bound, never
+/// below the 64-pixel floor, never leaving a fully-trimmed tile; and
+/// `encode_still_auto` routes oversize canvases through it. The
+/// external AVIF decoder binary accepts the elected grid and recovers
+/// the exact planes.
+#[test]
+fn grid_tiling_election_and_auto_encode() {
+    use oxideav_avif::{elect_grid_tiling, encode_still_auto, GRID_MIN_TILE_DIM};
+    assert_eq!(elect_grid_tiling(4096, 4096, 4096), Some((1, 1)));
+    assert_eq!(elect_grid_tiling(4097, 100, 4096), Some((2, 1)));
+    assert_eq!(elect_grid_tiling(9000, 5000, 4096), Some((3, 2)));
+    assert_eq!(elect_grid_tiling(150, 130, 80), Some((2, 2)));
+    assert_eq!(elect_grid_tiling(0, 10, 4096), None);
+    assert_eq!(elect_grid_tiling(100, 100, GRID_MIN_TILE_DIM - 1), None);
+    // A bound just above the floor: 100 wide needs 2 columns of 56 →
+    // below the floor → no tiling.
+    assert_eq!(elect_grid_tiling(100, 64, 64), None);
+
+    // Auto: a 300x70 canvas with a 128 bound would grid; with the real
+    // bound it is a single item. Exercise the grid arm directly.
+    let (w, h) = (300u32, 70u32);
+    let img = build_image(w, h, 8, StillChroma::Yuv420);
+    let single = encode_still_auto(&img, &StillEncodeOptions::default()).expect("auto");
+    assert!(!inspect(&single).expect("inspect").is_grid);
+    let (cols, rows) = elect_grid_tiling(w, h, 128).expect("tiling");
+    assert_eq!((cols, rows), (3, 1));
+    let grid = encode_still_grid(&img, &StillEncodeOptions::default(), cols, rows).expect("grid");
+    let info = inspect(&grid).expect("inspect");
+    assert!(info.is_grid);
+    let vf = decode_own("elected grid", &grid);
+    assert_eq!(vf.planes[0].data, narrow(&img.y));
+
+    // Black box: external AVIF decoder accepts the elected grid.
+    let tmp = std::env::temp_dir().join(format!("oxideav-avif-grid-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).expect("tmp dir");
+    let in_path = tmp.join("grid.avif");
+    let out_path = tmp.join("grid.y4m");
+    std::fs::write(&in_path, &grid).expect("write");
+    match std::process::Command::new("avifdec")
+        .arg(&in_path)
+        .arg(&out_path)
+        .output()
+    {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("elected grid: external decoder not installed — leg skipped");
+        }
+        Err(e) => panic!("spawn failed: {e}"),
+        Ok(out) => {
+            assert!(
+                out.status.success(),
+                "external decoder rejected the elected grid: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let y4m = std::fs::read(&out_path).expect("read y4m");
+            let (gw, gh, _, planes) = parse_y4m(&y4m).expect("parse y4m");
+            assert_eq!((gw, gh), (w, h));
+            assert_eq!(planes[0], narrow(&img.y), "external Y exact");
+            assert_eq!(planes[1], narrow(&img.u), "external U exact");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 // ───────────────────────── lossy leg ─────────────────────────
@@ -687,7 +747,7 @@ fn lossy_encode_is_smaller_and_psnr_gated() {
 /// the tile extents).
 #[test]
 fn grid_encode_round_trips_exact_with_trim() {
-    let (w, h) = (70u32, 50u32);
+    let (w, h) = (150u32, 130u32);
     let img = build_image(w, h, 8, StillChroma::Yuv420);
     let avif = encode_still_grid(&img, &StillEncodeOptions::default(), 2, 2).expect("grid encode");
 
@@ -709,16 +769,228 @@ fn grid_encode_round_trips_exact_with_trim() {
     assert_eq!(vf.planes[2].data, narrow(&img.v), "V exact across seams");
 }
 
-/// Grid guards: alpha is not yet supported on the grid path, and a
-/// tiling that leaves fully-trimmed tiles is rejected up front.
+/// Grid guards: a tiling that leaves fully-trimmed tiles is rejected
+/// up front, as are a depth map and an identity derivation over the
+/// grid.
 #[test]
 fn grid_encode_guards() {
+    // 506 wide split into 9 columns → ceil(56.2) = 57 → 64-wide coded
+    // tiles → 8 × 64 = 512 ≥ 506: column 8 starts past the canvas.
+    let wide = build_image(506, 64, 8, StillChroma::Yuv420);
+    let err = encode_still_grid(&wide, &StillEncodeOptions::default(), 9, 1).unwrap_err();
+    assert!(err.to_string().contains("fully-trimmed"), "{err}");
+    // Tiles below the 64-pixel floor are rejected.
     let img = build_image(16, 16, 8, StillChroma::Yuv420);
-    let with_alpha = img.clone().with_alpha(plane(16, 16, 8, 5)).unwrap();
-    assert!(encode_still_grid(&with_alpha, &StillEncodeOptions::default(), 2, 1).is_err());
-    // 16 wide split into 3 columns → 8-wide tiles → column 2 starts at
-    // x=16, past the canvas: rejected.
-    assert!(encode_still_grid(&img, &StillEncodeOptions::default(), 3, 1).is_err());
+    let err = encode_still_grid(&img, &StillEncodeOptions::default(), 2, 1).unwrap_err();
+    assert!(err.to_string().contains("floor"), "{err}");
+    let with_depth = build_image(128, 128, 8, StillChroma::Yuv420)
+        .with_depth_map(plane(128, 128, 8, 5))
+        .unwrap();
+    assert!(encode_still_grid(&with_depth, &StillEncodeOptions::default(), 2, 1).is_err());
+    let with_iden = img.with_props(StillProperties {
+        identity_derivation: Some(oxideav_avif::IdentityDerivation::default()),
+        ..Default::default()
+    });
+    assert!(encode_still_grid(&with_iden, &StillEncodeOptions::default(), 2, 1).is_err());
+}
+
+/// Grid + alpha: the alpha auxiliary of a grid primary is a hidden
+/// alpha `grid` of monochrome tiles (`auxl` → the colour grid). Both
+/// grids stitch sample-exact through the decoder with trim, at 8 and
+/// 10 bits; the container audits (mif1, alpha bit depth, grid
+/// derivation) stay compliant; and the external AVIF decoder binary
+/// recovers the exact alpha plane.
+#[test]
+fn grid_encode_with_alpha_round_trips_exact() {
+    for (depth, premultiplied) in [(8u8, false), (10, true)] {
+        let (w, h) = (150u32, 130u32);
+        let img = build_image(w, h, depth, StillChroma::Yuv420)
+            .with_alpha(plane(w, h, depth, 9))
+            .unwrap();
+        let opts = StillEncodeOptions {
+            premultiplied_alpha: premultiplied,
+            ..Default::default()
+        };
+        let avif = encode_still_grid(&img, &opts, 2, 2).expect("grid+alpha encode");
+        let label = format!("grid alpha {depth}-bit");
+
+        let info = inspect(&avif).expect("inspect");
+        assert!(info.is_grid && info.has_alpha, "{label}: grid + alpha");
+        assert_eq!(info.premultiplied_alpha, premultiplied, "{label}: prem");
+        assert!(audit_mif1(&avif).expect("audit").is_compliant());
+        assert_eq!(
+            info.grid_resolutions.len(),
+            2,
+            "{label}: colour + alpha grids"
+        );
+        assert!(info
+            .grid_derivation_compliance
+            .iter()
+            .all(|a| a.is_compliant()));
+        assert!(info
+            .alpha_bit_depth_compliance
+            .iter()
+            .all(|a| a.is_compliant()));
+        let hdr = parse_header(&avif).expect("parse");
+        let alpha_id =
+            oxideav_avif::find_alpha_item_id(&hdr.meta, hdr.meta.primary_item_id.unwrap())
+                .expect("alpha grid attached to the colour grid");
+        assert_eq!(
+            hdr.meta.item_by_id(alpha_id).unwrap().item_type,
+            oxideav_avif::ITEM_TYPE_GRID
+        );
+
+        let vf = decode_own(&label, &avif);
+        assert_eq!(vf.planes.len(), 4, "{label}: Yuva");
+        let alpha = img.alpha.as_ref().unwrap();
+        if depth == 8 {
+            assert_eq!(vf.planes[0].data, narrow(&img.y), "{label}: Y");
+            assert_eq!(vf.planes[1].data, narrow(&img.u), "{label}: U");
+            assert_eq!(vf.planes[3].data, narrow(alpha), "{label}: A");
+        } else {
+            assert_eq!(le_u16(&vf.planes[0].data), img.y, "{label}: Y");
+            assert_eq!(le_u16(&vf.planes[2].data), img.v, "{label}: V");
+            assert_eq!(le_u16(&vf.planes[3].data), *alpha, "{label}: A");
+        }
+
+        // Black box: alpha plane through the external AVIF decoder
+        // (PNG output, alpha channel extracted by ImageMagick).
+        if depth == 8 {
+            let tmp = std::env::temp_dir().join(format!("oxideav-avif-ga-{}", std::process::id()));
+            std::fs::create_dir_all(&tmp).expect("tmp dir");
+            let in_path = tmp.join("ga.avif");
+            let png = tmp.join("ga.png");
+            let raw = tmp.join("ga_alpha.raw");
+            std::fs::write(&in_path, &avif).expect("write");
+            let run = std::process::Command::new("avifdec")
+                .arg(&in_path)
+                .arg(&png)
+                .output();
+            match run {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    eprintln!("{label}: external decoder not installed — leg skipped");
+                }
+                Err(e) => panic!("{label}: spawn failed: {e}"),
+                Ok(out) => {
+                    assert!(
+                        out.status.success(),
+                        "{label}: external decoder rejected the grid+alpha file: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                    let conv = std::process::Command::new("magick")
+                        .arg(&png)
+                        .arg("-alpha")
+                        .arg("extract")
+                        .arg("-depth")
+                        .arg("8")
+                        .arg(format!("gray:{}", raw.display()))
+                        .output();
+                    match conv {
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            eprintln!("{label}: ImageMagick not installed — alpha leg skipped");
+                        }
+                        Err(e) => panic!("{label}: spawn failed: {e}"),
+                        Ok(c) => {
+                            assert!(c.status.success(), "{label}: magick failed");
+                            let ext = std::fs::read(&raw).expect("read alpha raw");
+                            assert_eq!(ext, narrow(alpha), "{label}: external alpha plane exact");
+                        }
+                    }
+                }
+            }
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
+    }
+}
+
+/// Depth map auxiliary: coded as a hidden monochrome item at the
+/// master's depth (`auxC` depth URN + `auxl`), surfaced by `inspect`,
+/// and its payload decodes back sample-exact.
+#[test]
+fn depth_map_auxiliary_round_trips_exact() {
+    let (w, h) = (24u32, 16u32);
+    let depth_map = plane(w, h, 10, 77);
+    let img = build_image(w, h, 10, StillChroma::Yuv420)
+        .with_depth_map(depth_map.clone())
+        .unwrap();
+    let avif = encode_still(&img, &StillEncodeOptions::default()).expect("encode");
+    let info = inspect(&avif).expect("inspect");
+    let depth_id = info.depth_map_item_id.expect("depth aux surfaced");
+    assert!(!info.has_alpha);
+    let hdr = parse_header(&avif).expect("parse");
+    let item = hdr.meta.item_by_id(depth_id).expect("depth item");
+    assert!(item.is_hidden());
+    let bytes = oxideav_avif::item_payload_bytes(&avif, depth_id).expect("depth payload");
+    let params = CodecParameters::video(CodecId::new("av1"));
+    let mut d = oxideav_av1::registry::make_decoder(&params).expect("av1 decoder");
+    d.send_packet(&Packet::new(0, TimeBase::new(1, 90_000), bytes))
+        .expect("depth send");
+    let Frame::Video(vf) = d.receive_frame().expect("depth frame") else {
+        panic!("non-video");
+    };
+    assert_eq!(vf.planes.len(), 1, "monochrome depth");
+    assert_eq!(le_u16(&vf.planes[0].data), depth_map, "depth samples exact");
+    // The primary decode is unaffected (depth is not composited).
+    let vf = decode_own("depth primary", &avif);
+    assert_eq!(vf.planes.len(), 3);
+    assert_eq!(le_u16(&vf.planes[0].data), img.y);
+}
+
+/// Grid path pass-through: HDR (`mdcv` / `clli` / `amve`), Exif / XMP
+/// and `irot` land on the grid item and round-trip; the rotation is
+/// applied to the stitched canvas.
+#[test]
+fn grid_pass_through_properties_round_trip() {
+    let (w, h) = (200u32, 80u32);
+    let exif = b"\x00\x00\x00\x00II*\x00grid-exif".to_vec();
+    let mdcv = oxideav_avif::Mdcv {
+        display_primaries_xy: [(34000, 16000), (13250, 34500), (7500, 3000)],
+        white_point_xy: (15635, 16450),
+        max_display_mastering_luminance: 10_000_000,
+        min_display_mastering_luminance: 50,
+    };
+    let amve = oxideav_avif::meta::Amve {
+        ambient_illuminance: 314_000,
+        ambient_light_x: 15635,
+        ambient_light_y: 16450,
+    };
+    let img = build_image(w, h, 8, StillChroma::Yuv420).with_props(StillProperties {
+        exif: Some(exif.clone()),
+        mdcv: Some(mdcv),
+        amve: Some(amve),
+        clli: Some(oxideav_avif::Clli {
+            max_content_light_level: 4000,
+            max_pic_average_light_level: 400,
+        }),
+        irot: Some(1),
+        pasp: Some(oxideav_avif::Pasp {
+            h_spacing: 4,
+            v_spacing: 3,
+        }),
+        ..Default::default()
+    });
+    let avif = encode_still_grid(&img, &StillEncodeOptions::default(), 2, 1).expect("grid encode");
+    let info = inspect(&avif).expect("inspect");
+    assert!(info.is_grid);
+    assert_eq!(info.mdcv, Some(mdcv), "mdcv on the grid item");
+    assert_eq!(info.amve, Some(amve), "amve on the grid item");
+    assert_eq!(info.clli.map(|c| c.max_content_light_level), Some(4000));
+    assert_eq!(info.pasp.map(|p| (p.h_spacing, p.v_spacing)), Some((4, 3)));
+    let exif_id = info.exif_item_id.expect("exif item");
+    assert_eq!(
+        oxideav_avif::item_payload_bytes(&avif, exif_id).expect("exif bytes"),
+        exif
+    );
+    assert!(audit_mif1(&avif).expect("audit").is_compliant());
+    let vf = decode_own("grid irot", &avif);
+    assert_eq!(vf.planes[0].stride as u32, h, "rotated width = h");
+    // irot 1: out(x, y) = in(W-1-y, x), out extents (H, W).
+    for y in 0..w {
+        for x in 0..h {
+            let src = img.y[(x * w + (w - 1 - y)) as usize] as u8;
+            assert_eq!(vf.planes[0].data[(y * h + x) as usize], src, "Y at {x},{y}");
+        }
+    }
 }
 
 // ───────────────── HBD AVIS sequence decode ─────────────────
