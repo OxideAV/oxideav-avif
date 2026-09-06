@@ -77,7 +77,7 @@ pub enum StillChroma {
 }
 
 impl StillChroma {
-    fn to_av1(self) -> ChromaFormat {
+    pub(crate) fn to_av1(self) -> ChromaFormat {
         match self {
             StillChroma::Yuv420 => ChromaFormat::Yuv420,
             StillChroma::Yuv422 => ChromaFormat::Yuv422,
@@ -87,7 +87,7 @@ impl StillChroma {
     }
 
     /// `(subsampling_x, subsampling_y)` as shift amounts.
-    fn subsampling(self) -> (u32, u32) {
+    pub(crate) fn subsampling(self) -> (u32, u32) {
         match self {
             StillChroma::Yuv420 => (1, 1),
             StillChroma::Yuv422 => (1, 0),
@@ -96,7 +96,7 @@ impl StillChroma {
         }
     }
 
-    fn has_chroma(self) -> bool {
+    pub(crate) fn has_chroma(self) -> bool {
         self != StillChroma::Monochrome
     }
 }
@@ -350,7 +350,7 @@ impl StillImage {
     }
 
     /// Chroma plane extents implied by `(width, height, chroma)`.
-    fn chroma_dims(&self) -> (u32, u32) {
+    pub(crate) fn chroma_dims(&self) -> (u32, u32) {
         if !self.chroma.has_chroma() {
             return (0, 0);
         }
@@ -359,7 +359,7 @@ impl StillImage {
     }
 
     /// Shape / depth / range validation.
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.width == 0 || self.height == 0 {
             return Err(Error::invalid(
                 "avif still: dimensions must be at least 1x1",
@@ -521,12 +521,12 @@ fn identity_full_range_colr() -> Colr {
 }
 
 /// Round `v` up to the coded-extent grid (multiple of 8, min 8).
-fn coded_extent(v: u32) -> u32 {
+pub(crate) fn coded_extent(v: u32) -> u32 {
     v.max(8).div_ceil(8) * 8
 }
 
 /// Edge-replicate `src` (`w × h`, row-major) out to `pw × ph`.
-fn pad_plane(src: &[u16], w: usize, h: usize, pw: usize, ph: usize) -> Vec<u16> {
+pub(crate) fn pad_plane(src: &[u16], w: usize, h: usize, pw: usize, ph: usize) -> Vec<u16> {
     debug_assert!(pw >= w && ph >= h && src.len() == w * h);
     if (pw, ph) == (w, h) {
         return src.to_vec();
@@ -575,7 +575,7 @@ fn extract_rect(
 /// mirroring the emitted sequence header — the av1-avif §2.2.1 `shall`
 /// ("the values of the fields ... shall match those of the Sequence
 /// Header OBU in the AV1 Image Item Data").
-fn av1c_from_seq(seq: &SequenceHeader) -> Vec<u8> {
+pub(crate) fn av1c_from_seq(seq: &SequenceHeader) -> Vec<u8> {
     let op = &seq.operating_points[0];
     let cc = &seq.color_config;
     let b0 = 0x80 | 0x01; // marker=1, version=1
@@ -591,7 +591,7 @@ fn av1c_from_seq(seq: &SequenceHeader) -> Vec<u8> {
 }
 
 /// Map an AV1-encoder error into the crate error type with context.
-fn av1_err(stage: &str, e: oxideav_av1::Error) -> Error {
+pub(crate) fn av1_err(stage: &str, e: oxideav_av1::Error) -> Error {
     Error::invalid(format!("avif still: AV1 {stage} encode failed: {e}"))
 }
 
@@ -602,7 +602,7 @@ fn av1_err(stage: &str, e: oxideav_av1::Error) -> Error {
 /// centre geometry, a top-left anchor means
 /// `horizOff = (cleanApertureWidth − frameWidth) / 2` (denominator 2
 /// keeps the half-pixel exact), and likewise vertically.
-fn top_left_clap(w: u32, h: u32, pw: u32, ph: u32) -> Clap {
+pub(crate) fn top_left_clap(w: u32, h: u32, pw: u32, ph: u32) -> Clap {
     Clap {
         clean_aperture_width_n: w as i32,
         clean_aperture_width_d: 1,
@@ -617,10 +617,10 @@ fn top_left_clap(w: u32, h: u32, pw: u32, ph: u32) -> Clap {
 
 /// One coded plane set: the AV1 Image Item Data payload plus its
 /// `av1C` record and the elected `seq_profile`.
-struct CodedItem {
-    payload: Vec<u8>,
-    av1c: Vec<u8>,
-    seq_profile: u8,
+pub(crate) struct CodedItem {
+    pub(crate) payload: Vec<u8>,
+    pub(crate) av1c: Vec<u8>,
+    pub(crate) seq_profile: u8,
 }
 
 /// Re-signal §5.5.2 `color_range = 1` (full range) in the temporal
@@ -642,7 +642,7 @@ struct CodedItem {
 /// * a full-range `colr` `nclx` on the colour item (e.g. the identity
 ///   RGB path) — MIAF gives the container property precedence, but a
 ///   matching in-stream flag keeps both signals consistent.
-fn full_range_temporal_unit(unit: &[u8], seq: &SequenceHeader) -> Result<Vec<u8>> {
+pub(crate) fn full_range_temporal_unit(unit: &[u8], seq: &SequenceHeader) -> Result<Vec<u8>> {
     let mut seq_full = seq.clone();
     seq_full.color_config.color_range = true;
     let new_sh = encode_sequence_header_obu(&seq_full);
@@ -672,7 +672,7 @@ fn full_range_temporal_unit(unit: &[u8], seq: &SequenceHeader) -> Result<Vec<u8>
 /// re-signals §5.5.2 `color_range = 1` in the emitted sequence header
 /// (see [`full_range_temporal_unit`]).
 #[allow(clippy::too_many_arguments)]
-fn encode_coded_item(
+pub(crate) fn encode_coded_item(
     pw: u32,
     ph: u32,
     bit_depth: u8,
@@ -713,7 +713,7 @@ fn encode_coded_item(
 
 /// True when the image's `colr` property declares full-range `nclx`
 /// samples — the in-stream §5.5.2 `color_range` flag then mirrors it.
-fn colr_is_full_range(img: &StillImage) -> bool {
+pub(crate) fn colr_is_full_range(img: &StillImage) -> bool {
     matches!(
         img.colr,
         Some(Colr::Nclx {
@@ -777,7 +777,7 @@ fn encode_alpha(img: &StillImage, alpha: &[u16], pw: u32, ph: u32, q: u8) -> Res
 }
 
 /// `pixi` bits-per-channel list for the image's colour item.
-fn pixi_bits(img: &StillImage) -> Vec<u8> {
+pub(crate) fn pixi_bits(img: &StillImage) -> Vec<u8> {
     let channels = if img.chroma.has_chroma() { 3 } else { 1 };
     vec![img.bit_depth; channels]
 }
@@ -858,7 +858,7 @@ pub fn encode_still(img: &StillImage, opts: &StillEncodeOptions) -> Result<Vec<u
     mux.build()
 }
 
-fn apply_profile_brand_mux(mux: AvifMuxer, seq_profile: u8) -> AvifMuxer {
+pub(crate) fn apply_profile_brand_mux(mux: AvifMuxer, seq_profile: u8) -> AvifMuxer {
     match seq_profile {
         0 => mux, // Main → Baseline (MA1B) — the muxer default
         1 => mux.advanced_profile(),

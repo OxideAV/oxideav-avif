@@ -133,6 +133,8 @@ pub mod decoder;
 pub mod encoder;
 
 #[cfg(feature = "registry")]
+pub mod sequence;
+#[cfg(feature = "registry")]
 pub mod still;
 
 pub use alpha::{composite_alpha, find_alpha_item_id, ALPHA_URN_PREFIX};
@@ -203,6 +205,9 @@ pub use decoder::{make_decoder, AvifDecoder};
 
 #[cfg(feature = "registry")]
 pub use encoder::{make_encoder, AvifEncoder};
+
+#[cfg(feature = "registry")]
+pub use sequence::{encode_sequence, SequenceEncodeOptions};
 
 #[cfg(feature = "registry")]
 pub use still::{

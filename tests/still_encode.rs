@@ -828,6 +828,228 @@ fn layered_item_round_trips_and_selects_layers() {
     assert!(encode_still_layered(&[&mid, &top], Some(2), &StillEncodeOptions::default()).is_err());
 }
 
+// ───────────────────────── image sequences ─────────────────────────
+
+/// Decode every frame of an `avis` file through the registry decoder
+/// (its `send_packet` routes sequence brands to the sample-table path).
+fn decode_sequence_own(label: &str, avif: &[u8]) -> Vec<oxideav_core::frame::VideoFrame> {
+    let mut d = AvifDecoder::new(CodecId::new(oxideav_avif::CODEC_ID_STR));
+    let pkt = Packet::new(0, TimeBase::new(1, 1), avif.to_vec());
+    d.send_packet(&pkt)
+        .unwrap_or_else(|e| panic!("{label}: send_packet failed: {e}"));
+    let mut out = Vec::new();
+    loop {
+        match d.receive_frame() {
+            Ok(Frame::Video(v)) => out.push(v),
+            Ok(other) => panic!("{label}: expected VideoFrame, got {other:?}"),
+            Err(oxideav_core::Error::NeedMore) => break,
+            Err(e) => panic!("{label}: receive_frame failed: {e}"),
+        }
+    }
+    out
+}
+
+/// All-intra `avis` sequence (every sample a sync sample, no `stss`,
+/// `avio` brand): the sample table, the §3 / §8.2 audits, the still
+/// primary aliasing sample 0, and every frame sample-exact through
+/// this crate's sequence decoder and the external AVIF decoder.
+#[test]
+fn avis_sequence_all_intra_round_trips_exact() {
+    use oxideav_avif::{encode_sequence, SequenceEncodeOptions};
+    let (w, h) = (32u32, 24u32);
+    let frames: Vec<StillImage> = (0..3)
+        .map(|i| {
+            let y = plane(w, h, 8, 100 + i);
+            let u = plane(w / 2, h / 2, 8, 200 + i);
+            let v = plane(w / 2, h / 2, 8, 300 + i);
+            StillImage::yuv(w, h, 8, StillChroma::Yuv420, y, u, v).unwrap()
+        })
+        .collect();
+    let opts = SequenceEncodeOptions {
+        all_intra: true,
+        timescale: 10,
+        frame_duration: 2,
+        ..Default::default()
+    };
+    let avif = encode_sequence(&frames, &opts).expect("sequence encode");
+
+    let hdr = parse_header(&avif).expect("parse");
+    let brands = classify_brands(&hdr.major_brand, &hdr.compatible_brands).expect("brands");
+    assert!(brands.is_sequence && brands.has_msf1, "avis + msf1 brands");
+    assert!(hdr.compatible_brands.contains(b"avio"), "all-intra → avio");
+    assert!(
+        hdr.compatible_brands.contains(b"av01"),
+        "AV1-ISOBMFF §2.1 av01"
+    );
+    let meta = oxideav_avif::parse_avis(&avif).expect("parse_avis");
+    assert_eq!(meta.samples.len(), 3);
+    assert!(meta.samples.iter().all(|s| s.is_sync), "no stss → all sync");
+    assert!(meta.samples.iter().all(|s| s.duration == 2));
+    assert_eq!(meta.timescale, 10);
+    assert_eq!(meta.display_dims, Some((w, h)));
+    assert!(meta.av1_codec_config.is_some(), "stsd → av01 → av1C");
+    let seq_audit = oxideav_avif::audit_avis_sequence(&meta, &avif);
+    assert!(seq_audit.is_compliant(), "{:?}", seq_audit.missing());
+    let info = oxideav_avif::inspect_avis(&avif).expect("inspect_avis");
+    assert!(info.is_compliant_all(), "{:?}", info.missing_all());
+
+    // Still primary = sample 0.
+    let still = decode_own("avis still primary", &avif);
+    assert_eq!(still.planes[0].data, narrow(&frames[0].y));
+
+    // Every frame through the sequence path.
+    let decoded = decode_sequence_own("avis all-intra", &avif);
+    assert_eq!(decoded.len(), 3);
+    for (i, (vf, src)) in decoded.iter().zip(&frames).enumerate() {
+        assert_eq!(vf.planes[0].data, narrow(&src.y), "frame {i} Y");
+        assert_eq!(vf.planes[1].data, narrow(&src.u), "frame {i} U");
+        assert_eq!(vf.planes[2].data, narrow(&src.v), "frame {i} V");
+        assert_eq!(vf.pts, Some(i as i64 * 2), "frame {i} pts");
+    }
+
+    // Black box: the external AVIF decoder decodes all three frames
+    // (`--index all` writes one Y4M per frame, `<stem>-NNNNNNNNNN.y4m`).
+    let tmp = std::env::temp_dir().join(format!("oxideav-avif-avis-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).expect("tmp dir");
+    let in_path = tmp.join("seq.avif");
+    let out_path = tmp.join("seq.y4m");
+    std::fs::write(&in_path, &avif).expect("write");
+    match std::process::Command::new("avifdec")
+        .arg("--index")
+        .arg("all")
+        .arg(&in_path)
+        .arg(&out_path)
+        .output()
+    {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("avis: external decoder not installed — leg skipped");
+        }
+        Err(e) => panic!("spawn failed: {e}"),
+        Ok(out) => {
+            assert!(
+                out.status.success(),
+                "external decoder rejected the sequence: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let mut outputs: Vec<std::path::PathBuf> = std::fs::read_dir(&tmp)
+                .expect("read tmp")
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().is_some_and(|x| x == "y4m"))
+                .collect();
+            outputs.sort();
+            assert_eq!(outputs.len(), 3, "external frame count: {outputs:?}");
+            for (i, (path, src)) in outputs.iter().zip(&frames).enumerate() {
+                let y4m = std::fs::read(path).expect("read y4m");
+                let (gw, gh, _, planes) = parse_y4m(&y4m).expect("parse y4m");
+                assert_eq!((gw, gh), (w, h));
+                assert_eq!(planes[0], narrow(&src.y), "external frame {i} Y");
+                assert_eq!(planes[1], narrow(&src.u), "external frame {i} U");
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// KEY + P groups at 10 bits: `stss` lists the group openers, the
+/// lossless inter encode decodes every frame sample-exact through this
+/// crate, and an external media decoder (`ffmpeg`) recovers the same
+/// frames.
+#[test]
+fn avis_sequence_gop_10bit_round_trips_exact() {
+    use oxideav_avif::{encode_sequence, SequenceEncodeOptions};
+    let (w, h) = (32u32, 32u32);
+    let frames: Vec<StillImage> = (0..6)
+        .map(|i| {
+            // Slowly varying content so inter prediction has something
+            // to predict from.
+            let base = gradient(w, h, 10);
+            let y: Vec<u16> = base.iter().map(|&v| (v + i * 37) & 1023).collect();
+            let u: Vec<u16> = plane(w / 2, h / 2, 10, 7)
+                .iter()
+                .map(|&v| (v + i) & 1023)
+                .collect();
+            let v: Vec<u16> = plane(w / 2, h / 2, 10, 9)
+                .iter()
+                .map(|&v| (v + 2 * i) & 1023)
+                .collect();
+            StillImage::yuv(w, h, 10, StillChroma::Yuv420, y, u, v).unwrap()
+        })
+        .collect();
+    let opts = SequenceEncodeOptions {
+        gop_length: 4,
+        ..Default::default()
+    };
+    let avif = encode_sequence(&frames, &opts).expect("sequence encode");
+    let meta = oxideav_avif::parse_avis(&avif).expect("parse_avis");
+    assert_eq!(meta.samples.len(), 6);
+    let sync: Vec<usize> = meta
+        .samples
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.is_sync)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(sync, vec![0, 4], "group openers are the sync samples");
+    let hdr = parse_header(&avif).expect("parse");
+    assert!(
+        !hdr.compatible_brands.contains(b"avio"),
+        "inter samples → no avio"
+    );
+    let info = oxideav_avif::inspect_avis(&avif).expect("inspect");
+    assert!(info.is_compliant_all(), "{:?}", info.missing_all());
+
+    let decoded = decode_sequence_own("avis gop", &avif);
+    assert_eq!(decoded.len(), 6);
+    for (i, (vf, src)) in decoded.iter().zip(&frames).enumerate() {
+        assert_eq!(le_u16(&vf.planes[0].data), src.y, "frame {i} Y");
+        assert_eq!(le_u16(&vf.planes[1].data), src.u, "frame {i} U");
+        assert_eq!(le_u16(&vf.planes[2].data), src.v, "frame {i} V");
+    }
+
+    // Black box: ffmpeg demuxes the avis track and decodes every frame.
+    let tmp = std::env::temp_dir().join(format!("oxideav-avif-avisg-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).expect("tmp dir");
+    let in_path = tmp.join("seq.avif");
+    let out_path = tmp.join("seq.raw");
+    std::fs::write(&in_path, &avif).expect("write");
+    // The file exposes the still primary as stream 0 and the `pict`
+    // track as stream 1; map the track.
+    match std::process::Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+        .arg(&in_path)
+        .args(["-map", "0:1", "-f", "rawvideo", "-pix_fmt", "yuv420p10le"])
+        .arg(&out_path)
+        .output()
+    {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("avis gop: ffmpeg not installed — leg skipped");
+        }
+        Err(e) => panic!("spawn failed: {e}"),
+        Ok(out) => {
+            assert!(
+                out.status.success(),
+                "ffmpeg rejected the sequence: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let raw = std::fs::read(&out_path).expect("read raw");
+            let frame_bytes = (w * h + 2 * (w / 2) * (h / 2)) as usize * 2;
+            assert_eq!(raw.len(), frame_bytes * 6, "ffmpeg frame count");
+            for (i, src) in frames.iter().enumerate() {
+                let f = &raw[i * frame_bytes..(i + 1) * frame_bytes];
+                let ylen = (w * h) as usize * 2;
+                assert_eq!(le_u16(&f[..ylen]), src.y, "ffmpeg frame {i} Y");
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    // Guards.
+    assert!(encode_sequence(&[], &SequenceEncodeOptions::default()).is_err());
+    let odd = build_image(16, 16, 8, StillChroma::Yuv420);
+    assert!(encode_sequence(&[frames[0].clone(), odd], &SequenceEncodeOptions::default()).is_err());
+}
+
 // ───────────────────────── lossy leg ─────────────────────────
 
 /// Lossy encode: strictly smaller than the lossless sibling on smooth

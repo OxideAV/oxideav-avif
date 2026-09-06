@@ -76,6 +76,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   layer (or the top one), and honours `a1op` through the AV1 crate's
   operating-point decode (upper layers dropped per §5.3.1). Top-layer
   decode is exact and black-box accepted by the external AVIF decoder.
+- **Image-sequence encode** (`sequence::encode_sequence` /
+  `SequenceEncodeOptions`, av1-avif §3 / §6.3 / §8, AV1-ISOBMFF §2,
+  ISO/IEC 14496-12 §8): `ftyp` (`avis` major; `avis`/`avif`/`mif1`/
+  `msf1`/`miaf`/`av01` + profile brand + `avio` when all-intra), a
+  still primary `av01` item aliasing sample 0 in `mdat`, and a `moov`
+  with `mvhd` / `tkhd` / `mdhd` / `hdlr('pict')` / `vmhd` / `dinf` /
+  `stbl` (`stsd` `av01` VisualSampleEntry + `av1C` + `colr` + `clap`,
+  `stts`, `stss` only when not every sample is sync, `stsc`, `stsz`,
+  `stco`/`co64`). Frames code all-intra or as KEY + P groups
+  (`gop_length` ≤ 64) through the AV1 crate's inter encoder; lossless
+  groups decode sample-exact at 8 and 10 bits through this crate's
+  sequence path, the external AVIF decoder (`--index all`) and ffmpeg
+  (track stream) recover every frame exactly.
 - Derived-image test suite (`tests/derived_images.rs`): overlay
   8-bit 4:2:0 / 10-bit 4:2:2 (clipped negative offset) / identity-matrix
   RGBA alpha-over with transparent fill / 12-bit monochrome odd offset +

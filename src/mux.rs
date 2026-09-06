@@ -46,36 +46,39 @@ use crate::meta::{Amve, Clap, Clli, Colr, Imir, Irot, Mdcv, Pasp};
 
 /// Little byte-buffer builder for box bodies.
 #[derive(Default)]
-struct W(Vec<u8>);
+pub(crate) struct W(pub(crate) Vec<u8>);
 
 impl W {
-    fn u8(&mut self, v: u8) {
+    pub(crate) fn u8(&mut self, v: u8) {
         self.0.push(v);
     }
-    fn u16(&mut self, v: u16) {
+    pub(crate) fn u16(&mut self, v: u16) {
         self.0.extend_from_slice(&v.to_be_bytes());
     }
-    fn u32(&mut self, v: u32) {
+    pub(crate) fn u32(&mut self, v: u32) {
         self.0.extend_from_slice(&v.to_be_bytes());
     }
-    fn bytes(&mut self, b: &[u8]) {
+    pub(crate) fn u64(&mut self, v: u64) {
+        self.0.extend_from_slice(&v.to_be_bytes());
+    }
+    pub(crate) fn bytes(&mut self, b: &[u8]) {
         self.0.extend_from_slice(b);
     }
-    fn fourcc(&mut self, b: &[u8; 4]) {
+    pub(crate) fn fourcc(&mut self, b: &[u8; 4]) {
         self.0.extend_from_slice(b);
     }
     /// NUL-terminated ASCII string.
-    fn cstr(&mut self, s: &str) {
+    pub(crate) fn cstr(&mut self, s: &str) {
         self.0.extend_from_slice(s.as_bytes());
         self.0.push(0);
     }
-    fn into_vec(self) -> Vec<u8> {
+    pub(crate) fn into_vec(self) -> Vec<u8> {
         self.0
     }
 }
 
 /// Encode a plain `Box`: `size(4) + type(4) + body`.
-fn boxed(box_type: &[u8; 4], body: &[u8]) -> Vec<u8> {
+pub(crate) fn boxed(box_type: &[u8; 4], body: &[u8]) -> Vec<u8> {
     let size = (8 + body.len()) as u32;
     let mut out = Vec::with_capacity(8 + body.len());
     out.extend_from_slice(&size.to_be_bytes());
@@ -85,7 +88,7 @@ fn boxed(box_type: &[u8; 4], body: &[u8]) -> Vec<u8> {
 }
 
 /// Encode a `FullBox`: prepends `version(1) + flags(3)` to `body`.
-fn full_boxed(box_type: &[u8; 4], version: u8, flags: u32, body: &[u8]) -> Vec<u8> {
+pub(crate) fn full_boxed(box_type: &[u8; 4], version: u8, flags: u32, body: &[u8]) -> Vec<u8> {
     let mut inner = Vec::with_capacity(4 + body.len());
     inner.push(version);
     inner.push((flags >> 16) as u8);
@@ -100,21 +103,21 @@ fn full_boxed(box_type: &[u8; 4], version: u8, flags: u32, body: &[u8]) -> Vec<u
 /// One item property, ready to be placed in `ipco` and referenced by
 /// `ipma`.
 #[derive(Clone)]
-struct PropBox {
+pub(crate) struct PropBox {
     /// Fully-encoded property box bytes (header + body).
-    bytes: Vec<u8>,
+    pub(crate) bytes: Vec<u8>,
     /// Whether the association marks this property essential.
-    essential: bool,
+    pub(crate) essential: bool,
 }
 
-fn prop_av1c(av1c: &[u8]) -> PropBox {
+pub(crate) fn prop_av1c(av1c: &[u8]) -> PropBox {
     PropBox {
         bytes: boxed(b"av1C", av1c),
         essential: true,
     }
 }
 
-fn prop_ispe(width: u32, height: u32) -> PropBox {
+pub(crate) fn prop_ispe(width: u32, height: u32) -> PropBox {
     let mut w = W::default();
     w.u32(width);
     w.u32(height);
@@ -124,7 +127,7 @@ fn prop_ispe(width: u32, height: u32) -> PropBox {
     }
 }
 
-fn prop_pixi(bits: &[u8]) -> PropBox {
+pub(crate) fn prop_pixi(bits: &[u8]) -> PropBox {
     let mut w = W::default();
     w.u8(bits.len() as u8);
     w.bytes(bits);
@@ -134,7 +137,7 @@ fn prop_pixi(bits: &[u8]) -> PropBox {
     }
 }
 
-fn prop_colr(colr: &Colr) -> Result<PropBox> {
+pub(crate) fn prop_colr(colr: &Colr) -> Result<PropBox> {
     let mut w = W::default();
     match colr {
         Colr::Nclx {
@@ -166,7 +169,7 @@ fn prop_colr(colr: &Colr) -> Result<PropBox> {
     })
 }
 
-fn prop_pasp(pasp: &Pasp) -> PropBox {
+pub(crate) fn prop_pasp(pasp: &Pasp) -> PropBox {
     let mut w = W::default();
     w.u32(pasp.h_spacing);
     w.u32(pasp.v_spacing);
@@ -176,7 +179,7 @@ fn prop_pasp(pasp: &Pasp) -> PropBox {
     }
 }
 
-fn prop_clap(clap: &Clap) -> PropBox {
+pub(crate) fn prop_clap(clap: &Clap) -> PropBox {
     let mut w = W::default();
     for v in [
         clap.clean_aperture_width_n,
@@ -197,14 +200,14 @@ fn prop_clap(clap: &Clap) -> PropBox {
     }
 }
 
-fn prop_irot(irot: &Irot) -> PropBox {
+pub(crate) fn prop_irot(irot: &Irot) -> PropBox {
     PropBox {
         bytes: boxed(b"irot", &[irot.angle & 0x03]),
         essential: true,
     }
 }
 
-fn prop_imir(imir: &Imir) -> PropBox {
+pub(crate) fn prop_imir(imir: &Imir) -> PropBox {
     PropBox {
         bytes: boxed(b"imir", &[imir.axis & 0x01]),
         essential: true,
@@ -212,7 +215,7 @@ fn prop_imir(imir: &Imir) -> PropBox {
 }
 
 /// AVIF alpha auxiliary URN (av1-avif §4.1 / HEIF §6.5.8).
-fn prop_auxc(urn: &str) -> PropBox {
+pub(crate) fn prop_auxc(urn: &str) -> PropBox {
     let mut w = W::default();
     w.cstr(urn);
     PropBox {
@@ -259,7 +262,7 @@ fn prop_a1op(op_index: u8) -> PropBox {
     }
 }
 
-fn prop_mdcv(m: &Mdcv) -> PropBox {
+pub(crate) fn prop_mdcv(m: &Mdcv) -> PropBox {
     let mut w = W::default();
     for (x, y) in m.display_primaries_xy {
         w.u16(x);
@@ -277,7 +280,7 @@ fn prop_mdcv(m: &Mdcv) -> PropBox {
 
 /// `clli` ContentLightLevelBox (ISO/IEC 14496-12 §12.1.5.4) — plain box,
 /// two u16 (MaxCLL, MaxFALL).
-fn prop_clli(c: &Clli) -> PropBox {
+pub(crate) fn prop_clli(c: &Clli) -> PropBox {
     let mut w = W::default();
     w.u16(c.max_content_light_level);
     w.u16(c.max_pic_average_light_level);
@@ -289,7 +292,7 @@ fn prop_clli(c: &Clli) -> PropBox {
 
 /// `amve` AmbientViewingEnvironmentBox (AVIF §6.5.36) — plain box, u32
 /// illuminance + 2×u16 CIE 1931 chromaticity.
-fn prop_amve(a: &Amve) -> PropBox {
+pub(crate) fn prop_amve(a: &Amve) -> PropBox {
     let mut w = W::default();
     w.u32(a.ambient_illuminance);
     w.u16(a.ambient_light_x);
@@ -304,26 +307,26 @@ fn prop_amve(a: &Amve) -> PropBox {
 
 /// One item to be muxed: an entry in `iinf`/`infe`, `iloc`, and (via its
 /// property list) `ipco`/`ipma`.
-struct MuxItem {
-    id: u32,
-    item_type: [u8; 4],
-    name: String,
-    hidden: bool,
+pub(crate) struct MuxItem {
+    pub(crate) id: u32,
+    pub(crate) item_type: [u8; 4],
+    pub(crate) name: String,
+    pub(crate) hidden: bool,
     /// MIME `content_type` for a `mime` item (e.g. XMP). Emitted in the
     /// `infe` v2 tail per ISO-BMFF §8.11.6.2; `None` for every other
     /// item type.
-    content_type: Option<String>,
+    pub(crate) content_type: Option<String>,
     /// Bytes placed in `mdat`. Every item this muxer emits is a
     /// single-extent, file-offset (`construction_method == 0`) item.
-    payload: Vec<u8>,
-    props: Vec<PropBox>,
+    pub(crate) payload: Vec<u8>,
+    pub(crate) props: Vec<PropBox>,
 }
 
 /// One typed item reference emitted into `iref`.
-struct MuxIref {
-    reference_type: [u8; 4],
-    from_id: u32,
-    to_ids: Vec<u32>,
+pub(crate) struct MuxIref {
+    pub(crate) reference_type: [u8; 4],
+    pub(crate) from_id: u32,
+    pub(crate) to_ids: Vec<u32>,
 }
 
 /// Which AVIF profile brand `ftyp` declares (av1-avif §8.2 / §8.3).
@@ -335,7 +338,7 @@ struct MuxIref {
 /// neither the `MA1B` Main-profile nor the `MA1A` High-profile
 /// constraint).
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ProfileBrand {
+pub(crate) enum ProfileBrand {
     /// `MA1B` — requires AV1 Main Profile, level <= 5.1 (§8.2).
     Baseline,
     /// `MA1A` — requires AV1 High Profile, level <= 6.0 (§8.3).
@@ -1546,28 +1549,7 @@ fn assemble(
 
     // 2. Build a global ipco property table (dedup identical property
     //    boxes) and per-item 1-based association lists.
-    let mut ipco_props: Vec<Vec<u8>> = Vec::new();
-    let mut item_assocs: Vec<Vec<(u16, bool)>> = Vec::with_capacity(items.len());
-    for it in items {
-        let mut assocs = Vec::with_capacity(it.props.len());
-        for p in &it.props {
-            let idx = match ipco_props.iter().position(|b| b == &p.bytes) {
-                Some(i) => i,
-                None => {
-                    ipco_props.push(p.bytes.clone());
-                    ipco_props.len() - 1
-                }
-            };
-            let one_based = (idx + 1) as u16;
-            if one_based > 0x7f {
-                return Err(Error::unsupported(
-                    "avif mux: >127 distinct properties need the large-index ipma form",
-                ));
-            }
-            assocs.push((one_based, p.essential));
-        }
-        item_assocs.push(assocs);
-    }
+    let (ipco_props, item_assocs) = build_property_table(items)?;
 
     let ftyp = build_ftyp(profile_brand);
     // 3. Measure the meta box length with placeholder offsets, then
@@ -1601,10 +1583,41 @@ fn assemble(
     Ok(out)
 }
 
+/// Global `ipco` property table (identical property boxes de-duplicated)
+/// plus each item's 1-based `(index, essential)` association list.
+/// `(ipco property boxes, per-item (1-based index, essential) lists)`.
+pub(crate) type PropertyTable = (Vec<Vec<u8>>, Vec<Vec<(u16, bool)>>);
+
+pub(crate) fn build_property_table(items: &[MuxItem]) -> Result<PropertyTable> {
+    let mut ipco_props: Vec<Vec<u8>> = Vec::new();
+    let mut item_assocs: Vec<Vec<(u16, bool)>> = Vec::with_capacity(items.len());
+    for it in items {
+        let mut assocs = Vec::with_capacity(it.props.len());
+        for p in &it.props {
+            let idx = match ipco_props.iter().position(|b| b == &p.bytes) {
+                Some(i) => i,
+                None => {
+                    ipco_props.push(p.bytes.clone());
+                    ipco_props.len() - 1
+                }
+            };
+            let one_based = (idx + 1) as u16;
+            if one_based > 0x7f {
+                return Err(Error::unsupported(
+                    "avif mux: >127 distinct properties need the large-index ipma form",
+                ));
+            }
+            assocs.push((one_based, p.essential));
+        }
+        item_assocs.push(assocs);
+    }
+    Ok((ipco_props, item_assocs))
+}
+
 /// `ftyp`: AVIF brand set (av1-avif §6.2 / §8.1 / §8.2 / §8.3).
 /// Baseline (`MA1B`) by default; `Advanced` selects `MA1A`; `Bare`
 /// lists only the general brands.
-fn build_ftyp(profile_brand: ProfileBrand) -> Vec<u8> {
+pub(crate) fn build_ftyp(profile_brand: ProfileBrand) -> Vec<u8> {
     let mut w = W::default();
     w.fourcc(b"avif"); // major_brand
     w.u32(0); // minor_version
@@ -1620,7 +1633,7 @@ fn build_ftyp(profile_brand: ProfileBrand) -> Vec<u8> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_meta(
+pub(crate) fn build_meta(
     items: &[MuxItem],
     primary_id: u32,
     irefs: &[MuxIref],
