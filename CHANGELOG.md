@@ -98,8 +98,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   plus `inspect` + the derivation-graph walk. Canvas bounds:
   `MAX_GRID_CANVAS_PIXELS` (2^28) on grid descriptors and
   `MAX_OVERLAY_CANVAS_PIXELS` (2^26) on overlays, both checked before any
-  tile is decoded. The fuzz sub-crate's lock now resolves the published
-  `oxideav-av1` that carries the spatial-layer / operating-point API.
+  tile is decoded. (The fuzz sub-crate resolves the published
+  `oxideav-av1` ≥ 0.1.18, which carries the spatial-layer /
+  operating-point API the crate now uses.)
 - Two findings from the new fuzz target, fixed with regression tests:
   the coded-leaf search behind `inspect` on a derived primary expanded
   every `dimg` entry recursively without a visited set (a self-referencing
