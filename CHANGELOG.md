@@ -33,6 +33,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whose extents differ from the master's is resized (§6.9.1,
   nearest-neighbour).
 - `AvifPixelFormat::from_layout` / `without_alpha` layout helpers.
+- **Overlay + identity encode.** `AvifOverlayMuxer` / `OverlayLayer` emit
+  an `iovl` primary (HEIF §6.6.2.2 descriptor — 16- or 32-bit field
+  widths elected from the canvas extents / offsets, RGBA fill, hidden
+  `av01` layers with optional `clap` + alpha auxiliary + `prem`, `irot` /
+  `imir` on the derived item); `still::encode_still_overlay` /
+  `OverlayCanvas` / `OverlayLayerImage` drive it from pixels (each layer
+  coded like an `encode_still` primary; one shared coded layout).
+  `AvifMuxer::with_identity_derivation` / `IdentityDerivation` and
+  `StillProperties::identity_derivation` make the primary an `iden` item
+  (§6.6.2.1: no extents — absent from `iloc` — single `dimg` input, the
+  coded item left exposed) carrying `clap` / `irot` / `imir`.
+- Derived-image test suite (`tests/derived_images.rs`): overlay
+  8-bit 4:2:0 / 10-bit 4:2:2 (clipped negative offset) / identity-matrix
+  RGBA alpha-over with transparent fill / 12-bit monochrome odd offset +
+  `irot`, identity `irot` and `clap`+`imir` with inherited alpha — all
+  sample-exact through the decoder, plus black-box legs where an
+  external HEIF decoder binary is installed (8-bit renders of the derived
+  files are byte-identical to flat encodes of the composed pixels;
+  identity-matrix RGB rasters match directly).
 
 ## [0.0.11](https://github.com/OxideAV/oxideav-avif/compare/v0.0.10...v0.0.11) - 2026-08-15
 

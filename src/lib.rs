@@ -176,7 +176,10 @@ pub use meta::{
     ITEM_TYPE_EXIF, ITEM_TYPE_IDEN, ITEM_TYPE_IOVL, ITEM_TYPE_MIME, ITEM_TYPE_SATO, ITEM_TYPE_TMAP,
     ITEM_TYPE_URI,
 };
-pub use mux::{encode_still_av1, AvifGridMuxer, AvifMuxer, GridTile};
+pub use mux::{
+    encode_still_av1, AvifGridMuxer, AvifMuxer, AvifOverlayMuxer, GridTile, IdentityDerivation,
+    OverlayLayer,
+};
 pub use overlay::{composite_overlay, OverlayInput, MAX_OVERLAY_CANVAS_PIXELS};
 pub use parser::{
     audit_mif1, classify_brands, item_bytes, item_bytes_owned, item_bytes_owned_full,
@@ -203,8 +206,8 @@ pub use encoder::{make_encoder, AvifEncoder};
 
 #[cfg(feature = "registry")]
 pub use still::{
-    encode_still, encode_still_grid, StillChroma, StillEncodeOptions, StillImage, StillProperties,
-    STILL_MAX_CODED_DIM,
+    encode_still, encode_still_grid, encode_still_overlay, OverlayCanvas, OverlayLayerImage,
+    StillChroma, StillEncodeOptions, StillImage, StillProperties, STILL_MAX_CODED_DIM,
 };
 
 #[cfg(feature = "registry")]

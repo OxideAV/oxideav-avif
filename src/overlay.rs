@@ -40,7 +40,7 @@
 //! **Fill colour.** `canvas_fill_value` is sRGB RGBA. Converting it to
 //! the inputs' coded colour space is exact for the H.273 identity
 //! matrix (`matrix_coefficients = 0`, full range: `Y = G`, `Cb = B`,
-//! `Cr = R`, scaled from 16 bits to the coded depth) and for a
+//! `Cr = R`, the 16-bit code values narrowed to the coded depth) and for a
 //! full-range monochrome master with a neutral (`R = G = B`) fill.
 //! Any other pairing needs the H.273 RGB → YCbCr equations, which this
 //! module does not carry; the fill is then only accepted when it can
@@ -314,10 +314,12 @@ pub fn pack_planes(planes: &SamplePlanes) -> Result<(AvifFrame, AvifPixelFormat)
     ))
 }
 
-/// Scale a 16-bit fill channel (`0..=65535`) to `bit_depth` bits.
+/// Narrow a 16-bit fill colour channel to `bit_depth` bits by dropping
+/// the low bits — a writer that thinks in 8 bits pads its code values
+/// with zeros (`0xC0` → `0xC000`), and the shift reproduces them
+/// exactly (a linear rescale would turn `0xC000` into 191).
 fn scale16(v: u16, bit_depth: u8) -> u16 {
-    let max = (1u32 << bit_depth) - 1;
-    ((u32::from(v) * max + 32767) / 65535) as u16
+    v >> (16 - bit_depth)
 }
 
 /// Convert the sRGB RGBA `canvas_fill_value` to the inputs' coded
@@ -868,7 +870,7 @@ mod tests {
             assert_eq!(ofmt.plane_count(), 1);
             assert!(!ofmt.has_alpha());
             let o = unpack_planes(&out, ofmt, depth, 4, 1).unwrap();
-            let fill = (16384.0 * max as f64 / 65535.0).round();
+            let fill = f64::from(16384u16 >> (16 - depth));
             for (i, &a) in alphas.iter().enumerate() {
                 let alpha = a as f64 / max as f64;
                 let expect = (max as f64 * alpha + fill * (1.0 - alpha)).round() as i64;

@@ -48,7 +48,9 @@
 
 use crate::error::{AvifError as Error, Result};
 use crate::meta::{Clap, Colr};
-use crate::mux::{AvifGridMuxer, AvifMuxer, GridTile};
+use crate::mux::{
+    AvifGridMuxer, AvifMuxer, AvifOverlayMuxer, GridTile, IdentityDerivation, OverlayLayer,
+};
 
 use oxideav_av1::encoder::key_frame::encode_key_frame_yuv_with_q;
 use oxideav_av1::encoder::temporal_unit::encode_sequence_header_obu;
@@ -161,6 +163,11 @@ pub struct StillProperties {
     pub imir: Option<u8>,
     /// Pixel aspect ratio.
     pub pasp: Option<crate::meta::Pasp>,
+    /// Make the primary an `iden` identity derivation of the coded
+    /// image carrying these transformative properties (HEIF
+    /// §6.6.2.1) — the coded item stays exposed untransformed
+    /// alongside. See [`AvifMuxer::with_identity_derivation`].
+    pub identity_derivation: Option<IdentityDerivation>,
 }
 
 impl StillImage {
@@ -749,6 +756,9 @@ pub fn encode_still(img: &StillImage, opts: &StillEncodeOptions) -> Result<Vec<u
     if let Some(axis) = props.imir {
         mux = mux.with_imir(axis);
     }
+    if let Some(iden) = &props.identity_derivation {
+        mux = mux.with_identity_derivation(iden.clone());
+    }
     if let Some(alpha) = &img.alpha {
         let coded_alpha = encode_alpha(img, alpha, pw, ph, opts.alpha_q_idx)?;
         max_profile = max_profile.max(coded_alpha.seq_profile);
@@ -801,6 +811,7 @@ pub fn encode_still_grid(
         || img.props.irot.is_some()
         || img.props.imir.is_some()
         || img.props.pasp.is_some()
+        || img.props.identity_derivation.is_some()
     {
         return Err(Error::unsupported(
             "avif still: pass-through properties on the grid encode path are not yet supported",
@@ -873,6 +884,137 @@ pub fn encode_still_grid(
                 av1c: coded.av1c,
             });
         }
+    }
+    muxer = match max_profile {
+        0 => muxer,
+        1 => muxer.advanced_profile(),
+        _ => muxer.no_profile_brand(),
+    };
+    muxer.build()
+}
+
+/// The canvas of an overlay-derived encode ([`encode_still_overlay`]).
+#[derive(Clone, Debug)]
+pub struct OverlayCanvas {
+    /// `output_width` of the `iovl` descriptor (HEIF §6.6.2.2.3).
+    pub width: u32,
+    /// `output_height`.
+    pub height: u32,
+    /// `canvas_fill_value` — sRGB RGBA, 16 bits per channel, `A`
+    /// linear 0 (transparent) … 65535 (opaque). Shows wherever no
+    /// layer covers the canvas.
+    pub fill_rgba: [u16; 4],
+    /// `colr` for the overlay item; defaults to the first layer's.
+    pub colr: Option<Colr>,
+    /// `irot` on the overlay item (applies to the composed canvas).
+    pub irot: Option<u8>,
+    /// `imir` on the overlay item.
+    pub imir: Option<u8>,
+}
+
+impl OverlayCanvas {
+    /// An opaque-black canvas of the given extents.
+    pub fn new(width: u32, height: u32) -> Self {
+        Self {
+            width,
+            height,
+            fill_rgba: [0, 0, 0, 65535],
+            colr: None,
+            irot: None,
+            imir: None,
+        }
+    }
+}
+
+/// One layer of an overlay-derived encode: a still image and the
+/// canvas position of its top-left corner (signed — partially or
+/// wholly off-canvas placements are legal and clipped, §6.6.2.2.3).
+#[derive(Clone, Copy, Debug)]
+pub struct OverlayLayerImage<'a> {
+    /// The layer's pixels (alpha optional, encoded as its auxiliary).
+    pub image: &'a StillImage,
+    /// `horizontal_offset`.
+    pub x: i32,
+    /// `vertical_offset`.
+    pub y: i32,
+}
+
+/// Encode `layers` (bottom-most first) as an **overlay-derived** AVIF:
+/// the primary is an `iovl` item (HEIF §6.6.2.2) whose hidden `av01`
+/// inputs are the layers, each coded exactly like an [`encode_still`]
+/// primary (edge-replicated pad to the coded 8-grid + top-left `clap`,
+/// same-depth monochrome alpha auxiliary with `auxl` / `prem`). Every
+/// layer must share one bit depth and chroma layout so a reader can
+/// composite them without colour conversion.
+pub fn encode_still_overlay(
+    canvas: &OverlayCanvas,
+    layers: &[OverlayLayerImage<'_>],
+    opts: &StillEncodeOptions,
+) -> Result<Vec<u8>> {
+    if layers.is_empty() {
+        return Err(Error::invalid(
+            "avif still: overlay needs at least one layer",
+        ));
+    }
+    if canvas.width == 0 || canvas.height == 0 {
+        return Err(Error::invalid("avif still: overlay canvas dimensions zero"));
+    }
+    let first = layers[0].image;
+    let mut muxer = AvifOverlayMuxer::new(canvas.width, canvas.height)
+        .with_fill(canvas.fill_rgba)
+        .with_pixi(pixi_bits(first));
+    if let Some(colr) = canvas.colr.as_ref().or(first.colr.as_ref()) {
+        muxer = muxer.with_colr(colr.clone());
+    }
+    if let Some(angle) = canvas.irot {
+        muxer = muxer.with_irot(angle);
+    }
+    if let Some(axis) = canvas.imir {
+        muxer = muxer.with_imir(axis);
+    }
+    let mut max_profile = 0u8;
+    for (i, layer) in layers.iter().enumerate() {
+        let img = layer.image;
+        img.validate()?;
+        if (img.bit_depth, img.chroma) != (first.bit_depth, first.chroma) {
+            return Err(Error::unsupported(format!(
+                "avif still: overlay layer {i} is {}-bit {:?} but layer 0 is {}-bit {:?} — \
+                 layers must share one coded layout",
+                img.bit_depth, img.chroma, first.bit_depth, first.chroma
+            )));
+        }
+        let (pw, ph) = (coded_extent(img.width), coded_extent(img.height));
+        if pw > STILL_MAX_CODED_DIM || ph > STILL_MAX_CODED_DIM {
+            return Err(Error::unsupported(format!(
+                "avif still: overlay layer {i} coded extents {pw}x{ph} exceed {STILL_MAX_CODED_DIM}"
+            )));
+        }
+        let coded = encode_primary(img, pw, ph, opts.base_q_idx)?;
+        max_profile = max_profile.max(coded.seq_profile);
+        let clap = ((pw, ph) != (img.width, img.height))
+            .then(|| top_left_clap(img.width, img.height, pw, ph));
+        let alpha = match &img.alpha {
+            Some(a) => {
+                let coded_alpha = encode_alpha(img, a, pw, ph, opts.alpha_q_idx)?;
+                max_profile = max_profile.max(coded_alpha.seq_profile);
+                Some((coded_alpha.payload, coded_alpha.av1c))
+            }
+            None => None,
+        };
+        muxer = muxer.layer(OverlayLayer {
+            width: pw,
+            height: ph,
+            payload: coded.payload,
+            av1c: coded.av1c,
+            pixi: Some(pixi_bits(img)),
+            colr: img.colr.clone(),
+            clap,
+            alpha_pixi: alpha.as_ref().map(|_| vec![img.bit_depth]),
+            alpha,
+            premultiplied: opts.premultiplied_alpha,
+            offset_x: layer.x,
+            offset_y: layer.y,
+        });
     }
     muxer = match max_profile {
         0 => muxer,
