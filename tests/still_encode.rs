@@ -705,6 +705,129 @@ fn grid_tiling_election_and_auto_encode() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+// ───────────────────────── layered items ─────────────────────────
+
+/// Layered (progressive) AVIF: 2 and 3 independently coded spatial
+/// layers in one temporal unit. `a1lx` documents the per-layer byte
+/// sizes (summing to the item size), `lsel = 0xFFFF` lets the reader
+/// finish on the top layer (sample-exact), a pinned `lsel` renders
+/// that layer, an `a1op` operating point drops the upper layers, and
+/// the external AVIF decoder binary decodes the top layer exactly.
+#[test]
+fn layered_item_round_trips_and_selects_layers() {
+    use oxideav_avif::encode_still_layered;
+    let top = build_image(64, 48, 8, StillChroma::Yuv420);
+    let mid = build_image(32, 24, 8, StillChroma::Yuv420);
+    let base = build_image(16, 16, 8, StillChroma::Yuv420);
+
+    for layers in [vec![&mid, &top], vec![&base, &mid, &top]] {
+        let n = layers.len();
+        let label = format!("{n}-layer");
+        let avif = encode_still_layered(&layers, None, &StillEncodeOptions::default())
+            .expect("layered encode");
+        let info = inspect(&avif).expect("inspect");
+        assert_eq!(
+            (info.width, info.height),
+            (64, 48),
+            "{label}: ispe = top layer"
+        );
+        let a1lx = info.layered_index.expect("a1lx present");
+        assert_eq!(
+            a1lx.documented_layers(),
+            n - 1,
+            "{label}: n-1 documented sizes"
+        );
+        let parsed = parse(&avif).expect("parse");
+        let item_len = parsed.primary_item_data.len() as u32;
+        let documented: u32 = a1lx.layer_size.iter().sum();
+        assert!(documented < item_len, "{label}: last layer implicit");
+        assert!(audit_mif1(&avif).expect("audit").is_compliant());
+        assert!(
+            info.sequence_header_obu_compliance
+                .iter()
+                .all(|a| a.is_compliant()),
+            "{label}: exactly one sequence header"
+        );
+
+        let vf = decode_own(&label, &avif);
+        assert_eq!(vf.planes[0].data, narrow(&top.y), "{label}: top Y exact");
+        assert_eq!(vf.planes[1].data, narrow(&top.u), "{label}: top U exact");
+
+        // Pin the base layer.
+        let pinned = encode_still_layered(&layers, Some(0), &StillEncodeOptions::default())
+            .expect("pinned encode");
+        let info = inspect(&pinned).expect("inspect");
+        let first = layers[0];
+        assert_eq!((info.width, info.height), (first.width, first.height));
+        let vf = decode_own(&format!("{label} lsel=0"), &pinned);
+        assert_eq!(
+            vf.planes[0].data,
+            narrow(&first.y),
+            "{label}: layer 0 Y exact"
+        );
+        assert_eq!(vf.planes[0].stride as u32, first.width);
+
+        // Operating point 1 = drop the top layer (nested prefix
+        // points): the last decoded frame is layer n-2.
+        let a1op = oxideav_avif::AvifMuxer::new(
+            layers[n - 2].width,
+            layers[n - 2].height,
+            parsed.primary_item_data.to_vec(),
+            parsed.av1c.clone().expect("av1c"),
+        )
+        .with_operating_point(1)
+        .with_layer_selector(0xFFFF)
+        .build()
+        .expect("a1op mux");
+        let info = inspect(&a1op).expect("inspect");
+        assert_eq!(info.operating_point.map(|o| o.op_index), Some(1));
+        let vf = decode_own(&format!("{label} a1op=1"), &a1op);
+        let want = layers[n - 2];
+        assert_eq!(
+            vf.planes[0].stride as u32, want.width,
+            "{label}: op 1 width"
+        );
+        assert_eq!(vf.planes[0].data, narrow(&want.y), "{label}: op 1 Y exact");
+
+        // Black box: the external AVIF decoder renders the top layer.
+        let tmp = std::env::temp_dir().join(format!("oxideav-avif-layered-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).expect("tmp dir");
+        let in_path = tmp.join("layered.avif");
+        let out_path = tmp.join("layered.y4m");
+        std::fs::write(&in_path, &avif).expect("write");
+        match std::process::Command::new("avifdec")
+            .arg(&in_path)
+            .arg(&out_path)
+            .output()
+        {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("{label}: external decoder not installed — leg skipped");
+            }
+            Err(e) => panic!("spawn failed: {e}"),
+            Ok(out) => {
+                assert!(
+                    out.status.success(),
+                    "{label}: external decoder rejected the layered file: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let y4m = std::fs::read(&out_path).expect("read y4m");
+                let (gw, gh, _, planes) = parse_y4m(&y4m).expect("parse y4m");
+                assert_eq!((gw, gh), (64, 48), "{label}: external dims");
+                assert_eq!(planes[0], narrow(&top.y), "{label}: external Y exact");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // Guards: layer count, mixed layouts, oversize lower layer.
+    assert!(encode_still_layered(&[&top], None, &StillEncodeOptions::default()).is_err());
+    let hbd = build_image(32, 24, 10, StillChroma::Yuv420);
+    assert!(encode_still_layered(&[&hbd, &top], None, &StillEncodeOptions::default()).is_err());
+    let big = build_image(80, 48, 8, StillChroma::Yuv420);
+    assert!(encode_still_layered(&[&big, &top], None, &StillEncodeOptions::default()).is_err());
+    assert!(encode_still_layered(&[&mid, &top], Some(2), &StillEncodeOptions::default()).is_err());
+}
+
 // ───────────────────────── lossy leg ─────────────────────────
 
 /// Lossy encode: strictly smaller than the lossless sibling on smooth

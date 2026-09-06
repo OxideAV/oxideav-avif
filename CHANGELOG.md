@@ -64,6 +64,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   depth URN (`AvifMuxer::with_depth`).
 - `audit_alpha_bit_depth` resolves `av1C` through the derivation chain,
   so an alpha grid / grid master audits by its coded tiles.
+- **Layered (progressive) image items** both directions (av1-avif §2.3).
+  `encode_still_layered` codes 2..=4 renditions as independently
+  decodable AV1 spatial layers in one temporal unit (one Sequence
+  Header, `spatial_id` extension headers) and writes `a1lx` (per-layer
+  byte sizes from an OBU walk, §2.3.2.3), `lsel` (`0xFFFF` progressive
+  or a pinned layer, HEIF §6.5.11) with `ispe` / `clap` of the selected
+  layer (§2.2.2); `AvifMuxer::{with_layered_index, with_layer_selector,
+  with_operating_point}` expose the `a1lx` / `lsel` / `a1op` properties.
+  The decoder drains every shown frame of an item, renders the `lsel`
+  layer (or the top one), and honours `a1op` through the AV1 crate's
+  operating-point decode (upper layers dropped per §5.3.1). Top-layer
+  decode is exact and black-box accepted by the external AVIF decoder.
 - Derived-image test suite (`tests/derived_images.rs`): overlay
   8-bit 4:2:0 / 10-bit 4:2:2 (clipped negative offset) / identity-matrix
   RGBA alpha-over with transparent fill / 12-bit monochrome odd offset +

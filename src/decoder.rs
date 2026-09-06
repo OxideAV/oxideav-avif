@@ -439,10 +439,23 @@ const MAX_AV1_ITEM_BYTES: usize = 32 * 1024 * 1024;
 /// its inferred `(format, width, height)` triple. The slim
 /// [`VideoFrame`] no longer carries those fields, so we recover them
 /// from plane geometry.
+/// Which reconstructed image of a (possibly layered) AV1 Image Item to
+/// surface — av1-avif §2.3: the `a1op` operating point to process and
+/// the `lsel` spatial layer to render.
+#[derive(Clone, Copy, Debug, Default)]
+struct LayerSelect {
+    /// `a1op` `op_index`; `None` = operating point 0.
+    operating_point: Option<u8>,
+    /// `lsel` `layer_id`; `None` or `0xFFFF` = the top (last decoded)
+    /// layer.
+    layer_id: Option<u16>,
+}
+
 fn decode_av01_item(
     obu_bytes: &[u8],
     av1c: &[u8],
     ispe: Option<(u32, u32)>,
+    select: LayerSelect,
 ) -> Result<(VideoFrame, PixelFormat, u32, u32)> {
     if obu_bytes.len() > MAX_AV1_ITEM_BYTES {
         return Err(Error::invalid(format!(
@@ -453,25 +466,115 @@ fn decode_av01_item(
     }
     let cfg = Av1CodecConfig::parse(av1c)?; // eagerly validate
     validate_av1_config(&cfg)?;
-    let mut params = CodecParameters::video(CodecId::new("av1"));
-    if let Some((w, h)) = ispe {
-        params.width = Some(w);
-        params.height = Some(h);
-    }
-    params.extradata = av1c.to_vec();
-    let mut av1 = oxideav_av1::registry::make_decoder(&params)?;
-    let pkt = Packet::new(0, TimeBase::new(1, 90_000), obu_bytes.to_vec());
-    av1.send_packet(&pkt)?;
-    let frame = match av1.receive_frame()? {
-        Frame::Video(v) => v,
-        other => {
-            return Err(Error::unsupported(format!(
-                "avif: AV1 decoder returned non-video frame: {other:?}"
-            )))
+    // Every shown frame of the temporal unit, in decode order — a
+    // layered item (av1-avif §2.3.1) shows one frame per spatial
+    // layer, increasing `spatial_id`.
+    let frames: Vec<VideoFrame> = match select.operating_point {
+        Some(op) if op > 0 => decode_at_operating_point(obu_bytes, ispe, op)?,
+        _ => {
+            let mut params = CodecParameters::video(CodecId::new("av1"));
+            if let Some((w, h)) = ispe {
+                params.width = Some(w);
+                params.height = Some(h);
+            }
+            params.extradata = av1c.to_vec();
+            let mut av1 = oxideav_av1::registry::make_decoder(&params)?;
+            let pkt = Packet::new(0, TimeBase::new(1, 90_000), obu_bytes.to_vec());
+            av1.send_packet(&pkt)?;
+            let mut out = Vec::new();
+            loop {
+                match av1.receive_frame() {
+                    Ok(Frame::Video(v)) => out.push(v),
+                    Ok(other) => {
+                        return Err(Error::unsupported(format!(
+                            "avif: AV1 decoder returned non-video frame: {other:?}"
+                        )))
+                    }
+                    Err(Error::NeedMore) => break,
+                    Err(e) => {
+                        if out.is_empty() {
+                            return Err(e);
+                        }
+                        break;
+                    }
+                }
+            }
+            out
         }
+    };
+    if frames.is_empty() {
+        return Err(Error::invalid("avif: AV1 item decoded to no shown frame"));
+    }
+    let frame = match select.layer_id {
+        Some(id) if id != 0xFFFF => {
+            let idx = usize::from(id);
+            if idx >= frames.len() {
+                return Err(Error::invalid(format!(
+                    "avif: lsel layer_id {id} but the item decodes {} layer frame(s) \
+                     (av1-avif §2.3.2.2: the layer shall be present and produce an output frame)",
+                    frames.len()
+                )));
+            }
+            frames.into_iter().nth(idx).expect("index checked")
+        }
+        _ => frames.into_iter().last().expect("non-empty"),
     };
     let (format, width, height) = infer_av1_pixmap(&frame, &cfg)?;
     Ok((frame, format, width, height))
+}
+
+/// Decode an item's temporal unit at a non-default operating point
+/// (av1-avif §2.3.2.1 `a1op`): the registry decoder has no
+/// operating-point control, so the unit is wrapped in a one-frame IVF
+/// stream for the AV1 crate's operating-point-aware file decoder and
+/// its frames are lifted into `VideoFrame`s.
+fn decode_at_operating_point(
+    obu_bytes: &[u8],
+    ispe: Option<(u32, u32)>,
+    op: u8,
+) -> Result<Vec<VideoFrame>> {
+    use oxideav_av1::encoder::ivf::{build_file_header, build_frame_header, FOURCC_AV01};
+    let (w, h) = ispe.unwrap_or((0, 0));
+    let mut ivf = Vec::with_capacity(44 + obu_bytes.len());
+    ivf.extend_from_slice(&build_file_header(
+        FOURCC_AV01,
+        w.min(u32::from(u16::MAX)) as u16,
+        h.min(u32::from(u16::MAX)) as u16,
+        30,
+        1,
+        1,
+    ));
+    ivf.extend_from_slice(&build_frame_header(obu_bytes.len() as u32, 0));
+    ivf.extend_from_slice(obu_bytes);
+    let frames = oxideav_av1::decode_av1_at_operating_point(&ivf, op).map_err(|e| {
+        Error::invalid(format!(
+            "avif: AV1 decode at operating point {op} failed: {e}"
+        ))
+    })?;
+    frames
+        .into_iter()
+        .map(|f| match f {
+            oxideav_av1::decoder::Frame::Spec(sf) => {
+                let bps = if sf.bit_depth > 8 { 2 } else { 1 };
+                Ok(VideoFrame {
+                    pts: None,
+                    planes: sf
+                        .planes
+                        .iter()
+                        .zip(&sf.plane_dims)
+                        .map(|(data, &(pw, _))| VideoPlane {
+                            stride: pw as usize * bps,
+                            data: data.clone(),
+                        })
+                        .collect(),
+                })
+            }
+            #[allow(unreachable_patterns)]
+            other => Err(Error::unsupported(format!(
+                "avif: AV1 decoder returned an unexpected frame kind: {other:?}"
+            ))),
+        })
+        .collect()
 }
 
 /// An image item's output image (HEIF §6.3) in the crate-local
@@ -627,7 +730,17 @@ fn decode_coded_item(hdr: &AvifHeader<'_>, item_id: u32) -> Result<ItemImage> {
         Some(Property::Ispe(e)) => Some((e.width, e.height)),
         _ => None,
     };
-    let (core_frame, fmt_core, mut w, mut h) = decode_av01_item(&bytes, &av1c, ispe)?;
+    let select = LayerSelect {
+        operating_point: match hdr.meta.property_for(item_id, b"a1op") {
+            Some(Property::A1op(a)) => Some(a.op_index),
+            _ => None,
+        },
+        layer_id: match hdr.meta.property_for(item_id, b"lsel") {
+            Some(Property::Lsel(l)) => Some(l.layer_id),
+            _ => None,
+        },
+    };
+    let (core_frame, fmt_core, mut w, mut h) = decode_av01_item(&bytes, &av1c, ispe, select)?;
     let bit_depth = Av1CodecConfig::parse(&av1c)?.bit_depth();
     let mut frame = core_to_avif_frame(core_frame);
     let format = from_core_pix(fmt_core)?;

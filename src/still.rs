@@ -53,6 +53,7 @@ use crate::mux::{
 };
 
 use oxideav_av1::encoder::key_frame::encode_key_frame_yuv_with_q;
+use oxideav_av1::encoder::scalable_gop::encode_spatial_layered_gop_yuv_with_q;
 use oxideav_av1::encoder::temporal_unit::encode_sequence_header_obu;
 use oxideav_av1::encoder::yuv_frame::{ChromaFormat, YuvFrame};
 use oxideav_av1::{parse_obu, ObuType, SequenceHeader};
@@ -1158,4 +1159,188 @@ pub fn encode_still_overlay(
         _ => muxer.no_profile_brand(),
     };
     muxer.build()
+}
+
+/// Per-layer byte sizes of a layered AV1 Image Item Data payload, in
+/// increasing `spatial_id` order — the `a1lx` `layer_size` values
+/// (av1-avif §2.3.2.3.4). OBUs without an extension header (temporal
+/// delimiter, sequence header) belong to `spatial_id` 0.
+#[doc(hidden)]
+pub fn layer_byte_sizes(payload: &[u8]) -> Result<Vec<u32>> {
+    let mut sizes = [0u32; 4];
+    let mut max_layer = 0usize;
+    let mut off = 0usize;
+    while off < payload.len() {
+        let (obu, consumed) = parse_obu(&payload[off..])
+            .map_err(|e| Error::invalid(format!("avif still: layered payload OBU walk: {e}")))?;
+        let layer = usize::from(obu.spatial_id.min(3));
+        max_layer = max_layer.max(layer);
+        sizes[layer] += consumed as u32;
+        off += consumed;
+    }
+    Ok(sizes[..=max_layer].to_vec())
+}
+
+/// Encode a **layered** (progressive) AVIF: `layers` are renditions of
+/// one image at increasing resolution — every layer at most the top
+/// layer's extents, all sharing one bit depth and chroma layout, 2 to
+/// 4 of them — coded as independently decodable AV1 spatial layers
+/// inside a single temporal unit (one Sequence Header, av1-avif §2.1;
+/// each layer's frame OBUs carry `spatial_id`, §2.3.1). The item
+/// carries `a1lx` (per-layer byte sizes, §2.3.2.3) and `lsel`
+/// (HEIF §6.5.11): `render_layer = None` writes `0xFFFF`, allowing a
+/// reader to render every layer progressively and finish on the top
+/// one; `Some(s)` pins layer `s`. `ispe` / `clap` describe the
+/// selected layer (§2.2.2: the last frame decoded at operating point 0
+/// when unpinned).
+///
+/// Alpha (of the top layer only) rides as the usual single-layer
+/// auxiliary. Pass-through properties come from the top layer.
+pub fn encode_still_layered(
+    layers: &[&StillImage],
+    render_layer: Option<u8>,
+    opts: &StillEncodeOptions,
+) -> Result<Vec<u8>> {
+    if !(2..=4).contains(&layers.len()) {
+        return Err(Error::invalid(format!(
+            "avif still: layered encode needs 2..=4 layers, got {}",
+            layers.len()
+        )));
+    }
+    let top = layers[layers.len() - 1];
+    top.validate()?;
+    let mut frames: Vec<Vec<YuvFrame>> = Vec::with_capacity(layers.len());
+    let mut coded_dims = Vec::with_capacity(layers.len());
+    for (i, layer) in layers.iter().enumerate() {
+        layer.validate()?;
+        if (layer.bit_depth, layer.chroma) != (top.bit_depth, top.chroma) {
+            return Err(Error::unsupported(format!(
+                "avif still: layer {i} is {}-bit {:?} but the top layer is {}-bit {:?}",
+                layer.bit_depth, layer.chroma, top.bit_depth, top.chroma
+            )));
+        }
+        if layer.width > top.width || layer.height > top.height {
+            return Err(Error::invalid(format!(
+                "avif still: layer {i} ({}x{}) exceeds the top layer ({}x{})",
+                layer.width, layer.height, top.width, top.height
+            )));
+        }
+        let (pw, ph) = (coded_extent(layer.width), coded_extent(layer.height));
+        if pw > STILL_MAX_CODED_DIM || ph > STILL_MAX_CODED_DIM {
+            return Err(Error::unsupported(format!(
+                "avif still: layer {i} coded extents {pw}x{ph} exceed {STILL_MAX_CODED_DIM}"
+            )));
+        }
+        let (w, h) = (layer.width as usize, layer.height as usize);
+        let y = pad_plane(&layer.y, w, h, pw as usize, ph as usize);
+        let (u, v) = if layer.chroma.has_chroma() {
+            let (sx, sy) = layer.chroma.subsampling();
+            let (cw, ch) = layer.chroma_dims();
+            let (pcw, pch) = ((pw >> sx) as usize, (ph >> sy) as usize);
+            (
+                pad_plane(&layer.u, cw as usize, ch as usize, pcw, pch),
+                pad_plane(&layer.v, cw as usize, ch as usize, pcw, pch),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        frames.push(vec![YuvFrame {
+            width: pw,
+            height: ph,
+            bit_depth: layer.bit_depth,
+            format: layer.chroma.to_av1(),
+            y,
+            u,
+            v,
+        }]);
+        coded_dims.push((pw, ph));
+    }
+    let selected = match render_layer {
+        Some(s) if usize::from(s) < layers.len() => usize::from(s),
+        Some(s) => {
+            return Err(Error::invalid(format!(
+                "avif still: render_layer {s} out of range for {} layers",
+                layers.len()
+            )))
+        }
+        None => layers.len() - 1,
+    };
+    let coded = encode_spatial_layered_gop_yuv_with_q(&frames, opts.base_q_idx)
+        .map_err(|e| av1_err("layered", e))?;
+    let unit =
+        coded.temporal_units.into_iter().next().ok_or_else(|| {
+            Error::invalid("avif still: layered encode produced no temporal unit")
+        })?;
+    let payload = if colr_is_full_range(top) {
+        full_range_temporal_unit(&unit, &coded.seq)?
+    } else {
+        unit
+    };
+    let sizes = layer_byte_sizes(&payload)?;
+    if sizes.len() != layers.len() {
+        return Err(Error::invalid(format!(
+            "avif still: layered payload carries {} spatial layers, expected {}",
+            sizes.len(),
+            layers.len()
+        )));
+    }
+    let mut a1lx = [0u32; 3];
+    for (slot, size) in a1lx.iter_mut().zip(&sizes[..sizes.len() - 1]) {
+        *slot = *size;
+    }
+    let av1c = av1c_from_seq(&coded.seq);
+    let mut max_profile = coded.seq.seq_profile;
+
+    let (pw, ph) = coded_dims[selected];
+    let sel_img = layers[selected];
+    let mut mux = AvifMuxer::new(pw, ph, payload, av1c)
+        .with_pixi(pixi_bits(top))
+        .with_layered_index(a1lx)
+        .with_layer_selector(render_layer.map_or(0xFFFF, u16::from));
+    if (pw, ph) != (sel_img.width, sel_img.height) {
+        mux = mux.with_clap(top_left_clap(sel_img.width, sel_img.height, pw, ph));
+    }
+    if let Some(colr) = &top.colr {
+        mux = mux.with_colr(colr.clone());
+    }
+    let props = &top.props;
+    if let Some(exif) = &props.exif {
+        mux = mux.with_exif(exif.clone());
+    }
+    if let Some(xmp) = &props.xmp {
+        mux = mux.with_xmp(xmp.clone());
+    }
+    if let Some(mdcv) = props.mdcv {
+        mux = mux.with_mdcv(mdcv);
+    }
+    if let Some(clli) = props.clli {
+        mux = mux.with_clli(clli);
+    }
+    if let Some(amve) = props.amve {
+        mux = mux.with_amve(amve);
+    }
+    if let Some(pasp) = props.pasp {
+        mux = mux.with_pasp(pasp);
+    }
+    if let Some(angle) = props.irot {
+        mux = mux.with_irot(angle);
+    }
+    if let Some(axis) = props.imir {
+        mux = mux.with_imir(axis);
+    }
+    if selected == layers.len() - 1 {
+        if let Some(alpha) = &top.alpha {
+            let coded_alpha = encode_alpha(top, alpha, pw, ph, opts.alpha_q_idx)?;
+            max_profile = max_profile.max(coded_alpha.seq_profile);
+            mux = mux
+                .with_alpha(
+                    coded_alpha.payload,
+                    coded_alpha.av1c,
+                    opts.premultiplied_alpha,
+                )
+                .with_alpha_pixi(vec![top.bit_depth]);
+        }
+    }
+    mux = apply_profile_brand_mux(mux, max_profile);
+    mux.build()
 }

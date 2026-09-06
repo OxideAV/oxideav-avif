@@ -224,6 +224,41 @@ fn prop_auxc(urn: &str) -> PropBox {
 /// `mdcv` MasteringDisplayColourVolumeBox (ISO/IEC 14496-12 §12.1.5.3) —
 /// a plain box, no FullBox header. 6×u16 primaries + 2×u16 white point +
 /// 2×u32 luminance.
+/// `a1lx` (av1-avif §2.3.2.3): `large_size` elected when any layer
+/// size exceeds 16 bits; never essential (§2.3.2.3.2 `shall not`).
+fn prop_a1lx(layer_size: [u32; 3]) -> PropBox {
+    let large = layer_size.iter().any(|&v| v > u16::MAX as u32);
+    let mut w = W::default();
+    w.u8(if large { 1 } else { 0 });
+    for v in layer_size {
+        if large {
+            w.u32(v);
+        } else {
+            w.u16(v as u16);
+        }
+    }
+    PropBox {
+        bytes: boxed(b"a1lx", &w.into_vec()),
+        essential: false,
+    }
+}
+
+/// `lsel` (HEIF §6.5.11): `unsigned int(16) layer_id`, essential.
+fn prop_lsel(layer_id: u16) -> PropBox {
+    PropBox {
+        bytes: boxed(b"lsel", &layer_id.to_be_bytes()),
+        essential: true,
+    }
+}
+
+/// `a1op` (av1-avif §2.3.2.1): `unsigned int(8) op_index`, essential.
+fn prop_a1op(op_index: u8) -> PropBox {
+    PropBox {
+        bytes: boxed(b"a1op", &[op_index]),
+        essential: true,
+    }
+}
+
 fn prop_mdcv(m: &Mdcv) -> PropBox {
     let mut w = W::default();
     for (x, y) in m.display_primaries_xy {
@@ -333,6 +368,9 @@ pub struct AvifMuxer {
     exif: Option<Vec<u8>>,
     xmp: Option<Vec<u8>>,
     identity: Option<IdentityDerivation>,
+    layered_index: Option<[u32; 3]>,
+    layer_selector: Option<u16>,
+    operating_point: Option<u8>,
     profile_brand: ProfileBrand,
 }
 
@@ -391,6 +429,9 @@ impl AvifMuxer {
             exif: None,
             xmp: None,
             identity: None,
+            layered_index: None,
+            layer_selector: None,
+            operating_point: None,
             profile_brand: ProfileBrand::Baseline,
         }
     }
@@ -526,6 +567,32 @@ impl AvifMuxer {
         self
     }
 
+    /// Document a **layered** AV1 Image Item's per-layer byte sizes
+    /// (`a1lx`, av1-avif §2.3.2.3): `layer_size[i]` is the byte count of
+    /// the `i`-th spatial layer in the item data (increasing
+    /// `spatial_id`), the last layer implicit; trailing zeros for
+    /// absent layers. Never marked essential.
+    pub fn with_layered_index(mut self, layer_size: [u32; 3]) -> Self {
+        self.layered_index = Some(layer_size);
+        self
+    }
+
+    /// Attach the `lsel` layer selector (HEIF §6.5.11, essential): the
+    /// `spatial_id` to render (0..=3), or `0xFFFF` to allow progressive
+    /// rendering of every layer up to the top one (av1-avif §2.3.2.2).
+    pub fn with_layer_selector(mut self, layer_id: u16) -> Self {
+        self.layer_selector = Some(layer_id);
+        self
+    }
+
+    /// Attach the `a1op` operating-point selector (av1-avif §2.3.2.1,
+    /// essential): the index of the Sequence Header operating point a
+    /// reader shall process for this item.
+    pub fn with_operating_point(mut self, op_index: u8) -> Self {
+        self.operating_point = Some(op_index);
+        self
+    }
+
     /// Make the primary item an `iden` identity derivation of the coded
     /// image (HEIF §6.6.2.1): the coded `av01` item stays a non-hidden
     /// item (NOTE 2 — both the original and the derived rendition are
@@ -556,6 +623,19 @@ impl AvifMuxer {
             payload: self.primary_payload,
             props: vec![prop_av1c(&self.av1c), prop_ispe(self.width, self.height)],
         };
+        // Layer / operating-point selectors precede every other
+        // descriptive property (HEIF §6.5.11: `lsel` shall precede all
+        // transformative properties and selects the reconstructed
+        // image the subsequent descriptive properties describe).
+        if let Some(op) = self.operating_point {
+            primary.props.push(prop_a1op(op));
+        }
+        if let Some(layer) = self.layer_selector {
+            primary.props.push(prop_lsel(layer));
+        }
+        if let Some(sizes) = self.layered_index {
+            primary.props.push(prop_a1lx(sizes));
+        }
         if let Some(bits) = &self.pixi {
             primary.props.push(prop_pixi(bits));
         }

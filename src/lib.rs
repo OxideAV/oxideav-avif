@@ -206,9 +206,9 @@ pub use encoder::{make_encoder, AvifEncoder};
 
 #[cfg(feature = "registry")]
 pub use still::{
-    elect_grid_tiling, encode_still, encode_still_auto, encode_still_grid, encode_still_overlay,
-    OverlayCanvas, OverlayLayerImage, StillChroma, StillEncodeOptions, StillImage, StillProperties,
-    GRID_MIN_TILE_DIM, STILL_MAX_CODED_DIM,
+    elect_grid_tiling, encode_still, encode_still_auto, encode_still_grid, encode_still_layered,
+    encode_still_overlay, OverlayCanvas, OverlayLayerImage, StillChroma, StillEncodeOptions,
+    StillImage, StillProperties, GRID_MIN_TILE_DIM, STILL_MAX_CODED_DIM,
 };
 
 #[cfg(feature = "registry")]
