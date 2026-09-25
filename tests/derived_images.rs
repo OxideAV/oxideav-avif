@@ -402,9 +402,10 @@ fn overlay_rgba_identity_alpha_over_and_transparent_fill() {
                 // Transparent fill: opacity 0, colour = fill (Y=G,
                 // Cb=B, Cr=R scaled 16→8 bits).
                 assert_eq!(oa[i], 0, "alpha at {x},{y}");
-                // 16-bit fill code values narrowed to 8 bits: 0x8000 →
-                // 128, 0xC000 → 192, 0x4000 → 64.
-                assert_eq!((oy[i], ou[i], ov[i]), (128, 192, 64), "fill at {x},{y}");
+                // 16-bit fill code values scaled to 8 bits (× 255 /
+                // 65535, rounded): 0x8000 → 128, 0xC000 → 191,
+                // 0x4000 → 64.
+                assert_eq!((oy[i], ou[i], ov[i]), (128, 191, 64), "fill at {x},{y}");
                 continue;
             }
             assert_eq!(oa[i], 255, "alpha at {x},{y}");

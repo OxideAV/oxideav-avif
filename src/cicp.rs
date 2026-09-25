@@ -72,6 +72,17 @@ pub struct CicpTriple {
 }
 
 impl CicpTriple {
+    /// The container crate's `nclx` colour information for this
+    /// triple (used when composing through its layer).
+    pub(crate) fn to_colr(self) -> oxideav_heif::props::Colr {
+        oxideav_heif::props::Colr::Nclx {
+            primaries: self.colour_primaries,
+            transfer: self.transfer_characteristics,
+            matrix: self.matrix_coefficients,
+            full_range: self.full_range,
+        }
+    }
+
     /// Default CICP signalling per ITU-T H.273: every code point set
     /// to `2` (Unspecified), `full_range = false`.
     ///

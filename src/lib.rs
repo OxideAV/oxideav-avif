@@ -112,6 +112,7 @@ pub mod box_parser;
 pub mod cicp;
 pub mod derived;
 pub mod error;
+mod frame_bridge;
 pub mod grid;
 pub mod image;
 pub mod inspect;

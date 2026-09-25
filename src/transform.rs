@@ -1,65 +1,61 @@
-//! Post-decode geometric transforms for AVIF primary items.
+//! Post-decode geometric transforms for AVIF image items — HEIF §6.5.9
+//! (`clap`), §6.5.10 (`irot`) and §6.5.12 (`imir`) — applied by the
+//! container crate's composition layer ([`oxideav_heif::compose`]).
 //!
-//! Covers HEIF §6.5.10 (`irot`, rotation), §6.5.12 (`imir`, mirror) and
-//! §6.5.11 (`clap`, clean-aperture cropping). The canonical application
-//! order once an AV1 frame has been reconstructed is:
+//! The canonical order once an AV1 frame has been reconstructed is:
 //!
 //!   1. Crop to the `ispe` declared size if the coded frame was padded
-//!      to alignment.
+//!      to alignment ([`crop_top_left`] — AV1 codes odd 4:2:0 / 4:2:2
+//!      pictures with ceiling chroma extents, so this trim keeps the
+//!      subsampled layout; av1-avif §2.2.2).
 //!   2. Apply `clap`.
 //!   3. Apply `irot`.
 //!   4. Apply `imir`.
 //!
 //! Each entry point takes the source frame plus the stream-level
-//! `(format, width, height)` triple (the slim [`VideoFrame`] no longer
-//! carries those fields) and returns a freshly-allocated frame plus its
-//! new `(width, height)` (the format is preserved). The source frame is
-//! left untouched. The `VideoFrame` layout matches what `oxideav-av1`
-//! emits: one plane per channel (Y, U, V for the planar layouts, a
-//! single plane for gray / packed-YA), one byte per sample for the
-//! 8-bit formats and a little-endian 16-bit word per sample for the
-//! 10/12-bit (`*10Le` / `*12Le`) and `Ya16Le` formats. All geometry is
-//! expressed in pixels; the byte maths scales by the format's
-//! per-pixel storage width internally.
+//! `(format, width, height)` triple and returns a freshly-allocated
+//! frame plus its new `(width, height)`; the source is left untouched.
+//! MIAF §7.3.6.7 makes an odd clean aperture (or an odd crop edge) on
+//! a chroma-subsampled picture implicitly upsample to 4:4:4, and the
+//! container applies the same promotion when a rotation or mirror
+//! would need a chroma sample that does not exist; these three entry
+//! points cannot express a layout change through their `(frame, width,
+//! height)` result, so such a call is refused with
+//! [`AvifError::Unsupported`](crate::error::AvifError::Unsupported)
+//! — the decoder composes on the container frame directly and does
+//! carry the promoted layout through.
 //!
-//! The transforms are strictly pixel-level operations — they do not
-//! understand chroma siting or BT.709 vs. full-range semantics, both of
-//! which are orthogonal to geometric manipulation.
+//! A degenerate `clap` (zero denominator, or a clean aperture that does
+//! not fit the picture) is treated as absent (pass-through) rather
+//! than an error, as this crate always has.
+
+use oxideav_heif::compose;
+use oxideav_heif::props as hprops;
 
 use crate::error::{AvifError as Error, Result};
+use crate::frame_bridge::{from_heif, to_heif};
 use crate::image::{
     AvifFrame as VideoFrame, AvifPixelFormat as PixelFormat, AvifPlane as VideoPlane,
 };
 
 use crate::meta::{Clap, Imir, Irot};
 
-/// Return the `(horizontal, vertical)` chroma subsampling shifts for a
-/// pixel format. `0` means no subsampling on that axis.
 fn subsampling(format: PixelFormat) -> (u8, u8) {
     format.chroma_subsampling()
 }
 
-/// Return the number of planes that ride on this pixel format.
 fn plane_count(format: PixelFormat) -> usize {
     format.plane_count()
 }
 
-/// Bytes one *pixel* occupies within a plane of this format: the
-/// storage bytes per sample, doubled for the packed Y-A layouts whose
-/// single plane interleaves two samples per pixel.
 fn pixel_bytes(format: PixelFormat) -> usize {
     format.bytes_per_sample() * if format.is_packed_ya() { 2 } else { 1 }
 }
 
-/// True when `plane` carries full-resolution samples for this format:
-/// the luma plane (0) always, and the alpha plane (3) of the `Yuva*`
-/// layouts (alpha rides at luma resolution — av1-avif §4.1 codes it as
-/// a monochrome AV1 stream at the master's extents).
 fn plane_is_full_res(plane: usize) -> bool {
     plane == 0 || plane == 3
 }
 
-/// Per-plane pixel dimensions for a frame of the given format and dims.
 fn plane_dims(format: PixelFormat, width: u32, height: u32, plane: usize) -> Result<(u32, u32)> {
     let (sx, sy) = subsampling(format);
     if plane_is_full_res(plane) {
@@ -71,12 +67,10 @@ fn plane_dims(format: PixelFormat, width: u32, height: u32, plane: usize) -> Res
     }
 }
 
-/// Crop every plane of `frame` to the top-left `out_w × out_h` pixels.
-/// Used both by `clap` application and by the ispe-vs-coded-size clamp
-/// on padded frames.
-///
-/// Returns the cropped frame; the format is preserved, the new
-/// dimensions are `(out_w, out_h)`.
+/// Crop the top-left `out_w × out_h` window out of a coded picture —
+/// the trim from the AV1 coded extents to the `ispe` extents. The
+/// layout is preserved: subsampled chroma planes keep their ceiling
+/// extents exactly as AV1 codes an odd-sized 4:2:0 / 4:2:2 picture.
 pub fn crop_top_left(
     frame: &VideoFrame,
     format: PixelFormat,
@@ -97,24 +91,6 @@ pub fn crop_top_left(
     if out_w == width && out_h == height {
         return Ok(frame.clone());
     }
-    crop_rect(frame, format, width, height, 0, 0, out_w, out_h)
-}
-
-/// Generic rectangular crop. Offsets and size are expressed in luma
-/// coordinates; chroma planes are scaled down by their subsampling.
-/// Every dimension must respect the chroma subsampling (i.e. on Yuv420P
-/// the offsets and sizes must be even).
-#[allow(clippy::too_many_arguments)]
-fn crop_rect(
-    frame: &VideoFrame,
-    format: PixelFormat,
-    width: u32,
-    height: u32,
-    x: u32,
-    y: u32,
-    w: u32,
-    h: u32,
-) -> Result<VideoFrame> {
     let (sx, sy) = subsampling(format);
     let planes = plane_count(format);
     let unit = pixel_bytes(format);
@@ -127,27 +103,19 @@ fn crop_rect(
     }
     let mut out = Vec::with_capacity(planes);
     for p in 0..planes {
-        // Chroma extents round **up** (a 3-pixel-wide 4:2:0 crop keeps
-        // 2 chroma columns), matching `plane_dims` — every downstream
-        // consumer sizes chroma planes with the same ceiling, so a
-        // floor here would leave the last chroma column/row missing and
-        // the next transform reading past the plane.
-        let (px, py, pw, ph) = if plane_is_full_res(p) {
-            (x, y, w, h)
+        let (pw, ph) = if plane_is_full_res(p) {
+            (out_w, out_h)
         } else {
             (
-                x >> sx,
-                y >> sy,
-                ((w + (1 << sx) - 1) >> sx).max(1),
-                ((h + (1 << sy) - 1) >> sy).max(1),
+                ((out_w + (1 << sx) - 1) >> sx).max(1),
+                ((out_h + (1 << sy) - 1) >> sy).max(1),
             )
         };
         let src = &frame.planes[p];
-        let src_stride = src.stride;
         let (plane_w, _plane_h) = plane_dims(format, width, height, p)?;
         let mut data = Vec::with_capacity((pw as usize) * (ph as usize) * unit);
         for row in 0..ph as usize {
-            let src_row = (py as usize + row) * src_stride + (px as usize) * unit;
+            let src_row = row * src.stride;
             let end = src_row + (pw as usize) * unit;
             if end > src.data.len() {
                 return Err(Error::invalid(format!(
@@ -167,17 +135,59 @@ fn crop_rect(
     })
 }
 
-/// Apply a `clap` (clean-aperture) crop. Dimensions that fall outside
-/// the source rectangle or whose denominators are zero return the input
-/// unchanged (defensive: a malformed `clap` is treated as a no-op rather
-/// than an error so the rest of the image still renders).
-///
-/// `clap` crop width / height / horizontal / vertical offsets are signed
-/// rationals. The spec defines the crop centre as
-/// `((W - 1) / 2 + horizOff, (H - 1) / 2 + vertOff)`, and the crop is
-/// `cleanApertureWidth × cleanApertureHeight` pixels.
-///
-/// Returns the cropped frame and its new `(width, height)`.
+/// The clean-aperture size a `clap` asks for, or `None` when the
+/// property is degenerate (zero denominator) or does not fit the
+/// `width × height` picture — cases this crate passes through.
+pub(crate) fn clap_extent(clap: &Clap, width: u32, height: u32) -> Option<(u32, u32)> {
+    if clap.clean_aperture_width_d == 0
+        || clap.clean_aperture_height_d == 0
+        || clap.horiz_off_d == 0
+        || clap.vert_off_d == 0
+    {
+        return None;
+    }
+    let cw_num = clap.clean_aperture_width_n as i64;
+    let cw_den = clap.clean_aperture_width_d as i64;
+    let ch_num = clap.clean_aperture_height_n as i64;
+    let ch_den = clap.clean_aperture_height_d as i64;
+    let cw = (cw_num + cw_den / 2) / cw_den;
+    let ch = (ch_num + ch_den / 2) / ch_den;
+    if cw <= 0 || ch <= 0 || cw > i64::from(width) || ch > i64::from(height) {
+        return None;
+    }
+    Some((cw as u32, ch as u32))
+}
+
+/// Run one container transform on a crate-local frame and hand the
+/// result back in the same layout, refusing a layout change (the
+/// implicit 4:4:4 promotion) that the three-tuple API cannot carry.
+fn same_layout_transform(
+    frame: &VideoFrame,
+    format: PixelFormat,
+    width: u32,
+    height: u32,
+    what: &str,
+    op: impl FnOnce(&oxideav_heif::HeifFrame) -> oxideav_heif::Result<oxideav_heif::HeifFrame>,
+) -> Result<(VideoFrame, u32, u32)> {
+    let depth = format.bit_depth();
+    let input = to_heif(frame, format, depth, width, height)?;
+    let output = op(&input)?;
+    if output.format != input.format {
+        return Err(Error::unsupported(format!(
+            "avif {what}: {format:?} {width}x{height} needs the implicit 4:4:4 promotion \
+             (MIAF §7.3.6.7) — the result layout {:?} cannot be returned through this call; \
+             decode through the decoder, which carries the promoted layout",
+            output.format
+        )));
+    }
+    let (w, h) = (output.width, output.height);
+    let (mut out, _) = from_heif(&output)?;
+    out.pts = frame.pts;
+    Ok((out, w, h))
+}
+
+/// Apply a `clap` (HEIF §6.5.9). Degenerate / non-fitting apertures
+/// pass the frame through unchanged.
 pub fn apply_clap(
     frame: &VideoFrame,
     format: PixelFormat,
@@ -185,74 +195,32 @@ pub fn apply_clap(
     height: u32,
     clap: &Clap,
 ) -> Result<(VideoFrame, u32, u32)> {
-    if clap.clean_aperture_width_d == 0
-        || clap.clean_aperture_height_d == 0
-        || clap.horiz_off_d == 0
-        || clap.vert_off_d == 0
-    {
+    if clap_extent(clap, width, height).is_none() {
         return Ok((frame.clone(), width, height));
     }
-    let w = width as i64;
-    let h = height as i64;
-    // Crop width / height rounded to nearest integer.
-    let cw_num = clap.clean_aperture_width_n as i64;
-    let cw_den = clap.clean_aperture_width_d as i64;
-    let ch_num = clap.clean_aperture_height_n as i64;
-    let ch_den = clap.clean_aperture_height_d as i64;
-    let cw = (cw_num + cw_den / 2) / cw_den;
-    let ch = (ch_num + ch_den / 2) / ch_den;
-    if cw <= 0 || ch <= 0 || cw > w || ch > h {
-        return Ok((frame.clone(), width, height));
-    }
-    // Centre, as a float per the §6.5.9 clean-aperture geometry;
-    // denominators are 32-bit so f64 has enough precision.
-    let centre_x = (w - 1) as f64 / 2.0 + clap.horiz_off_n as f64 / clap.horiz_off_d as f64;
-    let centre_y = (h - 1) as f64 / 2.0 + clap.vert_off_n as f64 / clap.vert_off_d as f64;
-    let mut x0 = (centre_x - (cw - 1) as f64 / 2.0 + 0.5).floor() as i64;
-    let mut y0 = (centre_y - (ch - 1) as f64 / 2.0 + 0.5).floor() as i64;
-    if x0 < 0 {
-        x0 = 0;
-    }
-    if y0 < 0 {
-        y0 = 0;
-    }
-    if x0 + cw > w {
-        x0 = w - cw;
-    }
-    if y0 + ch > h {
-        y0 = h - ch;
-    }
-    // Subsampling requires even offsets / sizes on subsampled planes —
-    // snap defensively so chroma cropping matches luma.
-    let (sx, sy) = subsampling(format);
-    let align_x = 1i64 << sx;
-    let align_y = 1i64 << sy;
-    x0 -= x0 % align_x;
-    y0 -= y0 % align_y;
-    let cw_aligned = cw - (cw % align_x);
-    let ch_aligned = ch - (ch % align_y);
-    if cw_aligned <= 0 || ch_aligned <= 0 {
-        return Ok((frame.clone(), width, height));
-    }
-    let cropped = crop_rect(
-        frame,
-        format,
-        width,
-        height,
-        x0 as u32,
-        y0 as u32,
-        cw_aligned as u32,
-        ch_aligned as u32,
-    )?;
-    Ok((cropped, cw_aligned as u32, ch_aligned as u32))
+    let hclap = hprops::Clap::from(clap);
+    same_layout_transform(frame, format, width, height, "clap", |f| {
+        compose::apply_clap(f, &hclap)
+    })
 }
 
-/// Apply an `irot` rotation (counter-clockwise, 0..3 × 90°). Rotating by
-/// 90° or 270° swaps the width and height. Chroma subsampling stays the
-/// same — a Yuv420P input returns a Yuv420P output with swapped chroma
-/// dims.
-///
-/// Returns the rotated frame and its new `(width, height)`.
+/// A quarter turn of a picture with asymmetric chroma subsampling
+/// (4:2:2) would need chroma subsampled vertically instead — no such
+/// layout exists; MIAF §7.3.6.7 NOTE 2 leaves the chroma re-sampling
+/// after rotation to the reader, and the container rotates the chroma
+/// planes in place without promoting, so this crate refuses the case
+/// (`(sx, sy)` chroma shifts, `turns` in `1..=3`).
+pub(crate) fn rotation_keeps_layout((sx, sy): (u8, u8), turns: u8) -> Result<()> {
+    if (turns & 1) == 1 && sx != sy {
+        return Err(Error::unsupported(format!(
+            "avif irot: {}° rotation of a 4:2:2 picture requires symmetric subsampling",
+            u32::from(turns) * 90
+        )));
+    }
+    Ok(())
+}
+
+/// Apply an `irot` (HEIF §6.5.10): `angle × 90°` anti-clockwise.
 pub fn apply_irot(
     frame: &VideoFrame,
     format: PixelFormat,
@@ -264,74 +232,15 @@ pub fn apply_irot(
     if turns == 0 {
         return Ok((frame.clone(), width, height));
     }
-    let (sx, sy) = subsampling(format);
-    let planes = plane_count(format);
-    let unit = pixel_bytes(format);
-    if frame.planes.len() != planes {
-        return Err(Error::invalid(format!(
-            "avif irot: frame has {} planes, expected {planes}",
-            frame.planes.len()
-        )));
-    }
-    // If the rotation parity is odd, the chroma dim swap must keep the
-    // 4:2:0 / 4:2:2 property legal. For 4:2:2 (sx=1, sy=0) a 90° turn
-    // produces 2:2:4 — which isn't a legal YUV layout — so reject that
-    // combination explicitly.
-    let odd = (turns & 1) == 1;
-    if odd && sx != sy {
-        return Err(Error::unsupported(format!(
-            "avif irot: {}° rotation of {:?} requires symmetric subsampling",
-            turns as u32 * 90,
-            format
-        )));
-    }
-    let mut out_planes = Vec::with_capacity(planes);
-    for p in 0..planes {
-        let (pw, ph) = plane_dims(format, width, height, p)?;
-        let src = &frame.planes[p];
-        let (ow, oh) = if odd { (ph, pw) } else { (pw, ph) };
-        let mut data = vec![0u8; (ow as usize) * (oh as usize) * unit];
-        // For each output pixel (ox, oy), compute its source (src_x,
-        // src_y) under a `turns × 90°` counter-clockwise rotation. A
-        // pixel at input (x, y) maps to output (y, W-1-x) for one CCW
-        // turn; inverting that gives src_x = W-1-oy, src_y = ox.
-        for oy in 0..oh as usize {
-            for ox in 0..ow as usize {
-                let (src_x, src_y) = match turns {
-                    1 => (pw as usize - 1 - oy, ox),
-                    2 => (pw as usize - 1 - ox, ph as usize - 1 - oy),
-                    3 => (oy, ph as usize - 1 - ox),
-                    _ => unreachable!(),
-                };
-                let si = src_y * src.stride + src_x * unit;
-                let di = (oy * ow as usize + ox) * unit;
-                data[di..di + unit].copy_from_slice(&src.data[si..si + unit]);
-            }
-        }
-        out_planes.push(VideoPlane {
-            stride: (ow as usize) * unit,
-            data,
-        });
-    }
-    let (new_w, new_h) = if odd {
-        (height, width)
-    } else {
-        (width, height)
-    };
-    Ok((
-        VideoFrame {
-            pts: frame.pts,
-            planes: out_planes,
-        },
-        new_w,
-        new_h,
-    ))
+    rotation_keeps_layout(format.chroma_subsampling(), turns)?;
+    let hirot = hprops::Irot { angle: turns };
+    same_layout_transform(frame, format, width, height, "irot", |f| {
+        compose::apply_irot(f, &hirot)
+    })
 }
 
-/// Apply an `imir` mirror. `axis == 0` flips top↔bottom, `axis == 1`
-/// flips left↔right. This matches the AVIF 1.1 / HEIF convention.
-///
-/// Width and height are unchanged; returned for caller convenience.
+/// Apply an `imir` (HEIF §6.5.12): axis 0 exchanges top and bottom,
+/// axis 1 exchanges left and right.
 pub fn apply_imir(
     frame: &VideoFrame,
     format: PixelFormat,
@@ -339,45 +248,12 @@ pub fn apply_imir(
     height: u32,
     imir: &Imir,
 ) -> Result<(VideoFrame, u32, u32)> {
-    let axis = imir.axis & 0x01;
-    let planes = plane_count(format);
-    let unit = pixel_bytes(format);
-    if frame.planes.len() != planes {
-        return Err(Error::invalid(format!(
-            "avif imir: frame has {} planes, expected {planes}",
-            frame.planes.len()
-        )));
-    }
-    let mut out_planes = Vec::with_capacity(planes);
-    for p in 0..planes {
-        let (pw, ph) = plane_dims(format, width, height, p)?;
-        let src = &frame.planes[p];
-        let mut data = vec![0u8; (pw as usize) * (ph as usize) * unit];
-        for y in 0..ph as usize {
-            for x in 0..pw as usize {
-                let (sx, sy) = if axis == 1 {
-                    (pw as usize - 1 - x, y)
-                } else {
-                    (x, ph as usize - 1 - y)
-                };
-                let si = sy * src.stride + sx * unit;
-                let di = (y * pw as usize + x) * unit;
-                data[di..di + unit].copy_from_slice(&src.data[si..si + unit]);
-            }
-        }
-        out_planes.push(VideoPlane {
-            stride: (pw as usize) * unit,
-            data,
-        });
-    }
-    Ok((
-        VideoFrame {
-            pts: frame.pts,
-            planes: out_planes,
-        },
-        width,
-        height,
-    ))
+    let himir = hprops::Imir {
+        axis: imir.axis & 0x01,
+    };
+    same_layout_transform(frame, format, width, height, "imir", |f| {
+        compose::apply_imir(f, &himir)
+    })
 }
 
 #[cfg(test)]

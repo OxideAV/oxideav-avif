@@ -24,20 +24,23 @@ use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, 
 
 use crate::av1_config::Av1CodecConfig;
 
-use crate::alpha::{composite_alpha, find_alpha_item_id};
+use crate::alpha::find_alpha_item_id;
 use crate::avis::{parse_avis, sample_bytes};
 use crate::box_parser::{b, BoxType};
 use crate::cicp::effective_cicp;
 use crate::derived::{ImageOverlay, MAX_DERIVATION_DEPTH};
-use crate::grid::{composite_grid, ImageGrid};
+use crate::frame_bridge::{from_heif, to_heif};
+use crate::grid::ImageGrid;
 use crate::image::{AvifFrame, AvifPixelFormat, AvifPlane};
 use crate::inspect::{build_info, build_info_derived, build_info_grid, AvifInfo};
 use crate::meta::{Property, ITEM_TYPE_IDEN, ITEM_TYPE_IOVL};
-use crate::overlay::{composite_overlay, pack_planes, unpack_planes, OverlayInput, SamplePlanes};
 use crate::parser::{
     classify_brands, parse, parse_header, AvifHeader, ITEM_TYPE_AV01, ITEM_TYPE_GRID,
 };
-use crate::transform::{apply_clap, apply_imir, apply_irot, crop_top_left};
+use crate::transform::{clap_extent, crop_top_left, rotation_keeps_layout};
+use oxideav_heif::compose;
+use oxideav_heif::props as hprops;
+use oxideav_heif::{Chroma, HeifFrame, HeifPixelFormat, HeifPlane};
 
 /// Re-export the `inspect` entry point so the registry-gated public API
 /// keeps its historical shape (`oxideav_avif::inspect`).
@@ -228,16 +231,17 @@ impl AvifDecoder {
 
         let mut ctx = DecodeCtx::default();
         let image = decode_item_output(&hdr, primary_id, 0, &mut ctx, true)?;
-        let format = image.format;
-        let mut out = avif_to_core_frame(image.frame);
+        let bit_depth = image.format.bit_depth;
+        let (frame, format) = from_heif(&image).map_err(core_err)?;
+        let mut out = avif_to_core_frame(frame);
         // A composited 10/12-bit monochrome + alpha frame rides the
         // 16-bit `Ya16Le` storage with the coded values in the low
         // bits; surface the effective depth through the core per-plane
         // significant-bits side channel (one packed image plane, both
         // components at the master depth per the av1-avif §4.1
         // same-depth `shall`).
-        if format == AvifPixelFormat::Ya16Le && image.bit_depth < 16 {
-            out.set_significant_bits(vec![image.bit_depth]);
+        if format == AvifPixelFormat::Ya16Le && bit_depth < 16 {
+            out.set_significant_bits(vec![bit_depth]);
         }
         self.pending.push(Frame::Video(out));
         self.info = Some(info.clone());
@@ -600,17 +604,14 @@ struct DecodeCtx {
     decodes: u32,
 }
 
-/// An image item's output image (HEIF §6.3) in the crate-local
-/// composition representation.
-#[derive(Clone)]
-struct ItemImage {
-    frame: AvifFrame,
-    format: AvifPixelFormat,
-    /// Coded bit depth of the leaf `av01` items (8 / 10 / 12) — the
-    /// packed `Ya16Le` layout does not encode it.
-    bit_depth: u8,
-    width: u32,
-    height: u32,
+/// An image item's output image (HEIF §6.3) — the container crate's
+/// planar frame, which its composition layer works on directly. The
+/// crate-local layout (packed `Ya8` / `Ya16Le`, the framework
+/// `PixelFormat`) is produced once, for the primary's final output.
+type ItemImage = HeifFrame;
+
+fn heif_err(e: oxideav_heif::HeifError) -> Error {
+    core_err(crate::error::AvifError::from(e))
 }
 
 /// Decode the output image of any image item — coded or derived —
@@ -619,12 +620,14 @@ struct ItemImage {
 /// 1. the **reconstructed image**: the AV1 decode of an `av01` item,
 ///    the tile stitch of a `grid`, the canvas composition of an
 ///    `iovl`, or the single input of an `iden`;
-/// 2. the alpha auxiliary (`auxl` + alpha `auxC`) composited into the
+/// 2. the alpha auxiliary (`auxl` + alpha `auxC`) attached to the
 ///    frame when `with_alpha` is set — the caller's rendering context
 ///    decides: the primary and overlay inputs carry their alpha, grid
 ///    tiles and auxiliaries themselves do not;
 /// 3. the item's transformative properties (`clap` / `irot` /
-///    `imir`) applied in `ipma` order (§6.3).
+///    `imir`) applied in `ipma` order (§6.3) by the container's
+///    composition layer — an odd clean aperture on subsampled chroma
+///    promotes the picture to 4:4:4 (MIAF §7.3.6.7).
 ///
 /// `depth` + the context's stack guard the walk against hostile
 /// graphs: chains deeper than [`MAX_DERIVATION_DEPTH`] and `dimg`
@@ -692,9 +695,6 @@ fn decode_item_output_inner(
                 inputs.len()
             )));
         }
-        // The identity derivation's reconstructed image is its input's
-        // output image (§6.6.1) — alpha included, so a `clap` on the
-        // iden crops colour and alpha together.
         decode_item_output(hdr, inputs[0], depth + 1, ctx, with_alpha)?
     } else {
         return Err(Error::unsupported(format!(
@@ -702,54 +702,59 @@ fn decode_item_output_inner(
             String::from_utf8_lossy(&item_type)
         )));
     };
-
     if with_alpha {
         if let Some(alpha_id) = find_alpha_item_id(&hdr.meta, item_id) {
-            if image.format.has_alpha() {
+            if image.format.has_alpha {
                 return Err(Error::unsupported(format!(
                     "avif: item {item_id} already carries alpha and has an alpha auxiliary {alpha_id}"
                 )));
             }
             let alpha = decode_item_output(hdr, alpha_id, depth + 1, ctx, false)?;
-            let alpha = alpha_as_gray(alpha, image.width, image.height)?;
-            let (composited, fmt) = composite_alpha(
-                &image.frame,
-                image.format,
-                image.width,
-                image.height,
-                &alpha.frame,
-                alpha.format,
-            )
-            .map_err(core_err)?;
-            image.frame = composited;
-            image.format = fmt;
+            let alpha = alpha_as_gray(&alpha, image.width, image.height)?;
+            if alpha.format.bit_depth != image.format.bit_depth {
+                return Err(Error::invalid(format!(
+                    "avif alpha: alpha item {alpha_id} is {}-bit but master item {item_id} is \
+                     {}-bit — the auxiliary shall be encoded at the master's bit depth \
+                     (av1-avif §4.1)",
+                    alpha.format.bit_depth, image.format.bit_depth
+                )));
+            }
+            image = compose::attach_alpha(&image, &alpha).map_err(heif_err)?;
         }
     }
-
-    // Transformative properties, in ipma order (§6.3).
     for prop in transforms_for(&hdr.meta, item_id) {
-        let (f, w, h) = match prop {
+        image = match prop {
             Property::Clap(clap) => {
-                apply_clap(&image.frame, image.format, image.width, image.height, clap)
+                // A degenerate / non-fitting clean aperture is treated
+                // as absent, as this crate always has.
+                if clap_extent(clap, image.width, image.height).is_none() {
+                    continue;
+                }
+                compose::apply_clap(&image, &hprops::Clap::from(clap))
             }
             Property::Irot(irot) => {
-                apply_irot(&image.frame, image.format, image.width, image.height, irot)
+                let turns = irot.angle & 0x03;
+                if turns != 0 {
+                    let (sx, sy) = image.format.chroma.shift();
+                    rotation_keeps_layout((sx as u8, sy as u8), turns).map_err(core_err)?;
+                }
+                compose::apply_irot(&image, &hprops::Irot { angle: turns })
             }
-            Property::Imir(imir) => {
-                apply_imir(&image.frame, image.format, image.width, image.height, imir)
-            }
+            Property::Imir(imir) => compose::apply_imir(
+                &image,
+                &hprops::Imir {
+                    axis: imir.axis & 0x01,
+                },
+            ),
             _ => continue,
         }
-        .map_err(core_err)?;
-        image.frame = f;
-        image.width = w;
-        image.height = h;
+        .map_err(heif_err)?;
     }
     Ok(image)
 }
 
 /// Decode one coded `av01` item: AV1 decode + the `ispe` clamp against
-/// a padded coded frame.
+/// a padded coded frame, re-laid out as the container frame.
 fn decode_coded_item(hdr: &AvifHeader<'_>, item_id: u32) -> Result<ItemImage> {
     let bytes = hdr.item_data(item_id).map_err(core_err)?;
     let av1c = match hdr.meta.property_for(item_id, &AV1C) {
@@ -778,9 +783,6 @@ fn decode_coded_item(hdr: &AvifHeader<'_>, item_id: u32) -> Result<ItemImage> {
     let bit_depth = Av1CodecConfig::parse(&av1c)?.bit_depth();
     let mut frame = core_to_avif_frame(core_frame);
     let format = from_core_pix(fmt_core)?;
-    // ispe-based crop against coded dimensions: if the AV1 decoder
-    // emitted a padded frame the ispe width/height clamps it back to
-    // the declared extents.
     if let Some((iw, ih)) = ispe {
         if iw > 0 && ih > 0 && iw <= w && ih <= h && (iw != w || ih != h) {
             frame = crop_top_left(&frame, format, w, h, iw, ih).map_err(core_err)?;
@@ -788,13 +790,7 @@ fn decode_coded_item(hdr: &AvifHeader<'_>, item_id: u32) -> Result<ItemImage> {
             h = ih;
         }
     }
-    Ok(ItemImage {
-        frame,
-        format,
-        bit_depth,
-        width: w,
-        height: h,
-    })
+    to_heif(&frame, format, bit_depth, w, h).map_err(core_err)
 }
 
 /// Decode a `grid` derived item: decode each `dimg` input (its output
@@ -832,45 +828,26 @@ fn decode_grid_item(
             grid.output_width, grid.output_height
         )));
     }
-    let mut tiles: Vec<AvifFrame> = Vec::with_capacity(tile_ids.len());
-    let mut tile_format: Option<AvifPixelFormat> = None;
-    let mut tile_dims: Option<(u32, u32)> = None;
-    let mut bit_depth = 8u8;
+    let mut tiles: Vec<HeifFrame> = Vec::with_capacity(tile_ids.len());
     for (i, tid) in tile_ids.iter().enumerate() {
         let tile = decode_item_output(hdr, *tid, depth + 1, ctx, false)?;
-        if let Some(want_fmt) = tile_format {
-            if want_fmt != tile.format {
+        if let Some(first) = tiles.first() {
+            if first.format != tile.format {
                 return Err(Error::invalid(format!(
-                    "avif: grid tile {i} format {:?} differs from tile 0 {want_fmt:?}",
-                    tile.format
+                    "avif: grid tile {i} format {:?} differs from tile 0 {:?}",
+                    tile.format, first.format
                 )));
             }
-        } else {
-            tile_format = Some(tile.format);
-            bit_depth = tile.bit_depth;
-        }
-        if let Some((tw, th)) = tile_dims {
-            if (tw, th) != (tile.width, tile.height) {
+            if (first.width, first.height) != (tile.width, tile.height) {
                 return Err(Error::invalid(format!(
-                    "avif: grid tile {i} dims {}x{} differ from tile 0 {tw}x{th}",
-                    tile.width, tile.height
+                    "avif: grid tile {i} dims {}x{} differ from tile 0 {}x{}",
+                    tile.width, tile.height, first.width, first.height
                 )));
             }
-        } else {
-            tile_dims = Some((tile.width, tile.height));
         }
-        tiles.push(tile.frame);
+        tiles.push(tile);
     }
-    let format = tile_format.expect("at least one tile present");
-    let (tile_w, tile_h) = tile_dims.expect("at least one tile present");
-    let composited = composite_grid(&grid, &tiles, format, tile_w, tile_h).map_err(core_err)?;
-    Ok(ItemImage {
-        frame: composited,
-        format,
-        bit_depth,
-        width: grid.output_width,
-        height: grid.output_height,
-    })
+    crate::grid::composite_grid_frames(&grid, &tiles).map_err(core_err)
 }
 
 const COLR: BoxType = b(b"colr");
@@ -889,7 +866,8 @@ fn is_premultiplied(hdr: &AvifHeader<'_>, item_id: u32) -> bool {
 
 /// Decode an `iovl` derived item: parse the descriptor, decode every
 /// input's output image (alpha included), and composite onto the
-/// canvas (HEIF §6.6.2.2 + §6.9.1).
+/// canvas (HEIF §6.6.2.2 + §6.9.1) — the fill converted with the
+/// output's colour information (MIAF §7.3.6.4 default when absent).
 fn decode_overlay_item(
     hdr: &AvifHeader<'_>,
     iovl_id: u32,
@@ -905,7 +883,6 @@ fn decode_overlay_item(
         return Err(Error::invalid("avif: iovl item has no dimg iref"));
     }
     let desc = ImageOverlay::parse(&bytes, sources.len()).map_err(core_err)?;
-    // Reject an oversized canvas before decoding a single input.
     let area = u64::from(desc.output_width) * u64::from(desc.output_height);
     if desc.output_width == 0 || desc.output_height == 0 {
         return Err(Error::invalid("avif: iovl canvas dimensions zero"));
@@ -918,12 +895,24 @@ fn decode_overlay_item(
             crate::overlay::MAX_OVERLAY_CANVAS_PIXELS
         )));
     }
-    let mut inputs = Vec::with_capacity(sources.len());
-    for &src in &sources {
-        inputs.push((
-            decode_item_output(hdr, src, depth + 1, ctx, true)?,
-            is_premultiplied(hdr, src),
-        ));
+    let mut inputs: Vec<(HeifFrame, bool)> = Vec::with_capacity(sources.len());
+    for (i, &src) in sources.iter().enumerate() {
+        let image = decode_item_output(hdr, src, depth + 1, ctx, true)?;
+        if let Some((first, _)) = inputs.first() {
+            if (first.format.chroma, first.format.bit_depth)
+                != (image.format.chroma, image.format.bit_depth)
+            {
+                return Err(Error::unsupported(format!(
+                    "avif overlay: input {i} layout ({}-bit {:?}) differs from input 0 \
+                     ({}-bit {:?}) — mixed layouts are not composited",
+                    image.format.bit_depth,
+                    image.format.chroma,
+                    first.format.bit_depth,
+                    first.format.chroma
+                )));
+            }
+        }
+        inputs.push((image, is_premultiplied(hdr, src)));
     }
     let colr = match hdr.meta.property_for(iovl_id, &COLR) {
         Some(Property::Colr(c)) => Some(c.clone()),
@@ -932,79 +921,56 @@ fn decode_overlay_item(
             _ => None,
         },
     };
-    let cicp = effective_cicp(colr.as_ref());
-    let overlay_inputs: Vec<OverlayInput<'_>> = inputs
+    let colr = effective_cicp(colr.as_ref()).to_colr();
+    let overlay_inputs: Vec<compose::OverlayInput<'_>> = inputs
         .iter()
-        .zip(&desc.entries)
-        .map(|((img, prem), entry)| OverlayInput {
-            frame: &img.frame,
-            format: img.format,
-            bit_depth: img.bit_depth,
-            width: img.width,
-            height: img.height,
-            offset_x: i64::from(entry.horizontal_offset),
-            offset_y: i64::from(entry.vertical_offset),
-            premultiplied: *prem,
+        .map(|(frame, premultiplied)| compose::OverlayInput {
+            frame,
+            premultiplied: *premultiplied,
         })
         .collect();
-    let (frame, format, w, h) =
-        composite_overlay(&desc, &overlay_inputs, &cicp).map_err(core_err)?;
-    Ok(ItemImage {
-        frame,
-        format,
-        bit_depth: inputs[0].0.bit_depth,
-        width: w,
-        height: h,
-    })
+    crate::overlay::composite_overlay_frames(&desc, &overlay_inputs, &colr).map_err(core_err)
 }
 
-/// Reduce a decoded alpha auxiliary to the single-plane gray layout
-/// [`composite_alpha`] consumes: only the luma plane of a colour-coded
-/// alpha is relevant (HEIF §6.9.1), and an alpha plane whose extents
-/// differ from the master's is resized to them (§6.9.1;
-/// nearest-neighbour).
-fn alpha_as_gray(alpha: ItemImage, master_w: u32, master_h: u32) -> Result<ItemImage> {
-    let planes = unpack_planes(
-        &alpha.frame,
-        alpha.format,
-        alpha.bit_depth,
-        alpha.width,
-        alpha.height,
-    )
-    .map_err(core_err)?;
-    let mut y = planes.y;
-    let (aw, ah) = (planes.width, planes.height);
-    if (aw, ah) != (master_w, master_h) {
-        let mut resized = Vec::with_capacity(master_w as usize * master_h as usize);
+/// Reduce a decoded alpha auxiliary to the single-plane gray frame the
+/// attachment consumes: only the luma plane of a colour-coded alpha is
+/// relevant (HEIF §6.9.1), and an alpha plane whose extents differ from
+/// the master's is resized to them (§6.9.1 — the rescaling is
+/// unspecified; this crate's reading is nearest-neighbour, kept here
+/// so the result is independent of the container's resampler).
+fn alpha_as_gray(alpha: &ItemImage, master_w: u32, master_h: u32) -> Result<ItemImage> {
+    let depth = alpha.format.bit_depth;
+    let bps = alpha.format.bytes_per_sample();
+    let (aw, ah) = (alpha.width, alpha.height);
+    let luma = &alpha.planes[0];
+    let mut data = Vec::with_capacity(master_w as usize * master_h as usize * bps);
+    if (aw, ah) == (master_w, master_h) {
+        for r in 0..ah as usize {
+            let s = r * luma.stride;
+            data.extend_from_slice(&luma.data[s..s + aw as usize * bps]);
+        }
+    } else {
         for r in 0..master_h {
             let sr = (u64::from(r) * u64::from(ah) / u64::from(master_h)) as usize;
+            let row = sr * luma.stride;
             for c in 0..master_w {
                 let sc = (u64::from(c) * u64::from(aw) / u64::from(master_w)) as usize;
-                resized.push(y[sr * aw as usize + sc]);
+                data.extend_from_slice(&luma.data[row + sc * bps..row + (sc + 1) * bps]);
             }
         }
-        y = resized;
     }
-    let gray = SamplePlanes {
+    let format = HeifPixelFormat::new(Chroma::Mono, depth, false).map_err(heif_err)?;
+    let out = HeifFrame {
         width: master_w,
         height: master_h,
-        bit_depth: planes.bit_depth,
-        sx: 0,
-        sy: 0,
-        gray: true,
-        y,
-        u: Vec::new(),
-        v: Vec::new(),
-        alpha: None,
-    };
-    let (frame, format) = pack_planes(&gray).map_err(core_err)?;
-    Ok(ItemImage {
-        frame,
         format,
-        bit_depth: planes.bit_depth,
-        width: master_w,
-        height: master_h,
-    })
+        planes: vec![HeifPlane {
+            stride: master_w as usize * bps,
+            data,
+        }],
+    };
+    out.validate().map_err(heif_err)?;
+    Ok(out)
 }
 
 impl Decoder for AvifDecoder {

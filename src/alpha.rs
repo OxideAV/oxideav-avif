@@ -10,9 +10,14 @@
 //!      URN starts with `urn:mpeg:mpegB:cicp:systems:auxiliary:alpha`.
 //!
 //! The helpers here locate the alpha item id, verify the URN match,
-//! and composite a decoded alpha plane onto a decoded colour frame.
-//! The composite path supports every colour layout the underlying AV1
-//! decoder emits, at every AV1 bit depth (8 / 10 / 12):
+//! and composite a decoded alpha plane onto a decoded colour frame —
+//! the §6.9.1 attachment is the container crate's
+//! ([`oxideav_heif::compose::attach_alpha`]); this crate adds the
+//! av1-avif v1.2.0 §4.1 `shall` ("AV1 Alpha Image Item ... shall be
+//! encoded with the same bit depth as the associated master AV1 Image
+//! Item") as a pre-check — a depth mismatch returns
+//! `Error::InvalidData` instead of being rescaled — and maps the
+//! result back onto its frame model:
 //!
 //!   * `Yuv420P`/`Yuv422P`/`Yuv444P` (+ their `*10Le` / `*12Le`
 //!     companions) + same-depth gray alpha -> the matching `Yuva*`
@@ -20,33 +25,28 @@
 //!   * `Gray8` + `Gray8` alpha -> packed `Ya8`; `Gray10Le` /
 //!     `Gray12Le` with same-depth alpha -> packed `Ya16Le` (raw coded
 //!     values in the low bits of each 16-bit LE word).
-//!
-//! The alpha auxiliary must carry the **same bit depth** as the master
-//! (the av1-avif §4.1 `shall`: "An AV1 Alpha Image Item ... shall be
-//! encoded with the same bit depth as the associated master AV1 Image
-//! Item"); a depth mismatch returns `Error::InvalidData`.
+
+use oxideav_heif::compose;
 
 use crate::error::{AvifError as Error, Result};
-use crate::image::{
-    AvifFrame as VideoFrame, AvifPixelFormat as PixelFormat, AvifPlane as VideoPlane,
-};
+use crate::frame_bridge::{from_heif, to_heif};
+#[cfg(test)]
+use crate::image::AvifPlane as VideoPlane;
+use crate::image::{AvifFrame as VideoFrame, AvifPixelFormat as PixelFormat};
 
 use crate::box_parser::{b, BoxType};
 use crate::meta::{Meta, Property};
 
-/// The CICP alpha-auxiliary URN. AVIF §7.3.3.
+/// The codec-independent alpha `aux_type` URN prefix (HEIF §6.9.1).
 pub const ALPHA_URN_PREFIX: &str = "urn:mpeg:mpegB:cicp:systems:auxiliary:alpha";
 
 const AUXL: BoxType = b(b"auxl");
 const AUXC: BoxType = b(b"auxC");
 
-/// Locate the alpha auxiliary item for the given primary item. Returns
-/// `Some(item_id)` when both an `auxl` iref targeting `primary_id` and a
-/// matching `auxC` URN are present; `None` otherwise.
+/// The alpha auxiliary of `primary_id`: the first `auxl` source whose
+/// `auxC` names the alpha URN.
 pub fn find_alpha_item_id(meta: &Meta, primary_id: u32) -> Option<u32> {
-    // Candidate: source of an auxl iref whose to_ids contains primary_id.
     let candidate = meta.iref_source_of(&AUXL, primary_id)?;
-    // Verify the candidate's auxC property carries the alpha URN.
     if let Some(Property::AuxC(aux)) = meta.property_for(candidate, &AUXC) {
         if aux.aux_type.starts_with(ALPHA_URN_PREFIX) {
             return Some(candidate);
@@ -55,23 +55,22 @@ pub fn find_alpha_item_id(meta: &Meta, primary_id: u32) -> Option<u32> {
     None
 }
 
-/// Composite a decoded alpha frame onto a decoded colour frame. Both
-/// frames must share `(width, height)`. The alpha frame must be a gray
-/// layout of the **same bit depth** as the colour frame (the av1-avif
-/// §4.1 `shall`); the colour frame must be planar YUV (any
-/// subsampling, any AV1 bit depth) or gray.
-///
-/// `color_format` / `alpha_format` and the shared `(width, height)`
-/// describe the per-stream metadata that no longer rides on
-/// [`VideoFrame`]. The returned `(VideoFrame, PixelFormat)` carries the
-/// composited pixels and the new packed format:
-///
-///   * the matching `Yuva*` layout when the colour frame is planar YUV
-///     (alpha appended as a fourth full-resolution plane, same storage
-///     width as the master).
-///   * `Ya8` when the colour frame is `Gray8`; `Ya16Le` when it is
-///     `Gray10Le` / `Gray12Le` (interleaved 16-bit LE words keeping
-///     the raw coded values in the low bits).
+/// The gray layout an alpha plane must use to attach to `color_format`
+/// (av1-avif §4.1: same bit depth as the master).
+pub(crate) fn expected_alpha_format(color_format: PixelFormat) -> Result<PixelFormat> {
+    match color_format.bit_depth() {
+        8 => Ok(PixelFormat::Gray8),
+        10 => Ok(PixelFormat::Gray10Le),
+        12 => Ok(PixelFormat::Gray12Le),
+        other => Err(Error::unsupported(format!(
+            "avif alpha: colour format {color_format:?} (depth {other}) cannot take an \
+             alpha auxiliary"
+        ))),
+    }
+}
+
+/// Attach a decoded alpha plane (`alpha`, a gray frame of the master's
+/// depth and extents) to a decoded colour frame.
 pub fn composite_alpha(
     color: &VideoFrame,
     color_format: PixelFormat,
@@ -80,117 +79,27 @@ pub fn composite_alpha(
     alpha: &VideoFrame,
     alpha_format: PixelFormat,
 ) -> Result<(VideoFrame, PixelFormat)> {
-    let expected_alpha = match color_format.bit_depth() {
-        8 => PixelFormat::Gray8,
-        10 => PixelFormat::Gray10Le,
-        12 => PixelFormat::Gray12Le,
-        other => {
-            return Err(Error::unsupported(format!(
-                "avif alpha: colour format {color_format:?} (depth {other}) cannot take an \
-                 alpha auxiliary"
-            )))
-        }
-    };
+    let expected_alpha = expected_alpha_format(color_format)?;
     if alpha_format != expected_alpha {
         return Err(Error::InvalidData(format!(
             "avif alpha: alpha plane format {alpha_format:?} != {expected_alpha:?} — the \
              auxiliary shall be encoded at the master's bit depth (av1-avif §4.1)"
         )));
     }
-    let bps = color_format.bytes_per_sample();
-    let out_format = color_format.with_alpha().ok_or_else(|| {
-        Error::invalid(format!(
-            "avif alpha: colour format {color_format:?} already carries alpha"
-        ))
-    })?;
-    // Pack the alpha plane into a tightly-strided buffer — downstream
-    // callers expect stride == width × bytes-per-sample.
-    let alpha_packed = pack_plane(&alpha.planes[0], (width as usize) * bps, height as usize)?;
-
-    if color_format.plane_count() == 3 {
-        if color.planes.len() != 3 {
-            return Err(Error::invalid(format!(
-                "avif alpha: {color_format:?} frame has {} planes",
-                color.planes.len()
-            )));
-        }
-        let (sx, sy) = color_format.chroma_subsampling();
-        let cw = (width as usize).div_ceil(1 << sx);
-        let ch = (height as usize).div_ceil(1 << sy);
-        let y = pack_plane(&color.planes[0], (width as usize) * bps, height as usize)?;
-        let u = pack_plane(&color.planes[1], cw * bps, ch)?;
-        let v = pack_plane(&color.planes[2], cw * bps, ch)?;
-        Ok((
-            VideoFrame {
-                pts: color.pts,
-                planes: vec![
-                    VideoPlane {
-                        stride: (width as usize) * bps,
-                        data: y,
-                    },
-                    VideoPlane {
-                        stride: cw * bps,
-                        data: u,
-                    },
-                    VideoPlane {
-                        stride: cw * bps,
-                        data: v,
-                    },
-                    VideoPlane {
-                        stride: (width as usize) * bps,
-                        data: alpha_packed,
-                    },
-                ],
-            },
-            out_format,
-        ))
-    } else {
-        // Gray master → packed Y A interleave (Ya8 / Ya16Le).
-        if color.planes.len() != 1 {
-            return Err(Error::invalid(format!(
-                "avif alpha: {color_format:?} frame has {} planes",
-                color.planes.len()
-            )));
-        }
-        let y = pack_plane(&color.planes[0], (width as usize) * bps, height as usize)?;
-        let mut ya = Vec::with_capacity(y.len() * 2);
-        for i in 0..y.len() / bps {
-            ya.extend_from_slice(&y[i * bps..(i + 1) * bps]);
-            ya.extend_from_slice(&alpha_packed[i * bps..(i + 1) * bps]);
-        }
-        Ok((
-            VideoFrame {
-                pts: color.pts,
-                planes: vec![VideoPlane {
-                    stride: (width as usize) * 2 * bps,
-                    data: ya,
-                }],
-            },
-            out_format,
-        ))
-    }
-}
-
-/// Row-pack a plane to a tight stride. `row_bytes` is the packed row
-/// width in **bytes** (pixel width × bytes-per-sample).
-fn pack_plane(plane: &VideoPlane, row_bytes: usize, h: usize) -> Result<Vec<u8>> {
-    if plane.stride == row_bytes && plane.data.len() == row_bytes * h {
-        return Ok(plane.data.clone());
-    }
-    if plane.data.len() < plane.stride * h {
+    if color_format.has_alpha() {
         return Err(Error::invalid(format!(
-            "avif alpha: plane truncated (stride={} rows={} have={})",
-            plane.stride,
-            h,
-            plane.data.len()
+            "avif alpha: colour format {color_format:?} already carries alpha"
         )));
     }
-    let mut out = Vec::with_capacity(row_bytes * h);
-    for row in 0..h {
-        let s = row * plane.stride;
-        out.extend_from_slice(&plane.data[s..s + row_bytes]);
-    }
-    Ok(out)
+    let depth = color_format.bit_depth();
+    let master = to_heif(color, color_format, depth, width, height)
+        .map_err(|e| Error::invalid(format!("avif alpha: {e}")))?;
+    let plane = to_heif(alpha, alpha_format, depth, width, height)
+        .map_err(|e| Error::invalid(format!("avif alpha: {e}")))?;
+    let attached = compose::attach_alpha(&master, &plane)?;
+    let (mut out, format) = from_heif(&attached)?;
+    out.pts = color.pts;
+    Ok((out, format))
 }
 
 #[cfg(test)]

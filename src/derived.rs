@@ -62,77 +62,42 @@ pub struct ImageOverlay {
 }
 
 impl ImageOverlay {
-    /// Parse `iovl` payload bytes against the `reference_count`
-    /// argument. `reference_count` is the number of `dimg` `to_ids`
-    /// for the overlay item — the `iovl` payload doesn't carry the
-    /// count itself, so the caller is responsible for supplying it
-    /// from the iref.
-    ///
-    /// Spec: ISO/IEC 23008-12 §6.6.2.2.2 (Syntax). The first byte is
-    /// `version` (must be 0), then `flags`; `flags & 1` selects 32-bit
-    /// over 16-bit field widths for `output_*` and `*_offset`.
+    /// Parse an `iovl` item body; `reference_count` is the number of
+    /// `dimg` inputs the item declares (HEIF §6.6.2.2.2).
     pub fn parse(payload: &[u8], reference_count: usize) -> Result<Self> {
-        if payload.len() < 2 {
-            return Err(Error::invalid("avif: iovl header too short"));
+        match payload.first() {
+            None => return Err(Error::invalid("avif: iovl header too short")),
+            Some(0) => {}
+            Some(v) => return Err(Error::invalid(format!("avif: iovl version {v} != 0"))),
         }
-        let version = payload[0];
-        if version != 0 {
-            return Err(Error::invalid(format!("avif: iovl version {version} != 0")));
-        }
-        let flags = payload[1];
-        // FieldLength = ((flags & 1) + 1) * 16 bits = 2 or 4 bytes.
-        let field_len = if flags & 1 != 0 { 4 } else { 2 };
-        // Header: canvas_fill_value (4 × u16) + output_width + output_height
-        let mut cursor = 2usize;
-        let min = 2 + 4 * 2 + 2 * field_len + reference_count * 2 * field_len;
-        if payload.len() < min {
-            return Err(Error::invalid(format!(
-                "avif: iovl too short ({} < {min})",
-                payload.len()
-            )));
-        }
-        let mut canvas = [0u16; 4];
-        for slot in canvas.iter_mut() {
-            *slot = read_u16(payload, cursor)?;
-            cursor += 2;
-        }
-        let output_width = read_field_u32(payload, cursor, field_len)?;
-        cursor += field_len;
-        let output_height = read_field_u32(payload, cursor, field_len)?;
-        cursor += field_len;
-        let mut entries = Vec::with_capacity(reference_count);
-        for _ in 0..reference_count {
-            let h = read_field_i32(payload, cursor, field_len)?;
-            cursor += field_len;
-            let v = read_field_i32(payload, cursor, field_len)?;
-            cursor += field_len;
-            entries.push(OverlayEntry {
-                horizontal_offset: h,
-                vertical_offset: v,
-            });
-        }
+        let desc = oxideav_heif::derived::OverlayDescriptor::parse(payload, reference_count)?;
         Ok(ImageOverlay {
-            canvas_fill_value: canvas,
-            output_width,
-            output_height,
-            entries,
+            canvas_fill_value: desc.canvas_fill,
+            output_width: desc.output_width,
+            output_height: desc.output_height,
+            entries: desc
+                .offsets
+                .iter()
+                .map(|&(h, v)| OverlayEntry {
+                    horizontal_offset: h,
+                    vertical_offset: v,
+                })
+                .collect(),
         })
     }
-}
 
-fn read_field_u32(buf: &[u8], cursor: usize, field_len: usize) -> Result<u32> {
-    match field_len {
-        2 => Ok(read_u16(buf, cursor)? as u32),
-        4 => read_u32(buf, cursor),
-        n => Err(Error::invalid(format!("avif: iovl field length {n}"))),
-    }
-}
-
-fn read_field_i32(buf: &[u8], cursor: usize, field_len: usize) -> Result<i32> {
-    match field_len {
-        2 => Ok(read_u16(buf, cursor)? as i16 as i32),
-        4 => Ok(read_u32(buf, cursor)? as i32),
-        n => Err(Error::invalid(format!("avif: iovl field length {n}"))),
+    /// The container crate's view of the same descriptor.
+    pub(crate) fn descriptor(&self) -> oxideav_heif::derived::OverlayDescriptor {
+        oxideav_heif::derived::OverlayDescriptor {
+            canvas_fill: self.canvas_fill_value,
+            output_width: self.output_width,
+            output_height: self.output_height,
+            offsets: self
+                .entries
+                .iter()
+                .map(|e| (e.horizontal_offset, e.vertical_offset))
+                .collect(),
+        }
     }
 }
 
@@ -3865,13 +3830,15 @@ mod tests {
         for v in [0u16, 0, 0, 0] {
             buf.extend_from_slice(&v.to_be_bytes());
         }
+        // 100 000 × 8 000 (8·10⁸ pixels): 32-bit fields, inside the
+        // container's 2³⁰-pixel descriptor bound.
         buf.extend_from_slice(&100_000u32.to_be_bytes()); // output_width
-        buf.extend_from_slice(&80_000u32.to_be_bytes()); // output_height
+        buf.extend_from_slice(&8_000u32.to_be_bytes()); // output_height
         buf.extend_from_slice(&(-5i32).to_be_bytes()); // h (negative clips)
         buf.extend_from_slice(&10_000i32.to_be_bytes()); // v
         let o = ImageOverlay::parse(&buf, 1).unwrap();
         assert_eq!(o.output_width, 100_000);
-        assert_eq!(o.output_height, 80_000);
+        assert_eq!(o.output_height, 8_000);
         assert_eq!(o.entries[0].horizontal_offset, -5);
         assert_eq!(o.entries[0].vertical_offset, 10_000);
     }

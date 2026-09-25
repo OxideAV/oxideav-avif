@@ -7,18 +7,24 @@
 //! canvas is built by pasting the tiles in row-major order and cropping
 //! to the declared output size.
 //!
-//! This module decodes the grid descriptor and exposes `composite_grid`
-//! which assembles a single `VideoFrame` from a slice of decoded tile
-//! frames. All tiles must share the same pixel format and tile size;
-//! mismatches return `Error::InvalidData`.
+//! The descriptor and the pixel composition are the container crate's
+//! ([`oxideav_heif::derived::GridDescriptor`],
+//! [`oxideav_heif::compose::composite_grid`]); [`ImageGrid`] keeps this
+//! crate's descriptor shape (with the raw `version` / `flags` bytes)
+//! and [`composite_grid`] its frame model. All tiles must share the
+//! same pixel format and tile size; mismatches return
+//! `Error::InvalidData`.
+
+use oxideav_heif::compose;
+use oxideav_heif::derived::GridDescriptor;
 
 use crate::error::{AvifError as Error, Result};
-use crate::image::{
-    AvifFrame as VideoFrame, AvifPixelFormat as PixelFormat, AvifPlane as VideoPlane,
-};
+use crate::frame_bridge::{from_heif, to_heif, trim_top_left};
+#[cfg(test)]
+use crate::image::AvifPlane as VideoPlane;
+use crate::image::{AvifFrame as VideoFrame, AvifPixelFormat as PixelFormat};
 
-/// Parsed `ImageGridBox` payload. Dimensions may be 16-bit or 32-bit
-/// depending on `flags & 1` (bit 0 = 1 selects the 32-bit layout).
+/// The `ImageGrid` descriptor (HEIF §6.6.2.3.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ImageGrid {
     pub version: u8,
@@ -30,83 +36,35 @@ pub struct ImageGrid {
 }
 
 impl ImageGrid {
-    /// Parse a grid item's payload — the bytes returned by
-    /// `iloc`-resolving the grid item. Spec: HEIF §6.6.2.3.
+    /// Parse a `grid` item body.
     pub fn parse(payload: &[u8]) -> Result<Self> {
-        if payload.len() < 8 {
-            return Err(Error::InvalidData(format!(
-                "avif grid: payload {} bytes < 8",
-                payload.len()
-            )));
+        match payload.first() {
+            None => return Err(Error::invalid("avif grid: payload 0 bytes < 8")),
+            Some(0) => {}
+            Some(v) => return Err(Error::invalid(format!("avif grid: version {v}"))),
         }
-        let version = payload[0];
-        if version != 0 {
-            return Err(Error::InvalidData(format!("avif grid: version {version}")));
-        }
-        let flags = payload[1];
-        let wide = (flags & 1) != 0;
-        let rows = (payload[2] as u16) + 1;
-        let columns = (payload[3] as u16) + 1;
-        let mut pos = 4;
-        let (output_width, output_height) = if wide {
-            if payload.len() < pos + 8 {
-                return Err(Error::InvalidData(
-                    "avif grid: 32-bit dims truncated".to_string(),
-                ));
-            }
-            let w = u32::from_be_bytes([
-                payload[pos],
-                payload[pos + 1],
-                payload[pos + 2],
-                payload[pos + 3],
-            ]);
-            pos += 4;
-            let h = u32::from_be_bytes([
-                payload[pos],
-                payload[pos + 1],
-                payload[pos + 2],
-                payload[pos + 3],
-            ]);
-            (w, h)
-        } else {
-            if payload.len() < pos + 4 {
-                return Err(Error::InvalidData(
-                    "avif grid: 16-bit dims truncated".to_string(),
-                ));
-            }
-            let w = u16::from_be_bytes([payload[pos], payload[pos + 1]]) as u32;
-            let h = u16::from_be_bytes([payload[pos + 2], payload[pos + 3]]) as u32;
-            (w, h)
-        };
+        let desc = GridDescriptor::parse(payload)?;
         Ok(Self {
-            version,
-            flags,
-            rows,
-            columns,
-            output_width,
-            output_height,
+            version: payload.first().copied().unwrap_or(0),
+            flags: payload.get(1).copied().unwrap_or(0),
+            rows: desc.rows,
+            columns: desc.columns,
+            output_width: desc.output_width,
+            output_height: desc.output_height,
         })
     }
 
+    /// `rows × columns`.
     pub fn expected_tile_count(&self) -> usize {
         (self.rows as usize) * (self.columns as usize)
     }
 }
 
-/// Composite the decoded tile frames in `tiles` into a single output
-/// frame of `grid.output_width × grid.output_height`, pasting tiles in
-/// row-major order (`tile_index = row * columns + col`) at `(col *
-/// tile_w, row * tile_h)`. Tiles that spill past the output rectangle
-/// are clipped at the edge.
-///
-/// All tiles must share the same pixel format + dimensions; the output
-/// frame inherits that format. The caller is responsible for decoding
-/// the tile items via the regular AV1 path and passing them in the same
-/// order as the `dimg` iref.
-///
-/// `format`, `tile_w`, `tile_h` describe every tile (per-frame metadata
-/// no longer rides on [`VideoFrame`]). The returned frame's display
-/// dimensions are `(grid.output_width, grid.output_height)`.
+/// Stitch `tiles` (row-major, all `tile_w × tile_h` in `format`) into
+/// the grid's `output_width × output_height` canvas, trimming the right
+/// and bottom edges (§6.6.2.3.1). Tile layouts carrying alpha are not
+/// grid inputs in this crate (the alpha of a grid rides on the grid
+/// item, see the crate README).
 pub fn composite_grid(
     grid: &ImageGrid,
     tiles: &[VideoFrame],
@@ -126,24 +84,26 @@ pub fn composite_grid(
     if tiles.is_empty() {
         return Err(Error::InvalidData("avif grid: empty tile list".to_string()));
     }
-    let out_w = grid.output_width;
-    let out_h = grid.output_height;
-    if out_w == 0 || out_h == 0 {
+    if grid.output_width == 0 || grid.output_height == 0 {
         return Err(Error::InvalidData(
             "avif grid: output dimensions zero".to_string(),
         ));
     }
-    // Grid rows × tile_h must cover output_height (same for width).
-    if (tile_w as u64) * (grid.columns as u64) < out_w as u64
-        || (tile_h as u64) * (grid.rows as u64) < out_h as u64
+    if (tile_w as u64) * (grid.columns as u64) < grid.output_width as u64
+        || (tile_h as u64) * (grid.rows as u64) < grid.output_height as u64
     {
         return Err(Error::InvalidData(format!(
             "avif grid: {}×{} tiles of {}x{} don't cover {}x{}",
-            grid.rows, grid.columns, tile_w, tile_h, out_w, out_h
+            grid.rows, grid.columns, tile_w, tile_h, grid.output_width, grid.output_height
+        )));
+    }
+    if format.has_alpha() {
+        return Err(Error::unsupported(format!(
+            "avif grid: pixel format {format:?} not supported as a tile layout"
         )));
     }
     let planes = format.plane_count();
-    if planes == 0 || tiles[0].planes.len() != planes {
+    if tiles[0].planes.len() != planes {
         return Err(Error::InvalidData(format!(
             "avif grid: format {:?} expects {} planes, got {}",
             format,
@@ -151,137 +111,58 @@ pub fn composite_grid(
             tiles[0].planes.len()
         )));
     }
-    let (sx, sy) = subsampling_shifts(format)?;
-    let bps = format.bytes_per_sample();
-    // Build planar output buffers at the output grid's final size.
-    let mut out_planes: Vec<VideoPlane> = Vec::with_capacity(planes);
-    for p in 0..planes {
-        let (pw, ph) = plane_dims(out_w, out_h, p, sx, sy);
-        out_planes.push(VideoPlane {
-            stride: (pw as usize) * bps,
-            data: vec![0u8; (pw as usize) * (ph as usize) * bps],
-        });
+    let depth = format.bit_depth();
+    let mut heif_tiles = Vec::with_capacity(tiles.len());
+    for (i, t) in tiles.iter().enumerate() {
+        heif_tiles.push(
+            to_heif(t, format, depth, tile_w, tile_h)
+                .map_err(|e| Error::invalid(format!("avif grid: tile {i}: {e}")))?,
+        );
     }
-    for (i, tile) in tiles.iter().enumerate() {
-        let row = i / grid.columns as usize;
-        let col = i % grid.columns as usize;
-        let dst_x = col as u32 * tile_w;
-        let dst_y = row as u32 * tile_h;
-        if dst_x >= out_w || dst_y >= out_h {
-            // Tiles entirely outside the declared output rectangle are
-            // silently dropped (HEIF §6.6.2.3: the grid is trimmed to
-            // output_width/output_height, so over-hang tiles contribute
-            // nothing).
-            continue;
-        }
-        let copy_w = (out_w - dst_x).min(tile_w);
-        let copy_h = (out_h - dst_y).min(tile_h);
-        for (p, (src, dst)) in tile
-            .planes
-            .iter()
-            .zip(out_planes.iter_mut())
-            .enumerate()
-            .take(planes)
-        {
-            let (ppw_src, _pph_src) = plane_dims(tile_w, tile_h, p, sx, sy);
-            let (ppw_dst, _pph_dst) = plane_dims(out_w, out_h, p, sx, sy);
-            let plane_shift_x = if p == 0 { 0 } else { sx };
-            let plane_shift_y = if p == 0 { 0 } else { sy };
-            // dst_x / dst_y are luma coordinates; chroma offsets are the
-            // shift-divided values. tile_w / tile_h are even for any
-            // 4:2:x / 4:2:0 AV1 tile (AV1 §5.6.1 requires even coded
-            // dimensions for subsampled chroma), so dst_x >> sx and
-            // dst_y >> sy are exact whole chroma columns / rows.
-            let plane_dst_x = dst_x >> plane_shift_x;
-            let plane_dst_y = dst_y >> plane_shift_y;
-            // Chroma copy extents use **ceiling** division of the luma
-            // copy extents — when the right-most or bottom-most tile is
-            // trimmed to an odd luma count (HEIF §6.6.2.3.3 allows the
-            // last column / row to be partial), a plain `>> 1` would
-            // drop the trailing chroma sample. Example: 4:2:0 grid with
-            // tile_w=4 + output_w=7. tile 1 contributes copy_w=3 luma
-            // cols, which cover 2 chroma cols (cols 2 and 3), not 1.
-            // The `.max(1)` floor remains for the degenerate copy_w=0
-            // case (filtered out earlier by the `dst_x >= out_w`
-            // guard, but kept for defence in depth).
-            let plane_copy_w = ceil_shift(copy_w, plane_shift_x).max(1);
-            let plane_copy_h = ceil_shift(copy_h, plane_shift_y).max(1);
-            // Also clamp the chroma copy to the source tile's chroma
-            // plane width / height — when the tile happens to have
-            // fewer chroma samples than the luma-derived ceiling
-            // suggests (e.g. an encoder that rounded down), copying past
-            // the source row boundary would smear later luma data into
-            // chroma. ppw_src / chroma rows of source are the upper
-            // bound.
-            let src_chroma_h = (src.data.len() / src.stride.max(1)) as u32;
-            let plane_copy_w = plane_copy_w.min(ppw_src);
-            let plane_copy_h = plane_copy_h.min(src_chroma_h);
-            // And clamp again to the destination plane's available
-            // columns / rows so a tile that spills past the canvas
-            // edge silently truncates rather than walking off the
-            // buffer.
-            let plane_copy_w = plane_copy_w.min(ppw_dst.saturating_sub(plane_dst_x));
-            let plane_copy_h = plane_copy_h.min(
-                (dst.data.len() as u32 / dst.stride.max(1) as u32).saturating_sub(plane_dst_y),
-            );
-            for row_i in 0..plane_copy_h as usize {
-                let dst_row_start =
-                    (plane_dst_y as usize + row_i) * dst.stride + (plane_dst_x as usize) * bps;
-                let src_row_start = row_i * src.stride;
-                let cw = (plane_copy_w as usize) * bps;
-                if dst_row_start + cw > dst.data.len() || src_row_start + cw > src.data.len() {
-                    return Err(Error::InvalidData(format!(
-                        "avif grid: tile {i} plane {p} row {row_i} out of range (src_w={}, dst_w={})",
-                        ppw_src, ppw_dst
-                    )));
-                }
-                dst.data[dst_row_start..dst_row_start + cw]
-                    .copy_from_slice(&src.data[src_row_start..src_row_start + cw]);
-            }
-        }
-    }
-    Ok(VideoFrame {
-        pts: tiles[0].pts,
-        planes: out_planes,
-    })
+    let composed = composite_grid_frames(grid, &heif_tiles)?;
+    let (mut out, _) = from_heif(&composed)?;
+    out.pts = tiles[0].pts;
+    Ok(out)
 }
 
-fn subsampling_shifts(format: PixelFormat) -> Result<(u32, u32)> {
-    // Grid tiles are decoded `av01` items — alpha-composited / packed
-    // layouts never appear as tile formats (alpha rides as its own
-    // auxiliary and is composited after the grid stitch).
-    if format.has_alpha() {
-        return Err(Error::unsupported(format!(
-            "avif grid: pixel format {format:?} not supported as a tile layout"
+/// Grid composition on container frames: the tiles are stitched by the
+/// container onto the full `columns × tile_w` by `rows × tile_h`
+/// canvas, then this crate trims to `output_width × output_height`
+/// with ceiling chroma extents — an odd 4:2:0 / 4:2:2 output keeps the
+/// layout AV1 codes it in (chroma covering the last luma column / row)
+/// instead of being promoted to 4:4:4 by an odd trim.
+pub(crate) fn composite_grid_frames(
+    grid: &ImageGrid,
+    tiles: &[oxideav_heif::HeifFrame],
+) -> Result<oxideav_heif::HeifFrame> {
+    let first = tiles
+        .first()
+        .ok_or_else(|| Error::invalid("avif grid: empty tile list"))?;
+    let full_w = u64::from(first.width) * u64::from(grid.columns);
+    let full_h = u64::from(first.height) * u64::from(grid.rows);
+    if full_w < u64::from(grid.output_width) || full_h < u64::from(grid.output_height) {
+        return Err(Error::invalid(format!(
+            "avif grid: {}×{} tiles of {}x{} don't cover {}x{}",
+            grid.rows,
+            grid.columns,
+            first.width,
+            first.height,
+            grid.output_width,
+            grid.output_height
         )));
     }
-    let (sx, sy) = format.chroma_subsampling();
-    Ok((sx as u32, sy as u32))
-}
-
-fn plane_dims(w: u32, h: u32, plane: usize, sx: u32, sy: u32) -> (u32, u32) {
-    if plane == 0 {
-        (w, h)
-    } else {
-        let pw = (w + (1 << sx) - 1) >> sx;
-        let ph = (h + (1 << sy) - 1) >> sy;
-        (pw.max(1), ph.max(1))
-    }
-}
-
-/// Ceiling shift — `ceil(v / 2^shift)`. Used to map a luma extent to
-/// the chroma extent that fully covers it. The reverse of the floor
-/// shift used to derive chroma plane *positions* (chroma-plane offsets
-/// always use plain `>>` because tile-edge alignment guarantees luma
-/// coordinates land on even chroma boundaries — see
-/// [`composite_grid`]).
-fn ceil_shift(v: u32, shift: u32) -> u32 {
-    if shift == 0 {
-        v
-    } else {
-        let unit = 1u32 << shift;
-        (v + unit - 1) >> shift
-    }
+    let (full_w, full_h) = (
+        u32::try_from(full_w).map_err(|_| Error::invalid("avif grid: canvas width overflow"))?,
+        u32::try_from(full_h).map_err(|_| Error::invalid("avif grid: canvas height overflow"))?,
+    );
+    let full = GridDescriptor {
+        rows: grid.rows,
+        columns: grid.columns,
+        output_width: full_w,
+        output_height: full_h,
+    };
+    let composed = compose::composite_grid(&full, tiles)?;
+    trim_top_left(&composed, grid.output_width, grid.output_height)
 }
 
 #[cfg(test)]
@@ -888,7 +769,7 @@ mod tests {
         };
         // Tile says 4×4 luma but its chroma plane only ships 1 row × 2
         // cols (instead of the spec-compliant 2×2). composite_grid
-        // must clamp to that.
+        // must refuse the malformed plane up front — never read past it.
         let tile = VideoFrame {
             pts: None,
             planes: vec![
@@ -906,14 +787,8 @@ mod tests {
                 },
             ],
         };
-        let out = composite_grid(&grid, &[tile], PixelFormat::Yuv420P, 4, 4).unwrap();
-        let u = &out.planes[1];
-        // Output U plane is 2×2; first row should be 100,100 (copied),
-        // second row should be 0,0 (untouched, since source had no data).
-        assert_eq!(u.stride, 2);
-        assert_eq!(u.data.len(), 4);
-        assert_eq!(&u.data[0..2], &[100, 100]);
-        assert_eq!(&u.data[2..4], &[0, 0]);
+        let err = composite_grid(&grid, &[tile], PixelFormat::Yuv420P, 4, 4).unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)), "{err}");
     }
 
     /// HBD grid stitch: 2×2 grid of 10-bit 4:2:0 tiles (16-bit LE
@@ -965,26 +840,5 @@ mod tests {
         assert_eq!(u, vec![100, 110, 120, 130]);
         let v = words(&out.planes[2]);
         assert_eq!(v, vec![200, 210, 220, 230]);
-    }
-
-    /// `ceil_shift` matches `ceil(v / 2^shift)` for the practical
-    /// range used by `composite_grid`: shift in {0, 1}.
-    #[test]
-    fn ceil_shift_matches_division_ceiling() {
-        // shift = 0 is the identity.
-        for v in [0u32, 1, 2, 3, 7, 100, 4096] {
-            assert_eq!(ceil_shift(v, 0), v);
-        }
-        // shift = 1 is `(v + 1) / 2`.
-        for v in 0..=33u32 {
-            let want = v.div_ceil(2);
-            assert_eq!(ceil_shift(v, 1), want, "ceil_shift({v}, 1)");
-        }
-        // shift = 2 (would arise for 4:1:0 — not currently emitted by
-        // composite_grid, but the helper should still match).
-        for v in 0..=33u32 {
-            let want = v.div_ceil(4);
-            assert_eq!(ceil_shift(v, 2), want, "ceil_shift({v}, 2)");
-        }
     }
 }

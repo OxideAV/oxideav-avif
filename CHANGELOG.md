@@ -29,6 +29,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `item_payload_bytes` use for item bytes (file offset, `idat` and
   item-offset construction methods alike); `parse` still borrows the
   primary payload zero-copy when it is one contiguous span.
+- **Composition by `oxideav-heif`.** Grid stitching, `iovl` overlay
+  painting, alpha attachment and the `clap` / `irot` / `imir`
+  transforms are the container crate's `compose` layer; the decoder
+  walks the derivation graph on the container's planar frame
+  (`HeifFrame`) and re-lays the primary's output out as this crate's
+  `AvifFrame` / `AvifPixelFormat` (packed `Ya8` / `Ya16Le` for
+  monochrome + alpha) once at the end. `ImageGrid::parse` /
+  `ImageOverlay::parse` are the container's descriptor parsers with
+  this crate's `version = 0` rule. The standalone `composite_grid` /
+  `composite_alpha` / `composite_overlay` / `apply_clap` / `apply_irot`
+  / `apply_imir` keep their signatures over the same layer. What this
+  crate keeps as AVIF-side rules, on top: the av1-avif §4.1 same-depth
+  `shall` for alpha (a mismatch is refused, not rescaled), the §6.9.1
+  nearest-neighbour alpha resize, the `ispe` trim of a padded coded
+  frame and the grid's right / bottom trim with AV1's ceiling chroma
+  extents (an odd 4:2:0 output stays 4:2:0), a monochrome overlay stays
+  monochrome, a degenerate / non-fitting `clap` passes through, and a
+  quarter turn of a 4:2:2 picture is refused. Behaviour that changed
+  with the container semantics: an odd clean aperture on subsampled
+  chroma promotes the picture to 4:4:4 (MIAF §7.3.6.7); an overlay
+  input at an odd offset on a subsampled axis, or carrying alpha,
+  promotes the canvas to 4:4:4; the `iovl` fill is converted with the
+  output's H.273 matrix at every `colr` (it used to be refused unless
+  identity / neutral) and 16-bit fill values scale proportionally to
+  the coded depth (`0xC000` → 191 at 8 bits, not the shifted 192); the
+  three standalone transform entry points refuse (with `Unsupported`)
+  a call whose result would change layout, as their `(frame, width,
+  height)` result cannot carry it. A grid tile with a chroma plane
+  shorter than its extents is refused instead of zero-filled.
 - `box_parser` is a thin surface over `oxideav_heif::boxes`:
   `BoxHeader` is the container crate's type (`total_len` is now a
   method and the header also carries `start` / `user_type`); an

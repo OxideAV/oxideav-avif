@@ -37,29 +37,29 @@
 //! layout and reports anything else as unsupported rather than
 //! converting.
 //!
-//! **Fill colour.** `canvas_fill_value` is sRGB RGBA. Converting it to
-//! the inputs' coded colour space is exact for the H.273 identity
-//! matrix (`matrix_coefficients = 0`, full range: `Y = G`, `Cb = B`,
-//! `Cr = R`, the 16-bit code values narrowed to the coded depth) and for a
-//! full-range monochrome master with a neutral (`R = G = B`) fill.
-//! Any other pairing needs the H.273 RGB → YCbCr equations, which this
-//! module does not carry; the fill is then only accepted when it can
-//! never show — i.e. when the canvas is fully covered by alpha-less
-//! inputs, or the fill is fully transparent (`A = 0`, colour
-//! irrelevant). Otherwise composition fails with
-//! [`AvifError::Unsupported`](crate::error::AvifError::Unsupported).
+//! The composition itself is the container crate's
+//! ([`oxideav_heif::compose::composite_overlay`]); this module maps
+//! the crate's frame model onto it and keeps the AVIF-side guards
+//! (canvas bound, one shared input layout).
+//!
+//! **Fill colour.** `canvas_fill_value` is sRGB RGBA; it is converted
+//! to the output's coded colour space with the H.273 matrix the
+//! `colr` names (MIAF §7.3.6.4 default when absent), at the coded
+//! depth.
 //!
 //! **Chroma-subsampled inputs.** §6.6.2.2.3 places inputs in luma
-//! pixel units and is silent about chroma planes. This module maps
-//! every canvas chroma sample to the input chroma sample co-located
-//! with the first covered luma sample of its `(1 << sx) × (1 << sy)`
-//! luma block (nearest-neighbour), and blends it with the block's
-//! mean alpha — the §6.9.1 "alpha plane resized to the master's
-//! extents" rule applied at the chroma plane's extent.
+//! pixel units and is silent about chroma planes. An input placed at a
+//! sub-sample chroma position (odd offset on a subsampled axis), or an
+//! input carrying an alpha plane, promotes the composition to 4:4:4
+//! (MIAF §7.3.6.7's implicit upsampling rule applied to the overlay
+//! canvas); the result then stays 4:4:4.
+
+use oxideav_heif::compose;
 
 use crate::cicp::CicpTriple;
 use crate::derived::ImageOverlay;
 use crate::error::{AvifError as Error, Result};
+use crate::frame_bridge::{demote_to_mono, from_heif, to_heif};
 use crate::image::{AvifFrame, AvifPixelFormat, AvifPlane};
 
 /// Upper bound on an overlay canvas (`output_width × output_height`),
@@ -315,141 +315,43 @@ pub fn pack_planes(planes: &SamplePlanes) -> Result<(AvifFrame, AvifPixelFormat)
     ))
 }
 
-/// Narrow a 16-bit fill colour channel to `bit_depth` bits by dropping
-/// the low bits — a writer that thinks in 8 bits pads its code values
-/// with zeros (`0xC0` → `0xC000`), and the shift reproduces them
-/// exactly (a linear rescale would turn `0xC000` into 191).
-fn scale16(v: u16, bit_depth: u8) -> u16 {
-    v >> (16 - bit_depth)
-}
-
-/// Convert the sRGB RGBA `canvas_fill_value` to the inputs' coded
-/// colour representation, where the staged specification pins the
-/// conversion exactly. Returns `(Y, Cb, Cr)` at `bit_depth` (`Cb`/`Cr`
-/// unused for monochrome), or `None` when the pairing needs the
-/// H.273 RGB → YCbCr equations.
-fn fill_samples(
-    fill: [u16; 4],
-    cicp: &CicpTriple,
-    gray: bool,
-    bit_depth: u8,
-) -> Option<(u16, u16, u16)> {
-    let [r, g, b, _] = fill;
-    if !cicp.full_range {
-        return None;
+/// Overlay composition on container frames (every input already one
+/// shared chroma / depth layout): the container paints the canvas;
+/// when every input is monochrome the result is kept monochrome — the
+/// container promotes alpha-carrying monochrome inputs to 4:4:4 with
+/// neutral chroma, which carries no colour and would turn a
+/// monochrome AVIF into a colour one.
+pub(crate) fn composite_overlay_frames(
+    desc: &ImageOverlay,
+    inputs: &[compose::OverlayInput<'_>],
+    colr: &oxideav_heif::props::Colr,
+) -> Result<oxideav_heif::HeifFrame> {
+    let composed = compose::composite_overlay(&desc.descriptor(), inputs, Some(colr))?;
+    let all_mono = inputs
+        .iter()
+        .all(|i| i.frame.format.chroma == oxideav_heif::Chroma::Mono);
+    if all_mono && composed.format.chroma != oxideav_heif::Chroma::Mono {
+        return demote_to_mono(&composed);
     }
-    if gray {
-        // A neutral fill on a full-range monochrome master: the
-        // achromatic axis carries the same code value under every
-        // H.273 matrix (Y = R = G = B when Kr + Kg + Kb = 1).
-        if r == g && g == b {
-            return Some((scale16(r, bit_depth), 0, 0));
-        }
-        return None;
-    }
-    if cicp.matrix_coefficients == 0 {
-        // Identity: Y = G, Cb = B, Cr = R (H.273 §8.3, GBR order).
-        return Some((
-            scale16(g, bit_depth),
-            scale16(b, bit_depth),
-            scale16(r, bit_depth),
-        ));
-    }
-    None
+    Ok(composed)
 }
 
-/// True when the union of `rects` (`(x, y, w, h)`) covers the whole
-/// `cw × ch` canvas. Exact sweep over the distinct x boundaries —
-/// O(n² log n), no per-pixel allocation.
-fn rects_cover_canvas(rects: &[(u32, u32, u32, u32)], cw: u32, ch: u32) -> bool {
-    if cw == 0 || ch == 0 {
-        return true;
-    }
-    let mut xs: Vec<u32> = vec![0, cw];
-    for &(x, _, w, _) in rects {
-        xs.push(x.min(cw));
-        xs.push((x + w).min(cw));
-    }
-    xs.sort_unstable();
-    xs.dedup();
-    for pair in xs.windows(2) {
-        let (x0, x1) = (pair[0], pair[1]);
-        if x1 <= x0 {
-            continue;
-        }
-        // Every rect spanning this x-strip contributes a y-interval.
-        let mut ys: Vec<(u32, u32)> = rects
-            .iter()
-            .filter(|&&(x, _, w, _)| x <= x0 && x + w >= x1)
-            .map(|&(_, y, _, h)| (y.min(ch), (y + h).min(ch)))
-            .collect();
-        ys.sort_unstable();
-        let mut reach = 0u32;
-        for (y0, y1) in ys {
-            if y0 > reach {
-                return false;
-            }
-            reach = reach.max(y1);
-        }
-        if reach < ch {
-            return false;
-        }
-    }
-    true
+/// One decoded overlay input as the container crate composes it: its
+/// frame, the layout the offsets of the descriptor place it at, and
+/// whether its samples are pre-multiplied by its alpha (`prem`).
+fn heif_input(inp: &OverlayInput<'_>, i: usize) -> Result<oxideav_heif::HeifFrame> {
+    to_heif(inp.frame, inp.format, inp.bit_depth, inp.width, inp.height)
+        .map_err(|e| Error::invalid(format!("avif overlay: input {i}: {e}")))
 }
 
-/// Alpha sample at `bit_depth` → 16-bit opacity (`0..=65535`).
-fn alpha16(a: u16, bit_depth: u8) -> u32 {
-    let max = (1u32 << bit_depth) - 1;
-    (u32::from(a) * 65535 + max / 2) / max
-}
-
-/// One "over" step on a pre-multiplied canvas colour sample. `prem`
-/// is the canvas colour × opacity (65535-scaled); `m` the input
-/// sample, `alpha` its 16-bit opacity. The canvas opacity is advanced
-/// separately by [`over_alpha`] (once per pixel, however many colour
-/// planes share it).
-#[inline]
-fn over(prem: &mut u32, m: u32, alpha: u32, premultiplied: bool) {
-    let keep = 65535 - alpha;
-    let carried = (u64::from(*prem) * u64::from(keep) + 32767) / 65535;
-    let added = if premultiplied {
-        u64::from(m) * 65535
-    } else {
-        u64::from(m) * u64::from(alpha)
-    };
-    *prem = (added + carried).min(u64::from(u32::MAX)) as u32;
-}
-
-/// Canvas opacity update: `α + a × (1 − α)`.
-#[inline]
-fn over_alpha(a: &mut u16, alpha: u32) {
-    let keep = 65535 - alpha;
-    let a_new = u64::from(alpha) + (u64::from(*a) * u64::from(keep) + 32767) / 65535;
-    *a = a_new.min(65535) as u16;
-}
-
-/// Resolve a pre-multiplied canvas plane back to straight samples at
-/// `bit_depth`; fully transparent samples take `fallback`.
-fn unpremultiply(prem: &[u32], a: &[u16], bit_depth: u8, fallback: u16) -> Vec<u16> {
-    let max = (1u32 << bit_depth) - 1;
-    prem.iter()
-        .zip(a)
-        .map(|(&p, &a)| {
-            if a == 0 {
-                fallback
-            } else {
-                (((u64::from(p) + u64::from(a) / 2) / u64::from(a)) as u32).min(max) as u16
-            }
-        })
-        .collect()
-}
-
-/// Composite an `iovl` overlay. `inputs` are in `dimg` order and must
-/// match `desc.entries` one-to-one; `cicp` is the colour signalling
-/// the fill colour is converted against (the overlay item's `colr`,
-/// or the first input's). Returns the reconstructed canvas, its
-/// layout, and `(output_width, output_height)`.
+/// §6.6.2.2 overlay composition on this crate's frame model: `inputs`
+/// in `dimg` order (bottom-most first), `cicp` the output's colour
+/// information (the canvas fill is converted with its H.273 matrix).
+/// Every input must share one layout (chroma, depth); the descriptor's
+/// offsets place them. Returns the composed frame, its layout (with an
+/// alpha plane when the fill is not fully opaque; promoted to 4:4:4
+/// when an input carries alpha or sits at a sub-sample chroma
+/// position) and the canvas extents.
 pub fn composite_overlay(
     desc: &ImageOverlay,
     inputs: &[OverlayInput<'_>],
@@ -474,191 +376,39 @@ pub fn composite_overlay(
     if inputs.is_empty() {
         return Err(Error::invalid("avif overlay: no input images"));
     }
-    let mut unpacked = Vec::with_capacity(inputs.len());
+    let mut frames = Vec::with_capacity(inputs.len());
     for (i, inp) in inputs.iter().enumerate() {
-        let p = unpack_planes(inp.frame, inp.format, inp.bit_depth, inp.width, inp.height)?;
+        let f = heif_input(inp, i)?;
         if i > 0 {
-            let first = &unpacked[0];
-            let (f, p): (&SamplePlanes, &SamplePlanes) = (first, &p);
-            if (f.bit_depth, f.sx, f.sy, f.gray) != (p.bit_depth, p.sx, p.sy, p.gray) {
+            let first: &oxideav_heif::HeifFrame = &frames[0];
+            if (first.format.chroma, first.format.bit_depth)
+                != (f.format.chroma, f.format.bit_depth)
+            {
                 return Err(Error::unsupported(format!(
-                    "avif overlay: input {i} layout ({}-bit sx={} sy={} gray={}) differs from \
-                     input 0 ({}-bit sx={} sy={} gray={}) — mixed layouts are not composited",
-                    p.bit_depth, p.sx, p.sy, p.gray, f.bit_depth, f.sx, f.sy, f.gray
+                    "avif overlay: input {i} layout ({}-bit {:?}) differs from input 0 \
+                     ({}-bit {:?}) — mixed layouts are not composited",
+                    f.format.bit_depth,
+                    f.format.chroma,
+                    first.format.bit_depth,
+                    first.format.chroma
                 )));
             }
         }
-        unpacked.push(p);
+        frames.push(f);
     }
-    let (bit_depth, sx, sy, gray) = {
-        let f = &unpacked[0];
-        (f.bit_depth, f.sx, f.sy, f.gray)
-    };
-    let max = (1u32 << bit_depth) - 1;
-
-    // Visible rectangles (canvas space) per input; opaque ones drive
-    // the "does the fill ever show" test.
-    let mut visible: Vec<Option<(u32, u32, u32, u32)>> = Vec::with_capacity(inputs.len());
-    let mut opaque_rects = Vec::new();
-    for (inp, p) in inputs.iter().zip(&unpacked) {
-        let left = inp.offset_x.max(0);
-        let top = inp.offset_y.max(0);
-        let right = (inp.offset_x + i64::from(p.width)).min(i64::from(cw));
-        let bottom = (inp.offset_y + i64::from(p.height)).min(i64::from(ch));
-        let rect = if right > left && bottom > top {
-            Some((
-                left as u32,
-                top as u32,
-                (right - left) as u32,
-                (bottom - top) as u32,
-            ))
-        } else {
-            None
-        };
-        if let (Some(r), None) = (rect, &p.alpha) {
-            opaque_rects.push(r);
-        }
-        visible.push(rect);
-    }
-    let fill_alpha = u32::from(desc.canvas_fill_value[3]);
-    let fill_shows = fill_alpha > 0 && !rects_cover_canvas(&opaque_rects, cw, ch);
-    let fill = fill_samples(desc.canvas_fill_value, cicp, gray, bit_depth);
-    if fill_shows && fill.is_none() {
-        return Err(Error::unsupported(format!(
-            "avif overlay: canvas_fill_value {:?} shows through but cannot be converted to \
-             the inputs' coded colour space (matrix_coefficients={}, full_range={}, gray={}) — \
-             only the H.273 identity matrix / neutral monochrome fills are converted",
-            desc.canvas_fill_value, cicp.matrix_coefficients, cicp.full_range, gray
-        )));
-    }
-    let (fy, fu, fv) = fill.unwrap_or((0, max as u16 / 2 + 1, max as u16 / 2 + 1));
-
-    // Canvas: pre-multiplied colour + opacity, luma and chroma tracked
-    // separately (chroma alpha is the block mean).
-    let n = cw as usize * ch as usize;
-    let mut prem_y = vec![u32::from(fy) * fill_alpha; n];
-    let mut a_y = vec![fill_alpha as u16; n];
-    let (ccw, cch) = chroma_dims(cw, ch, sx, sy);
-    let cn = if gray { 0 } else { ccw as usize * cch as usize };
-    let mut prem_u = vec![u32::from(fu) * fill_alpha; cn];
-    let mut prem_v = vec![u32::from(fv) * fill_alpha; cn];
-    let mut a_c = vec![fill_alpha as u16; cn];
-
-    for ((inp, p), rect) in inputs.iter().zip(&unpacked).zip(&visible) {
-        let Some((vx, vy, vw, vh)) = *rect else {
-            continue;
-        };
-        let (ox, oy) = (inp.offset_x, inp.offset_y);
-        let iw = p.width as usize;
-        // Luma.
-        for y in vy..vy + vh {
-            let iy = (i64::from(y) - oy) as usize;
-            let dst_row = y as usize * cw as usize;
-            let src_row = iy * iw;
-            for x in vx..vx + vw {
-                let ix = (i64::from(x) - ox) as usize;
-                let m = u32::from(p.y[src_row + ix]);
-                let alpha = match &p.alpha {
-                    Some(a) => alpha16(a[src_row + ix], bit_depth),
-                    None => 65535,
-                };
-                over(
-                    &mut prem_y[dst_row + x as usize],
-                    m,
-                    alpha,
-                    inp.premultiplied,
-                );
-                over_alpha(&mut a_y[dst_row + x as usize], alpha);
-            }
-        }
-        if gray {
-            continue;
-        }
-        // Chroma: every canvas chroma sample whose luma block meets
-        // the visible rect.
-        let (icw, _) = p.chroma_dims();
-        let bx = 1u32 << sx;
-        let by = 1u32 << sy;
-        let cx0 = vx >> sx;
-        let cx1 = (vx + vw - 1) >> sx;
-        let cy0 = vy >> sy;
-        let cy1 = (vy + vh - 1) >> sy;
-        for cy in cy0..=cy1 {
-            for cx in cx0..=cx1 {
-                // Luma block of this chroma sample ∩ visible rect.
-                let lx0 = (cx * bx).max(vx);
-                let lx1 = ((cx + 1) * bx).min(vx + vw);
-                let ly0 = (cy * by).max(vy);
-                let ly1 = ((cy + 1) * by).min(vy + vh);
-                if lx1 <= lx0 || ly1 <= ly0 {
-                    continue;
-                }
-                let alpha = match &p.alpha {
-                    Some(a) => {
-                        let mut sum = 0u64;
-                        let mut count = 0u64;
-                        for ly in ly0..ly1 {
-                            let iy = (i64::from(ly) - oy) as usize;
-                            for lx in lx0..lx1 {
-                                let ix = (i64::from(lx) - ox) as usize;
-                                sum += u64::from(alpha16(a[iy * iw + ix], bit_depth));
-                                count += 1;
-                            }
-                        }
-                        ((sum + count / 2) / count) as u32
-                    }
-                    None => 65535,
-                };
-                let ix = (i64::from(lx0) - ox) as usize >> sx;
-                let iy = (i64::from(ly0) - oy) as usize >> sy;
-                let src = iy * icw as usize + ix;
-                let dst = cy as usize * ccw as usize + cx as usize;
-                over(
-                    &mut prem_u[dst],
-                    u32::from(p.u[src]),
-                    alpha,
-                    inp.premultiplied,
-                );
-                over(
-                    &mut prem_v[dst],
-                    u32::from(p.v[src]),
-                    alpha,
-                    inp.premultiplied,
-                );
-                over_alpha(&mut a_c[dst], alpha);
-            }
-        }
-    }
-
-    let out_alpha = fill_alpha < 65535;
-    let y = unpremultiply(&prem_y, &a_y, bit_depth, fy);
-    let (u, v) = if gray {
-        (Vec::new(), Vec::new())
-    } else {
-        (
-            unpremultiply(&prem_u, &a_c, bit_depth, fu),
-            unpremultiply(&prem_v, &a_c, bit_depth, fv),
-        )
-    };
-    let alpha = out_alpha.then(|| {
-        a_y.iter()
-            .map(|&a| ((u32::from(a) * max + 32767) / 65535) as u16)
-            .collect::<Vec<u16>>()
-    });
-    let planes = SamplePlanes {
-        width: cw,
-        height: ch,
-        bit_depth,
-        sx,
-        sy,
-        gray,
-        y,
-        u,
-        v,
-        alpha,
-    };
-    let (frame, format) = pack_planes(&planes)?;
-    Ok((frame, format, cw, ch))
+    let heif_inputs: Vec<compose::OverlayInput<'_>> = frames
+        .iter()
+        .zip(inputs)
+        .map(|(frame, inp)| compose::OverlayInput {
+            frame,
+            premultiplied: inp.premultiplied,
+        })
+        .collect();
+    let colr = cicp.to_colr();
+    let composed = composite_overlay_frames(desc, &heif_inputs, &colr)?;
+    let (mut out, format) = from_heif(&composed)?;
+    out.pts = inputs[0].frame.pts;
+    Ok((out, format, composed.width, composed.height))
 }
 
 #[cfg(test)]
@@ -816,7 +566,7 @@ mod tests {
 
     /// A fill that shows and cannot be converted is refused.
     #[test]
-    fn unconvertible_visible_fill_is_unsupported() {
+    fn visible_fill_is_converted_with_the_output_matrix() {
         let p = planes(2, 2, 8, 1, 1, false, 1, None);
         let (frame, fmt) = pack_planes(&p).unwrap();
         let inp = OverlayInput {
@@ -829,9 +579,20 @@ mod tests {
             offset_y: 0,
             premultiplied: false,
         };
+        // An opaque fill showing beside a BT.709 limited-range input is
+        // converted with that matrix (H.273) — a dark near-black fill
+        // lands on the limited-range black level, distinct from the
+        // input's samples.
         let d = desc(4, 4, [1, 2, 3, 65535], &[(0, 0)]);
-        let err = composite_overlay(&d, &[inp], &bt709_limited()).unwrap_err();
-        assert!(matches!(err, Error::Unsupported(_)), "{err}");
+        let (out, ofmt, _, _) = composite_overlay(&d, &[inp], &bt709_limited()).expect("ok");
+        assert_eq!(ofmt, AvifPixelFormat::Yuv420P);
+        let o = unpack_planes(&out, ofmt, 8, 4, 4).unwrap();
+        assert_eq!(o.y[0], p.y[0], "input copied at (0,0)");
+        assert_eq!(
+            o.y[15], 16,
+            "fill converted to the limited-range black level"
+        );
+        assert_eq!((o.u[3], o.v[3]), (128, 128), "fill chroma neutral");
         // Fully transparent fill: colour irrelevant → accepted, output
         // carries alpha.
         let d = desc(4, 4, [1, 2, 3, 0], &[(0, 0)]);
@@ -986,24 +747,9 @@ mod tests {
         assert!(composite_overlay(&desc(2, 2, [0; 4], &[]), &[], &identity_full()).is_err());
     }
 
-    #[test]
-    fn rect_cover_sweep() {
-        assert!(rects_cover_canvas(&[(0, 0, 4, 4)], 4, 4));
-        assert!(rects_cover_canvas(&[(0, 0, 2, 4), (2, 0, 2, 4)], 4, 4));
-        assert!(rects_cover_canvas(&[(0, 0, 4, 2), (0, 2, 4, 2)], 4, 4));
-        assert!(!rects_cover_canvas(&[(0, 0, 2, 4), (3, 0, 1, 4)], 4, 4));
-        assert!(!rects_cover_canvas(&[(0, 0, 4, 3)], 4, 4));
-        assert!(!rects_cover_canvas(&[], 1, 1));
-        // Overlapping, out-of-order rects.
-        assert!(rects_cover_canvas(
-            &[(1, 1, 3, 3), (0, 0, 2, 2), (0, 2, 2, 2), (2, 0, 2, 1)],
-            4,
-            4
-        ));
-    }
-
-    /// 4:2:0 input at an odd offset: chroma is nearest-neighbour mapped
-    /// and luma is exact.
+    /// 4:2:0 input at an odd offset: the canvas is promoted to 4:4:4
+    /// (the input would land on a sub-sample chroma position), luma is
+    /// exact and the input's chroma is replicated to its luma positions.
     #[test]
     fn odd_offset_subsampled_input() {
         let p = planes(4, 4, 8, 1, 1, false, 33, None);
@@ -1020,18 +766,26 @@ mod tests {
         };
         let d = desc(6, 6, [0, 0, 0, 0], &[(1, 1)]);
         let (out, ofmt, _, _) = composite_overlay(&d, &[inp], &bt709_limited()).expect("ok");
+        assert_eq!(
+            ofmt,
+            AvifPixelFormat::Yuva444P,
+            "promoted; transparent fill → alpha"
+        );
         let o = unpack_planes(&out, ofmt, 8, 6, 6).unwrap();
+        let a = o.alpha.as_ref().unwrap();
         for y in 0..4usize {
             for x in 0..4usize {
-                assert_eq!(o.y[(y + 1) * 6 + x + 1], p.y[y * 4 + x]);
+                let i = (y + 1) * 6 + x + 1;
+                assert_eq!(o.y[i], p.y[y * 4 + x]);
+                // Input chroma (x/2, y/2) replicated to every covered
+                // luma position.
+                assert_eq!(o.u[i], p.u[(y / 2) * 2 + x / 2]);
+                assert_eq!(o.v[i], p.v[(y / 2) * 2 + x / 2]);
+                assert_eq!(a[i], 255);
             }
         }
-        // Canvas chroma (1,1) covers luma (2..4, 2..4) → input luma
-        // (1..3) → input chroma (0,0) for the first covered luma (1,1).
-        assert_eq!(o.u[4], p.u[0]);
-        assert_eq!(o.v[4], p.v[0]);
-        // Canvas chroma (0,0) covers luma (0..2)² of which (1,1) is
-        // covered → input luma (0,0) → chroma (0,0); opacity 1/4.
-        assert_eq!(o.u[0], p.u[0]);
+        // Outside the input the transparent fill shows.
+        assert_eq!(a[0], 0);
+        assert_eq!(a[35], 0);
     }
 }
