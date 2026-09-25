@@ -105,6 +105,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   0; the `moov` / `trak` / `stbl` serialisation stays here because the
   container's `SequenceWriter` has no brand override and no
   cover-still aliasing (cross-crate item).
+- `av1C` record parsing for the decoder is the container's
+  `oxideav_heif::Av1Config` (`av1_config::Av1CodecConfig` is now that
+  type; the AV1 §A.4 / §5.5.2 constraint checks stay here). The
+  audit-side field readers (`seq_profile` / `seq_level_idx_0` / bit
+  depth out of a possibly malformed record) keep their lenient local
+  byte reads.
 - `box_parser` is a thin surface over `oxideav_heif::boxes`:
   `BoxHeader` is the container crate's type (`total_len` is now a
   method and the header also carries `start` / `user_type`); an

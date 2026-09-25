@@ -22,7 +22,7 @@ use oxideav_core::frame::{VideoFrame, VideoPlane};
 use oxideav_core::Decoder;
 use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Result, TimeBase};
 
-use crate::av1_config::Av1CodecConfig;
+use crate::av1_config::{parse_av1c, Av1CodecConfig};
 
 use crate::alpha::find_alpha_item_id;
 use crate::avis::{parse_avis, sample_bytes};
@@ -291,7 +291,7 @@ impl AvifDecoder {
         // out exactly as the AV1 decoder emits them (little-endian
         // 16-bit words for a `high_bitdepth` track), no composition
         // step involved.
-        let cfg = Av1CodecConfig::parse(&av1c)?;
+        let cfg = parse_av1c(&av1c)?;
         validate_av1_config(&cfg)?;
 
         let timescale = if meta.timescale == 0 {
@@ -467,7 +467,7 @@ fn decode_av01_item(
             MAX_AV1_ITEM_BYTES
         )));
     }
-    let cfg = Av1CodecConfig::parse(av1c)?; // eagerly validate
+    let cfg = parse_av1c(av1c)?; // eagerly validate
     validate_av1_config(&cfg)?;
     // Every shown frame of the temporal unit, in decode order — a
     // layered item (av1-avif §2.3.1) shows one frame per spatial
@@ -780,7 +780,7 @@ fn decode_coded_item(hdr: &AvifHeader<'_>, item_id: u32) -> Result<ItemImage> {
         },
     };
     let (core_frame, fmt_core, mut w, mut h) = decode_av01_item(&bytes, &av1c, ispe, select)?;
-    let bit_depth = Av1CodecConfig::parse(&av1c)?.bit_depth();
+    let bit_depth = parse_av1c(&av1c)?.bit_depth();
     let mut frame = core_to_avif_frame(core_frame);
     let format = from_core_pix(fmt_core)?;
     if let Some((iw, ih)) = ispe {
@@ -1047,7 +1047,7 @@ mod tests {
     /// profiles 3..=7).
     #[test]
     fn validate_av1_config_rejects_high_profile() {
-        let mut cfg = Av1CodecConfig::parse(&[0x81, 0x00, 0x0c, 0x00]).unwrap();
+        let mut cfg = parse_av1c(&[0x81, 0x00, 0x0c, 0x00]).unwrap();
         cfg.seq_profile = 3;
         let err = validate_av1_config(&cfg).unwrap_err();
         match err {
@@ -1060,7 +1060,7 @@ mod tests {
     /// (24..=30 are reserved per AV1 §A.3).
     #[test]
     fn validate_av1_config_rejects_reserved_level() {
-        let mut cfg = Av1CodecConfig::parse(&[0x81, 0x00, 0x0c, 0x00]).unwrap();
+        let mut cfg = parse_av1c(&[0x81, 0x00, 0x0c, 0x00]).unwrap();
         cfg.seq_level_idx_0 = 27;
         let err = validate_av1_config(&cfg).unwrap_err();
         match err {
@@ -1074,7 +1074,7 @@ mod tests {
     /// requires both bits for 4:0:0.
     #[test]
     fn validate_av1_config_rejects_monochrome_without_subsampling() {
-        let mut cfg = Av1CodecConfig::parse(&[0x81, 0x00, 0x0c, 0x00]).unwrap();
+        let mut cfg = parse_av1c(&[0x81, 0x00, 0x0c, 0x00]).unwrap();
         cfg.monochrome = true;
         cfg.chroma_subsampling_x = false;
         cfg.chroma_subsampling_y = true;
@@ -1089,7 +1089,7 @@ mod tests {
     /// AV1 §5.5.2 only allows 4:2:2 chroma in profile 2.
     #[test]
     fn validate_av1_config_rejects_422_outside_profile_2() {
-        let mut cfg = Av1CodecConfig::parse(&[0x81, 0x00, 0x0c, 0x00]).unwrap();
+        let mut cfg = parse_av1c(&[0x81, 0x00, 0x0c, 0x00]).unwrap();
         cfg.seq_profile = 0;
         cfg.chroma_subsampling_x = true;
         cfg.chroma_subsampling_y = false;
@@ -1104,7 +1104,7 @@ mod tests {
     /// §5.5.2 confines 4:4:4 to profiles 1 and 2.
     #[test]
     fn validate_av1_config_rejects_444_in_profile_0() {
-        let mut cfg = Av1CodecConfig::parse(&[0x81, 0x00, 0x0c, 0x00]).unwrap();
+        let mut cfg = parse_av1c(&[0x81, 0x00, 0x0c, 0x00]).unwrap();
         cfg.seq_profile = 0;
         cfg.chroma_subsampling_x = false;
         cfg.chroma_subsampling_y = false;
@@ -1122,7 +1122,7 @@ mod tests {
     fn validate_av1_config_accepts_canonical_420_profile0() {
         // 0x81 = marker=1 version=1; 0x00 = seq_profile=0 level=0;
         // 0x0c = chroma_subsampling_x=chroma_subsampling_y=1 (4:2:0).
-        let cfg = Av1CodecConfig::parse(&[0x81, 0x00, 0x0c, 0x00]).unwrap();
+        let cfg = parse_av1c(&[0x81, 0x00, 0x0c, 0x00]).unwrap();
         validate_av1_config(&cfg).expect("canonical 4:2:0 / profile 0 must validate");
     }
 
