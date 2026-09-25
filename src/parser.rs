@@ -7,15 +7,15 @@ use std::borrow::Cow;
 use crate::derived::Mif1Compliance;
 use crate::error::{AvifError as Error, Result};
 
-use crate::box_parser::{b, iter_boxes, parse_full_box, read_u32, type_str, BoxType};
+use crate::box_parser::{b, find_box, iter_boxes, parse_full_box, type_str, BoxType};
 use crate::meta::{
     Amve, Cclv, Clli, Colr, IlocExtent, Ispe, ItemInfo, ItemLocation, Mdcv, Meta, Pasp, Pixi,
     Property,
 };
+use oxideav_heif::{FileType, HeifFile};
 
 const FTYP: BoxType = b(b"ftyp");
 const META: BoxType = b(b"meta");
-const MDAT: BoxType = b(b"mdat");
 const HDLR: BoxType = b(b"hdlr");
 const PITM: BoxType = b(b"pitm");
 const IINF: BoxType = b(b"iinf");
@@ -91,33 +91,64 @@ pub struct AvifHeader<'a> {
     pub minor_version: u32,
     pub compatible_brands: Vec<BoxType>,
     pub meta: Meta,
+    /// The container crate's parsed view of the same bytes — the source
+    /// of truth for item payload resolution across every `iloc`
+    /// construction method (file offset, `idat`, item offset). The
+    /// `meta` above is the AVIF-side model derived from it.
+    pub heif: HeifFile,
+}
+
+impl AvifHeader<'_> {
+    /// Payload bytes of `item_id` (every construction method, all
+    /// extents concatenated), borrowed from the container view when
+    /// the item is one contiguous span.
+    pub fn item_data(&self, item_id: u32) -> Result<Cow<'_, [u8]>> {
+        if self.meta.location_by_id(item_id).is_none() {
+            return Err(Error::invalid(format!(
+                "avif: item {item_id} missing in iloc"
+            )));
+        }
+        Ok(self.heif.item_data(item_id)?)
+    }
 }
 
 pub fn parse_header(file: &[u8]) -> Result<AvifHeader<'_>> {
-    let mut ftyp_payload: Option<&[u8]> = None;
-    let mut meta_payload: Option<&[u8]> = None;
-    for hdr in iter_boxes(file) {
-        let hdr = hdr?;
-        let payload = &file[hdr.payload_start..hdr.end()];
-        match &hdr.box_type {
-            x if x == &FTYP => ftyp_payload = Some(payload),
-            x if x == &META => meta_payload = Some(payload),
-            x if x == &MDAT => {}
-            _ => {}
+    // The AVIF brand rule runs on the raw `ftyp` first so a file that is
+    // not AVIF / HEIF at all is refused with the brand list in the
+    // message, before the container parse gets a say.
+    let (ftyp_payload, _) =
+        find_box(file, &FTYP)?.ok_or_else(|| Error::invalid("avif: missing ftyp"))?;
+    let (major_brand, minor_version, compatible_brands) = parse_ftyp(ftyp_payload)?;
+    classify_brands(&major_brand, &compatible_brands)?;
+    let heif = HeifFile::parse(file)?;
+    let container = heif
+        .meta
+        .as_ref()
+        .ok_or_else(|| Error::invalid("avif: missing meta"))?;
+    let mut meta = Meta::from_container(container)?;
+    if let Some(meta_payload) = heif.top_level_payload(&META) {
+        let (_version, _flags, body) = parse_full_box(meta_payload)?;
+        if let Some((grpl, _)) = find_box(body, &b(b"grpl"))? {
+            meta.grpl = Some(grpl.to_vec());
         }
     }
-    let ftyp = ftyp_payload.ok_or_else(|| Error::invalid("avif: missing ftyp"))?;
-    let (major_brand, minor_version, compatible_brands) = parse_ftyp(ftyp)?;
-    classify_brands(&major_brand, &compatible_brands)?;
-    let meta_p = meta_payload.ok_or_else(|| Error::invalid("avif: missing meta"))?;
-    let meta = Meta::parse(meta_p)?;
     Ok(AvifHeader {
         file,
         major_brand,
         minor_version,
         compatible_brands,
         meta,
+        heif,
     })
+}
+
+/// `(major_brand, minor_version, compatible_brands)` of a parsed `ftyp`.
+fn brands_of(ft: &FileType) -> (BoxType, u32, Vec<BoxType>) {
+    (
+        ft.major_brand,
+        ft.minor_version,
+        ft.compatible_brands.clone(),
+    )
 }
 
 /// Resolve a single-extent, `construction_method == 0` item's payload
@@ -265,6 +296,7 @@ pub fn parse(file: &[u8]) -> Result<AvifImage<'_>> {
         minor_version,
         compatible_brands,
         meta,
+        heif,
     } = hdr;
 
     let primary_id = meta
@@ -281,10 +313,10 @@ pub fn parse(file: &[u8]) -> Result<AvifImage<'_>> {
         )));
     }
 
-    let loc = meta
-        .location_by_id(primary_id)
-        .ok_or_else(|| Error::invalid("avif: primary item missing in iloc"))?;
-    let primary_data = resolve_item_bytes_with_idat(file, meta.idat.as_deref(), loc)?;
+    if meta.location_by_id(primary_id).is_none() {
+        return Err(Error::invalid("avif: primary item missing in iloc"));
+    }
+    let primary_data = primary_payload(file, &heif, primary_id)?;
 
     let av1c = match meta.property_for(primary_id, b"av1C") {
         Some(Property::Av1C(bytes)) => Some(bytes.clone()),
@@ -344,21 +376,22 @@ pub fn parse(file: &[u8]) -> Result<AvifImage<'_>> {
 }
 
 pub(crate) fn parse_ftyp(payload: &[u8]) -> Result<(BoxType, u32, Vec<BoxType>)> {
-    if payload.len() < 8 {
-        return Err(Error::invalid("avif: ftyp too short"));
+    let ft = FileType::parse(FTYP, payload)?;
+    Ok(brands_of(&ft))
+}
+
+/// The primary item's payload: zero-copy into `file` when the container
+/// reports one contiguous file-offset span, otherwise the concatenated
+/// (or `idat` / item-offset resolved) bytes, owned.
+fn primary_payload<'a>(file: &'a [u8], heif: &HeifFile, item_id: u32) -> Result<Cow<'a, [u8]>> {
+    if let Ok(spans) = heif.item_file_spans(item_id) {
+        if let [(start, end)] = spans.as_slice() {
+            if let Some(slice) = file.get(*start..*end) {
+                return Ok(Cow::Borrowed(slice));
+            }
+        }
     }
-    let mut major = [0u8; 4];
-    major.copy_from_slice(&payload[..4]);
-    let minor = read_u32(payload, 4)?;
-    let mut brands = Vec::new();
-    let mut cursor = 8;
-    while cursor + 4 <= payload.len() {
-        let mut b4 = [0u8; 4];
-        b4.copy_from_slice(&payload[cursor..cursor + 4]);
-        brands.push(b4);
-        cursor += 4;
-    }
-    Ok((major, minor, brands))
+    Ok(Cow::Owned(heif.item_data_owned(item_id)?))
 }
 
 /// Classification of an AVIF / HEIF `ftyp` box per av1-avif §6 + §7 +

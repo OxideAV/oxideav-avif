@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Container layer by `oxideav-heif`.** The ISOBMFF box reader, the
+  `meta` item model (`hdlr` / `pitm` / `iinf` + `infe` / `iloc` /
+  `iref` / `iprp` + `ipco` + `ipma` / `idat`) and item payload
+  resolution across every `iloc` construction method now come from the
+  published `oxideav-heif` crate (`default-features = false`, so the
+  standalone build stays framework-free). `Meta::parse` builds this
+  crate's item model from the container's (`Meta::from_container`);
+  the container-typed properties (`ispe` `pixi` `colr` `pasp` `clap`
+  `irot` `imir` `iscl` `auxC` `clli` `amve` `rloc` `lsel` `a1op` `a1lx`
+  `rref` `crtt` `mdft` `udes` `altt`) are converted from
+  `oxideav_heif::props`, the HEIF-extension properties this crate types
+  beyond that set (`aebr` … `cmin`, the transition effects, `prdi`,
+  `sstr`, `txlo`, `elng`, `fnch`, `mskC`) are parsed from the raw
+  property bytes, `av1C` is carried raw for the AV1 layer, and `mdcv` /
+  `cclv` keep this crate's field reading. `parse_header` /
+  `AvifHeader` carry the container view (`AvifHeader::heif`,
+  `AvifHeader::item_data`) which `parse`, the decoder, `inspect` and
+  `item_payload_bytes` use for item bytes (file offset, `idat` and
+  item-offset construction methods alike); `parse` still borrows the
+  primary payload zero-copy when it is one contiguous span.
+- `box_parser` is a thin surface over `oxideav_heif::boxes`:
+  `BoxHeader` is the container crate's type (`total_len` is now a
+  method and the header also carries `start` / `user_type`); an
+  `ipma` index-0 placeholder is dropped by the container instead of
+  refusing the file. `AvifError: From<oxideav_heif::HeifError>`.
+
 ### Added
 
 - **`iovl` overlay + `iden` identity pixel composition** (HEIF §6.6.2.2 /

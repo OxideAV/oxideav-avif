@@ -13,22 +13,12 @@
 
 use crate::error::{AvifError as Error, Result};
 
-use crate::box_parser::{
-    b, find_box, iter_boxes, parse_box_header, parse_full_box, read_cstr, read_u16, read_u32,
-    read_u64, read_var_uint, type_str, BoxType,
-};
-
-const HDLR: BoxType = b(b"hdlr");
-const PITM: BoxType = b(b"pitm");
-const IINF: BoxType = b(b"iinf");
-const INFE: BoxType = b(b"infe");
-const ILOC: BoxType = b(b"iloc");
-const IPRP: BoxType = b(b"iprp");
-const IPCO: BoxType = b(b"ipco");
-const IPMA: BoxType = b(b"ipma");
-const IREF: BoxType = b(b"iref");
-const GRPL: BoxType = b(b"grpl");
-const IDAT: BoxType = b(b"idat");
+#[cfg(test)]
+use crate::box_parser::iter_boxes;
+use crate::box_parser::{b, parse_full_box, read_cstr, read_u16, read_u32, type_str, BoxType};
+use oxideav_heif::boxes::FourCc;
+use oxideav_heif::meta as hmeta;
+use oxideav_heif::props as hprops;
 
 /// HEIF / ISOBMFF item-type four-CC carrying a generic MIME-tagged blob
 /// in the `mdat` (Exif/XMP item carriers when the writer chose the
@@ -2882,42 +2872,65 @@ impl Meta {
     /// Parse the raw payload of the top-level `meta` box (i.e. the bytes
     /// *after* its 4-byte FullBox prefix).
     pub fn parse(meta_payload: &[u8]) -> Result<Self> {
+        let container = hmeta::Meta::parse(meta_payload)?;
+        let mut me = Meta::from_container(&container)?;
+        // The container crate types the entity groups eagerly; this
+        // crate's `grpl` consumers ([`crate::derived::parse_grpl`]) read
+        // the raw payload, so lift it off the box tree as well.
         let (_version, _flags, body) = parse_full_box(meta_payload)?;
-        let mut me = Meta::default();
-        for hdr in iter_boxes(body) {
-            let hdr = hdr?;
-            let payload = &body[hdr.payload_start..hdr.end()];
-            match &hdr.box_type {
-                x if x == &HDLR => {
-                    me.handler = Some(parse_hdlr(payload)?);
-                }
-                x if x == &PITM => {
-                    me.primary_item_id = Some(parse_pitm(payload)?);
-                }
-                x if x == &IINF => {
-                    me.items = parse_iinf(payload)?;
-                }
-                x if x == &ILOC => {
-                    me.locations = parse_iloc(payload)?;
-                }
-                x if x == &IPRP => {
-                    let (props, assocs) = parse_iprp(payload)?;
-                    me.properties = props;
-                    me.associations = assocs;
-                }
-                x if x == &IREF => {
-                    me.irefs = parse_iref(payload)?;
-                }
-                x if x == &GRPL => {
-                    me.grpl = Some(payload.to_vec());
-                }
-                x if x == &IDAT => {
-                    me.idat = Some(payload.to_vec());
-                }
-                _ => {}
-            }
+        if let Some((grpl, _)) = crate::box_parser::find_box(body, &b(b"grpl"))? {
+            me.grpl = Some(grpl.to_vec());
         }
         Ok(me)
+    }
+
+    /// Build the AVIF-side item model from the container crate's parsed
+    /// `meta` tree ([`oxideav_heif::Meta`]): items, locations, typed
+    /// properties (the AVIF / HEIF-extension properties this crate
+    /// types beyond the container's set are parsed from the raw
+    /// property bytes), associations, references and `idat`. The raw
+    /// `grpl` payload is not part of the container model and is left
+    /// `None`; [`Meta::parse`] fills it from the box tree.
+    pub fn from_container(container: &hmeta::Meta) -> Result<Self> {
+        let mut properties = Vec::with_capacity(container.properties.len());
+        for raw in &container.properties {
+            properties.push(property_from_raw(raw)?);
+        }
+        Ok(Meta {
+            handler: container.handler.as_ref().map(|h| h.handler_type),
+            primary_item_id: container.primary_item_id,
+            items: container.items.iter().map(ItemInfo::from).collect(),
+            locations: container.locations.iter().map(ItemLocation::from).collect(),
+            properties,
+            associations: container
+                .associations
+                .iter()
+                .map(|a| ItemPropertyAssociation {
+                    item_id: a.item_id,
+                    entries: a
+                        .entries
+                        .iter()
+                        .map(|e| PropertyAssociation {
+                            // The container keeps the spec's 1-based
+                            // `ipco` index; this model stores 0-based.
+                            index: e.index.saturating_sub(1),
+                            essential: e.essential,
+                        })
+                        .collect(),
+                })
+                .collect(),
+            irefs: container
+                .references
+                .iter()
+                .map(|r| IrefEntry {
+                    reference_type: r.reference_type,
+                    from_id: r.from_item_id,
+                    to_ids: r.to_item_ids.clone(),
+                })
+                .collect(),
+            grpl: None,
+            idat: container.idat.clone(),
+        })
     }
 
     /// Return the list of target item IDs referenced from `from_id` via
@@ -3113,411 +3126,483 @@ impl Meta {
     }
 }
 
-fn parse_hdlr(payload: &[u8]) -> Result<BoxType> {
-    let (_v, _f, body) = parse_full_box(payload)?;
-    // body layout: pre_defined(4) + handler_type(4) + reserved(12) + name(str)
-    if body.len() < 8 {
-        return Err(Error::invalid("avif: hdlr too short"));
-    }
-    let mut t = [0u8; 4];
-    t.copy_from_slice(&body[4..8]);
-    Ok(t)
-}
+/// The property box types the container crate ([`oxideav_heif::props`])
+/// types for us. Everything else in [`Property`] is an AVIF / HEIF
+/// extension this crate parses from the raw property bytes.
+const CONTAINER_TYPED: &[FourCc] = &[
+    ISPE, COLR, PIXI, PASP, IROT, IMIR, CLAP, AUXC, CLLI, AMVE, RLOC, LSEL, A1OP, A1LX, ISCL, RREF,
+    CRTT, MDFT, UDES, ALTT,
+];
 
-fn parse_pitm(payload: &[u8]) -> Result<u32> {
-    let (version, _flags, body) = parse_full_box(payload)?;
-    if version == 0 {
-        if body.len() < 2 {
-            return Err(Error::invalid("avif: pitm too short"));
-        }
-        Ok(read_u16(body, 0)? as u32)
-    } else {
-        if body.len() < 4 {
-            return Err(Error::invalid("avif: pitm v1 too short"));
-        }
-        read_u32(body, 0)
-    }
-}
+/// FullBox properties this crate only accepts at `version = 0` (the
+/// value their HEIF definitions fix); the container layer reads any
+/// version, so the rule is applied here before delegating.
+const VERSION_ZERO_ONLY: &[FourCc] = &[RLOC, ISCL, RREF, CRTT, MDFT, UDES, ALTT];
 
-fn parse_iinf(payload: &[u8]) -> Result<Vec<ItemInfo>> {
-    let (version, _flags, body) = parse_full_box(payload)?;
-    let (count, mut cursor) = if version == 0 {
-        (read_u16(body, 0)? as u32, 2)
-    } else {
-        (read_u32(body, 0)?, 4)
-    };
-    let mut out = Vec::with_capacity(count as usize);
-    // Each child is an `infe` box.
-    while out.len() < count as usize {
-        if cursor >= body.len() {
-            return Err(Error::invalid("avif: iinf ran off end"));
-        }
-        let hdr = parse_box_header(body, cursor)?;
-        if hdr.box_type != INFE {
+/// Strictness this crate keeps on top of the container's typed parse:
+/// `version = 0` for [`VERSION_ZERO_ONLY`], and every `utf8string`
+/// field NUL-terminated (four for `udes`, two for `altt`, the
+/// `aux_type` of `auxC` before its subtype bytes) — a body that runs
+/// out mid-string is refused rather than read partially; bytes past
+/// the last terminator are forward-compatibility padding.
+fn container_typed(raw: &hmeta::RawProperty) -> Result<hprops::Property> {
+    let body = raw.body.as_slice();
+    let tag = &raw.box_type;
+    if VERSION_ZERO_ONLY.contains(tag) {
+        let (version, _flags, _rest) = parse_full_box(body)?;
+        if version != 0 {
             return Err(Error::invalid(format!(
-                "avif: iinf child '{}' != infe",
-                type_str(&hdr.box_type)
+                "avif: {} version {version} != 0",
+                type_str(tag)
             )));
         }
-        let infe_payload = &body[hdr.payload_start..hdr.end()];
-        out.push(parse_infe(infe_payload)?);
-        cursor = hdr.end();
     }
-    Ok(out)
-}
-
-fn parse_infe(payload: &[u8]) -> Result<ItemInfo> {
-    let (version, flags, body) = parse_full_box(payload)?;
-    // Versions 2 and 3 are the ones used by AVIF / HEIF. Version 0/1
-    // predate item_type and aren't legal for image items.
-    let (id, _protection_index, item_type, mut cursor) = match version {
-        2 => {
-            if body.len() < 8 {
-                return Err(Error::invalid("avif: infe v2 too short"));
-            }
-            let id = read_u16(body, 0)? as u32;
-            let protection_index = read_u16(body, 2)?;
-            let mut t = [0u8; 4];
-            t.copy_from_slice(&body[4..8]);
-            (id, protection_index, t, 8usize)
-        }
-        3 => {
-            if body.len() < 10 {
-                return Err(Error::invalid("avif: infe v3 too short"));
-            }
-            let id = read_u32(body, 0)?;
-            let protection_index = read_u16(body, 4)?;
-            let mut t = [0u8; 4];
-            t.copy_from_slice(&body[6..10]);
-            (id, protection_index, t, 10usize)
-        }
-        v => {
-            return Err(Error::invalid(format!(
-                "avif: unsupported infe version {v}"
-            )))
-        }
-    };
-    let (name, next) = read_cstr(body, cursor)?;
-    cursor = next;
-    // ISO/IEC 14496-12 §8.11.6.2 ItemInfoEntry syntax: for v2/v3 the
-    // tail of the box carries type-dependent fields. `mime` items ship
-    // `content_type` then optional `content_encoding`; `uri ` items
-    // ship `item_uri_type`. Every other type stops after `item_name`.
-    let (content_type, content_encoding, item_uri_type) = match &item_type {
-        x if x == &ITEM_TYPE_MIME => {
-            // content_type is mandatory for 'mime'; content_encoding is
-            // optional — when the box ends after content_type the field
-            // is treated as absent (§8.11.6.3: an explicit empty string
-            // means "no encoding", we collapse that to None for parity
-            // so callers don't have to special-case the empty case).
-            let (ct, after_ct) = read_cstr(body, cursor)?;
-            cursor = after_ct;
-            let ce = if cursor < body.len() {
-                let (raw, after_ce) = read_cstr(body, cursor)?;
-                cursor = after_ce;
-                if raw.is_empty() {
-                    None
-                } else {
-                    Some(raw)
-                }
-            } else {
-                None
-            };
-            (Some(ct), ce, None)
-        }
-        x if x == &ITEM_TYPE_URI => {
-            let (u, after_u) = read_cstr(body, cursor)?;
-            cursor = after_u;
-            (None, None, Some(u))
-        }
-        _ => (None, None, None),
-    };
-    let _ = cursor;
-    Ok(ItemInfo {
-        id,
-        item_type,
-        name,
-        content_type,
-        content_encoding,
-        item_uri_type,
-        flags,
-    })
-}
-
-fn parse_iloc(payload: &[u8]) -> Result<Vec<ItemLocation>> {
-    let (version, _flags, body) = parse_full_box(payload)?;
-    if body.len() < 2 {
-        return Err(Error::invalid("avif: iloc too short"));
-    }
-    let b0 = body[0];
-    let b1 = body[1];
-    let offset_size = (b0 >> 4) as usize;
-    let length_size = (b0 & 0x0f) as usize;
-    let base_offset_size = (b1 >> 4) as usize;
-    // v1/v2 also carry index_size in the low nibble; v0 reserved.
-    let index_size = if version == 1 || version == 2 {
-        (b1 & 0x0f) as usize
+    let strings = if tag == &UDES {
+        4
+    } else if tag == &ALTT {
+        2
     } else {
         0
     };
-    let mut cursor = 2usize;
-    let item_count = match version {
-        0 | 1 => {
-            let v = read_u16(body, cursor)? as u32;
-            cursor += 2;
-            v
+    if strings > 0 {
+        let (_v, _f, rest) = parse_full_box(body)?;
+        if rest.iter().filter(|&&c| c == 0).count() < strings {
+            return Err(Error::invalid(format!(
+                "avif: {} needs {strings} NUL-terminated strings",
+                type_str(tag)
+            )));
         }
-        2 => {
-            let v = read_u32(body, cursor)?;
-            cursor += 4;
-            v
+    }
+    if tag == &AUXC {
+        let (_v, _f, rest) = parse_full_box(body)?;
+        if !rest.contains(&0) {
+            return Err(Error::invalid("avif: auxC aux_type is not NUL-terminated"));
         }
-        v => return Err(Error::invalid(format!("avif: iloc version {v}"))),
+    }
+    Ok(hprops::Property::parse(raw)?)
+}
+
+/// Type one raw `ipco` entry.
+///
+/// `av1C` is carried as its raw record (the AV1 layer interprets it),
+/// `cclv` keeps this crate's reading of the box body, the
+/// container-typed set goes through [`oxideav_heif::props::Property::parse`]
+/// and is converted, the HEIF-extension set is parsed here, and
+/// anything else is kept as [`Property::Other`].
+fn property_from_raw(raw: &hmeta::RawProperty) -> Result<Property> {
+    let body = raw.body.as_slice();
+    if CONTAINER_TYPED.contains(&raw.box_type) {
+        return container_property(&container_typed(raw)?, &raw.box_type);
+    }
+    let prop = match &raw.box_type {
+        x if x == &AV1C => Property::Av1C(body.to_vec()),
+        x if x == &MDCV => Property::Mdcv(parse_mdcv(body)?),
+        x if x == &CCLV => Property::Cclv(parse_cclv(body)?),
+        x if x == &AEBR => Property::Aebr(parse_aebr(body)?),
+        x if x == &WBBR => Property::Wbbr(parse_wbbr(body)?),
+        x if x == &FOBR => Property::Fobr(parse_fobr(body)?),
+        x if x == &AFBR => Property::Afbr(parse_afbr(body)?),
+        x if x == &DOBR => Property::Dobr(parse_dobr(body)?),
+        x if x == &PANO => Property::Pano(parse_pano(body)?),
+        x if x == &SUBS => Property::Subs(parse_subs(body)?),
+        x if x == &TOLS => Property::Tols(parse_tols(body)?),
+        x if x == &WIPE => Property::Wipe(parse_wipe(body)?),
+        x if x == &ZOOM => Property::Zoom(parse_zoom(body)?),
+        x if x == &FADE => Property::Fade(parse_fade(body)?),
+        x if x == &SPLT => Property::Splt(parse_splt(body)?),
+        x if x == &STPE => Property::Stpe(parse_stpe(body)?),
+        x if x == &SSLD => Property::Ssld(parse_ssld(body)?),
+        x if x == &PRDI => Property::Prdi(parse_prdi(body)?),
+        x if x == &SSTR => Property::Sstr(parse_sstr(body)?),
+        x if x == &TXLO => Property::Txlo(parse_txlo(body)?),
+        x if x == &ELNG => Property::Elng(parse_elng(body)?),
+        x if x == &FNCH => Property::Fnch(parse_fnch(body)?),
+        x if x == &MSKC => Property::MaskC(parse_mskc(body)?),
+        x if x == &CMEX => Property::Cmex(parse_cmex(body)?),
+        x if x == &CMIN => Property::Cmin(parse_cmin(body)?),
+        other => Property::Other(*other, body.to_vec()),
     };
-    let mut out = Vec::with_capacity(item_count as usize);
-    for _ in 0..item_count {
-        // item_id sizing differs by version.
-        let item_id = match version {
-            0 | 1 => {
-                let v = read_u16(body, cursor)? as u32;
-                cursor += 2;
-                v
-            }
-            2 => {
-                let v = read_u32(body, cursor)?;
-                cursor += 4;
-                v
-            }
-            _ => unreachable!(),
-        };
-        let construction_method = if version == 1 || version == 2 {
-            // reserved(12) + construction_method(4), big-endian across 2B.
-            let w = read_u16(body, cursor)?;
-            cursor += 2;
-            (w & 0x0f) as u8
-        } else {
-            0
-        };
-        let data_reference_index = read_u16(body, cursor)?;
-        cursor += 2;
-        let base_offset = read_var_uint(body, cursor, base_offset_size)?;
-        cursor += base_offset_size;
-        let extent_count = read_u16(body, cursor)?;
-        cursor += 2;
-        let mut extents = Vec::with_capacity(extent_count as usize);
-        for _ in 0..extent_count {
-            // v1/v2: optional extent_index before offset/length. The spec
-            // (§8.11.3.3) only assigns it meaning for construction_method
-            // 2 (item_offset), where it is the 1-based index of the
-            // 'iloc' item reference naming the data-origin item; we
-            // capture it unconditionally so the cm=2 resolver can use it.
-            let extent_index = if (version == 1 || version == 2) && index_size > 0 {
-                let v = read_var_uint(body, cursor, index_size)?;
-                cursor += index_size;
-                v
-            } else {
-                0
-            };
-            let offset = read_var_uint(body, cursor, offset_size)?;
-            cursor += offset_size;
-            let length = read_var_uint(body, cursor, length_size)?;
-            cursor += length_size;
-            extents.push(IlocExtent {
-                offset,
-                length,
-                extent_index,
-            });
-        }
-        out.push(ItemLocation {
-            id: item_id,
-            construction_method,
-            data_reference_index,
-            base_offset,
-            extents,
-        });
-    }
-    Ok(out)
+    Ok(prop)
 }
 
-fn parse_iprp(payload: &[u8]) -> Result<(Vec<Property>, Vec<ItemPropertyAssociation>)> {
-    // iprp is a plain Box containing ipco then one or more ipma.
-    let (ipco_payload, _) =
-        find_box(payload, &IPCO)?.ok_or_else(|| Error::invalid("avif: iprp missing ipco"))?;
-    let properties = parse_ipco(ipco_payload)?;
-    let mut assocs = Vec::new();
-    // Multiple ipma boxes may appear; walk them all.
-    for hdr in iter_boxes(payload) {
-        let hdr = hdr?;
-        if hdr.box_type == IPMA {
-            let p = &payload[hdr.payload_start..hdr.end()];
-            assocs.extend(parse_ipma(p)?);
+/// Convert a container-typed property into this crate's model.
+fn container_property(p: &hprops::Property, box_type: &FourCc) -> Result<Property> {
+    use hprops::Property as H;
+    Ok(match p {
+        H::Ispe(v) => Property::Ispe((*v).into()),
+        H::Pixi(v) => Property::Pixi(v.clone().into()),
+        H::Colr(v) => Property::Colr(v.clone().into()),
+        H::Pasp(v) => Property::Pasp((*v).into()),
+        H::Clap(v) => Property::Clap((*v).into()),
+        H::Irot(v) => Property::Irot((*v).into()),
+        H::Imir(v) => Property::Imir((*v).into()),
+        H::Iscl(v) => Property::Iscl((*v).into()),
+        H::AuxC(v) => Property::AuxC(v.clone().into()),
+        H::Clli(v) => Property::Clli((*v).into()),
+        H::Amve(v) => Property::Amve((*v).into()),
+        H::Rloc(v) => Property::Rloc((*v).into()),
+        H::Lsel(v) => Property::Lsel((*v).into()),
+        H::A1op(v) => Property::A1op((*v).into()),
+        H::A1lx(v) => Property::A1lx((*v).into()),
+        H::Rref(v) => Property::Rref(v.clone().into()),
+        H::Crtt(v) => Property::Crtt(Crtt {
+            creation_time: v.time,
+        }),
+        H::Mdft(v) => Property::Mdft(Mdft {
+            modification_time: v.time,
+        }),
+        H::Udes(v) => Property::Udes(v.clone().into()),
+        H::Altt(v) => Property::Altt(v.clone().into()),
+        _ => {
+            return Err(Error::invalid(format!(
+                "avif: property '{}' typed unexpectedly by the container layer",
+                type_str(box_type)
+            )))
         }
-    }
-    Ok((properties, assocs))
+    })
 }
 
+/// Parse one property body through the container crate's typed parser
+/// (test scaffolding for the historical per-property unit tests).
+#[cfg(test)]
+fn container_parse(box_type: &FourCc, body: &[u8]) -> Result<hprops::Property> {
+    let raw = hmeta::RawProperty {
+        box_type: *box_type,
+        user_type: None,
+        body: body.to_vec(),
+        box_size: body.len() + 8,
+    };
+    container_typed(&raw)
+}
+
+macro_rules! container_typed_parser {
+    ($name:ident, $tag:expr, $variant:ident, $ty:ty, $conv:expr) => {
+        #[cfg(test)]
+        fn $name(body: &[u8]) -> Result<$ty> {
+            match container_parse(&$tag, body)? {
+                hprops::Property::$variant(v) => Ok($conv(v)),
+                _ => Err(Error::invalid(format!(
+                    "avif: '{}' body did not type as expected",
+                    type_str(&$tag)
+                ))),
+            }
+        }
+    };
+}
+
+container_typed_parser!(parse_ispe, ISPE, Ispe, Ispe, Ispe::from);
+container_typed_parser!(parse_colr, COLR, Colr, Colr, Colr::from);
+container_typed_parser!(parse_pixi, PIXI, Pixi, Pixi, Pixi::from);
+container_typed_parser!(parse_pasp, PASP, Pasp, Pasp, Pasp::from);
+container_typed_parser!(parse_irot, IROT, Irot, Irot, Irot::from);
+container_typed_parser!(parse_imir, IMIR, Imir, Imir, Imir::from);
+container_typed_parser!(parse_clap, CLAP, Clap, Clap, Clap::from);
+container_typed_parser!(parse_auxc, AUXC, AuxC, AuxC, AuxC::from);
+container_typed_parser!(parse_clli, CLLI, Clli, Clli, Clli::from);
+container_typed_parser!(parse_amve, AMVE, Amve, Amve, Amve::from);
+container_typed_parser!(parse_rloc, RLOC, Rloc, Rloc, Rloc::from);
+container_typed_parser!(parse_lsel, LSEL, Lsel, Lsel, Lsel::from);
+container_typed_parser!(parse_a1op, A1OP, A1op, A1op, A1op::from);
+container_typed_parser!(parse_a1lx, A1LX, A1lx, A1lx, A1lx::from);
+container_typed_parser!(parse_iscl, ISCL, Iscl, Iscl, Iscl::from);
+container_typed_parser!(parse_rref, RREF, Rref, Rref, Rref::from);
+container_typed_parser!(parse_crtt, CRTT, Crtt, Crtt, |v: hprops::TimeInfo| Crtt {
+    creation_time: v.time
+});
+container_typed_parser!(parse_mdft, MDFT, Mdft, Mdft, |v: hprops::TimeInfo| Mdft {
+    modification_time: v.time
+});
+container_typed_parser!(parse_udes, UDES, Udes, Udes, Udes::from);
+container_typed_parser!(parse_altt, ALTT, Altt, Altt, Altt::from);
+
+/// Type every property box packed in an `ipco` payload, in order (test
+/// scaffolding: the container crate walks `ipco` for the real parse).
+#[cfg(test)]
 fn parse_ipco(payload: &[u8]) -> Result<Vec<Property>> {
     let mut out = Vec::new();
     for hdr in iter_boxes(payload) {
         let hdr = hdr?;
-        let body = &payload[hdr.payload_start..hdr.end()];
-        let prop = match &hdr.box_type {
-            x if x == &AV1C => Property::Av1C(body.to_vec()),
-            x if x == &ISPE => Property::Ispe(parse_ispe(body)?),
-            x if x == &COLR => Property::Colr(parse_colr(body)?),
-            x if x == &PIXI => Property::Pixi(parse_pixi(body)?),
-            x if x == &PASP => Property::Pasp(parse_pasp(body)?),
-            x if x == &IROT => Property::Irot(parse_irot(body)?),
-            x if x == &IMIR => Property::Imir(parse_imir(body)?),
-            x if x == &CLAP => Property::Clap(parse_clap(body)?),
-            x if x == &AUXC => Property::AuxC(parse_auxc(body)?),
-            x if x == &MDCV => Property::Mdcv(parse_mdcv(body)?),
-            x if x == &CLLI => Property::Clli(parse_clli(body)?),
-            x if x == &CCLV => Property::Cclv(parse_cclv(body)?),
-            x if x == &AMVE => Property::Amve(parse_amve(body)?),
-            x if x == &RLOC => Property::Rloc(parse_rloc(body)?),
-            x if x == &LSEL => Property::Lsel(parse_lsel(body)?),
-            x if x == &A1OP => Property::A1op(parse_a1op(body)?),
-            x if x == &A1LX => Property::A1lx(parse_a1lx(body)?),
-            x if x == &ISCL => Property::Iscl(parse_iscl(body)?),
-            x if x == &RREF => Property::Rref(parse_rref(body)?),
-            x if x == &CRTT => Property::Crtt(parse_crtt(body)?),
-            x if x == &MDFT => Property::Mdft(parse_mdft(body)?),
-            x if x == &UDES => Property::Udes(parse_udes(body)?),
-            x if x == &ALTT => Property::Altt(parse_altt(body)?),
-            x if x == &AEBR => Property::Aebr(parse_aebr(body)?),
-            x if x == &WBBR => Property::Wbbr(parse_wbbr(body)?),
-            x if x == &FOBR => Property::Fobr(parse_fobr(body)?),
-            x if x == &AFBR => Property::Afbr(parse_afbr(body)?),
-            x if x == &DOBR => Property::Dobr(parse_dobr(body)?),
-            x if x == &PANO => Property::Pano(parse_pano(body)?),
-            x if x == &SUBS => Property::Subs(parse_subs(body)?),
-            x if x == &TOLS => Property::Tols(parse_tols(body)?),
-            x if x == &WIPE => Property::Wipe(parse_wipe(body)?),
-            x if x == &ZOOM => Property::Zoom(parse_zoom(body)?),
-            x if x == &FADE => Property::Fade(parse_fade(body)?),
-            x if x == &SPLT => Property::Splt(parse_splt(body)?),
-            x if x == &STPE => Property::Stpe(parse_stpe(body)?),
-            x if x == &SSLD => Property::Ssld(parse_ssld(body)?),
-            x if x == &PRDI => Property::Prdi(parse_prdi(body)?),
-            x if x == &SSTR => Property::Sstr(parse_sstr(body)?),
-            x if x == &TXLO => Property::Txlo(parse_txlo(body)?),
-            x if x == &ELNG => Property::Elng(parse_elng(body)?),
-            x if x == &FNCH => Property::Fnch(parse_fnch(body)?),
-            x if x == &MSKC => Property::MaskC(parse_mskc(body)?),
-            x if x == &CMEX => Property::Cmex(parse_cmex(body)?),
-            x if x == &CMIN => Property::Cmin(parse_cmin(body)?),
-            other => Property::Other(*other, body.to_vec()),
+        let raw = hmeta::RawProperty {
+            box_type: hdr.box_type,
+            user_type: hdr.user_type,
+            body: payload[hdr.payload_start..hdr.end()].to_vec(),
+            box_size: hdr.total_len(),
         };
-        out.push(prop);
+        out.push(property_from_raw(&raw)?);
     }
     Ok(out)
 }
 
-fn parse_ispe(body: &[u8]) -> Result<Ispe> {
-    let (_v, _f, rest) = parse_full_box(body)?;
-    if rest.len() < 8 {
-        return Err(Error::invalid("avif: ispe too short"));
+impl From<&hmeta::ItemInfo> for ItemInfo {
+    fn from(i: &hmeta::ItemInfo) -> Self {
+        ItemInfo {
+            id: i.id,
+            item_type: i.item_type,
+            name: i.name.clone(),
+            content_type: i.content_type.clone(),
+            content_encoding: i.content_encoding.clone(),
+            item_uri_type: i.item_uri_type.clone(),
+            flags: i.flags,
+        }
     }
-    Ok(Ispe {
-        width: read_u32(rest, 0)?,
-        height: read_u32(rest, 4)?,
-    })
 }
 
-fn parse_colr(body: &[u8]) -> Result<Colr> {
-    if body.len() < 4 {
-        return Err(Error::invalid("avif: colr too short"));
+impl From<&hmeta::ItemLocation> for ItemLocation {
+    fn from(l: &hmeta::ItemLocation) -> Self {
+        ItemLocation {
+            id: l.item_id,
+            construction_method: l.construction_method,
+            data_reference_index: l.data_reference_index,
+            base_offset: l.base_offset,
+            extents: l
+                .extents
+                .iter()
+                .map(|e| IlocExtent {
+                    offset: e.offset,
+                    length: e.length,
+                    extent_index: e.index,
+                })
+                .collect(),
+        }
     }
-    let mut tag = [0u8; 4];
-    tag.copy_from_slice(&body[..4]);
-    match &tag {
-        b"nclx" => {
-            if body.len() < 4 + 7 {
-                return Err(Error::invalid("avif: colr nclx too short"));
-            }
-            let colour_primaries = read_u16(body, 4)?;
-            let transfer_characteristics = read_u16(body, 6)?;
-            let matrix_coefficients = read_u16(body, 8)?;
-            let full_range = (body[10] & 0x80) != 0;
-            Ok(Colr::Nclx {
+}
+
+impl From<hprops::Ispe> for Ispe {
+    fn from(v: hprops::Ispe) -> Self {
+        Ispe {
+            width: v.width,
+            height: v.height,
+        }
+    }
+}
+
+impl From<hprops::Pixi> for Pixi {
+    fn from(v: hprops::Pixi) -> Self {
+        Pixi {
+            bits_per_channel: v.bits_per_channel,
+        }
+    }
+}
+
+impl From<hprops::Pasp> for Pasp {
+    fn from(v: hprops::Pasp) -> Self {
+        Pasp {
+            h_spacing: v.h_spacing,
+            v_spacing: v.v_spacing,
+        }
+    }
+}
+
+impl From<hprops::Colr> for Colr {
+    fn from(v: hprops::Colr) -> Self {
+        match v {
+            hprops::Colr::Nclx {
+                primaries,
+                transfer,
+                matrix,
+                full_range,
+            } => Colr::Nclx {
+                colour_primaries: primaries,
+                transfer_characteristics: transfer,
+                matrix_coefficients: matrix,
+                full_range,
+            },
+            hprops::Colr::Icc { profile, .. } => Colr::Icc(profile),
+            hprops::Colr::Other { colour_type, .. } => Colr::Unknown(colour_type),
+        }
+    }
+}
+
+impl From<&Colr> for hprops::Colr {
+    fn from(v: &Colr) -> Self {
+        match v {
+            Colr::Nclx {
                 colour_primaries,
                 transfer_characteristics,
                 matrix_coefficients,
                 full_range,
-            })
+            } => hprops::Colr::Nclx {
+                primaries: *colour_primaries,
+                transfer: *transfer_characteristics,
+                matrix: *matrix_coefficients,
+                full_range: *full_range,
+            },
+            Colr::Icc(profile) => hprops::Colr::Icc {
+                restricted: false,
+                profile: profile.clone(),
+            },
+            Colr::Unknown(t) => hprops::Colr::Other {
+                colour_type: *t,
+                payload: Vec::new(),
+            },
         }
-        b"rICC" | b"prof" => Ok(Colr::Icc(body[4..].to_vec())),
-        other => Ok(Colr::Unknown(*other)),
     }
 }
 
-fn parse_pixi(body: &[u8]) -> Result<Pixi> {
-    let (_v, _f, rest) = parse_full_box(body)?;
-    if rest.is_empty() {
-        return Err(Error::invalid("avif: pixi too short"));
+impl From<hprops::Irot> for Irot {
+    fn from(v: hprops::Irot) -> Self {
+        Irot {
+            angle: v.angle & 0x03,
+        }
     }
-    let n = rest[0] as usize;
-    if rest.len() < 1 + n {
-        return Err(Error::invalid("avif: pixi channels truncated"));
-    }
-    Ok(Pixi {
-        bits_per_channel: rest[1..1 + n].to_vec(),
-    })
 }
 
-fn parse_pasp(body: &[u8]) -> Result<Pasp> {
-    if body.len() < 8 {
-        return Err(Error::invalid("avif: pasp too short"));
+impl From<hprops::Imir> for Imir {
+    fn from(v: hprops::Imir) -> Self {
+        Imir {
+            axis: v.axis & 0x01,
+        }
     }
-    Ok(Pasp {
-        h_spacing: read_u32(body, 0)?,
-        v_spacing: read_u32(body, 4)?,
-    })
 }
 
-fn parse_irot(body: &[u8]) -> Result<Irot> {
-    if body.is_empty() {
-        return Err(Error::invalid("avif: irot empty"));
+impl From<hprops::Clap> for Clap {
+    fn from(v: hprops::Clap) -> Self {
+        Clap {
+            clean_aperture_width_n: v.width_n as i32,
+            clean_aperture_width_d: v.width_d as i32,
+            clean_aperture_height_n: v.height_n as i32,
+            clean_aperture_height_d: v.height_d as i32,
+            horiz_off_n: v.horiz_off_n,
+            horiz_off_d: v.horiz_off_d as i32,
+            vert_off_n: v.vert_off_n,
+            vert_off_d: v.vert_off_d as i32,
+        }
     }
-    Ok(Irot {
-        angle: body[0] & 0x03,
-    })
 }
 
-fn parse_imir(body: &[u8]) -> Result<Imir> {
-    if body.is_empty() {
-        return Err(Error::invalid("avif: imir empty"));
+impl From<&Clap> for hprops::Clap {
+    fn from(v: &Clap) -> Self {
+        hprops::Clap {
+            width_n: v.clean_aperture_width_n as u32,
+            width_d: v.clean_aperture_width_d as u32,
+            height_n: v.clean_aperture_height_n as u32,
+            height_d: v.clean_aperture_height_d as u32,
+            horiz_off_n: v.horiz_off_n,
+            horiz_off_d: v.horiz_off_d as u32,
+            vert_off_n: v.vert_off_n,
+            vert_off_d: v.vert_off_d as u32,
+        }
     }
-    Ok(Imir {
-        axis: body[0] & 0x01,
-    })
 }
 
-fn parse_clap(body: &[u8]) -> Result<Clap> {
-    if body.len() < 32 {
-        return Err(Error::invalid("avif: clap too short"));
+impl From<hprops::AuxC> for AuxC {
+    fn from(v: hprops::AuxC) -> Self {
+        AuxC {
+            aux_type: v.aux_type,
+            aux_subtype: v.aux_subtype,
+        }
     }
-    Ok(Clap {
-        clean_aperture_width_n: read_u32(body, 0)? as i32,
-        clean_aperture_width_d: read_u32(body, 4)? as i32,
-        clean_aperture_height_n: read_u32(body, 8)? as i32,
-        clean_aperture_height_d: read_u32(body, 12)? as i32,
-        horiz_off_n: read_u32(body, 16)? as i32,
-        horiz_off_d: read_u32(body, 20)? as i32,
-        vert_off_n: read_u32(body, 24)? as i32,
-        vert_off_d: read_u32(body, 28)? as i32,
-    })
 }
 
-fn parse_auxc(body: &[u8]) -> Result<AuxC> {
-    let (_v, _f, rest) = parse_full_box(body)?;
-    let (aux_type, next) = read_cstr(rest, 0)?;
-    let aux_subtype = rest.get(next..).unwrap_or(&[]).to_vec();
-    Ok(AuxC {
-        aux_type,
-        aux_subtype,
-    })
+impl From<hprops::Clli> for Clli {
+    fn from(v: hprops::Clli) -> Self {
+        Clli {
+            max_content_light_level: v.max_content_light_level,
+            max_pic_average_light_level: v.max_pic_average_light_level,
+        }
+    }
+}
+
+impl From<&Clli> for hprops::Clli {
+    fn from(v: &Clli) -> Self {
+        hprops::Clli {
+            max_content_light_level: v.max_content_light_level,
+            max_pic_average_light_level: v.max_pic_average_light_level,
+        }
+    }
+}
+
+impl From<hprops::Amve> for Amve {
+    fn from(v: hprops::Amve) -> Self {
+        Amve {
+            ambient_illuminance: v.ambient_illuminance,
+            ambient_light_x: v.ambient_light_x,
+            ambient_light_y: v.ambient_light_y,
+        }
+    }
+}
+
+impl From<&Amve> for hprops::Amve {
+    fn from(v: &Amve) -> Self {
+        hprops::Amve {
+            ambient_illuminance: v.ambient_illuminance,
+            ambient_light_x: v.ambient_light_x,
+            ambient_light_y: v.ambient_light_y,
+        }
+    }
+}
+
+impl From<hprops::Rloc> for Rloc {
+    fn from(v: hprops::Rloc) -> Self {
+        Rloc {
+            horizontal_offset: v.horizontal_offset,
+            vertical_offset: v.vertical_offset,
+        }
+    }
+}
+
+impl From<hprops::Lsel> for Lsel {
+    fn from(v: hprops::Lsel) -> Self {
+        Lsel {
+            layer_id: v.layer_id,
+        }
+    }
+}
+
+impl From<hprops::A1op> for A1op {
+    fn from(v: hprops::A1op) -> Self {
+        A1op {
+            op_index: v.op_index,
+        }
+    }
+}
+
+impl From<hprops::A1lx> for A1lx {
+    fn from(v: hprops::A1lx) -> Self {
+        A1lx {
+            large_size: v.large_size,
+            layer_size: v.layer_size,
+        }
+    }
+}
+
+impl From<hprops::Iscl> for Iscl {
+    fn from(v: hprops::Iscl) -> Self {
+        Iscl {
+            target_width_numerator: v.width_num,
+            target_width_denominator: v.width_den,
+            target_height_numerator: v.height_num,
+            target_height_denominator: v.height_den,
+        }
+    }
+}
+
+impl From<hprops::Rref> for Rref {
+    fn from(v: hprops::Rref) -> Self {
+        Rref {
+            reference_types: v.reference_types,
+        }
+    }
+}
+
+impl From<hprops::Udes> for Udes {
+    fn from(v: hprops::Udes) -> Self {
+        Udes {
+            lang: v.lang,
+            name: v.name,
+            description: v.description,
+            tags: v.tags,
+        }
+    }
+}
+
+impl From<hprops::Altt> for Altt {
+    fn from(v: hprops::Altt) -> Self {
+        Altt {
+            alt_text: v.alt_text,
+            alt_lang: v.alt_lang,
+        }
+    }
 }
 
 /// Parse `mdcv` (MasteringDisplayColourVolumeBox). Layout per ISO/IEC 14496-12
@@ -3549,21 +3634,6 @@ fn parse_mdcv(body: &[u8]) -> Result<Mdcv> {
     })
 }
 
-/// Parse `clli` (ContentLightLevelBox). Layout per ISO/IEC 14496-12
-/// §12.1.5.4: two u16 values — MaxCLL and MaxFALL in cd/m². No FullBox header.
-fn parse_clli(body: &[u8]) -> Result<Clli> {
-    if body.len() < 4 {
-        return Err(Error::invalid(format!(
-            "avif: clli too short ({} < 4)",
-            body.len()
-        )));
-    }
-    Ok(Clli {
-        max_content_light_level: read_u16(body, 0)?,
-        max_pic_average_light_level: read_u16(body, 2)?,
-    })
-}
-
 /// Parse `cclv` (ColourVolumeLuminanceBox — draft av1-avif extension).
 /// Same binary layout as `clli`: two u16 values (MaxCLL, MaxFALL). Some
 /// encoders write this instead of or in addition to `clli`.
@@ -3578,336 +3648,6 @@ fn parse_cclv(body: &[u8]) -> Result<Cclv> {
         max_content_light_level: read_u16(body, 0)?,
         max_pic_average_light_level: read_u16(body, 2)?,
     })
-}
-
-/// Parse `amve` (AmbientViewingEnvironmentBox — AVIF §6.5.36). A plain
-/// `Box` (no version/flags) with a fixed 8-byte body: a big-endian
-/// `unsigned int(32)` illuminance followed by two big-endian
-/// `unsigned int(16)` CIE 1931 chromaticity values.
-fn parse_amve(body: &[u8]) -> Result<Amve> {
-    if body.len() < 8 {
-        return Err(Error::invalid(format!(
-            "avif: amve too short ({} < 8)",
-            body.len()
-        )));
-    }
-    Ok(Amve {
-        ambient_illuminance: read_u32(body, 0)?,
-        ambient_light_x: read_u16(body, 4)?,
-        ambient_light_y: read_u16(body, 6)?,
-    })
-}
-
-/// Parse `rloc` (RelativeLocationProperty — HEIF §6.5.7). FullBox(v=0,
-/// f=0) followed by two big-endian `unsigned int(32)` offsets in pixels.
-fn parse_rloc(body: &[u8]) -> Result<Rloc> {
-    let (version, _flags, rest) = parse_full_box(body)?;
-    if version != 0 {
-        return Err(Error::invalid(format!("avif: rloc version {version} != 0")));
-    }
-    if rest.len() < 8 {
-        return Err(Error::invalid(format!(
-            "avif: rloc too short ({} < 8)",
-            rest.len()
-        )));
-    }
-    Ok(Rloc {
-        horizontal_offset: read_u32(rest, 0)?,
-        vertical_offset: read_u32(rest, 4)?,
-    })
-}
-
-/// Parse `lsel` (LayerSelectorProperty — HEIF §6.5.11). ItemProperty
-/// (NO FullBox header) containing a single big-endian `unsigned int(16)`
-/// `layer_id`.
-fn parse_lsel(body: &[u8]) -> Result<Lsel> {
-    if body.len() < 2 {
-        return Err(Error::invalid(format!(
-            "avif: lsel too short ({} < 2)",
-            body.len()
-        )));
-    }
-    Ok(Lsel {
-        layer_id: read_u16(body, 0)?,
-    })
-}
-
-/// Parse `a1op` (OperatingPointSelectorProperty — av1-avif §2.3.2.1).
-/// ItemProperty (NO FullBox header) carrying a single
-/// `unsigned int(8) op_index`.
-fn parse_a1op(body: &[u8]) -> Result<A1op> {
-    if body.is_empty() {
-        return Err(Error::invalid("avif: a1op too short (0 < 1)"));
-    }
-    Ok(A1op { op_index: body[0] })
-}
-
-/// Parse `a1lx` (AV1LayeredImageIndexingProperty — av1-avif §2.3.2.3).
-/// ItemProperty (NO FullBox header):
-///
-/// ```text
-/// unsigned int(7) reserved = 0;
-/// unsigned int(1) large_size;
-/// FieldLength = (large_size + 1) * 16;
-/// unsigned int(FieldLength) layer_size[3];
-/// ```
-///
-/// `large_size == 0` → three 16-bit sizes (7 bytes total);
-/// `large_size == 1` → three 32-bit sizes (13 bytes total). The reserved
-/// 7 bits of the first byte are ignored on read.
-fn parse_a1lx(body: &[u8]) -> Result<A1lx> {
-    if body.is_empty() {
-        return Err(Error::invalid("avif: a1lx too short (0 < 1)"));
-    }
-    let large_size = (body[0] & 0x01) != 0;
-    let field_bytes = if large_size { 4 } else { 2 };
-    let need = 1 + field_bytes * 3;
-    if body.len() < need {
-        return Err(Error::invalid(format!(
-            "avif: a1lx too short ({} < {need})",
-            body.len()
-        )));
-    }
-    let mut layer_size = [0u32; 3];
-    for (i, slot) in layer_size.iter_mut().enumerate() {
-        let at = 1 + i * field_bytes;
-        *slot = if large_size {
-            read_u32(body, at)?
-        } else {
-            u32::from(read_u16(body, at)?)
-        };
-    }
-    Ok(A1lx {
-        large_size,
-        layer_size,
-    })
-}
-
-/// Parse `iscl` (ImageScaling — HEIF §6.5.13). FullBox(`iscl`,
-/// version=0, flags=0) followed by four big-endian
-/// `unsigned int(16)` fields totalling 8 bytes:
-///
-/// ```text
-/// unsigned int(16) target_width_numerator;
-/// unsigned int(16) target_width_denominator;
-/// unsigned int(16) target_height_numerator;
-/// unsigned int(16) target_height_denominator;
-/// ```
-///
-/// The §6.5.13.3 `shall` that every numerator and denominator be
-/// non-zero is not enforced at parse time — the parser surfaces
-/// the bytes as written and the caller routes to
-/// [`Iscl::is_well_formed`] for the §6.5.13.3 check. This keeps the
-/// "did the bytes decode" and "did they satisfy the normative
-/// constraint" signals separate, matching the pattern used by the
-/// other HEIF property parsers in this module.
-///
-/// An unknown `version` is rejected so a future v1 layout never
-/// gets misread as v0.
-fn parse_iscl(body: &[u8]) -> Result<Iscl> {
-    let (version, _flags, rest) = parse_full_box(body)?;
-    if version != 0 {
-        return Err(Error::invalid(format!("avif: iscl version {version} != 0")));
-    }
-    if rest.len() < 8 {
-        return Err(Error::invalid(format!(
-            "avif: iscl too short ({} < 8)",
-            rest.len()
-        )));
-    }
-    Ok(Iscl {
-        target_width_numerator: read_u16(rest, 0)?,
-        target_width_denominator: read_u16(rest, 2)?,
-        target_height_numerator: read_u16(rest, 4)?,
-        target_height_denominator: read_u16(rest, 6)?,
-    })
-}
-
-/// Parse `rref` (RequiredReferenceTypesProperty — HEIF §6.5.17).
-/// FullBox(`rref`, version=0, flags=0) followed by:
-///
-/// ```text
-/// unsigned int(8) reference_type_count;
-/// for (i=0; i< reference_type_count; i++) {
-///     unsigned int(32) reference_type[i];
-/// }
-/// ```
-///
-/// A declared `reference_type_count` that exceeds the available
-/// body bytes returns an error rather than silently truncating —
-/// per §6.5.17 a reader that fails to honour every listed type
-/// `shall` refuse to process the associated item, so a partial
-/// read would defeat the property's purpose.
-///
-/// An unknown `version` is rejected so a future-version layout
-/// can't be misread.
-fn parse_rref(body: &[u8]) -> Result<Rref> {
-    let (version, _flags, rest) = parse_full_box(body)?;
-    if version != 0 {
-        return Err(Error::invalid(format!("avif: rref version {version} != 0")));
-    }
-    if rest.is_empty() {
-        return Err(Error::invalid("avif: rref too short (0 < 1)"));
-    }
-    let count = rest[0] as usize;
-    let need = 1 + count * 4;
-    if rest.len() < need {
-        return Err(Error::invalid(format!(
-            "avif: rref reference_type table truncated ({} < {need})",
-            rest.len()
-        )));
-    }
-    let mut reference_types = Vec::with_capacity(count);
-    for i in 0..count {
-        let at = 1 + i * 4;
-        let mut t = [0u8; 4];
-        t.copy_from_slice(&rest[at..at + 4]);
-        reference_types.push(t);
-    }
-    Ok(Rref { reference_types })
-}
-
-/// Parse `crtt` (CreationTimeProperty — HEIF §6.5.18). FullBox(`crtt`,
-/// version=0, flags=0) followed by a single big-endian
-/// `unsigned int(64)` field totalling 8 bytes:
-///
-/// ```text
-/// unsigned int(64) creation_time;
-/// ```
-///
-/// `creation_time` is in microseconds since midnight, Jan. 1, 1904 UTC
-/// per §6.5.18.3 — the parser surfaces the value as written; the
-/// [`Crtt::seconds_since_unix_epoch`] / [`Crtt::subsecond_micros`]
-/// helpers convert to the Unix epoch when a caller wants a directly
-/// comparable timestamp.
-///
-/// An unknown `version` is rejected so a future-version layout cannot
-/// be misread as v0.
-fn parse_crtt(body: &[u8]) -> Result<Crtt> {
-    let (version, _flags, rest) = parse_full_box(body)?;
-    if version != 0 {
-        return Err(Error::invalid(format!("avif: crtt version {version} != 0")));
-    }
-    if rest.len() < 8 {
-        return Err(Error::invalid(format!(
-            "avif: crtt too short ({} < 8)",
-            rest.len()
-        )));
-    }
-    Ok(Crtt {
-        creation_time: read_u64(rest, 0)?,
-    })
-}
-
-/// Parse `mdft` (ModificationTimeProperty — HEIF §6.5.19).
-/// FullBox(`mdft`, version=0, flags=0) followed by a single
-/// big-endian `unsigned int(64)` field totalling 8 bytes:
-///
-/// ```text
-/// unsigned int(64) modification_time;
-/// ```
-///
-/// `modification_time` is in microseconds since midnight, Jan. 1, 1904
-/// UTC per §6.5.19.3 — the parser surfaces the value as written; the
-/// [`Mdft::seconds_since_unix_epoch`] / [`Mdft::subsecond_micros`]
-/// helpers convert to the Unix epoch when a caller wants a directly
-/// comparable timestamp.
-///
-/// The wire layout mirrors §6.5.18 `crtt` exactly (same FullBox header,
-/// same u64 field width, same 1904-epoch microsecond unit), so the
-/// parser is structurally identical — only the box four-CC and the
-/// surfaced struct differ.
-///
-/// An unknown `version` is rejected so a future-version layout cannot
-/// be misread as v0.
-fn parse_mdft(body: &[u8]) -> Result<Mdft> {
-    let (version, _flags, rest) = parse_full_box(body)?;
-    if version != 0 {
-        return Err(Error::invalid(format!("avif: mdft version {version} != 0")));
-    }
-    if rest.len() < 8 {
-        return Err(Error::invalid(format!(
-            "avif: mdft too short ({} < 8)",
-            rest.len()
-        )));
-    }
-    Ok(Mdft {
-        modification_time: read_u64(rest, 0)?,
-    })
-}
-
-/// Parse `udes` (UserDescriptionProperty — HEIF §6.5.20).
-/// FullBox(`udes`, version=0, flags=0) followed by four
-/// sequential null-terminated UTF-8 strings:
-///
-/// ```text
-/// utf8string lang;
-/// utf8string name;
-/// utf8string description;
-/// utf8string tags;
-/// ```
-///
-/// Per §6.5.20.3 each field's empty-string form (a single nul byte)
-/// is the documented "absent" sentinel; the parser preserves the raw
-/// string and leaves the `Option` projection to the
-/// [`Udes::lang_opt`] / [`Udes::name_opt`] / [`Udes::description_opt`]
-/// / [`Udes::tags_opt`] / [`Udes::tag_list`] helpers.
-///
-/// An unknown `version` is rejected so a future-version layout (which
-/// might re-shape the field order or widths) cannot be misread as v0.
-/// A body that runs out before all four strings have been read is
-/// rejected by [`read_cstr`]; trailing bytes past the fourth
-/// terminator are ignored, mirroring the §8.11.6 `infe` tail-field
-/// behaviour for forward compatibility with future spec revisions
-/// that append new fields under the same `version=0` slot.
-fn parse_udes(body: &[u8]) -> Result<Udes> {
-    let (version, _flags, rest) = parse_full_box(body)?;
-    if version != 0 {
-        return Err(Error::invalid(format!("avif: udes version {version} != 0")));
-    }
-    let (lang, after_lang) = read_cstr(rest, 0)?;
-    let (name, after_name) = read_cstr(rest, after_lang)?;
-    let (description, after_desc) = read_cstr(rest, after_name)?;
-    let (tags, _after_tags) = read_cstr(rest, after_desc)?;
-    Ok(Udes {
-        lang,
-        name,
-        description,
-        tags,
-    })
-}
-
-/// Parse `altt` (AccessibilityTextProperty — HEIF §6.5.21).
-/// FullBox(`altt`, version=0, flags=0) followed by two sequential
-/// null-terminated UTF-8 strings:
-///
-/// ```text
-/// utf8string alt_text;
-/// utf8string alt_lang;
-/// ```
-///
-/// Per §6.5.21.3 an empty `alt_lang` flags the language as
-/// unknown/undefined; the parser preserves the raw empty string and
-/// the [`Altt::alt_lang_opt`] / [`Altt::alt_text_opt`] helpers project
-/// the empty form to `None`. The parsed field order is
-/// `alt_text`-first to mirror the §6.5.21.2 syntax verbatim — this
-/// reverses the field ordering relative to `udes`, where the language
-/// tag comes first.
-///
-/// An unknown `version` is rejected so a future-version layout cannot
-/// be misread as v0. A body that runs out before both strings have
-/// been read is rejected by [`read_cstr`]. Trailing bytes past the
-/// second terminator are ignored, mirroring the §8.11.6 `infe`
-/// tail-field behaviour for forward compatibility with future spec
-/// revisions that append new fields under the same `version=0` slot.
-fn parse_altt(body: &[u8]) -> Result<Altt> {
-    let (version, _flags, rest) = parse_full_box(body)?;
-    if version != 0 {
-        return Err(Error::invalid(format!("avif: altt version {version} != 0")));
-    }
-    let (alt_text, after_text) = read_cstr(rest, 0)?;
-    let (alt_lang, _after_lang) = read_cstr(rest, after_text)?;
-    Ok(Altt { alt_text, alt_lang })
 }
 
 /// Parse `aebr` (AutoExposureProperty — HEIF §6.5.22). FullBox(`aebr`,
@@ -4723,107 +4463,38 @@ fn parse_cmin(body: &[u8]) -> Result<Cmin> {
     })
 }
 
-/// Parse an `iref` box: FullBox header followed by a sequence of typed
-/// child boxes (`SingleItemTypeReferenceBox`), each carrying `from_item_ID`,
-/// `reference_count`, and `reference_count` × `to_item_ID`. v0 uses 16-bit
-/// item IDs; v1 uses 32-bit. Spec: ISO/IEC 14496-12 §8.11.12.
-fn parse_iref(payload: &[u8]) -> Result<Vec<IrefEntry>> {
-    let (version, _flags, body) = parse_full_box(payload)?;
-    if version != 0 && version != 1 {
-        return Err(Error::invalid(format!("avif: iref version {version}")));
-    }
-    let mut out = Vec::new();
-    for hdr in iter_boxes(body) {
-        let hdr = hdr?;
-        let child = &body[hdr.payload_start..hdr.end()];
-        let mut cursor = 0usize;
-        let from_id = if version == 0 {
-            let v = read_u16(child, cursor)? as u32;
-            cursor += 2;
-            v
-        } else {
-            let v = read_u32(child, cursor)?;
-            cursor += 4;
-            v
-        };
-        let ref_count = read_u16(child, cursor)? as usize;
-        cursor += 2;
-        let mut to_ids = Vec::with_capacity(ref_count);
-        for _ in 0..ref_count {
-            let v = if version == 0 {
-                let x = read_u16(child, cursor)? as u32;
-                cursor += 2;
-                x
-            } else {
-                let x = read_u32(child, cursor)?;
-                cursor += 4;
-                x
-            };
-            to_ids.push(v);
-        }
-        out.push(IrefEntry {
-            reference_type: hdr.box_type,
-            from_id,
-            to_ids,
-        });
-    }
-    Ok(out)
+/// Test scaffolding: wrap one `meta` child box into a minimal `meta`
+/// payload and run it through the container parser, so the historical
+/// per-box unit tests keep exercising the same bytes.
+#[cfg(test)]
+fn meta_with_child(box_type: &[u8; 4], payload: &[u8]) -> Result<Meta> {
+    let mut body = vec![0u8, 0, 0, 0]; // meta FullBox v0
+    body.extend_from_slice(&((8 + payload.len()) as u32).to_be_bytes());
+    body.extend_from_slice(box_type);
+    body.extend_from_slice(payload);
+    Meta::parse(&body)
 }
 
-fn parse_ipma(payload: &[u8]) -> Result<Vec<ItemPropertyAssociation>> {
-    let (version, flags, body) = parse_full_box(payload)?;
-    if body.len() < 4 {
-        return Err(Error::invalid("avif: ipma too short"));
-    }
-    let entry_count = read_u32(body, 0)?;
-    let mut cursor = 4usize;
-    let mut out = Vec::with_capacity(entry_count as usize);
-    let index_is_large = (flags & 1) != 0;
-    for _ in 0..entry_count {
-        let item_id = if version < 1 {
-            let v = read_u16(body, cursor)? as u32;
-            cursor += 2;
-            v
-        } else {
-            let v = read_u32(body, cursor)?;
-            cursor += 4;
-            v
-        };
-        if cursor >= body.len() {
-            return Err(Error::invalid("avif: ipma truncated at assoc count"));
-        }
-        let n = body[cursor] as usize;
-        cursor += 1;
-        let mut entries = Vec::with_capacity(n);
-        for _ in 0..n {
-            let (index, essential) = if index_is_large {
-                let w = read_u16(body, cursor)?;
-                cursor += 2;
-                let essential = (w & 0x8000) != 0;
-                // Spec: 1-based 15-bit index. Convert to 0-based.
-                let raw = (w & 0x7fff) as i32 - 1;
-                if raw < 0 {
-                    return Err(Error::invalid("avif: ipma index 0"));
-                }
-                (raw as u16, essential)
-            } else {
-                if cursor >= body.len() {
-                    return Err(Error::invalid("avif: ipma truncated at entry"));
-                }
-                let w = body[cursor];
-                cursor += 1;
-                let essential = (w & 0x80) != 0;
-                let raw = (w & 0x7f) as i32 - 1;
-                if raw < 0 {
-                    return Err(Error::invalid("avif: ipma index 0"));
-                }
-                (raw as u16, essential)
-            };
-            entries.push(PropertyAssociation { index, essential });
-        }
-        out.push(ItemPropertyAssociation { item_id, entries });
-    }
-    Ok(out)
+#[cfg(test)]
+fn parse_infe(payload: &[u8]) -> Result<ItemInfo> {
+    let mut iinf = vec![0u8, 0, 0, 0, 0, 1]; // iinf v0, entry_count = 1
+    iinf.extend_from_slice(&((8 + payload.len()) as u32).to_be_bytes());
+    iinf.extend_from_slice(b"infe");
+    iinf.extend_from_slice(payload);
+    let mut items = meta_with_child(b"iinf", &iinf)?.items;
+    items
+        .pop()
+        .ok_or_else(|| Error::invalid("test: iinf yielded no item"))
+}
+
+#[cfg(test)]
+fn parse_iloc(payload: &[u8]) -> Result<Vec<ItemLocation>> {
+    Ok(meta_with_child(b"iloc", payload)?.locations)
+}
+
+#[cfg(test)]
+fn parse_iref(payload: &[u8]) -> Result<Vec<IrefEntry>> {
+    Ok(meta_with_child(b"iref", payload)?.irefs)
 }
 
 #[cfg(test)]

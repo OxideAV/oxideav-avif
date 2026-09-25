@@ -35,8 +35,7 @@ use crate::inspect::{build_info, build_info_derived, build_info_grid, AvifInfo};
 use crate::meta::{Property, ITEM_TYPE_IDEN, ITEM_TYPE_IOVL};
 use crate::overlay::{composite_overlay, pack_planes, unpack_planes, OverlayInput, SamplePlanes};
 use crate::parser::{
-    classify_brands, item_bytes_with_idat, parse, parse_header, AvifHeader, ITEM_TYPE_AV01,
-    ITEM_TYPE_GRID,
+    classify_brands, parse, parse_header, AvifHeader, ITEM_TYPE_AV01, ITEM_TYPE_GRID,
 };
 use crate::transform::{apply_clap, apply_imir, apply_irot, crop_top_left};
 
@@ -752,11 +751,7 @@ fn decode_item_output_inner(
 /// Decode one coded `av01` item: AV1 decode + the `ispe` clamp against
 /// a padded coded frame.
 fn decode_coded_item(hdr: &AvifHeader<'_>, item_id: u32) -> Result<ItemImage> {
-    let loc = hdr
-        .meta
-        .location_by_id(item_id)
-        .ok_or_else(|| Error::invalid(format!("avif: item {item_id} missing in iloc")))?;
-    let bytes = item_bytes_with_idat(hdr.file, hdr.meta.idat.as_deref(), loc).map_err(core_err)?;
+    let bytes = hdr.item_data(item_id).map_err(core_err)?;
     let av1c = match hdr.meta.property_for(item_id, &AV1C) {
         Some(Property::Av1C(b)) => b.clone(),
         _ => {
@@ -812,12 +807,10 @@ fn decode_grid_item(
     depth: u32,
     ctx: &mut DecodeCtx,
 ) -> Result<ItemImage> {
-    let loc = hdr
-        .meta
-        .location_by_id(grid_id)
-        .ok_or_else(|| Error::invalid("avif: grid item missing in iloc"))?;
-    let grid_bytes =
-        item_bytes_with_idat(hdr.file, hdr.meta.idat.as_deref(), loc).map_err(core_err)?;
+    if hdr.meta.location_by_id(grid_id).is_none() {
+        return Err(Error::invalid("avif: grid item missing in iloc"));
+    }
+    let grid_bytes = hdr.item_data(grid_id).map_err(core_err)?;
     let grid = ImageGrid::parse(&grid_bytes).map_err(core_err)?;
     let tile_ids = hdr.meta.iref_targets(&DIMG, grid_id);
     if tile_ids.is_empty() {
@@ -903,11 +896,10 @@ fn decode_overlay_item(
     depth: u32,
     ctx: &mut DecodeCtx,
 ) -> Result<ItemImage> {
-    let loc = hdr
-        .meta
-        .location_by_id(iovl_id)
-        .ok_or_else(|| Error::invalid("avif: iovl item missing in iloc"))?;
-    let bytes = item_bytes_with_idat(hdr.file, hdr.meta.idat.as_deref(), loc).map_err(core_err)?;
+    if hdr.meta.location_by_id(iovl_id).is_none() {
+        return Err(Error::invalid("avif: iovl item missing in iloc"));
+    }
+    let bytes = hdr.item_data(iovl_id).map_err(core_err)?;
     let sources = hdr.meta.iref_targets(&DIMG, iovl_id);
     if sources.is_empty() {
         return Err(Error::invalid("avif: iovl item has no dimg iref"));

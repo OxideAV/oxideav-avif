@@ -45,6 +45,20 @@ impl fmt::Display for AvifError {
 
 impl std::error::Error for AvifError {}
 
+/// Bridge the container crate's errors. `InvalidData` / `Unsupported`
+/// map one-to-one; a structural-limit refusal (`ResourceExhausted`) is
+/// reported as malformed input, which is what this crate's own bounds
+/// checks always said about hostile counts and sizes.
+impl From<oxideav_heif::HeifError> for AvifError {
+    fn from(e: oxideav_heif::HeifError) -> Self {
+        match e {
+            oxideav_heif::HeifError::InvalidData(s) => Self::InvalidData(s),
+            oxideav_heif::HeifError::Unsupported(s) => Self::Unsupported(s),
+            oxideav_heif::HeifError::ResourceExhausted(s) => Self::InvalidData(s),
+        }
+    }
+}
+
 /// Crate-local result alias used throughout the parser + composition
 /// pipeline.
 pub type Result<T> = core::result::Result<T, AvifError>;

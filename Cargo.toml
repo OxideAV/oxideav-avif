@@ -22,6 +22,10 @@ categories = ["multimedia::encoding", "multimedia::images"]
 # See `src/lib.rs` for the standalone-vs-registry split.
 oxideav-core = { version = "0.1", optional = true }
 oxideav-av1 = { version = "0.1", optional = true }
+# The ISOBMFF / HEIF container layer (box reader, `meta` item model,
+# item payload resolution, derived-image graph, composition, sequence
+# tables, writer). Always on: the standalone build talks to it too.
+oxideav-heif = { version = "0.0", default-features = false }
 
 [features]
 default = ["registry"]
