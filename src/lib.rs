@@ -1,34 +1,43 @@
-//! AVIF (AV1 Image File Format) — pure-Rust container parser with
-//! AV1 pixel decode delegated to [`oxideav_av1`].
+//! AVIF (AV1 Image File Format) — the AV1 profile of HEIF / MIAF, with
+//! the ISOBMFF / HEIF container served by [`oxideav_heif`] and AV1
+//! pixel decode delegated to [`oxideav_av1`].
+//!
+//! # Layering
+//!
+//! * **Container (`oxideav-heif`)**: the box reader ([`box_parser`] is
+//!   a thin surface over it), the `meta` item model — `hdlr`, `pitm`,
+//!   `iinf` + `infe`, `iloc` (every construction method), `iref`,
+//!   `iprp` / `ipco` / `ipma`, `idat`, `grpl` — item payload
+//!   resolution, the typed `ispe` / `pixi` / `colr` / `pasp` / `clap` /
+//!   `irot` / `imir` / `iscl` / `auxC` / `clli` / `amve` / `rloc` /
+//!   `lsel` / `a1op` / `a1lx` / `rref` / `crtt` / `mdft` / `udes` /
+//!   `altt` properties, the derived-image descriptors, pixel
+//!   composition (grid / `iovl` / `iden`, alpha attachment, `clap` /
+//!   `irot` / `imir`), the `moov` / `trak` / `stbl` sample tables and
+//!   the still-image writer.
+//! * **AVIF profile (this crate)**: [`parse`] / [`parse_header`] build
+//!   this crate's [`Meta`] from the container's, keep `av1C` raw for
+//!   the AV1 layer, read `mdcv` / `cclv` and the HEIF-extension
+//!   properties (`aebr` … `cmin`, the slideshow transition effects,
+//!   `prdi`, `sstr`, `txlo`, `elng`, `fnch`, `mskC`) from the raw
+//!   property bytes, and enforce the AVIF brand rule; the av1-avif
+//!   §2–§8 audits ([`audit_avif_profile_compliance`],
+//!   [`audit_alpha_bit_depth`], [`audit_sequence_header_obu`],
+//!   [`audit_tone_map`], [`audit_avis_sequence`] …), the `sato`
+//!   descriptor / evaluator (§4.2.3) and `tmap` detection (§4.2.2),
+//!   the AV1 decode of every coded item with `lsel` / `a1op` layer
+//!   selection, the AVIF-side composition rules (av1-avif §4.1
+//!   same-depth alpha, nearest-neighbour alpha resize, the `ispe` /
+//!   grid trim with AV1's ceiling chroma extents, monochrome overlays
+//!   staying monochrome), the `avis` sample handling, the writer's
+//!   AVIF layout (brands, item order, property sets, `auxC` URNs) and
+//!   the pixel encoder's tile election.
 //!
 //! # Status
 //!
-//! * HEIF / ISOBMFF box walker: `ftyp`, `meta`, `hdlr`, `pitm`, `iinf`
-//!   (v0/v1) + `infe` (v2/v3), `iloc` (v0/v1/v2), `iref`, `iprp` /
-//!   `ipco` / `ipma` (v0/v1, small + large indices), plus item
-//!   properties `av1C`, `ispe`, `colr` (nclx + ICC), `pixi`, `pasp`,
-//!   `irot`, `imir`, `clap`, `auxC`, `mdcv`, `clli`, `cclv`,
-//!   `a1op`, `a1lx`, `iscl`, `rref`, `crtt`, `mdft`, `udes`, `altt`,
-//!   `aebr`, `wbbr`, `fobr`, `afbr`, `dobr`, `pano`, `subs`, `tols`,
-//!   the `wipe` / `zoom` / `fade` / `splt` / `stpe` / `ssld` slideshow
-//!   transition-effect family, and `prdi`.
-//!   Derived-image
-//!   carriers: `iovl` / `iden` /
-//!   `grid` / `sato` (Sample Transform — av1-avif v1.2.0 §4.2.3) /
-//!   `tmap` item-type detection plus an av1-avif §4.2.2 `should`-
-//!   level compliance audit ([`audit_tone_map`] /
-//!   [`ToneMapCompliance`]) covering the `altr` pairing + hidden
-//!   gain-map signals, and the `tmap` descriptor body parse
-//!   ([`GainMapMetadata`], ISO 21496-1:2025 Annex C.2).
-//! * Primary item resolution via `pitm`, file-offset extent reads via
-//!   `iloc`, brand check accepting `avif` / `avis` / `mif1` / `msf1` /
-//!   `miaf`.
-//! * Primary item's AV1 OBU bitstream is handed to `oxideav_av1`'s
-//!   registry decoder (when the default-on `registry` feature is
-//!   enabled) — the conformance-grade spec-driver decode path.
-//!   [`AvifDecoder::receive_frame`] composites the result:
+//! * [`AvifDecoder`]'s `receive_frame` composites the result:
 //!   * Grid items (HEIF §6.6.2) — decode each tile via `dimg` iref
-//!     and paste into the declared output rectangle (see [`grid`]).
+//!     and stitch into the declared output rectangle (see [`grid`]).
 //!   * Alpha auxiliary — AV1-coded monochrome item referenced via
 //!     `auxl` + `auxC` URN (see [`alpha`]). The av1-avif v1.2.0 §4.1
 //!     `shall` "AV1 Alpha Image Item shall be encoded with the same
@@ -37,9 +46,10 @@
 //!     [`AlphaBitDepthAudit`], surfaced through
 //!     [`AvifInfo::alpha_bit_depth_compliance`].
 //!   * `irot` / `imir` / `clap` post-transforms (see [`transform`]).
-//! * AVIS image sequences — sample table walk via [`avis::parse_avis`]
-//!   produces a flat frame-offset list with `(timescale, display_dims,
-//!   samples, av1_codec_config, handler, sample_description_types)`.
+//! * AVIS image sequences — [`avis::parse_avis`] walks the first
+//!   track through the container's sample-table parser and produces a
+//!   flat frame-offset list with `(timescale, display_dims, samples,
+//!   av1_codec_config, handler, sample_description_types)`.
 //!   [`avis::sample_bytes`] resolves a sample's byte slice inside the
 //!   source file. The registry-gated decoder
 //!   ([`decoder::AvifDecoder::decode_avis_file`]) walks the table end
@@ -61,9 +71,11 @@
 //! # Encoder
 //!
 //! The **container muxer** is implemented in [`mux`]: [`AvifMuxer`] /
-//! [`AvifGridMuxer`] / [`encode_still_av1`] emit a conformant AVIF file
-//! (`ftyp` + `meta` box tree + `mdat`) around an already-coded AV1 Image
-//! Item Data payload plus its `av1C` record, with `ispe` / `pixi` /
+//! [`AvifGridMuxer`] / [`AvifOverlayMuxer`] / [`encode_still_av1`] emit
+//! a conformant AVIF file around an already-coded AV1 Image Item Data
+//! payload plus its `av1C` record — this crate decides the brands,
+//! item order and property sets, [`oxideav_heif::HeifWriter`]
+//! serialises the `meta` tree and `mdat` — with `ispe` / `pixi` /
 //! `colr` / `pasp` / `clap` / `irot` / `imir` item properties, an
 //! optional AV1-coded alpha auxiliary (`auxC` + `auxl`), and optional
 //! `grid` tiling (`dimg`). The output round-trips through this crate's
@@ -91,13 +103,13 @@
 //! point. Disable the feature (`default-features = false`) for an
 //! `oxideav-core`-free build that still exposes:
 //!
-//! * The HEIF box walker + meta parser ([`box_parser`], [`meta`],
-//!   [`parser`], [`parse`], [`parse_header`]).
+//! * The container parse ([`parser`], [`parse`], [`parse_header`],
+//!   [`meta`]; [`box_parser`] over `oxideav_heif::boxes`).
 //! * The AVIS sample-table walker ([`avis::parse_avis`]).
-//! * The grid descriptor + composition layer ([`grid`]) operating on
-//!   crate-local [`image::AvifFrame`] / [`image::AvifPixelFormat`].
-//! * The alpha + transform composition helpers ([`alpha`],
-//!   [`transform`]) on the same crate-local image types.
+//! * The grid / overlay / alpha / transform composition entry points
+//!   ([`grid`], [`overlay`], [`alpha`], [`transform`]) over the
+//!   container's `compose` layer, operating on crate-local
+//!   [`image::AvifFrame`] / [`image::AvifPixelFormat`].
 //! * Container-side inspection: [`inspect::inspect`],
 //!   [`inspect::AvifInfo`], [`inspect::transforms_for`].
 //! * The CICP signalling helpers ([`cicp`]).
