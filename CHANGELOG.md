@@ -58,6 +58,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a call whose result would change layout, as their `(frame, width,
   height)` result cannot carry it. A grid tile with a chroma plane
   shorter than its extents is refused instead of zero-filled.
+- **Image sequences by `oxideav-heif`.** `parse_avis` walks `moov` /
+  `trak` / `stbl` through the container's `sequence::parse_movie`
+  (sample table with bounded expansion and every sample range checked
+  against the file, `stsd` entries with `av1C`, `tkhd` extents, `mdhd`
+  timescale, `hdlr`, `elst`); the sample-group boxes (`sbgp` / `csgp` /
+  `sgpd`) of the first track's `stbl` and the top-level `prft` / `ssix`
+  boxes stay this crate's. `AvisMeta` is unchanged. The container
+  applies ISO/IEC 14496-12's mandatory-box rules — a `moov` without
+  `mvhd`, a `trak` without `tkhd`, an `mdia` without `mdhd` / `hdlr` or
+  an `stbl` without `stts` is refused (this crate used to read such
+  files with defaults) — and bounds a hostile `stsc` expansion by what
+  `stsz` declares instead of refusing it. Removed: the raw-payload
+  helper `sample_table(stbl)` (use `parse_avis(file).samples`; the
+  sample offsets are absolute file offsets, so a bare `stbl` has no
+  file to check them against).
 - `box_parser` is a thin surface over `oxideav_heif::boxes`:
   `BoxHeader` is the container crate's type (`total_len` is now a
   method and the header also carries `start` / `user_type`); an

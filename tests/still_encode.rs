@@ -1446,9 +1446,53 @@ fn hbd_avis_sequence_decodes_sample_exact() {
         stbl_children.extend_from_slice(&stss);
         let stbl = bx(b"stbl", &stbl_children);
         let minf = bx(b"minf", &stbl);
-        let mdia = bx(b"mdia", &minf);
-        let trak = bx(b"trak", &mdia);
-        let moov = bx(b"moov", &trak);
+        // The mandatory track boxes (ISO/IEC 14496-12: mvhd, tkhd, mdhd,
+        // hdlr): timescale 1, duration 2, track 1 of w x h, 'pict'.
+        let mdhd = bx(b"mdhd", &{
+            let mut b = full(&[0u8; 8]);
+            b.extend_from_slice(&1u32.to_be_bytes()); // timescale
+            b.extend_from_slice(&2u32.to_be_bytes()); // duration
+            b.extend_from_slice(&[0x55, 0xc4, 0, 0]); // language 'und', pre_defined
+            b
+        });
+        let hdlr = bx(b"hdlr", &{
+            let mut b = full(&[0u8; 4]);
+            b.extend_from_slice(b"pict");
+            b.extend_from_slice(&[0u8; 12]);
+            b.push(0);
+            b
+        });
+        let mut mdia_children = mdhd;
+        mdia_children.extend_from_slice(&hdlr);
+        mdia_children.extend_from_slice(&minf);
+        let mdia = bx(b"mdia", &mdia_children);
+        let tkhd = bx(b"tkhd", &{
+            let mut b = vec![0u8, 0, 0, 3]; // version 0, flags: enabled + in_movie
+            b.extend_from_slice(&[0u8; 8]); // creation / modification
+            b.extend_from_slice(&1u32.to_be_bytes()); // track_ID
+            b.extend_from_slice(&[0u8; 4]); // reserved
+            b.extend_from_slice(&2u32.to_be_bytes()); // duration
+            b.extend_from_slice(&[0u8; 16]); // reserved, layer, alternate_group, volume, reserved
+            for m in [0x0001_0000u32, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x4000_0000] {
+                b.extend_from_slice(&m.to_be_bytes());
+            }
+            b.extend_from_slice(&(w << 16).to_be_bytes());
+            b.extend_from_slice(&(h << 16).to_be_bytes());
+            b
+        });
+        let mut trak_children = tkhd;
+        trak_children.extend_from_slice(&mdia);
+        let trak = bx(b"trak", &trak_children);
+        let mvhd = bx(b"mvhd", &{
+            let mut b = full(&[0u8; 8]);
+            b.extend_from_slice(&1u32.to_be_bytes()); // timescale
+            b.extend_from_slice(&2u32.to_be_bytes()); // duration
+            b.extend_from_slice(&[0u8; 80]); // rate .. next_track_ID
+            b
+        });
+        let mut moov_children = mvhd;
+        moov_children.extend_from_slice(&trak);
+        let moov = bx(b"moov", &moov_children);
         let mut file = ftyp.clone();
         file.extend_from_slice(&moov);
         let mdat_payload_at = file.len() + 8;

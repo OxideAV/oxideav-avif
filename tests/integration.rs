@@ -297,20 +297,12 @@ fn avis_sample_bytes_rejects_out_of_range() {
 /// ISO/IEC 14496-12 §8.6.1.1 (stts).
 #[test]
 fn avis_sample_duration_to_rational() {
-    use oxideav_avif::sample_table;
-
     // Timescale 0 must not divide-by-zero — fall back to (dur, 1).
     let (n, d) = oxideav_avif::avis::sample_duration_seconds(33, 0);
     assert_eq!((n, d), (33, 1));
     // Normal case: 1000-unit duration at 600 Hz = 1000/600 seconds.
     let (n, d) = oxideav_avif::avis::sample_duration_seconds(1000, 600);
     assert_eq!((n, d), (1000, 600));
-
-    // sample_table is re-exported so consumers can fan their own stbl
-    // walks; calling it on the alpha_video.avif's stbl directly would
-    // require pre-extracting the box, but it's exercised end-to-end
-    // by parse_avis.
-    let _ = sample_table; // keep the import live.
 }
 
 /// `audit_avis_sequence` on the Netflix `alpha_video.avif` fixture
