@@ -2992,15 +2992,22 @@ impl Meta {
         out
     }
 
-    /// True when the alpha auxiliary attached to `to_id` is signalled as
-    /// premultiplied per HEIF iref type `prem`. The `prem` iref's
-    /// `from_id` is the alpha item and `to_ids` contains the colour
-    /// image. Spec: ISO/IEC 23008-12 (HEIF) §6.10.1.1 — `prem` is the
-    /// canonical signal that the colour values have been premultiplied
-    /// by the alpha.
+    /// True when the colour image `to_id` is signalled as pre-multiplied
+    /// by its alpha auxiliary through a `prem` item reference — in
+    /// either direction: HEIF 3rd ed. §6.9.1 writes it from the master
+    /// image to the auxiliary (what this crate's muxer emits), the 2017
+    /// edition's readers saw it from the alpha item to the colour image.
     pub fn is_alpha_premultiplied_for(&self, to_id: u32) -> bool {
         const PREM: BoxType = b(b"prem");
-        self.iref_source_of(&PREM, to_id).is_some()
+        const AUXL: BoxType = b(b"auxl");
+        if self.iref_source_of(&PREM, to_id).is_some() {
+            return true;
+        }
+        // Master → auxiliary: the `prem` target must be an auxiliary
+        // attached to `to_id` (an `auxl` from it back to `to_id`).
+        self.iref_targets_of(&PREM, to_id)
+            .iter()
+            .any(|aux| self.iref_targets_of(&AUXL, *aux).contains(&to_id))
     }
 
     pub fn item_by_id(&self, id: u32) -> Option<&ItemInfo> {

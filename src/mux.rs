@@ -1,358 +1,222 @@
-//! AVIF container **muxer** (encoder) — emits a conformant AVIF file
-//! (`ftyp` + `meta` box tree + `mdat`) around one or more already-coded
-//! AV1 Image Item bitstreams.
+//! AVIF container muxer — the AV1-profile item layout over the
+//! container crate's writer ([`oxideav_heif::HeifWriter`]).
 //!
-//! This module operates purely at the ISO-BMFF / HEIF / MIAF container
-//! level. It takes the AV1 bitstream as an **opaque byte payload** (the
-//! AV1 Image Item Data — the content of a `sync` AV1 sample, av1-avif
-//! §2.1) plus its `av1C` configuration record, and wraps them in the box
-//! hierarchy an AVIF reader expects. It does **not** encode pixels to
-//! AV1 — that is the job of an AV1 encoder (not yet available in
-//! oxideav; see the crate README's "Encoder" section).
+//! Given already-coded AV1 Image Item Data payloads plus their `av1C`
+//! records, [`AvifMuxer`] / [`AvifGridMuxer`] / [`AvifOverlayMuxer`] /
+//! [`encode_still_av1`] emit a conformant AVIF file. What this module
+//! decides is the AVIF side of the layout: the `ftyp` brands
+//! (`avif` / `mif1` / `miaf` + the av1-avif §8 profile brand `MA1B` /
+//! `MA1A`), the item kinds and their order (primary `av01` first, so
+//! the primary is item 1; a `grid` / `iovl` before its inputs; the
+//! alpha auxiliary right after its master), the property set of every
+//! item (`av1C` essential, `ispe`, `pixi`, `colr`, `pasp`, the HDR
+//! metadata, `a1op` / `lsel` / `a1lx`, `clap` / `irot` / `imir`), the
+//! alpha / depth `auxC` URNs, and the descriptor bodies. Box
+//! serialisation — `meta` tree, `iloc` / `idat` placement (derived
+//! item bodies ride `idat`, construction method 1), `ipco`
+//! de-duplication, `ipma`, `iref`, MIAF `mdat` ordering — is the
+//! container's.
 //!
-//! The emitted structure is deliberately the minimal-but-conformant set
-//! every AVIF reader understands (av1-avif §9.1.1 "Minimum set of
-//! boxes"):
-//!
-//! * `ftyp` — `avif` major brand, `[avif, mif1, miaf, MA1B]` compatible
-//!   brands (AVIF Baseline Profile, av1-avif §8.2).
-//! * `meta` (FullBox v0) containing `hdlr` (`pict`), `pitm`, `iinf` /
-//!   `infe` (v2), `iref` (when an alpha auxiliary or grid derivation is
-//!   present), `iprp` (`ipco` + `ipma`), and `iloc` (v0, file-offset
-//!   `construction_method == 0`).
-//! * `mdat` — the concatenated item payloads.
-//!
-//! Item properties emitted per item: `av1C` (essential), `ispe`, `pixi`,
-//! `colr` (`nclx` or ICC), `pasp`, `clap` / `irot` / `imir` (essential
-//! transformative properties).
-//!
-//! # Round-trip
-//!
-//! The output is designed to read back through this crate's own
-//! [`crate::parse`] / [`crate::parse_header`] path pixel-consistently:
-//! the coded AV1 payload and every property round-trips byte-for-byte.
-//!
-//! # Layout strategy
-//!
-//! `iloc` extent offsets are absolute file offsets. Because the width of
-//! an `iloc` offset field (4 bytes here) is independent of its value, the
-//! `meta` box's *size* does not depend on the offset values. The muxer
-//! therefore builds the `meta` box once to measure its length, computes
-//! the `mdat` data start (`ftyp.len() + meta.len() + 8`), then rebuilds
-//! `meta` with the real absolute offsets patched in.
+//! The output round-trips through this crate's own [`crate::parse`]
+//! path byte-for-byte on every coded payload and property (see the
+//! tests) and passes [`crate::audit_mif1`]. A `prem` reference is
+//! written from the master to its alpha auxiliary (HEIF 3rd ed.
+//! §6.9.1); the reader accepts either direction.
+
+use oxideav_heif::derived::{GridDescriptor, OverlayDescriptor};
+use oxideav_heif::props::{self as hprops, Property as HProp};
+use oxideav_heif::{Av1Config, HeifWriter, RawProperty};
 
 use crate::error::{AvifError as Error, Result};
 use crate::meta::{Amve, Clap, Clli, Colr, Imir, Irot, Mdcv, Pasp};
 
-/// Little byte-buffer builder for box bodies.
-#[derive(Default)]
-pub(crate) struct W(pub(crate) Vec<u8>);
+/// One property with its `essential` flag, as the container writer
+/// takes it.
+type Prop = (HProp, bool);
 
-impl W {
-    pub(crate) fn u8(&mut self, v: u8) {
-        self.0.push(v);
+fn prop_av1c(av1c: &[u8], what: &str) -> Result<Prop> {
+    if av1c.len() < 4 {
+        return Err(Error::invalid(format!(
+            "avif mux: {what}av1C configuration record must be at least 4 bytes"
+        )));
     }
-    pub(crate) fn u16(&mut self, v: u16) {
-        self.0.extend_from_slice(&v.to_be_bytes());
-    }
-    pub(crate) fn u32(&mut self, v: u32) {
-        self.0.extend_from_slice(&v.to_be_bytes());
-    }
-    #[cfg_attr(not(feature = "registry"), allow(dead_code))]
-    pub(crate) fn u64(&mut self, v: u64) {
-        self.0.extend_from_slice(&v.to_be_bytes());
-    }
-    pub(crate) fn bytes(&mut self, b: &[u8]) {
-        self.0.extend_from_slice(b);
-    }
-    pub(crate) fn fourcc(&mut self, b: &[u8; 4]) {
-        self.0.extend_from_slice(b);
-    }
-    /// NUL-terminated ASCII string.
-    pub(crate) fn cstr(&mut self, s: &str) {
-        self.0.extend_from_slice(s.as_bytes());
-        self.0.push(0);
-    }
-    pub(crate) fn into_vec(self) -> Vec<u8> {
-        self.0
-    }
+    Ok((HProp::Av1C(Av1Config::parse(av1c)?), true))
 }
 
-/// Encode a plain `Box`: `size(4) + type(4) + body`.
-pub(crate) fn boxed(box_type: &[u8; 4], body: &[u8]) -> Vec<u8> {
-    let size = (8 + body.len()) as u32;
-    let mut out = Vec::with_capacity(8 + body.len());
-    out.extend_from_slice(&size.to_be_bytes());
-    out.extend_from_slice(box_type);
-    out.extend_from_slice(body);
-    out
+fn prop_ispe(width: u32, height: u32) -> Prop {
+    (HProp::Ispe(hprops::Ispe { width, height }), false)
 }
 
-/// Encode a `FullBox`: prepends `version(1) + flags(3)` to `body`.
-pub(crate) fn full_boxed(box_type: &[u8; 4], version: u8, flags: u32, body: &[u8]) -> Vec<u8> {
-    let mut inner = Vec::with_capacity(4 + body.len());
-    inner.push(version);
-    inner.push((flags >> 16) as u8);
-    inner.push((flags >> 8) as u8);
-    inner.push(flags as u8);
-    inner.extend_from_slice(body);
-    boxed(box_type, &inner)
+fn prop_pixi(bits: &[u8]) -> Prop {
+    (
+        HProp::Pixi(hprops::Pixi {
+            bits_per_channel: bits.to_vec(),
+        }),
+        false,
+    )
 }
 
-// ─────────────────────────── item-property encoders ───────────────────
-
-/// One item property, ready to be placed in `ipco` and referenced by
-/// `ipma`.
-#[derive(Clone)]
-pub(crate) struct PropBox {
-    /// Fully-encoded property box bytes (header + body).
-    pub(crate) bytes: Vec<u8>,
-    /// Whether the association marks this property essential.
-    pub(crate) essential: bool,
-}
-
-pub(crate) fn prop_av1c(av1c: &[u8]) -> PropBox {
-    PropBox {
-        bytes: boxed(b"av1C", av1c),
-        essential: true,
+fn prop_colr(colr: &Colr) -> Result<Prop> {
+    if let Colr::Unknown(t) = colr {
+        return Err(Error::unsupported(format!(
+            "avif mux: cannot emit colr of unknown type '{}'",
+            String::from_utf8_lossy(t)
+        )));
     }
+    Ok((HProp::Colr(hprops::Colr::from(colr)), false))
 }
 
-pub(crate) fn prop_ispe(width: u32, height: u32) -> PropBox {
-    let mut w = W::default();
-    w.u32(width);
-    w.u32(height);
-    PropBox {
-        bytes: full_boxed(b"ispe", 0, 0, &w.into_vec()),
-        essential: false,
-    }
+fn prop_pasp(pasp: &Pasp) -> Prop {
+    (
+        HProp::Pasp(hprops::Pasp {
+            h_spacing: pasp.h_spacing,
+            v_spacing: pasp.v_spacing,
+        }),
+        false,
+    )
 }
 
-pub(crate) fn prop_pixi(bits: &[u8]) -> PropBox {
-    let mut w = W::default();
-    w.u8(bits.len() as u8);
-    w.bytes(bits);
-    PropBox {
-        bytes: full_boxed(b"pixi", 0, 0, &w.into_vec()),
-        essential: false,
-    }
+fn prop_clap(clap: &Clap) -> Prop {
+    (HProp::Clap(hprops::Clap::from(clap)), true)
 }
 
-pub(crate) fn prop_colr(colr: &Colr) -> Result<PropBox> {
-    let mut w = W::default();
-    match colr {
-        Colr::Nclx {
-            colour_primaries,
-            transfer_characteristics,
-            matrix_coefficients,
-            full_range,
-        } => {
-            w.fourcc(b"nclx");
-            w.u16(*colour_primaries);
-            w.u16(*transfer_characteristics);
-            w.u16(*matrix_coefficients);
-            w.u8(if *full_range { 0x80 } else { 0x00 });
-        }
-        Colr::Icc(icc) => {
-            w.fourcc(b"prof");
-            w.bytes(icc);
-        }
-        Colr::Unknown(t) => {
-            return Err(Error::unsupported(format!(
-                "avif mux: cannot emit colr of unknown type '{}'",
-                String::from_utf8_lossy(t)
-            )));
-        }
-    }
-    Ok(PropBox {
-        bytes: boxed(b"colr", &w.into_vec()),
-        essential: false,
-    })
+fn prop_irot(irot: &Irot) -> Prop {
+    (
+        HProp::Irot(hprops::Irot {
+            angle: irot.angle & 0x03,
+        }),
+        true,
+    )
 }
 
-pub(crate) fn prop_pasp(pasp: &Pasp) -> PropBox {
-    let mut w = W::default();
-    w.u32(pasp.h_spacing);
-    w.u32(pasp.v_spacing);
-    PropBox {
-        bytes: boxed(b"pasp", &w.into_vec()),
-        essential: false,
-    }
+fn prop_imir(imir: &Imir) -> Prop {
+    (
+        HProp::Imir(hprops::Imir {
+            axis: imir.axis & 0x01,
+        }),
+        true,
+    )
 }
 
-pub(crate) fn prop_clap(clap: &Clap) -> PropBox {
-    let mut w = W::default();
-    for v in [
-        clap.clean_aperture_width_n,
-        clap.clean_aperture_width_d,
-        clap.clean_aperture_height_n,
-        clap.clean_aperture_height_d,
-        clap.horiz_off_n,
-        clap.horiz_off_d,
-        clap.vert_off_n,
-        clap.vert_off_d,
-    ] {
-        w.u32(v as u32);
-    }
-    PropBox {
-        bytes: boxed(b"clap", &w.into_vec()),
-        // Transformative properties are marked essential per MIAF.
-        essential: true,
-    }
+fn prop_auxc(urn: &str) -> Prop {
+    (
+        HProp::AuxC(hprops::AuxC {
+            aux_type: urn.to_string(),
+            aux_subtype: Vec::new(),
+        }),
+        false,
+    )
 }
 
-pub(crate) fn prop_irot(irot: &Irot) -> PropBox {
-    PropBox {
-        bytes: boxed(b"irot", &[irot.angle & 0x03]),
-        essential: true,
-    }
+fn prop_a1lx(layer_size: [u32; 3]) -> Prop {
+    let large_size = layer_size.iter().any(|&v| v > u32::from(u16::MAX));
+    (
+        HProp::A1lx(hprops::A1lx {
+            large_size,
+            layer_size,
+        }),
+        false,
+    )
 }
 
-pub(crate) fn prop_imir(imir: &Imir) -> PropBox {
-    PropBox {
-        bytes: boxed(b"imir", &[imir.axis & 0x01]),
-        essential: true,
-    }
+fn prop_lsel(layer_id: u16) -> Prop {
+    (HProp::Lsel(hprops::Lsel { layer_id }), true)
 }
 
-/// AVIF alpha auxiliary URN (av1-avif §4.1 / HEIF §6.5.8).
-pub(crate) fn prop_auxc(urn: &str) -> PropBox {
-    let mut w = W::default();
-    w.cstr(urn);
-    PropBox {
-        bytes: full_boxed(b"auxC", 0, 0, &w.into_vec()),
-        essential: false,
-    }
+fn prop_a1op(op_index: u8) -> Prop {
+    (HProp::A1op(hprops::A1op { op_index }), true)
 }
 
-/// `mdcv` MasteringDisplayColourVolumeBox (ISO/IEC 14496-12 §12.1.5.3) —
-/// a plain box, no FullBox header. 6×u16 primaries + 2×u16 white point +
-/// 2×u32 luminance.
-/// `a1lx` (av1-avif §2.3.2.3): `large_size` elected when any layer
-/// size exceeds 16 bits; never essential (§2.3.2.3.2 `shall not`).
-fn prop_a1lx(layer_size: [u32; 3]) -> PropBox {
-    let large = layer_size.iter().any(|&v| v > u16::MAX as u32);
-    let mut w = W::default();
-    w.u8(if large { 1 } else { 0 });
-    for v in layer_size {
-        if large {
-            w.u32(v);
-        } else {
-            w.u16(v as u16);
-        }
-    }
-    PropBox {
-        bytes: boxed(b"a1lx", &w.into_vec()),
-        essential: false,
-    }
-}
-
-/// `lsel` (HEIF §6.5.11): `unsigned int(16) layer_id`, essential.
-fn prop_lsel(layer_id: u16) -> PropBox {
-    PropBox {
-        bytes: boxed(b"lsel", &layer_id.to_be_bytes()),
-        essential: true,
-    }
-}
-
-/// `a1op` (av1-avif §2.3.2.1): `unsigned int(8) op_index`, essential.
-fn prop_a1op(op_index: u8) -> PropBox {
-    PropBox {
-        bytes: boxed(b"a1op", &[op_index]),
-        essential: true,
-    }
-}
-
-pub(crate) fn prop_mdcv(m: &Mdcv) -> PropBox {
-    let mut w = W::default();
+/// `mdcv` in the layout this crate reads (ISO/IEC 14496-12
+/// MasteringDisplayColourVolumeBox: three `(x, y)` primaries pairs in
+/// file order, the white point, then the max / min luminance) — kept
+/// as raw bytes because the container types the primaries in a
+/// different field order.
+fn prop_mdcv(m: &Mdcv) -> Prop {
+    let mut body = Vec::with_capacity(24);
     for (x, y) in m.display_primaries_xy {
-        w.u16(x);
-        w.u16(y);
+        body.extend_from_slice(&x.to_be_bytes());
+        body.extend_from_slice(&y.to_be_bytes());
     }
-    w.u16(m.white_point_xy.0);
-    w.u16(m.white_point_xy.1);
-    w.u32(m.max_display_mastering_luminance);
-    w.u32(m.min_display_mastering_luminance);
-    PropBox {
-        bytes: boxed(b"mdcv", &w.into_vec()),
-        essential: false,
-    }
+    body.extend_from_slice(&m.white_point_xy.0.to_be_bytes());
+    body.extend_from_slice(&m.white_point_xy.1.to_be_bytes());
+    body.extend_from_slice(&m.max_display_mastering_luminance.to_be_bytes());
+    body.extend_from_slice(&m.min_display_mastering_luminance.to_be_bytes());
+    (
+        HProp::Unknown(RawProperty {
+            box_type: *b"mdcv",
+            user_type: None,
+            box_size: body.len() + 8,
+            body,
+        }),
+        false,
+    )
 }
 
-/// `clli` ContentLightLevelBox (ISO/IEC 14496-12 §12.1.5.4) — plain box,
-/// two u16 (MaxCLL, MaxFALL).
-pub(crate) fn prop_clli(c: &Clli) -> PropBox {
-    let mut w = W::default();
-    w.u16(c.max_content_light_level);
-    w.u16(c.max_pic_average_light_level);
-    PropBox {
-        bytes: boxed(b"clli", &w.into_vec()),
-        essential: false,
-    }
+fn prop_clli(c: &Clli) -> Prop {
+    (HProp::Clli(hprops::Clli::from(c)), false)
 }
 
-/// `amve` AmbientViewingEnvironmentBox (AVIF §6.5.36) — plain box, u32
-/// illuminance + 2×u16 CIE 1931 chromaticity.
-pub(crate) fn prop_amve(a: &Amve) -> PropBox {
-    let mut w = W::default();
-    w.u32(a.ambient_illuminance);
-    w.u16(a.ambient_light_x);
-    w.u16(a.ambient_light_y);
-    PropBox {
-        bytes: boxed(b"amve", &w.into_vec()),
-        essential: false,
-    }
+fn prop_amve(a: &Amve) -> Prop {
+    (HProp::Amve(hprops::Amve::from(a)), false)
 }
 
-// ───────────────────────────── item model ─────────────────────────────
-
-/// One item to be muxed: an entry in `iinf`/`infe`, `iloc`, and (via its
-/// property list) `ipco`/`ipma`.
-pub(crate) struct MuxItem {
-    pub(crate) id: u32,
-    pub(crate) item_type: [u8; 4],
-    pub(crate) name: String,
-    pub(crate) hidden: bool,
-    /// MIME `content_type` for a `mime` item (e.g. XMP). Emitted in the
-    /// `infe` v2 tail per ISO-BMFF §8.11.6.2; `None` for every other
-    /// item type.
-    pub(crate) content_type: Option<String>,
-    /// Bytes placed in `mdat`. Every item this muxer emits is a
-    /// single-extent, file-offset (`construction_method == 0`) item.
-    pub(crate) payload: Vec<u8>,
-    pub(crate) props: Vec<PropBox>,
-}
-
-/// One typed item reference emitted into `iref`.
-pub(crate) struct MuxIref {
-    pub(crate) reference_type: [u8; 4],
-    pub(crate) from_id: u32,
-    pub(crate) to_ids: Vec<u32>,
-}
-
-/// Which AVIF profile brand `ftyp` declares (av1-avif §8.2 / §8.3).
-///
-/// `Bare` emits only the general brands (`avif` / `mif1` / `miaf`) —
-/// the shape §8.1 prescribes when "the corresponding AV1 encoding
-/// characteristics do not match any of the defined profiles" (e.g. an
-/// AV1 Professional-profile 4:2:2 or 12-bit payload, which satisfies
-/// neither the `MA1B` Main-profile nor the `MA1A` High-profile
-/// constraint).
+/// The av1-avif §8 profile brand carried in `ftyp`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProfileBrand {
-    /// `MA1B` — requires AV1 Main Profile, level <= 5.1 (§8.2).
     Baseline,
-    /// `MA1A` — requires AV1 High Profile, level <= 6.0 (§8.3).
     Advanced,
-    /// No profile brand — general AVIF brands only (§8.1).
     Bare,
 }
 
-// ───────────────────────────── public API ─────────────────────────────
+/// `ftyp` of an AVIF image: major `avif`, compatible `avif` / `mif1` /
+/// `miaf` and the elected profile brand.
+fn still_brands(profile: ProfileBrand) -> ([u8; 4], Vec<[u8; 4]>) {
+    let mut compat = vec![*b"avif", *b"mif1", *b"miaf"];
+    match profile {
+        ProfileBrand::Baseline => compat.push(*b"MA1B"),
+        ProfileBrand::Advanced => compat.push(*b"MA1A"),
+        ProfileBrand::Bare => {}
+    }
+    (*b"avif", compat)
+}
 
-/// Builder for a single-image AVIF file wrapping one coded AV1 primary
-/// item, with optional colour / transform properties and an optional
-/// alpha auxiliary.
+/// Add an Exif metadata item from its item body (HEIF Annex A.2.1: a
+/// 4-byte `exif_tiff_header_offset` followed by the Exif payload). The
+/// container writer takes the payload and prepends a zero offset
+/// itself, so only a body whose offset word is zero can be expressed.
+fn add_exif_item(w: &mut HeifWriter, image: u32, payload: &[u8]) -> Result<u32> {
+    match payload.split_first_chunk::<4>() {
+        Some(([0, 0, 0, 0], tiff)) => Ok(w.add_exif(image, tiff)),
+        _ => Err(Error::unsupported(
+            "avif mux: Exif item body must start with a zero exif_tiff_header_offset word \
+             (the container writer prepends its own)",
+        )),
+    }
+}
+
+/// Add an XMP metadata item (`mime` / `application/rdf+xml`).
+fn add_xmp_item(w: &mut HeifWriter, image: u32, payload: &[u8]) -> Result<u32> {
+    let xmp = std::str::from_utf8(payload)
+        .map_err(|_| Error::unsupported("avif mux: XMP packet must be UTF-8"))?;
+    Ok(w.add_xmp(image, xmp))
+}
+
+/// Guard: the container assigns item ids in insertion order; the AVIF
+/// layout predicts them (a derived primary names its inputs before
+/// they exist). A mismatch is a bug, never silent.
+fn expect_id(got: u32, want: u32, what: &str) -> Result<()> {
+    if got != want {
+        return Err(Error::invalid(format!(
+            "avif mux: {what} got item id {got}, expected {want}"
+        )));
+    }
+    Ok(())
+}
+
+/// Builder for a single-item AVIF file: one `av01` primary plus the
+/// optional alpha / depth auxiliaries, metadata items, an `iden`
+/// wrapper and the AVIF profile brand.
 pub struct AvifMuxer {
     width: u32,
     height: u32,
@@ -378,29 +242,24 @@ pub struct AvifMuxer {
     profile_brand: ProfileBrand,
 }
 
-/// Transformative properties for an `iden` identity derivation
-/// (HEIF §6.6.2.1) layered over the coded primary — see
-/// [`AvifMuxer::with_identity_derivation`]. Applied in the §6.5.10 /
-/// MIAF order `clap` → `irot` → `imir`.
+/// Make the primary an `iden` derived item (HEIF §6.6.2.1) over the
+/// coded `av01` item, carrying these transformative properties.
 #[derive(Clone, Debug, Default)]
 pub struct IdentityDerivation {
-    /// Clean-aperture crop of the coded image's output.
+    /// `clap` on the identity item.
     pub clap: Option<Clap>,
-    /// Anti-clockwise quarter turns 0..=3.
+    /// `irot` angle on the identity item.
     pub irot: Option<u8>,
-    /// Mirror axis (0 = vertical flip, 1 = horizontal flip).
+    /// `imir` axis on the identity item.
     pub imir: Option<u8>,
 }
 
-/// A generic AV1-coded auxiliary image (used for the depth map).
 struct AuxCoded {
     payload: Vec<u8>,
     av1c: Vec<u8>,
     pixi: Option<Vec<u8>>,
 }
 
-/// An AV1-coded alpha plane, carried as a monochrome auxiliary image item
-/// (`auxC` URN + `auxl` iref to the primary).
 struct AlphaImage {
     payload: Vec<u8>,
     av1c: Vec<u8>,
@@ -409,10 +268,8 @@ struct AlphaImage {
 }
 
 impl AvifMuxer {
-    /// Start a muxer for a `width × height` primary image whose coded AV1
-    /// Image Item Data is `payload` and whose configuration record is
-    /// `av1c` (the `AV1CodecConfigurationRecord` bytes — the same bytes
-    /// the reader surfaces as [`crate::AvifImage::av1c`]).
+    /// A primary `av01` item of `width × height` with its coded payload
+    /// and `av1C` record.
     pub fn new(width: u32, height: u32, payload: Vec<u8>, av1c: Vec<u8>) -> Self {
         Self {
             width,
@@ -440,32 +297,31 @@ impl AvifMuxer {
         }
     }
 
-    /// Set the `pixi` per-channel bit depths (e.g. `[8, 8, 8]` for 8-bit
-    /// colour, `[8]` for monochrome).
+    /// `pixi` bits per channel.
     pub fn with_pixi(mut self, bits: Vec<u8>) -> Self {
         self.pixi = Some(bits);
         self
     }
 
-    /// Attach a colour-information (`colr`) property.
+    /// `colr` colour information.
     pub fn with_colr(mut self, colr: Colr) -> Self {
         self.colr = Some(colr);
         self
     }
 
-    /// Attach a pixel-aspect-ratio (`pasp`) property.
+    /// `pasp` pixel aspect ratio.
     pub fn with_pasp(mut self, pasp: Pasp) -> Self {
         self.pasp = Some(pasp);
         self
     }
 
-    /// Attach a clean-aperture (`clap`) transformative property.
+    /// `clap` clean aperture (essential).
     pub fn with_clap(mut self, clap: Clap) -> Self {
         self.clap = Some(clap);
         self
     }
 
-    /// Attach an image-rotation (`irot`) transformative property.
+    /// `irot` rotation (essential).
     pub fn with_irot(mut self, angle: u8) -> Self {
         self.irot = Some(Irot {
             angle: angle & 0x03,
@@ -473,73 +329,56 @@ impl AvifMuxer {
         self
     }
 
-    /// Attach an image-mirror (`imir`) transformative property.
+    /// `imir` mirror (essential).
     pub fn with_imir(mut self, axis: u8) -> Self {
         self.imir = Some(Imir { axis: axis & 0x01 });
         self
     }
 
-    /// Attach a mastering-display-colour-volume (`mdcv`) HDR property.
+    /// `mdcv` mastering display colour volume.
     pub fn with_mdcv(mut self, mdcv: Mdcv) -> Self {
         self.mdcv = Some(mdcv);
         self
     }
 
-    /// Attach a content-light-level (`clli`) HDR property.
+    /// `clli` content light level.
     pub fn with_clli(mut self, clli: Clli) -> Self {
         self.clli = Some(clli);
         self
     }
 
-    /// Attach an ambient-viewing-environment (`amve`) HDR property.
+    /// `amve` ambient viewing environment.
     pub fn with_amve(mut self, amve: Amve) -> Self {
         self.amve = Some(amve);
         self
     }
 
-    /// Attach an Exif metadata item, linked to the primary via a `cdsc`
-    /// item reference (av1-avif §5.2 / HEIF §A.2.1). `payload` is the full
-    /// `ExifDataBlock` — a 4-byte `exif_tiff_header_offset` followed by
-    /// the TIFF-structured Exif bytes; it is stored verbatim.
+    /// An `Exif` metadata item (item body: 4-byte offset word + payload).
     pub fn with_exif(mut self, payload: Vec<u8>) -> Self {
         self.exif = Some(payload);
         self
     }
 
-    /// Attach an XMP metadata item (a `mime` item with content type
-    /// `application/rdf+xml`), linked to the primary via a `cdsc` item
-    /// reference (av1-avif §5.3).
+    /// An XMP metadata item (`mime` / `application/rdf+xml`).
     pub fn with_xmp(mut self, payload: Vec<u8>) -> Self {
         self.xmp = Some(payload);
         self
     }
 
-    /// Declare the AVIF Advanced Profile (`MA1A`) in `ftyp` instead of
-    /// the default Baseline Profile (`MA1B`) (av1-avif §8.2 / §8.3). The
-    /// muxer does not itself validate that the AV1 bitstream meets the
-    /// profile constraints — that is the encoder's responsibility.
+    /// Declare the AVIF Advanced profile (`MA1A`) instead of Baseline.
     pub fn advanced_profile(mut self) -> Self {
         self.profile_brand = ProfileBrand::Advanced;
         self
     }
 
-    /// Declare **no** AVIF profile brand: `ftyp` lists only the general
-    /// brands (`avif` / `mif1` / `miaf`). av1-avif §8.1 prescribes this
-    /// shape when the coded AV1 characteristics match neither defined
-    /// profile — e.g. an AV1 Professional-profile payload (4:2:2 at any
-    /// depth, or 12-bit at any subsampling), which fails both the
-    /// `MA1B` Main-profile `shall` (§8.2) and the `MA1A` High-profile
-    /// `shall` (§8.3).
+    /// Declare no AVIF profile brand (general brands only).
     pub fn no_profile_brand(mut self) -> Self {
         self.profile_brand = ProfileBrand::Bare;
         self
     }
 
-    /// Attach an AV1-coded alpha plane as an auxiliary image item. The
-    /// alpha item is emitted as a hidden monochrome `av01` item carrying
-    /// an `auxC` (alpha URN) property and linked to the primary via an
-    /// `auxl` item reference (av1-avif §4.1). When `premultiplied` is
-    /// true a `prem` iref is also emitted (HEIF §6.10.1.1).
+    /// An AV1-coded alpha auxiliary (`auxC` alpha URN + `auxl`; `prem`
+    /// when `premultiplied`).
     pub fn with_alpha(mut self, payload: Vec<u8>, av1c: Vec<u8>, premultiplied: bool) -> Self {
         self.alpha = Some(AlphaImage {
             payload,
@@ -550,7 +389,7 @@ impl AvifMuxer {
         self
     }
 
-    /// Override the alpha item's `pixi` bit depth (default `[8]`).
+    /// `pixi` of the alpha auxiliary (default one 8-bit channel).
     pub fn with_alpha_pixi(mut self, bits: Vec<u8>) -> Self {
         if let Some(a) = self.alpha.as_mut() {
             a.pixi = Some(bits);
@@ -558,10 +397,7 @@ impl AvifMuxer {
         self
     }
 
-    /// Attach an AV1-coded depth map as an auxiliary image item — a
-    /// hidden monochrome `av01` item carrying the depth `auxC` URN
-    /// (`urn:mpeg:mpegB:cicp:systems:auxiliary:depth`, HEIF §6.5.8) and
-    /// linked to the primary via an `auxl` item reference.
+    /// An AV1-coded depth-map auxiliary.
     pub fn with_depth(mut self, payload: Vec<u8>, av1c: Vec<u8>) -> Self {
         self.depth = Some(AuxCoded {
             payload,
@@ -571,133 +407,94 @@ impl AvifMuxer {
         self
     }
 
-    /// Document a **layered** AV1 Image Item's per-layer byte sizes
-    /// (`a1lx`, av1-avif §2.3.2.3): `layer_size[i]` is the byte count of
-    /// the `i`-th spatial layer in the item data (increasing
-    /// `spatial_id`), the last layer implicit; trailing zeros for
-    /// absent layers. Never marked essential.
+    /// `a1lx` layer sizes of a layered (progressive) item.
     pub fn with_layered_index(mut self, layer_size: [u32; 3]) -> Self {
         self.layered_index = Some(layer_size);
         self
     }
 
-    /// Attach the `lsel` layer selector (HEIF §6.5.11, essential): the
-    /// `spatial_id` to render (0..=3), or `0xFFFF` to allow progressive
-    /// rendering of every layer up to the top one (av1-avif §2.3.2.2).
+    /// `lsel` layer selector (essential).
     pub fn with_layer_selector(mut self, layer_id: u16) -> Self {
         self.layer_selector = Some(layer_id);
         self
     }
 
-    /// Attach the `a1op` operating-point selector (av1-avif §2.3.2.1,
-    /// essential): the index of the Sequence Header operating point a
-    /// reader shall process for this item.
+    /// `a1op` operating point selector (essential).
     pub fn with_operating_point(mut self, op_index: u8) -> Self {
         self.operating_point = Some(op_index);
         self
     }
 
-    /// Make the primary item an `iden` identity derivation of the coded
-    /// image (HEIF §6.6.2.1): the coded `av01` item stays a non-hidden
-    /// item (NOTE 2 — both the original and the derived rendition are
-    /// exposed), the `iden` item carries the given transformative
-    /// properties, has no item body, and `dimg`-references the coded
-    /// item. Alpha / depth auxiliaries and metadata stay attached to
-    /// the coded item; the identity derivation inherits them (§6.6.1
-    /// — its reconstructed image is the coded item's output image).
+    /// Make the primary an `iden` item over the coded item.
     pub fn with_identity_derivation(mut self, derivation: IdentityDerivation) -> Self {
         self.identity = Some(derivation);
         self
     }
 
-    /// Build the AVIF file bytes.
+    /// Serialise the file.
     pub fn build(self) -> Result<Vec<u8>> {
-        if self.av1c.len() < 4 {
-            return Err(Error::invalid(
-                "avif mux: av1C configuration record must be at least 4 bytes",
-            ));
-        }
-        // Item 1 = primary colour image.
-        let mut primary = MuxItem {
-            id: 1,
-            item_type: *b"av01",
-            name: String::new(),
-            hidden: false,
-            content_type: None,
-            payload: self.primary_payload,
-            props: vec![prop_av1c(&self.av1c), prop_ispe(self.width, self.height)],
-        };
-        // Layer / operating-point selectors precede every other
-        // descriptive property (HEIF §6.5.11: `lsel` shall precede all
-        // transformative properties and selects the reconstructed
-        // image the subsequent descriptive properties describe).
+        let (major, compat) = still_brands(self.profile_brand);
+        let mut w = HeifWriter::new().with_brands(major, compat);
+        let mut props = vec![
+            prop_av1c(&self.av1c, "")?,
+            prop_ispe(self.width, self.height),
+        ];
         if let Some(op) = self.operating_point {
-            primary.props.push(prop_a1op(op));
+            props.push(prop_a1op(op));
         }
         if let Some(layer) = self.layer_selector {
-            primary.props.push(prop_lsel(layer));
+            props.push(prop_lsel(layer));
         }
         if let Some(sizes) = self.layered_index {
-            primary.props.push(prop_a1lx(sizes));
+            props.push(prop_a1lx(sizes));
         }
         if let Some(bits) = &self.pixi {
-            primary.props.push(prop_pixi(bits));
+            props.push(prop_pixi(bits));
         }
         if let Some(colr) = &self.colr {
-            primary.props.push(prop_colr(colr)?);
+            props.push(prop_colr(colr)?);
         }
         if let Some(pasp) = &self.pasp {
-            primary.props.push(prop_pasp(pasp));
+            props.push(prop_pasp(pasp));
         }
-        // HDR descriptive properties.
         if let Some(mdcv) = &self.mdcv {
-            primary.props.push(prop_mdcv(mdcv));
+            props.push(prop_mdcv(mdcv));
         }
         if let Some(clli) = &self.clli {
-            primary.props.push(prop_clli(clli));
+            props.push(prop_clli(clli));
         }
         if let Some(amve) = &self.amve {
-            primary.props.push(prop_amve(amve));
+            props.push(prop_amve(amve));
         }
-        // Transformative properties come last (they apply after the
-        // descriptive ones); MIAF constrains their relative order.
         if let Some(clap) = &self.clap {
-            primary.props.push(prop_clap(clap));
+            props.push(prop_clap(clap));
         }
         if let Some(irot) = &self.irot {
-            primary.props.push(prop_irot(irot));
+            props.push(prop_irot(irot));
         }
         if let Some(imir) = &self.imir {
-            primary.props.push(prop_imir(imir));
+            props.push(prop_imir(imir));
         }
-
-        let mut items = vec![primary];
-        let mut irefs = Vec::new();
-        let mut next_id = 2u32;
-        let mut primary_id = 1u32;
-
+        let coded = w.add_coded_item(*b"av01", self.primary_payload, props);
+        expect_id(coded, 1, "primary")?;
+        let mut primary_id = coded;
         if let Some(iden) = self.identity {
-            let iden_id = next_id;
-            next_id += 1;
-            primary_id = iden_id;
-            // `ispe` on the derived item documents its reconstructed
-            // image — the coded item's output image, i.e. after the
-            // coded item's own clap / irot / imir.
-            let (mut w, mut h) = (self.width, self.height);
+            // The identity item's `ispe` is the coded item's output size.
+            let (mut iw, mut ih) = (self.width, self.height);
             if let Some(clap) = &self.clap {
-                (w, h) = crate::derived::DimTransform::Crop {
+                (iw, ih) = crate::derived::DimTransform::Crop {
                     width_n: clap.clean_aperture_width_n,
                     width_d: clap.clean_aperture_width_d,
                     height_n: clap.clean_aperture_height_n,
                     height_d: clap.clean_aperture_height_d,
                 }
-                .apply_dims(w, h);
+                .apply_dims(iw, ih);
             }
             if let Some(irot) = &self.irot {
-                (w, h) =
-                    crate::derived::DimTransform::Rotate { angle: irot.angle }.apply_dims(w, h);
+                (iw, ih) =
+                    crate::derived::DimTransform::Rotate { angle: irot.angle }.apply_dims(iw, ih);
             }
-            let mut iprops = vec![prop_ispe(w, h)];
+            let mut iprops = vec![prop_ispe(iw, ih)];
             if let Some(bits) = &self.pixi {
                 iprops.push(prop_pixi(bits));
             }
@@ -712,140 +509,44 @@ impl AvifMuxer {
             if let Some(axis) = iden.imir {
                 iprops.push(prop_imir(&Imir { axis: axis & 0x01 }));
             }
-            items.push(MuxItem {
-                id: iden_id,
-                item_type: *b"iden",
-                name: String::new(),
-                hidden: false,
-                content_type: None,
-                payload: Vec::new(),
-                props: iprops,
-            });
-            irefs.push(MuxIref {
-                reference_type: *b"dimg",
-                from_id: iden_id,
-                to_ids: vec![1],
-            });
+            primary_id = w.add_identity(coded, iprops);
         }
-
         if let Some(alpha) = self.alpha {
-            if alpha.av1c.len() < 4 {
-                return Err(Error::invalid(
-                    "avif mux: alpha av1C configuration record must be at least 4 bytes",
-                ));
-            }
-            let alpha_id = next_id;
-            next_id += 1;
             let mut aprops = vec![
-                prop_av1c(&alpha.av1c),
+                prop_av1c(&alpha.av1c, "alpha ")?,
                 prop_ispe(self.width, self.height),
                 prop_auxc(crate::alpha::ALPHA_URN_PREFIX),
             ];
             if let Some(bits) = &alpha.pixi {
                 aprops.push(prop_pixi(bits));
             }
-            items.push(MuxItem {
-                id: alpha_id,
-                item_type: *b"av01",
-                name: "Alpha".to_string(),
-                hidden: true,
-                content_type: None,
-                payload: alpha.payload,
-                props: aprops,
-            });
-            // `auxl`: alpha item -> primary (HEIF §6.5.8 / av1-avif §4.1).
-            irefs.push(MuxIref {
-                reference_type: *b"auxl",
-                from_id: alpha_id,
-                to_ids: vec![1],
-            });
-            if alpha.premultiplied {
-                irefs.push(MuxIref {
-                    reference_type: *b"prem",
-                    from_id: alpha_id,
-                    to_ids: vec![1],
-                });
-            }
+            let id = w.add_alpha(coded, *b"av01", alpha.payload, aprops, alpha.premultiplied);
+            w.set_hidden(id, true);
         }
-
         if let Some(depth) = self.depth {
-            if depth.av1c.len() < 4 {
-                return Err(Error::invalid(
-                    "avif mux: depth av1C configuration record must be at least 4 bytes",
-                ));
-            }
-            let depth_id = next_id;
-            next_id += 1;
             let mut dprops = vec![
-                prop_av1c(&depth.av1c),
+                prop_av1c(&depth.av1c, "depth ")?,
                 prop_ispe(self.width, self.height),
                 prop_auxc(crate::meta::AUX_URN_DEPTH_MPEG),
             ];
             if let Some(bits) = &depth.pixi {
                 dprops.push(prop_pixi(bits));
             }
-            items.push(MuxItem {
-                id: depth_id,
-                item_type: *b"av01",
-                name: "Depth".to_string(),
-                hidden: true,
-                content_type: None,
-                payload: depth.payload,
-                props: dprops,
-            });
-            irefs.push(MuxIref {
-                reference_type: *b"auxl",
-                from_id: depth_id,
-                to_ids: vec![1],
-            });
+            let id = w.add_depth(coded, *b"av01", depth.payload, dprops);
+            w.set_hidden(id, true);
         }
-
-        // Exif / XMP metadata items, each linked to the primary via a
-        // `cdsc` (content-describes) iref (av1-avif §5.2 / §5.3).
-        if let Some(exif) = self.exif {
-            let id = next_id;
-            next_id += 1;
-            items.push(MuxItem {
-                id,
-                item_type: *b"Exif",
-                name: String::new(),
-                hidden: false,
-                content_type: None,
-                payload: exif,
-                props: Vec::new(),
-            });
-            irefs.push(MuxIref {
-                reference_type: *b"cdsc",
-                from_id: id,
-                to_ids: vec![1],
-            });
+        if let Some(exif) = &self.exif {
+            add_exif_item(&mut w, coded, exif)?;
         }
-        if let Some(xmp) = self.xmp {
-            let id = next_id;
-            items.push(MuxItem {
-                id,
-                item_type: *b"mime",
-                name: String::new(),
-                hidden: false,
-                content_type: Some("application/rdf+xml".to_string()),
-                payload: xmp,
-                props: Vec::new(),
-            });
-            irefs.push(MuxIref {
-                reference_type: *b"cdsc",
-                from_id: id,
-                to_ids: vec![1],
-            });
+        if let Some(xmp) = &self.xmp {
+            add_xmp_item(&mut w, coded, xmp)?;
         }
-
-        assemble(&items, primary_id, &irefs, self.profile_brand)
+        w.set_primary(primary_id);
+        Ok(w.write_to_vec()?)
     }
 }
 
-/// Convenience: mux a still AVIF from a coded AV1 payload + config record
-/// with an `ispe` of `width × height` and the given `pixi` bit depths.
-/// Equivalent to [`AvifMuxer::new`] + [`AvifMuxer::with_pixi`] +
-/// [`AvifMuxer::build`].
+/// One-shot: a single `av01` primary with `pixi`.
 pub fn encode_still_av1(
     width: u32,
     height: u32,
@@ -858,21 +559,20 @@ pub fn encode_still_av1(
         .build()
 }
 
-/// One coded AV1 tile for a grid image.
+/// One coded tile of a grid.
 pub struct GridTile {
-    /// Tile width in pixels (its own `ispe`).
+    /// Coded tile width.
     pub width: u32,
-    /// Tile height in pixels.
+    /// Coded tile height.
     pub height: u32,
-    /// Coded AV1 Image Item Data for the tile.
+    /// AV1 Image Item Data.
     pub payload: Vec<u8>,
-    /// The tile's `av1C` configuration record.
+    /// `av1C` record.
     pub av1c: Vec<u8>,
 }
 
-/// Builder for a tiled (grid-derived) AVIF image. The primary item is a
-/// `grid` derived item (HEIF §6.6.2); its inputs are `rows × columns`
-/// hidden `av01` tile items linked via a `dimg` item reference.
+/// Builder for a `grid` primary (HEIF §6.6.2.3) over hidden `av01`
+/// tiles, with an optional alpha grid of the same geometry.
 pub struct AvifGridMuxer {
     rows: u16,
     columns: u16,
@@ -896,9 +596,8 @@ pub struct AvifGridMuxer {
 }
 
 impl AvifGridMuxer {
-    /// Start a grid muxer. `rows × columns` tiles compose an
-    /// `output_width × output_height` canvas. Tiles are supplied in
-    /// row-major order via [`Self::tile`].
+    /// A `rows × columns` grid whose output image is
+    /// `output_width × output_height`.
     pub fn new(rows: u16, columns: u16, output_width: u32, output_height: u32) -> Self {
         Self {
             rows,
@@ -923,43 +622,38 @@ impl AvifGridMuxer {
         }
     }
 
-    /// Append a tile (row-major order).
+    /// Append a colour tile (row-major order).
     pub fn tile(mut self, tile: GridTile) -> Self {
         self.tiles.push(tile);
         self
     }
 
-    /// Append an **alpha** tile (row-major order, same `rows ×
-    /// columns` as the colour tiles). The alpha auxiliary of a grid
-    /// primary is itself a `grid` derived item (HEIF §6.4.1: roles are
-    /// independent of coded-vs-derived representation) of hidden
-    /// monochrome `av01` tiles, carrying `auxC` and an `auxl` reference
-    /// to the colour grid.
+    /// Append an alpha tile (row-major order, same geometry as the
+    /// colour tiles).
     pub fn alpha_tile(mut self, tile: GridTile) -> Self {
         self.alpha_tiles.push(tile);
         self
     }
 
-    /// `pixi` for the alpha grid item.
+    /// `pixi` of the alpha grid.
     pub fn with_alpha_pixi(mut self, bits: Vec<u8>) -> Self {
         self.alpha_pixi = Some(bits);
         self
     }
 
-    /// Emit `prem` (colour pre-multiplied by alpha) from the alpha grid.
+    /// Signal the colour grid as pre-multiplied by its alpha (`prem`).
     pub fn premultiplied_alpha(mut self, premultiplied: bool) -> Self {
         self.premultiplied = premultiplied;
         self
     }
 
-    /// Attach a `pasp` property to the grid item.
+    /// `pasp` on the grid item.
     pub fn with_pasp(mut self, pasp: Pasp) -> Self {
         self.pasp = Some(pasp);
         self
     }
 
-    /// Rotate the composed grid (`irot`) — transformative properties
-    /// are only permitted on the grid item itself (av1-avif §7).
+    /// `irot` on the grid item (essential).
     pub fn with_irot(mut self, angle: u8) -> Self {
         self.irot = Some(Irot {
             angle: angle & 0x03,
@@ -967,69 +661,67 @@ impl AvifGridMuxer {
         self
     }
 
-    /// Mirror the composed grid (`imir`).
+    /// `imir` on the grid item (essential).
     pub fn with_imir(mut self, axis: u8) -> Self {
         self.imir = Some(Imir { axis: axis & 0x01 });
         self
     }
 
-    /// Mastering display colour volume on the grid item.
+    /// `mdcv` on the grid item.
     pub fn with_mdcv(mut self, mdcv: Mdcv) -> Self {
         self.mdcv = Some(mdcv);
         self
     }
 
-    /// Content light level on the grid item.
+    /// `clli` on the grid item.
     pub fn with_clli(mut self, clli: Clli) -> Self {
         self.clli = Some(clli);
         self
     }
 
-    /// Ambient viewing environment on the grid item.
+    /// `amve` on the grid item.
     pub fn with_amve(mut self, amve: Amve) -> Self {
         self.amve = Some(amve);
         self
     }
 
-    /// Exif item (`cdsc` → the grid item).
+    /// An `Exif` metadata item describing the grid.
     pub fn with_exif(mut self, payload: Vec<u8>) -> Self {
         self.exif = Some(payload);
         self
     }
 
-    /// XMP item (`cdsc` → the grid item).
+    /// An XMP metadata item describing the grid.
     pub fn with_xmp(mut self, payload: Vec<u8>) -> Self {
         self.xmp = Some(payload);
         self
     }
 
-    /// Attach a `pixi` property to the grid item.
+    /// `pixi` on the grid item.
     pub fn with_pixi(mut self, bits: Vec<u8>) -> Self {
         self.pixi = Some(bits);
         self
     }
 
-    /// Attach a `colr` property to the grid item.
+    /// `colr` on the grid item.
     pub fn with_colr(mut self, colr: Colr) -> Self {
         self.colr = Some(colr);
         self
     }
 
-    /// Declare the AVIF Advanced Profile (`MA1A`) in `ftyp` (av1-avif
-    /// §8.3) — see [`AvifMuxer::advanced_profile`].
+    /// Declare the AVIF Advanced profile (`MA1A`).
     pub fn advanced_profile(mut self) -> Self {
         self.profile_brand = ProfileBrand::Advanced;
         self
     }
 
-    /// Declare no AVIF profile brand in `ftyp` (av1-avif §8.1) — see
-    /// [`AvifMuxer::no_profile_brand`].
+    /// Declare no AVIF profile brand.
     pub fn no_profile_brand(mut self) -> Self {
         self.profile_brand = ProfileBrand::Bare;
         self
     }
 
-    /// Build the AVIF grid file bytes.
+    /// Serialise the file.
     pub fn build(self) -> Result<Vec<u8>> {
         let expected = self.rows as usize * self.columns as usize;
         if self.tiles.len() != expected {
@@ -1043,14 +735,22 @@ impl AvifGridMuxer {
         if self.tiles.is_empty() {
             return Err(Error::invalid("avif mux: grid needs at least one tile"));
         }
-
-        // Grid item = id 1 (the primary); tiles = ids 2.. .
-        let grid_payload = build_grid_descriptor(
-            self.rows,
-            self.columns,
-            self.output_width,
-            self.output_height,
-        );
+        if !self.alpha_tiles.is_empty() && self.alpha_tiles.len() != expected {
+            return Err(Error::invalid(format!(
+                "avif mux: {}×{} alpha grid needs {expected} tiles, got {}",
+                self.rows,
+                self.columns,
+                self.alpha_tiles.len()
+            )));
+        }
+        let (major, compat) = still_brands(self.profile_brand);
+        let mut w = HeifWriter::new().with_brands(major, compat);
+        let desc = GridDescriptor {
+            rows: self.rows,
+            columns: self.columns,
+            output_width: self.output_width,
+            output_height: self.output_height,
+        };
         let mut grid_props = vec![prop_ispe(self.output_width, self.output_height)];
         if let Some(bits) = &self.pixi {
             grid_props.push(prop_pixi(bits));
@@ -1076,54 +776,27 @@ impl AvifGridMuxer {
         if let Some(imir) = &self.imir {
             grid_props.push(prop_imir(imir));
         }
-        let mut items = vec![MuxItem {
-            id: 1,
-            item_type: *b"grid",
-            name: String::new(),
-            hidden: false,
-            content_type: None,
-            payload: grid_payload,
-            props: grid_props,
-        }];
-
-        let mut tile_ids = Vec::with_capacity(self.tiles.len());
+        // Layout: grid = 1, tiles 2..=n+1, then the alpha grid and its
+        // tiles, then the metadata items.
+        let n = self.tiles.len() as u32;
+        let tile_ids: Vec<u32> = (2..2 + n).collect();
+        let grid_id = w.add_grid(desc, &tile_ids, grid_props)?;
+        expect_id(grid_id, 1, "grid")?;
         for (i, tile) in self.tiles.into_iter().enumerate() {
-            if tile.av1c.len() < 4 {
-                return Err(Error::invalid(
-                    "avif mux: grid tile av1C must be at least 4 bytes",
-                ));
-            }
-            let id = 2 + i as u32;
-            tile_ids.push(id);
-            items.push(MuxItem {
-                id,
-                item_type: *b"av01",
-                name: String::new(),
-                hidden: true,
-                content_type: None,
-                payload: tile.payload,
-                props: vec![prop_av1c(&tile.av1c), prop_ispe(tile.width, tile.height)],
-            });
+            let id = w.add_coded_item(
+                *b"av01",
+                tile.payload,
+                vec![
+                    prop_av1c(&tile.av1c, "grid tile ")?,
+                    prop_ispe(tile.width, tile.height),
+                ],
+            );
+            expect_id(id, tile_ids[i], "grid tile")?;
+            w.set_hidden(id, true);
         }
-
-        let mut irefs = vec![MuxIref {
-            reference_type: *b"dimg",
-            from_id: 1,
-            to_ids: tile_ids,
-        }];
-        let mut next_id = 2 + items.len() as u32 - 1;
-
         if !self.alpha_tiles.is_empty() {
-            if self.alpha_tiles.len() != expected {
-                return Err(Error::invalid(format!(
-                    "avif mux: {}×{} alpha grid needs {expected} tiles, got {}",
-                    self.rows,
-                    self.columns,
-                    self.alpha_tiles.len()
-                )));
-            }
-            let alpha_grid_id = next_id;
-            next_id += 1;
+            let alpha_grid_id = 2 + n;
+            let alpha_tile_ids: Vec<u32> = (alpha_grid_id + 1..alpha_grid_id + 1 + n).collect();
             let mut aprops = vec![
                 prop_ispe(self.output_width, self.output_height),
                 prop_auxc(crate::alpha::ALPHA_URN_PREFIX),
@@ -1131,133 +804,68 @@ impl AvifGridMuxer {
             if let Some(bits) = &self.alpha_pixi {
                 aprops.push(prop_pixi(bits));
             }
-            items.push(MuxItem {
-                id: alpha_grid_id,
-                item_type: *b"grid",
-                name: "Alpha".to_string(),
-                hidden: true,
-                content_type: None,
-                payload: build_grid_descriptor(
-                    self.rows,
-                    self.columns,
-                    self.output_width,
-                    self.output_height,
-                ),
-                props: aprops,
-            });
-            let mut alpha_tile_ids = Vec::with_capacity(expected);
+            let ag = w.add_grid(desc, &alpha_tile_ids, aprops)?;
+            expect_id(ag, alpha_grid_id, "alpha grid")?;
+            w.set_hidden(ag, true);
             for (i, tile) in self.alpha_tiles.into_iter().enumerate() {
-                if tile.av1c.len() < 4 {
-                    return Err(Error::invalid(format!(
-                        "avif mux: alpha grid tile {i} av1C must be at least 4 bytes"
-                    )));
-                }
-                let id = next_id;
-                next_id += 1;
-                alpha_tile_ids.push(id);
-                items.push(MuxItem {
-                    id,
-                    item_type: *b"av01",
-                    name: String::new(),
-                    hidden: true,
-                    content_type: None,
-                    payload: tile.payload,
-                    props: vec![prop_av1c(&tile.av1c), prop_ispe(tile.width, tile.height)],
-                });
+                let id = w.add_coded_item(
+                    *b"av01",
+                    tile.payload,
+                    vec![
+                        prop_av1c(&tile.av1c, &format!("alpha grid tile {i} "))?,
+                        prop_ispe(tile.width, tile.height),
+                    ],
+                );
+                expect_id(id, alpha_tile_ids[i], "alpha grid tile")?;
+                w.set_hidden(id, true);
             }
-            irefs.push(MuxIref {
-                reference_type: *b"dimg",
-                from_id: alpha_grid_id,
-                to_ids: alpha_tile_ids,
-            });
-            irefs.push(MuxIref {
-                reference_type: *b"auxl",
-                from_id: alpha_grid_id,
-                to_ids: vec![1],
-            });
+            w.add_reference(*b"auxl", ag, vec![grid_id]);
             if self.premultiplied {
-                irefs.push(MuxIref {
-                    reference_type: *b"prem",
-                    from_id: alpha_grid_id,
-                    to_ids: vec![1],
-                });
+                w.add_reference(*b"prem", grid_id, vec![ag]);
             }
         }
-
-        if let Some(exif) = self.exif {
-            let id = next_id;
-            next_id += 1;
-            items.push(MuxItem {
-                id,
-                item_type: *b"Exif",
-                name: String::new(),
-                hidden: false,
-                content_type: None,
-                payload: exif,
-                props: Vec::new(),
-            });
-            irefs.push(MuxIref {
-                reference_type: *b"cdsc",
-                from_id: id,
-                to_ids: vec![1],
-            });
+        if let Some(exif) = &self.exif {
+            add_exif_item(&mut w, grid_id, exif)?;
         }
-        if let Some(xmp) = self.xmp {
-            let id = next_id;
-            items.push(MuxItem {
-                id,
-                item_type: *b"mime",
-                name: String::new(),
-                hidden: false,
-                content_type: Some("application/rdf+xml".to_string()),
-                payload: xmp,
-                props: Vec::new(),
-            });
-            irefs.push(MuxIref {
-                reference_type: *b"cdsc",
-                from_id: id,
-                to_ids: vec![1],
-            });
+        if let Some(xmp) = &self.xmp {
+            add_xmp_item(&mut w, grid_id, xmp)?;
         }
-        assemble(&items, 1, &irefs, self.profile_brand)
+        w.set_primary(grid_id);
+        Ok(w.write_to_vec()?)
     }
 }
 
-/// One input image of an overlay: a coded AV1 item (plus optional
-/// alpha auxiliary) and where it lands on the canvas.
+/// One layer of an overlay: a hidden `av01` item placed at
+/// `(offset_x, offset_y)`, with an optional alpha auxiliary.
 pub struct OverlayLayer {
-    /// The layer's `ispe` width (coded extents).
+    /// Coded width.
     pub width: u32,
-    /// The layer's `ispe` height (coded extents).
+    /// Coded height.
     pub height: u32,
-    /// Coded AV1 Image Item Data for the layer.
+    /// AV1 Image Item Data.
     pub payload: Vec<u8>,
-    /// The layer's `av1C` configuration record.
+    /// `av1C` record.
     pub av1c: Vec<u8>,
-    /// Optional `pixi` bits per channel.
+    /// `pixi` of the layer.
     pub pixi: Option<Vec<u8>>,
-    /// Optional `colr` for the layer item.
+    /// `colr` of the layer.
     pub colr: Option<Colr>,
-    /// Optional `clap` (e.g. the encoder's pad-back crop); applies to
-    /// the layer's own output image before placement.
+    /// `clap` on the layer (essential).
     pub clap: Option<Clap>,
-    /// Optional AV1-coded alpha auxiliary `(payload, av1C)` for the
-    /// layer, carried as a hidden monochrome item with `auxl` to it.
+    /// Alpha auxiliary `(payload, av1C)`.
     pub alpha: Option<(Vec<u8>, Vec<u8>)>,
-    /// `pixi` for the alpha auxiliary.
+    /// `pixi` of the alpha auxiliary.
     pub alpha_pixi: Option<Vec<u8>>,
-    /// Emit `prem` (colour pre-multiplied by alpha) for the layer.
+    /// `prem`: the layer is pre-multiplied by its alpha.
     pub premultiplied: bool,
-    /// `horizontal_offset` of the layer's top-left corner on the canvas.
+    /// Horizontal offset on the canvas.
     pub offset_x: i32,
-    /// `vertical_offset` of the layer's top-left corner on the canvas.
+    /// Vertical offset on the canvas.
     pub offset_y: i32,
 }
 
-/// Builder for an overlay-derived AVIF image (HEIF §6.6.2.2): the
-/// primary item is an `iovl` derived item whose `dimg` inputs are
-/// hidden `av01` layer items placed on an `output_width ×
-/// output_height` canvas, bottom-most layer first.
+/// Builder for an `iovl` primary (HEIF §6.6.2.2) over hidden `av01`
+/// layers.
 pub struct AvifOverlayMuxer {
     output_width: u32,
     output_height: u32,
@@ -1271,8 +879,8 @@ pub struct AvifOverlayMuxer {
 }
 
 impl AvifOverlayMuxer {
-    /// Start an overlay muxer for an `output_width × output_height`
-    /// canvas. The fill defaults to opaque black (`[0, 0, 0, 65535]`).
+    /// An overlay canvas of `output_width × output_height` (opaque
+    /// black fill by default).
     pub fn new(output_width: u32, output_height: u32) -> Self {
         Self {
             output_width,
@@ -1287,8 +895,7 @@ impl AvifOverlayMuxer {
         }
     }
 
-    /// Set `canvas_fill_value` — sRGB RGBA, 16 bits per channel, `A`
-    /// linear from 0 (transparent) to 65535 (opaque) (§6.6.2.2.3).
+    /// `canvas_fill_value` (sRGB R, G, B and opacity, 16-bit each).
     pub fn with_fill(mut self, rgba: [u16; 4]) -> Self {
         self.fill = rgba;
         self
@@ -1300,20 +907,19 @@ impl AvifOverlayMuxer {
         self
     }
 
-    /// Attach a `pixi` property to the overlay item.
+    /// `pixi` on the overlay item.
     pub fn with_pixi(mut self, bits: Vec<u8>) -> Self {
         self.pixi = Some(bits);
         self
     }
 
-    /// Attach a `colr` property to the overlay item.
+    /// `colr` on the overlay item.
     pub fn with_colr(mut self, colr: Colr) -> Self {
         self.colr = Some(colr);
         self
     }
 
-    /// Rotate the composed canvas (`irot`, anti-clockwise quarter
-    /// turns) — a transformative property on the derived item itself.
+    /// `irot` on the overlay item (essential).
     pub fn with_irot(mut self, angle: u8) -> Self {
         self.irot = Some(Irot {
             angle: angle & 0x03,
@@ -1321,26 +927,25 @@ impl AvifOverlayMuxer {
         self
     }
 
-    /// Mirror the composed canvas (`imir`).
+    /// `imir` on the overlay item (essential).
     pub fn with_imir(mut self, axis: u8) -> Self {
         self.imir = Some(Imir { axis: axis & 0x01 });
         self
     }
 
-    /// Declare the AVIF Advanced Profile (`MA1A`) — see
-    /// [`AvifMuxer::advanced_profile`].
+    /// Declare the AVIF Advanced profile (`MA1A`).
     pub fn advanced_profile(mut self) -> Self {
         self.profile_brand = ProfileBrand::Advanced;
         self
     }
 
-    /// Declare no AVIF profile brand — see [`AvifMuxer::no_profile_brand`].
+    /// Declare no AVIF profile brand.
     pub fn no_profile_brand(mut self) -> Self {
         self.profile_brand = ProfileBrand::Bare;
         self
     }
 
-    /// Build the AVIF overlay file bytes.
+    /// Serialise the file.
     pub fn build(self) -> Result<Vec<u8>> {
         if self.layers.is_empty() {
             return Err(Error::invalid("avif mux: overlay needs at least one layer"));
@@ -1348,13 +953,18 @@ impl AvifOverlayMuxer {
         if self.output_width == 0 || self.output_height == 0 {
             return Err(Error::invalid("avif mux: overlay canvas dimensions zero"));
         }
-        let offsets: Vec<(i32, i32)> = self
-            .layers
-            .iter()
-            .map(|l| (l.offset_x, l.offset_y))
-            .collect();
-        let descriptor =
-            build_overlay_descriptor(self.fill, self.output_width, self.output_height, &offsets);
+        let (major, compat) = still_brands(self.profile_brand);
+        let mut w = HeifWriter::new().with_brands(major, compat);
+        let desc = OverlayDescriptor {
+            canvas_fill: self.fill,
+            output_width: self.output_width,
+            output_height: self.output_height,
+            offsets: self
+                .layers
+                .iter()
+                .map(|l| (l.offset_x, l.offset_y))
+                .collect(),
+        };
         let mut props = vec![prop_ispe(self.output_width, self.output_height)];
         if let Some(bits) = &self.pixi {
             props.push(prop_pixi(bits));
@@ -1368,28 +978,21 @@ impl AvifOverlayMuxer {
         if let Some(imir) = &self.imir {
             props.push(prop_imir(imir));
         }
-        let mut items = vec![MuxItem {
-            id: 1,
-            item_type: *b"iovl",
-            name: String::new(),
-            hidden: false,
-            content_type: None,
-            payload: descriptor,
-            props,
-        }];
-        let mut irefs = Vec::new();
+        // Layout: overlay = 1, then per layer its item and (right
+        // after) its alpha auxiliary.
         let mut layer_ids = Vec::with_capacity(self.layers.len());
-        let mut next_id = 2u32;
+        let mut next = 2u32;
+        for layer in &self.layers {
+            layer_ids.push(next);
+            next += 1 + u32::from(layer.alpha.is_some());
+        }
+        let ov = w.add_overlay(desc, &layer_ids, props)?;
+        expect_id(ov, 1, "overlay")?;
         for (i, layer) in self.layers.into_iter().enumerate() {
-            if layer.av1c.len() < 4 {
-                return Err(Error::invalid(format!(
-                    "avif mux: overlay layer {i} av1C must be at least 4 bytes"
-                )));
-            }
-            let id = next_id;
-            next_id += 1;
-            layer_ids.push(id);
-            let mut lprops = vec![prop_av1c(&layer.av1c), prop_ispe(layer.width, layer.height)];
+            let mut lprops = vec![
+                prop_av1c(&layer.av1c, &format!("overlay layer {i} "))?,
+                prop_ispe(layer.width, layer.height),
+            ];
             if let Some(bits) = &layer.pixi {
                 lprops.push(prop_pixi(bits));
             }
@@ -1399,25 +1002,12 @@ impl AvifOverlayMuxer {
             if let Some(clap) = &layer.clap {
                 lprops.push(prop_clap(clap));
             }
-            items.push(MuxItem {
-                id,
-                item_type: *b"av01",
-                name: String::new(),
-                hidden: true,
-                content_type: None,
-                payload: layer.payload,
-                props: lprops,
-            });
+            let id = w.add_coded_item(*b"av01", layer.payload, lprops);
+            expect_id(id, layer_ids[i], "overlay layer")?;
+            w.set_hidden(id, true);
             if let Some((apayload, aav1c)) = layer.alpha {
-                if aav1c.len() < 4 {
-                    return Err(Error::invalid(format!(
-                        "avif mux: overlay layer {i} alpha av1C must be at least 4 bytes"
-                    )));
-                }
-                let alpha_id = next_id;
-                next_id += 1;
                 let mut aprops = vec![
-                    prop_av1c(&aav1c),
+                    prop_av1c(&aav1c, &format!("overlay layer {i} alpha "))?,
                     prop_ispe(layer.width, layer.height),
                     prop_auxc(crate::alpha::ALPHA_URN_PREFIX),
                 ];
@@ -1427,349 +1017,94 @@ impl AvifOverlayMuxer {
                 if let Some(clap) = &layer.clap {
                     aprops.push(prop_clap(clap));
                 }
-                items.push(MuxItem {
-                    id: alpha_id,
-                    item_type: *b"av01",
-                    name: "Alpha".to_string(),
-                    hidden: true,
-                    content_type: None,
-                    payload: apayload,
-                    props: aprops,
-                });
-                irefs.push(MuxIref {
-                    reference_type: *b"auxl",
-                    from_id: alpha_id,
-                    to_ids: vec![id],
-                });
-                if layer.premultiplied {
-                    irefs.push(MuxIref {
-                        reference_type: *b"prem",
-                        from_id: alpha_id,
-                        to_ids: vec![id],
-                    });
-                }
+                let aid = w.add_alpha(id, *b"av01", apayload, aprops, layer.premultiplied);
+                w.set_hidden(aid, true);
             }
         }
-        irefs.insert(
-            0,
-            MuxIref {
-                reference_type: *b"dimg",
-                from_id: 1,
-                to_ids: layer_ids,
-            },
-        );
-        assemble(&items, 1, &irefs, self.profile_brand)
+        w.set_primary(ov);
+        Ok(w.write_to_vec()?)
     }
 }
 
-/// Encode a HEIF `iovl` descriptor (HEIF §6.6.2.2.2): `version = 0`,
-/// `flags & 1` selects 32-bit fields when any canvas extent exceeds
-/// 65535 or any offset falls outside the signed 16-bit range.
-fn build_overlay_descriptor(
-    fill: [u16; 4],
-    output_width: u32,
-    output_height: u32,
-    offsets: &[(i32, i32)],
-) -> Vec<u8> {
-    let wide = output_width > u16::MAX as u32
-        || output_height > u16::MAX as u32
-        || offsets
-            .iter()
-            .any(|&(x, y)| i16::try_from(x).is_err() || i16::try_from(y).is_err());
-    let mut w = W::default();
-    w.u8(0); // version
-    w.u8(if wide { 1 } else { 0 }); // flags
-    for v in fill {
-        w.u16(v);
+/// The `ftyp` brand list of an AVIF image sequence (av1-avif §6.3 +
+/// AV1-ISOBMFF §2.1): major `avis`, compatible `avis` / `avif` /
+/// `mif1` / `msf1` / `miaf` / `av01`, `avio` when every sample is a
+/// sync sample, and the profile brand.
+#[cfg(feature = "registry")]
+pub(crate) fn sequence_brands(profile: ProfileBrand, all_sync: bool) -> ([u8; 4], Vec<[u8; 4]>) {
+    let mut compat = vec![*b"avis", *b"avif", *b"mif1", *b"msf1", *b"miaf", *b"av01"];
+    if all_sync {
+        compat.push(*b"avio");
     }
-    if wide {
-        w.u32(output_width);
-        w.u32(output_height);
-        for &(x, y) in offsets {
-            w.u32(x as u32);
-            w.u32(y as u32);
-        }
-    } else {
-        w.u16(output_width as u16);
-        w.u16(output_height as u16);
-        for &(x, y) in offsets {
-            w.u16(x as i16 as u16);
-            w.u16(y as i16 as u16);
-        }
-    }
-    w.into_vec()
-}
-
-/// Encode a HEIF `grid` descriptor (HEIF §6.6.2.3). Output dims ≤ 65535
-/// use the compact 16-bit form; larger canvases set the `flags` LSB and
-/// emit 32-bit dims.
-fn build_grid_descriptor(
-    rows: u16,
-    columns: u16,
-    output_width: u32,
-    output_height: u32,
-) -> Vec<u8> {
-    let wide = output_width > u16::MAX as u32 || output_height > u16::MAX as u32;
-    let mut w = W::default();
-    w.u8(0); // version
-    w.u8(if wide { 1 } else { 0 }); // flags: bit 0 => 32-bit output dims
-    w.u8((rows - 1) as u8);
-    w.u8((columns - 1) as u8);
-    if wide {
-        w.u32(output_width);
-        w.u32(output_height);
-    } else {
-        w.u16(output_width as u16);
-        w.u16(output_height as u16);
-    }
-    w.into_vec()
-}
-
-// ───────────────────────────── assembly ───────────────────────────────
-
-/// Assemble the full AVIF file from an item list, the primary item id,
-/// and the item-reference list. `profile_brand` selects which (if any)
-/// AVIF profile brand `ftyp` declares.
-fn assemble(
-    items: &[MuxItem],
-    primary_id: u32,
-    irefs: &[MuxIref],
-    profile_brand: ProfileBrand,
-) -> Result<Vec<u8>> {
-    if items.len() > u16::MAX as usize {
-        return Err(Error::unsupported("avif mux: too many items for v0 boxes"));
-    }
-    // 1. Lay out mdat: record each item's offset relative to the start of
-    //    the mdat payload.
-    let mut rel_offsets = Vec::with_capacity(items.len());
-    let mut mdat_payload = Vec::new();
-    for it in items {
-        rel_offsets.push(mdat_payload.len() as u64);
-        mdat_payload.extend_from_slice(&it.payload);
-    }
-
-    // 2. Build a global ipco property table (dedup identical property
-    //    boxes) and per-item 1-based association lists.
-    let (ipco_props, item_assocs) = build_property_table(items)?;
-
-    let ftyp = build_ftyp(profile_brand);
-    // 3. Measure the meta box length with placeholder offsets, then
-    //    rebuild with absolute offsets. Offset field width is fixed, so
-    //    the length is stable across the two builds.
-    let probe_meta = build_meta(
-        items,
-        primary_id,
-        irefs,
-        &ipco_props,
-        &item_assocs,
-        &rel_offsets,
-        0,
-    );
-    let mdat_data_start = (ftyp.len() + probe_meta.len() + 8) as u64;
-    let meta = build_meta(
-        items,
-        primary_id,
-        irefs,
-        &ipco_props,
-        &item_assocs,
-        &rel_offsets,
-        mdat_data_start,
-    );
-    debug_assert_eq!(meta.len(), probe_meta.len());
-
-    let mut out = Vec::with_capacity(ftyp.len() + meta.len() + 8 + mdat_payload.len());
-    out.extend_from_slice(&ftyp);
-    out.extend_from_slice(&meta);
-    out.extend_from_slice(&boxed(b"mdat", &mdat_payload));
-    Ok(out)
-}
-
-/// Global `ipco` property table (identical property boxes de-duplicated)
-/// plus each item's 1-based `(index, essential)` association list.
-/// `(ipco property boxes, per-item (1-based index, essential) lists)`.
-pub(crate) type PropertyTable = (Vec<Vec<u8>>, Vec<Vec<(u16, bool)>>);
-
-pub(crate) fn build_property_table(items: &[MuxItem]) -> Result<PropertyTable> {
-    let mut ipco_props: Vec<Vec<u8>> = Vec::new();
-    let mut item_assocs: Vec<Vec<(u16, bool)>> = Vec::with_capacity(items.len());
-    for it in items {
-        let mut assocs = Vec::with_capacity(it.props.len());
-        for p in &it.props {
-            let idx = match ipco_props.iter().position(|b| b == &p.bytes) {
-                Some(i) => i,
-                None => {
-                    ipco_props.push(p.bytes.clone());
-                    ipco_props.len() - 1
-                }
-            };
-            let one_based = (idx + 1) as u16;
-            if one_based > 0x7f {
-                return Err(Error::unsupported(
-                    "avif mux: >127 distinct properties need the large-index ipma form",
-                ));
-            }
-            assocs.push((one_based, p.essential));
-        }
-        item_assocs.push(assocs);
-    }
-    Ok((ipco_props, item_assocs))
-}
-
-/// `ftyp`: AVIF brand set (av1-avif §6.2 / §8.1 / §8.2 / §8.3).
-/// Baseline (`MA1B`) by default; `Advanced` selects `MA1A`; `Bare`
-/// lists only the general brands.
-pub(crate) fn build_ftyp(profile_brand: ProfileBrand) -> Vec<u8> {
-    let mut w = W::default();
-    w.fourcc(b"avif"); // major_brand
-    w.u32(0); // minor_version
-    w.fourcc(b"avif");
-    w.fourcc(b"mif1");
-    w.fourcc(b"miaf");
-    match profile_brand {
-        ProfileBrand::Baseline => w.fourcc(b"MA1B"),
-        ProfileBrand::Advanced => w.fourcc(b"MA1A"),
+    match profile {
+        ProfileBrand::Baseline => compat.push(*b"MA1B"),
+        ProfileBrand::Advanced => compat.push(*b"MA1A"),
         ProfileBrand::Bare => {}
     }
-    boxed(b"ftyp", &w.into_vec())
+    (*b"avis", compat)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn build_meta(
-    items: &[MuxItem],
-    primary_id: u32,
-    irefs: &[MuxIref],
-    ipco_props: &[Vec<u8>],
-    item_assocs: &[Vec<(u16, bool)>],
-    rel_offsets: &[u64],
-    mdat_data_start: u64,
-) -> Vec<u8> {
-    let mut body = Vec::new();
-    body.extend_from_slice(&build_hdlr());
-    body.extend_from_slice(&build_pitm(primary_id));
-    body.extend_from_slice(&build_iinf(items));
-    if !irefs.is_empty() {
-        body.extend_from_slice(&build_iref(irefs));
+/// The cover still of an image sequence: sample 0's coded bytes as one
+/// `av01` item with the track's properties.
+#[cfg(feature = "registry")]
+pub(crate) struct CoverStill<'a> {
+    /// `ftyp` brands of the sequence.
+    pub brands: ([u8; 4], Vec<[u8; 4]>),
+    /// Coded extents.
+    pub width: u32,
+    /// Coded extents.
+    pub height: u32,
+    /// Sample 0.
+    pub payload: Vec<u8>,
+    /// `av1C` record.
+    pub av1c: &'a [u8],
+    /// `pixi` bits per channel.
+    pub pixi: &'a [u8],
+    /// `colr`, when the sequence carries one.
+    pub colr: Option<&'a Colr>,
+    /// `clap`, when the coded extents exceed the picture.
+    pub clap: Option<&'a Clap>,
+}
+
+/// Write the cover still of an image sequence through the container:
+/// the sequence writer appends its `moov` and the remaining samples so
+/// the primary item aliases sample 0. Returns the file bytes and the
+/// primary's payload span inside them.
+#[cfg(feature = "registry")]
+pub(crate) fn sequence_cover_still(cover: CoverStill<'_>) -> Result<(Vec<u8>, (usize, usize))> {
+    let CoverStill {
+        brands,
+        width,
+        height,
+        payload,
+        av1c,
+        pixi,
+        colr,
+        clap,
+    } = cover;
+    let mut w = HeifWriter::new().with_brands(brands.0, brands.1);
+    let mut props = vec![
+        prop_av1c(av1c, "sequence ")?,
+        prop_ispe(width, height),
+        prop_pixi(pixi),
+    ];
+    if let Some(c) = colr {
+        props.push(prop_colr(c)?);
     }
-    body.extend_from_slice(&build_iprp(ipco_props, items, item_assocs));
-    body.extend_from_slice(&build_iloc(items, rel_offsets, mdat_data_start));
-    full_boxed(b"meta", 0, 0, &body)
-}
-
-fn build_hdlr() -> Vec<u8> {
-    let mut w = W::default();
-    w.u32(0); // pre_defined
-    w.fourcc(b"pict"); // handler_type
-    w.u32(0); // reserved[0]
-    w.u32(0); // reserved[1]
-    w.u32(0); // reserved[2]
-    w.cstr(""); // name
-    full_boxed(b"hdlr", 0, 0, &w.into_vec())
-}
-
-fn build_pitm(primary_id: u32) -> Vec<u8> {
-    let mut w = W::default();
-    w.u16(primary_id as u16);
-    full_boxed(b"pitm", 0, 0, &w.into_vec())
-}
-
-fn build_iinf(items: &[MuxItem]) -> Vec<u8> {
-    let mut infe_all = Vec::new();
-    for it in items {
-        infe_all.extend_from_slice(&build_infe(it));
+    if let Some(c) = clap {
+        props.push(prop_clap(c));
     }
-    let mut w = W::default();
-    w.u16(items.len() as u16); // entry_count
-    w.bytes(&infe_all);
-    full_boxed(b"iinf", 0, 0, &w.into_vec())
-}
-
-fn build_infe(it: &MuxItem) -> Vec<u8> {
-    let mut w = W::default();
-    w.u16(it.id as u16);
-    w.u16(0); // item_protection_index
-    w.fourcc(&it.item_type);
-    w.cstr(&it.name);
-    // `mime` items carry a content_type (and optional content_encoding,
-    // which we always omit) after the name (ISO-BMFF §8.11.6.2).
-    if let Some(ct) = &it.content_type {
-        w.cstr(ct);
+    let id = w.add_coded_item(*b"av01", payload, props);
+    w.set_primary(id);
+    let bytes = w.write_to_vec()?;
+    let file = oxideav_heif::HeifFile::parse(&bytes)?;
+    let spans = file.item_file_spans(id)?;
+    match spans.as_slice() {
+        [span] => Ok((bytes, *span)),
+        _ => Err(Error::invalid(
+            "avif mux: sequence cover still is not one contiguous span",
+        )),
     }
-    // FullBox flags bit 0 = hidden-image-item signal (HEIF §6.4.2).
-    let flags = if it.hidden { 1 } else { 0 };
-    full_boxed(b"infe", 2, flags, &w.into_vec())
-}
-
-fn build_iref(irefs: &[MuxIref]) -> Vec<u8> {
-    let mut children = Vec::new();
-    for r in irefs {
-        let mut w = W::default();
-        w.u16(r.from_id as u16);
-        w.u16(r.to_ids.len() as u16);
-        for &to in &r.to_ids {
-            w.u16(to as u16);
-        }
-        children.extend_from_slice(&boxed(&r.reference_type, &w.into_vec()));
-    }
-    // iref version 0 => 16-bit item ids.
-    full_boxed(b"iref", 0, 0, &children)
-}
-
-fn build_iprp(
-    ipco_props: &[Vec<u8>],
-    items: &[MuxItem],
-    item_assocs: &[Vec<(u16, bool)>],
-) -> Vec<u8> {
-    // ipco: concatenated property boxes.
-    let mut ipco_body = Vec::new();
-    for p in ipco_props {
-        ipco_body.extend_from_slice(p);
-    }
-    let ipco = boxed(b"ipco", &ipco_body);
-
-    // ipma: one entry per item.
-    let mut w = W::default();
-    w.u32(items.len() as u32); // entry_count
-    for (it, assocs) in items.iter().zip(item_assocs) {
-        w.u16(it.id as u16);
-        w.u8(assocs.len() as u8);
-        for &(idx, essential) in assocs {
-            // Small form: bit 7 = essential, low 7 bits = 1-based index.
-            let byte = (if essential { 0x80 } else { 0 }) | (idx as u8 & 0x7f);
-            w.u8(byte);
-        }
-    }
-    let ipma = full_boxed(b"ipma", 0, 0, &w.into_vec());
-
-    let mut body = Vec::new();
-    body.extend_from_slice(&ipco);
-    body.extend_from_slice(&ipma);
-    boxed(b"iprp", &body)
-}
-
-fn build_iloc(items: &[MuxItem], rel_offsets: &[u64], mdat_data_start: u64) -> Vec<u8> {
-    let mut w = W::default();
-    // offset_size=4, length_size=4, base_offset_size=0, index_size(reserved v0)=0.
-    w.u8(0x44);
-    w.u8(0x00);
-    // Items without an item body (`iden`, HEIF §6.6.2.1 "no extents")
-    // are absent from iloc altogether.
-    let located: Vec<(&MuxItem, u64)> = items
-        .iter()
-        .zip(rel_offsets)
-        .filter(|(it, _)| it.item_type != *b"iden")
-        .map(|(it, &rel)| (it, rel))
-        .collect();
-    w.u16(located.len() as u16); // item_count
-    for (it, rel) in located {
-        w.u16(it.id as u16);
-        w.u16(0); // data_reference_index
-                  // base_offset omitted (base_offset_size == 0).
-        w.u16(1); // extent_count
-        let abs = mdat_data_start + rel;
-        w.u32(abs as u32); // extent_offset
-        w.u32(it.payload.len() as u32); // extent_length
-    }
-    full_boxed(b"iloc", 0, 0, &w.into_vec())
 }
 
 #[cfg(test)]
@@ -1906,9 +1241,9 @@ mod tests {
         let tiles = hdr.meta.iref_targets_of(b"dimg", 1);
         assert_eq!(tiles, vec![2, 3, 4, 5]);
         // Grid descriptor decodes to a 2×2 / 32×32 grid.
-        let loc = hdr.meta.location_by_id(1).expect("grid iloc");
-        let payload = crate::parser::item_bytes(&bytes, loc).expect("grid bytes");
-        let g = crate::grid::ImageGrid::parse(payload).expect("grid parse");
+        assert!(hdr.meta.location_by_id(1).is_some(), "grid iloc");
+        let payload = hdr.item_data(1).expect("grid bytes");
+        let g = crate::grid::ImageGrid::parse(&payload).expect("grid parse");
         assert_eq!((g.rows, g.columns), (2, 2));
         assert_eq!((g.output_width, g.output_height), (32, 32));
         // Each tile item is hidden and carries its own av1C + ispe.
@@ -2083,9 +1418,9 @@ mod tests {
         }
         let bytes = m.build().expect("mux wide grid");
         let hdr = parse_header(&bytes).expect("parse");
-        let loc = hdr.meta.location_by_id(1).expect("grid iloc");
-        let payload = crate::parser::item_bytes(&bytes, loc).expect("grid bytes");
-        let g = crate::grid::ImageGrid::parse(payload).expect("grid parse");
+        assert!(hdr.meta.location_by_id(1).is_some(), "grid iloc");
+        let payload = hdr.item_data(1).expect("grid bytes");
+        let g = crate::grid::ImageGrid::parse(&payload).expect("grid parse");
         assert_eq!((g.output_width, g.output_height), (70_000, 8));
         assert_eq!((g.rows, g.columns), (1, 2));
     }

@@ -1013,6 +1013,17 @@ pub fn gain_map_metadata(
 /// Decode `av1C` bytes into `(bit_depth, monochrome, chroma_subsampling)`.
 /// Returns `(None, false, None)` on parse failure so callers degrade
 /// gracefully rather than erroring out on this auxiliary field.
+/// A `prem` item reference between a master image and its alpha
+/// auxiliary, in either direction (HEIF 3rd ed. §6.9.1 master →
+/// auxiliary; 2017-edition readers saw alpha → master).
+fn prem_between(meta: &Meta, master: u32, alpha: u32) -> bool {
+    meta.irefs.iter().any(|e| {
+        &e.reference_type == b"prem"
+            && ((e.from_id == alpha && e.to_ids.contains(&master))
+                || (e.from_id == master && e.to_ids.contains(&alpha)))
+    })
+}
+
 fn decode_av1c_flags(av1c: &[u8]) -> (Option<u8>, bool, Option<(bool, bool)>) {
     if av1c.len() < 3 {
         return (None, false, None);
@@ -1072,15 +1083,7 @@ pub(crate) fn build_info(
     // contains the primary item. Find the alpha first, then check.
     let premultiplied_alpha = if has_alpha {
         match find_alpha_item_id(&img.meta, primary_id) {
-            // The alpha item is the `from_id` of the `prem` iref;
-            // `prem`'s `to_ids` lists the colour image(s) it premuls.
-            // Walk every `prem` iref and look for one whose from matches
-            // our alpha and whose to contains the primary.
-            Some(alpha_id) => img.meta.irefs.iter().any(|e| {
-                &e.reference_type == b"prem"
-                    && e.from_id == alpha_id
-                    && e.to_ids.contains(&primary_id)
-            }),
+            Some(alpha_id) => prem_between(&img.meta, primary_id, alpha_id),
             None => false,
         }
     } else {
@@ -1270,11 +1273,7 @@ pub(crate) fn build_info_grid(
     let has_alpha = find_alpha_item_id(&hdr.meta, primary_id).is_some();
     let premultiplied_alpha = if has_alpha {
         match find_alpha_item_id(&hdr.meta, primary_id) {
-            Some(alpha_id) => hdr.meta.irefs.iter().any(|e| {
-                &e.reference_type == b"prem"
-                    && e.from_id == alpha_id
-                    && e.to_ids.contains(&primary_id)
-            }),
+            Some(alpha_id) => prem_between(&hdr.meta, primary_id, alpha_id),
             None => false,
         }
     } else {
@@ -1500,11 +1499,7 @@ pub(crate) fn build_info_derived(
     let has_alpha = find_alpha_item_id(&hdr.meta, primary_id).is_some();
     let premultiplied_alpha = if has_alpha {
         match find_alpha_item_id(&hdr.meta, primary_id) {
-            Some(alpha_id) => hdr.meta.irefs.iter().any(|e| {
-                &e.reference_type == b"prem"
-                    && e.from_id == alpha_id
-                    && e.to_ids.contains(&primary_id)
-            }),
+            Some(alpha_id) => prem_between(&hdr.meta, primary_id, alpha_id),
             None => false,
         }
     } else {

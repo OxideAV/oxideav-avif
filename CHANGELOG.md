@@ -73,6 +73,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   helper `sample_table(stbl)` (use `parse_avis(file).samples`; the
   sample offsets are absolute file offsets, so a bare `stbl` has no
   file to check them against).
+- **Still-image writer by `oxideav-heif`.** `AvifMuxer` /
+  `AvifGridMuxer` / `AvifOverlayMuxer` / `encode_still_av1` (and so
+  `encode_still*` and the framework `Encoder`) assemble their items
+  with the container's `HeifWriter`: this crate decides the AVIF
+  layout — brands (`avif` / `mif1` / `miaf` + `MA1B` / `MA1A`), item
+  order (primary first so it is item 1, a `grid` / `iovl` before its
+  inputs, the alpha auxiliary right after its master), every item's
+  property set and essential flags, the alpha / depth `auxC` URNs,
+  the grid / overlay descriptors — and the container serialises the
+  `meta` tree. What changed on the wire: derived item bodies (`grid` /
+  `iovl` descriptors) ride `idat` (construction method 1) instead of
+  `mdat`, `iloc` is v1 with 64-bit offsets, `ipco` de-duplicates
+  descriptive properties across items while each coded item keeps its
+  own `av1C`, the `prem` reference is written from the master to its
+  alpha auxiliary (HEIF 3rd ed. §6.9.1; the reader now accepts either
+  direction, in `Meta::is_alpha_premultiplied_for` and
+  `AvifInfo::premultiplied_alpha`), `mdat` follows the MIAF §7.2.1
+  order, and the alpha / depth items no longer carry an `item_name`.
+  An `Exif` item body must start with a zero
+  `exif_tiff_header_offset` (the container writer prepends its own)
+  and an XMP packet must be UTF-8; anything else is refused with
+  `Unsupported`. Every emitted shape still opens in the third-party
+  readers the tests use (an `iovl` primary was never accepted by the
+  reference AVIF decoder binary, before or after).
+- **Image-sequence writer.** `encode_sequence` writes the cover still
+  (sample 0 as the primary `av01` item, the sequence's brands `avis` /
+  `avif` / `mif1` / `msf1` / `miaf` / `av01` [+ `avio`] + profile)
+  through the container writer and appends its own `moov` and the
+  remaining samples in a second `mdat`, so the primary aliases sample
+  0; the `moov` / `trak` / `stbl` serialisation stays here because the
+  container's `SequenceWriter` has no brand override and no
+  cover-still aliasing (cross-crate item).
 - `box_parser` is a thin surface over `oxideav_heif::boxes`:
   `BoxHeader` is the container crate's type (`total_len` is now a
   method and the header also carries `start` / `user_type`); an
