@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`oxideav-heif = "0.0.5"` minimum.** The container's HEIF Amd 1:2025
+  / Amd 2:2026 typed properties no longer make the property conversion
+  refuse a file: the Amd 2 per-channel `pixi` (`px_flags & 1`) lands on
+  `Property::Pixi` with its channel descriptors in the new
+  `Pixi::channels` field (empty for the plain form), and every other
+  form the container types beyond this crate's model — `reve`, `ndwt`,
+  `cexg`, `dadj`, `stag`, `tilC` today, whatever the container learns
+  next — rides as the new `Property::Container(oxideav_heif::props::Property)`
+  (readable, index-stable; an essential one is reported by
+  `Meta::unsupported_essential_properties` instead of refused; a body
+  the container rejects stays a raw `Property::Other`). The container
+  conversion's "typed unexpectedly" error is gone. New
+  `Meta::properties_for(item_id)` lists an item's properties in `ipma`
+  order.
+
 - **Container layer by `oxideav-heif`.** The ISOBMFF box reader, the
   `meta` item model (`hdlr` / `pitm` / `iinf` + `infe` / `iloc` /
   `iref` / `iprp` + `ipco` + `ipma` / `idat`) and item payload

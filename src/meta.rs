@@ -113,6 +113,18 @@ const ELNG: BoxType = b(b"elng");
 const FNCH: BoxType = b(b"fnch");
 /// HEIF §11.2.2.2 — Mask Configuration descriptive property.
 const MSKC: BoxType = b(b"mskC");
+/// HEIF Amd 1:2025 §6.5.44 — Reference Viewing Environment.
+const REVE: BoxType = b(b"reve");
+/// HEIF Amd 1:2025 §6.5.45 — Nominal Diffuse White.
+const NDWT: BoxType = b(b"ndwt");
+/// HEIF Amd 1:2025 §6.5.41 — Constrained Extents Grid.
+const CEXG: BoxType = b(b"cexg");
+/// HEIF Amd 1:2025 §6.5.42 — Disparity Adjustment.
+const DADJ: BoxType = b(b"dadj");
+/// HEIF Amd 1:2025 §6.5.43 — Stereo Aggressors.
+const STAG: BoxType = b(b"stag");
+/// HEIF Amd 2:2026 §6.11.3 — Tiled Image Configuration.
+const TILC: BoxType = b(b"tilC");
 
 /// HEIF §6.6.2.2 — image overlay derived-image type.
 pub const ITEM_TYPE_IOVL: BoxType = b(b"iovl");
@@ -275,6 +287,10 @@ pub struct Ispe {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Pixi {
     pub bits_per_channel: Vec<u8>,
+    /// The HEIF Amd 2:2026 §6.5.6 per-channel descriptors (`px_flags
+    /// & 1`: content, component format, subsampling, label), one per
+    /// entry of `bits_per_channel`; empty for the plain `pixi` form.
+    pub channels: Vec<hprops::PixiChannel>,
 }
 
 impl Pixi {
@@ -2780,6 +2796,14 @@ pub enum Property {
     Cmex(Cmex),
     /// Camera-intrinsic-matrix descriptive property (HEIF §6.5.40).
     Cmin(Cmin),
+    /// A property the container crate types but AVIF does not model
+    /// itself — the HEIF Amd 1:2025 / Amd 2:2026 set (`reve`, `ndwt`,
+    /// `cexg`, `dadj`, `stag`, `tilC`) and whatever the container
+    /// learns to type next. Carried as the container's typed value so
+    /// callers can read it; the AVIF layer treats it like
+    /// [`Property::Other`] (an essential one it cannot honour is
+    /// reported by [`Meta::unsupported_essential_properties`]).
+    Container(hprops::Property),
     Other(BoxType, Vec<u8>),
 }
 
@@ -2831,6 +2855,7 @@ impl Property {
             Property::MaskC(_) => MSKC,
             Property::Cmex(_) => CMEX,
             Property::Cmin(_) => CMIN,
+            Property::Container(p) => p.box_type(),
             Property::Other(t, _) => *t,
         }
     }
@@ -3022,6 +3047,19 @@ impl Meta {
         self.associations.iter().find(|a| a.item_id == id)
     }
 
+    /// Every property associated with `item_id`, in `ipma` order
+    /// (an index past the `ipco` container is skipped).
+    pub fn properties_for(&self, item_id: u32) -> Vec<&Property> {
+        let Some(assoc) = self.assoc_by_id(item_id) else {
+            return Vec::new();
+        };
+        assoc
+            .entries
+            .iter()
+            .filter_map(|pa| self.properties.get(pa.index as usize))
+            .collect()
+    }
+
     /// Return the first property of `kind` associated with `item_id`.
     pub fn property_for<'a>(&'a self, item_id: u32, kind: &BoxType) -> Option<&'a Property> {
         let assoc = self.assoc_by_id(item_id)?;
@@ -3070,6 +3108,10 @@ impl Meta {
                 // An unknown property carried as `Other` and flagged
                 // essential is exactly the case the spec guards against.
                 Some(Property::Other(t, _)) => out.push(*t),
+                // A container-typed property this crate does not act
+                // on (the HEIF Amd 1 / Amd 2 set) is readable but not
+                // honoured by the AVIF decode path; essential ⇒ report.
+                Some(Property::Container(p)) => out.push(p.box_type()),
                 // A property index that points past the container is
                 // malformed; treat the missing essential property as
                 // unsupported (its 4CC is unknowable, use zeros).
@@ -3141,6 +3183,13 @@ const CONTAINER_TYPED: &[FourCc] = &[
     CRTT, MDFT, UDES, ALTT,
 ];
 
+/// Properties typed by the container crate that AVIF carries opaque
+/// ([`Property::Container`]): the HEIF Amd 1:2025 / Amd 2:2026 set. A
+/// body the container refuses is kept raw as [`Property::Other`] — an
+/// unreadable descriptive property never fails the file, its index
+/// must stay valid for the `ipma` associations around it.
+const CONTAINER_OPAQUE: &[FourCc] = &[REVE, NDWT, CEXG, DADJ, STAG, TILC];
+
 /// FullBox properties this crate only accepts at `version = 0` (the
 /// value their HEIF definitions fix); the container layer reads any
 /// version, so the rule is applied here before delegating.
@@ -3199,7 +3248,15 @@ fn container_typed(raw: &hmeta::RawProperty) -> Result<hprops::Property> {
 fn property_from_raw(raw: &hmeta::RawProperty) -> Result<Property> {
     let body = raw.body.as_slice();
     if CONTAINER_TYPED.contains(&raw.box_type) {
-        return container_property(&container_typed(raw)?, &raw.box_type);
+        return Ok(container_property(&container_typed(raw)?));
+    }
+    if CONTAINER_OPAQUE.contains(&raw.box_type) {
+        return Ok(match hprops::Property::parse(raw) {
+            Ok(hprops::Property::Unknown(_)) | Err(_) => {
+                Property::Other(raw.box_type, body.to_vec())
+            }
+            Ok(p) => Property::Container(p),
+        });
     }
     let prop = match &raw.box_type {
         x if x == &AV1C => Property::Av1C(body.to_vec()),
@@ -3232,10 +3289,15 @@ fn property_from_raw(raw: &hmeta::RawProperty) -> Result<Property> {
     Ok(prop)
 }
 
-/// Convert a container-typed property into this crate's model.
-fn container_property(p: &hprops::Property, box_type: &FourCc) -> Result<Property> {
+/// Convert a container-typed property into this crate's model. The
+/// AVIF-modelled set converts field by field; the Amd 2 per-channel
+/// `pixi` lands on [`Property::Pixi`] with its channel descriptors;
+/// every other typed form the container produces — today or after a
+/// container upgrade — rides as [`Property::Container`], never an
+/// error (the heif seat found this match refusing `PixiExtended`).
+fn container_property(p: &hprops::Property) -> Property {
     use hprops::Property as H;
-    Ok(match p {
+    match p {
         H::Ispe(v) => Property::Ispe((*v).into()),
         H::Pixi(v) => Property::Pixi(v.clone().into()),
         H::Colr(v) => Property::Colr(v.clone().into()),
@@ -3260,13 +3322,10 @@ fn container_property(p: &hprops::Property, box_type: &FourCc) -> Result<Propert
         }),
         H::Udes(v) => Property::Udes(v.clone().into()),
         H::Altt(v) => Property::Altt(v.clone().into()),
-        _ => {
-            return Err(Error::invalid(format!(
-                "avif: property '{}' typed unexpectedly by the container layer",
-                type_str(box_type)
-            )))
-        }
-    })
+        H::PixiExtended(v) => Property::Pixi(v.clone().into()),
+        H::Unknown(raw) => Property::Other(raw.box_type, raw.body.clone()),
+        other => Property::Container(other.clone()),
+    }
 }
 
 /// Parse one property body through the container crate's typed parser
@@ -3387,6 +3446,16 @@ impl From<hprops::Pixi> for Pixi {
     fn from(v: hprops::Pixi) -> Self {
         Pixi {
             bits_per_channel: v.bits_per_channel,
+            channels: Vec::new(),
+        }
+    }
+}
+
+impl From<hprops::PixiExtended> for Pixi {
+    fn from(v: hprops::PixiExtended) -> Self {
+        Pixi {
+            bits_per_channel: v.pixi.bits_per_channel,
+            channels: v.channels,
         }
     }
 }

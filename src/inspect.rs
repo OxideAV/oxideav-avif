@@ -1067,7 +1067,7 @@ pub(crate) fn build_info(
     let bits_per_channel = img
         .pixi
         .as_ref()
-        .map(|Pixi { bits_per_channel }| bits_per_channel.clone())
+        .map(|p: &Pixi| p.bits_per_channel.clone())
         .unwrap_or_default();
     let (bit_depth, monochrome, chroma_subsampling) = decode_av1c_flags(&av1c);
     // HDR metadata from item properties.
