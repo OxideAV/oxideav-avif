@@ -195,7 +195,7 @@ pub use meta::{
 };
 pub use mux::{
     encode_still_av1, AvifGridMuxer, AvifMuxer, AvifOverlayMuxer, EntityGroupSpec, GridTile,
-    IdentityDerivation, OverlayLayer,
+    IdentityDerivation, OverlayLayer, ToneMapItem,
 };
 pub use overlay::{composite_overlay, OverlayInput, MAX_OVERLAY_CANVAS_PIXELS};
 pub use parser::{
@@ -230,8 +230,8 @@ pub use signal::{color_signal_for, labelled_pixel_format, miaf_default_signal};
 #[cfg(feature = "registry")]
 pub use still::{
     elect_grid_tiling, encode_still, encode_still_auto, encode_still_grid, encode_still_layered,
-    encode_still_overlay, OverlayCanvas, OverlayLayerImage, StillChroma, StillEncodeOptions,
-    StillImage, StillProperties, GRID_MIN_TILE_DIM, STILL_MAX_CODED_DIM,
+    encode_still_overlay, GainMapSpec, OverlayCanvas, OverlayLayerImage, StillChroma,
+    StillEncodeOptions, StillImage, StillProperties, GRID_MIN_TILE_DIM, STILL_MAX_CODED_DIM,
 };
 
 #[cfg(feature = "registry")]

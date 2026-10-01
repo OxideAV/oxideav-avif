@@ -50,6 +50,7 @@ use crate::error::{AvifError as Error, Result};
 use crate::meta::{Clap, Colr};
 use crate::mux::{
     AvifGridMuxer, AvifMuxer, AvifOverlayMuxer, GridTile, IdentityDerivation, OverlayLayer,
+    ToneMapItem,
 };
 
 use oxideav_av1::encoder::key_frame::encode_key_frame_yuv_with_q;
@@ -173,6 +174,37 @@ pub struct StillProperties {
     /// §6.6.2.1) — the coded item stays exposed untransformed
     /// alongside. See [`AvifMuxer::with_identity_derivation`].
     pub identity_derivation: Option<IdentityDerivation>,
+    /// A gain map (ISO 21496-1) making the file a `tmap` tone-map
+    /// derived image (HEIF Amd 1:2025 §6.6.2.4, av1-avif §4.2.2) with
+    /// this picture as the base. See [`GainMapSpec`].
+    pub gain_map: Option<Box<GainMapSpec>>,
+}
+
+/// A gain map to author alongside a still (`StillProperties::gain_map`):
+/// the map picture is coded as a hidden `av01` item (its own size,
+/// depth and chroma; its `colr` matrix / range as given with
+/// primaries / transfer forced to 2 per HEIF Amd 1 §6.6.2.4.1), the
+/// metadata becomes the `tmap` item body, `alternate_colr` the
+/// `tmap` item's own `colr` (the fully-applied rendition's
+/// colorimetry), and the `tmap` is placed in an `altr` group with the
+/// base, which stays the primary.
+#[derive(Clone, Debug)]
+pub struct GainMapSpec {
+    /// The gain map picture (monochrome, or 3-channel when the
+    /// metadata is multichannel; alpha / depth ignored).
+    pub map: StillImage,
+    /// The ISO 21496-1 metadata (C.2).
+    pub metadata: oxideav_heif::gainmap::GainMapMetadata,
+    /// The alternate (fully applied) colorimetry.
+    pub alternate_colr: Colr,
+    /// `clli` of the alternate rendition.
+    pub alternate_clli: Option<crate::meta::Clli>,
+    /// Bits per channel of the reconstructed image (the `tmap`
+    /// `pixi` hint, which also sets the depth the decoder
+    /// reconstructs at); defaults to the base's depth.
+    pub alternate_bit_depth: Option<u8>,
+    /// AV1 `base_q_idx` for the gain map (`0` = lossless).
+    pub q: u8,
 }
 
 impl StillImage {
@@ -837,6 +869,42 @@ pub fn encode_still(img: &StillImage, opts: &StillEncodeOptions) -> Result<Vec<u
     }
     if let Some(iden) = &props.identity_derivation {
         mux = mux.with_identity_derivation(iden.clone());
+    }
+    if let Some(gm) = &props.gain_map {
+        gm.map.validate()?;
+        let (gw, gh) = (coded_extent(gm.map.width), coded_extent(gm.map.height));
+        if (gw, gh) != (gm.map.width, gm.map.height) {
+            return Err(Error::unsupported(format!(
+                "avif still: gain map extents {}x{} are not on the coded 8-grid (a padded gain \
+                 map would need its own clap, which the tmap derivation does not carry)",
+                gm.map.width, gm.map.height
+            )));
+        }
+        let coded_map = encode_primary(&gm.map, gw, gh, gm.q)?;
+        max_profile = max_profile.max(coded_map.seq_profile);
+        let channels = if gm.map.chroma == StillChroma::Monochrome {
+            1
+        } else {
+            3
+        };
+        let alt_depth = gm.alternate_bit_depth.unwrap_or(img.bit_depth);
+        mux = mux.with_tone_map(ToneMapItem {
+            payload: coded_map.payload,
+            av1c: coded_map.av1c,
+            width: gw,
+            height: gh,
+            pixi: Some(vec![gm.map.bit_depth; channels]),
+            colr: gm.map.colr.clone().unwrap_or(Colr::Nclx {
+                colour_primaries: 2,
+                transfer_characteristics: 2,
+                matrix_coefficients: 2,
+                full_range: colr_is_full_range(&gm.map),
+            }),
+            metadata: gm.metadata.clone(),
+            alternate_colr: gm.alternate_colr.clone(),
+            alternate_clli: gm.alternate_clli,
+            alternate_pixi: Some(vec![alt_depth; pixi_bits(img).len()]),
+        });
     }
     if let Some(alpha) = &img.alpha {
         let coded_alpha = encode_alpha(img, alpha, pw, ph, opts.alpha_q_idx)?;

@@ -245,6 +245,43 @@ pub struct AvifMuxer {
     profile_brand: ProfileBrand,
     item_name: Option<String>,
     entity_groups: Vec<EntityGroupSpec>,
+    tone_map: Option<ToneMapItem>,
+}
+
+/// A `tmap` tone-map derived item (HEIF Amd 1:2025 §6.6.2.4,
+/// av1-avif §4.2.2) over the primary: the coded gain-map image plus
+/// the ISO 21496-1 metadata and the alternate (fully applied)
+/// colorimetry. The container writes the gain map hidden with its
+/// `nclx` (primaries = transfer = 2 — `colr` carries only the matrix
+/// and range), the `tmap` body (`ToneMapImage` version 0 + C.2
+/// metadata) in `idat`, the essential alternate `colr`, an `ispe` of
+/// the base's size, the `tmap` brand and the `altr` [tmap, base]
+/// group (MIAF Amd 1 §7.3.11.5); the primary stays the base.
+#[derive(Clone, Debug)]
+pub struct ToneMapItem {
+    /// The gain map's coded AV1 Image Item Data.
+    pub payload: Vec<u8>,
+    /// The gain map's `av1C` record.
+    pub av1c: Vec<u8>,
+    /// The gain map's coded extents (`ispe`; may differ from the base,
+    /// ISO 21496-1 §4.2 / §6.2.2).
+    pub width: u32,
+    /// The gain map's coded extents.
+    pub height: u32,
+    /// The gain map's `pixi` bits per channel.
+    pub pixi: Option<Vec<u8>>,
+    /// The gain map's coding `nclx`: `matrix_coefficients` and
+    /// `full_range_flag` as coded (primaries / transfer are written as
+    /// 2 whatever is given, §6.6.2.4.1).
+    pub colr: Colr,
+    /// The ISO 21496-1 gain-map metadata.
+    pub metadata: oxideav_heif::gainmap::GainMapMetadata,
+    /// The alternate colorimetry — the `tmap` item's `colr`.
+    pub alternate_colr: Colr,
+    /// `clli` of the alternate rendition (should, §6.6.2.4.1).
+    pub alternate_clli: Option<Clli>,
+    /// `pixi` hint of the reconstructed image (should, §6.6.2.4.1).
+    pub alternate_pixi: Option<Vec<u8>>,
 }
 
 /// One `grpl` entity group to write (ISO/IEC 14496-12 §8.18):
@@ -318,7 +355,16 @@ impl AvifMuxer {
             profile_brand: ProfileBrand::Baseline,
             item_name: None,
             entity_groups: Vec::new(),
+            tone_map: None,
         }
+    }
+
+    /// Attach a `tmap` tone-map derived item over the primary (see
+    /// [`ToneMapItem`]). Item ids: the gain map and then the `tmap`
+    /// follow every other item of the layout.
+    pub fn with_tone_map(mut self, tone_map: ToneMapItem) -> Self {
+        self.tone_map = Some(tone_map);
+        self
     }
 
     /// `infe` `item_name` of the primary item (a UTF-8 string, written
@@ -581,6 +627,43 @@ impl AvifMuxer {
         }
         if let Some(name) = &self.item_name {
             w.set_item_name(primary_id, name);
+        }
+        if let Some(tm) = self.tone_map {
+            let gain_colr = match &tm.colr {
+                Colr::Nclx {
+                    matrix_coefficients,
+                    full_range,
+                    ..
+                } => Colr::Nclx {
+                    colour_primaries: 2,
+                    transfer_characteristics: 2,
+                    matrix_coefficients: *matrix_coefficients,
+                    full_range: *full_range,
+                },
+                _ => {
+                    return Err(Error::invalid(
+                        "avif mux: the gain map's colr must be nclx (HEIF Amd 1 §6.6.2.4.1)",
+                    ))
+                }
+            };
+            let mut gprops = vec![
+                prop_av1c(&tm.av1c, "gain map ")?,
+                prop_ispe(tm.width, tm.height),
+                prop_colr(&gain_colr)?,
+            ];
+            if let Some(bits) = &tm.pixi {
+                gprops.push(prop_pixi(bits));
+            }
+            let gain = w.add_coded_item(*b"av01", tm.payload, gprops);
+            let (alternate, _) = prop_colr(&tm.alternate_colr)?;
+            let mut tprops = Vec::new();
+            if let Some(clli) = &tm.alternate_clli {
+                tprops.push(prop_clli(clli));
+            }
+            if let Some(bits) = &tm.alternate_pixi {
+                tprops.push(prop_pixi(bits));
+            }
+            w.add_tone_map(primary_id, gain, &tm.metadata, alternate, tprops)?;
         }
         for g in self.entity_groups {
             w.add_entity_group_with_flags(g.grouping_type, g.group_id, g.flags, g.entity_ids);

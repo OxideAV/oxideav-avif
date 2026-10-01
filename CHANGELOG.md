@@ -83,6 +83,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   primary, `set_item_name`) and `with_entity_group(EntityGroupSpec)`
   (`grpl` groups with their 24-bit `EntityToGroupBox` flags,
   `add_entity_group_with_flags`).
+- **Gain maps (`tmap`) decode and encode** (av1-avif §4.2.2 over HEIF
+  Amd 1:2025 §6.6.2.4 + ISO 21496-1 — the published clause, staged
+  2026-09-28, closes the "geometry-only" hold). Decode: by default the
+  base image (a `tmap` primary yields its base input's output image,
+  what a reader without tone-map support shows); with
+  `AvifDecoder::set_tone_mapped(true)` / `with_tone_mapped` / the
+  registry option `gain_map=apply` the decoder picks the `tmap`
+  alternative of the primary (the primary itself, or the `tmap` whose
+  base input it is — preferring the one sharing an `altr` group, MIAF
+  Amd 1 §7.3.11.5) and reconstructs it through the container's
+  normative `gainmap::reconstruct_tone_map`: the gain map fully
+  applied (weight ±1 at the alternate headroom), re-encoded in the
+  `tmap` item's own `colr` at its `pixi` depth (else the base's), the
+  base's alpha carried over; the frame's colour signal is the `tmap`
+  `colr`. A `tmap` that is the input of another derived item is
+  always applied. `reference_white` (cd/m², default 203) anchors a
+  PQ alternate. Black box: the reconstruction of an
+  `avifgainmaputil combine` file matches `avifgainmaputil tonemap` at
+  the alternate headroom within 1 code (8-bit), and the tool's
+  tone-map of our authored file matches our applied decode within 1
+  code (10-bit). `GainMapMetadata::parse_tone_map_image` /
+  `inspect::gain_map_metadata` now read the `ToneMapImage` wrapper
+  (version byte 0, else `Unsupported`) before the C.2 descriptor —
+  `gain_map_metadata` used to parse the body as a bare C.2 descriptor,
+  mis-aligned by one byte against the published clause. Encode:
+  `StillProperties::gain_map: Option<Box<GainMapSpec>>` (the map
+  picture, the 21496-1 metadata, the alternate `colr` / `clli` / bit
+  depth, the map's `q`) codes the map as a hidden `av01` with a
+  primaries / transfer = 2 `nclx` and lets the container's
+  `HeifWriter::add_tone_map` write the `tmap` (essential alternate
+  `colr`, base-sized `ispe`, `pixi` hint, `clli`, body in `idat`, the
+  `tmap` brand and the `altr` [tmap, base] group; the base stays the
+  primary); `AvifMuxer::with_tone_map(ToneMapItem)` is the muxer form.
+  `inspect` accepts a `tmap` primary.
 
 - **Container layer by `oxideav-heif`.** The ISOBMFF box reader, the
   `meta` item model (`hdlr` / `pitm` / `iinf` + `infe` / `iloc` /

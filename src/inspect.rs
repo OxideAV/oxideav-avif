@@ -975,14 +975,17 @@ pub fn derivation_graph(file: &[u8]) -> Result<crate::derived::DerivationGraph> 
     ))
 }
 
-/// Resolve a `'tmap'` item's payload bytes and parse them as an ISO
-/// 21496-1:2025 Annex C.2 gain map metadata descriptor.
+/// Resolve a `'tmap'` item's body and parse it as the `ToneMapImage`
+/// of HEIF Amd 1:2025 §6.6.2.4.2 — one `version` byte (shall be 0)
+/// followed by the ISO 21496-1:2025 Annex C.2 gain map metadata
+/// descriptor.
 ///
 /// One-call wrapper that combines [`item_payload_bytes`] (to pull the
-/// raw descriptor body out of `mdat` per the item's `iloc`) with
-/// [`crate::derived::GainMapMetadata::parse`] (to decode the binary
-/// layout). Callers that already hold the payload bytes can skip this
-/// and call `GainMapMetadata::parse` directly.
+/// item body out of `mdat` / `idat` per the item's `iloc`) with
+/// [`crate::derived::GainMapMetadata::parse_tone_map_image`] (to
+/// decode the wrapper + binary layout). Callers that already hold
+/// the body can call that directly; `GainMapMetadata::parse` takes a
+/// bare C.2 descriptor.
 ///
 /// Pick `tmap_item_id` from [`AvifInfo::tmap_item_ids`] — every entry
 /// in that list is guaranteed to have an `infe` declaring `item_type ==
@@ -1007,7 +1010,7 @@ pub fn gain_map_metadata(
     tmap_item_id: u32,
 ) -> Result<crate::derived::GainMapMetadata> {
     let bytes = item_payload_bytes(file, tmap_item_id)?;
-    crate::derived::GainMapMetadata::parse(&bytes)
+    crate::derived::GainMapMetadata::parse_tone_map_image(&bytes)
 }
 
 /// Decode `av1C` bytes into `(bit_depth, monochrome, chroma_subsampling)`.

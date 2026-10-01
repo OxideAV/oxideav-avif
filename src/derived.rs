@@ -1208,8 +1208,25 @@ pub struct GainMapMetadata {
 }
 
 impl GainMapMetadata {
-    /// Parse an ISO 21496-1 Annex C.2.2 `GainMapMetadata` payload from
-    /// the raw `'tmap'` item bytes.
+    /// Parse the body of a `'tmap'` item — the `ToneMapImage` of
+    /// HEIF Amd 1:2025 §6.6.2.4.2: one `version` byte that shall be 0
+    /// followed by the ISO 21496-1 C.2 `GainMapMetadata` to the end
+    /// of the item. Any other version is `Unsupported` (§6.6.2.4.3:
+    /// readers shall not process it; the base image is what to show).
+    pub fn parse_tone_map_image(body: &[u8]) -> Result<Self> {
+        match body.split_first() {
+            Some((0, metadata)) => Self::parse(metadata),
+            Some((version, _)) => Err(Error::unsupported(format!(
+                "avif: ToneMapImage version {version} — readers shall not process a version other \
+                 than 0 (HEIF Amd 1:2025 §6.6.2.4.3); display the base image"
+            ))),
+            None => Err(Error::invalid("avif: empty tmap item body")),
+        }
+    }
+
+    /// Parse a bare ISO 21496-1 Annex C.2.2 `GainMapMetadata` payload
+    /// (the bytes after a `tmap` body's `ToneMapImage` version byte —
+    /// see [`Self::parse_tone_map_image`]).
     ///
     /// Behaviour:
     ///

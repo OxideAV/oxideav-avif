@@ -35,13 +35,16 @@ use crate::frame_bridge::{from_heif, to_heif};
 use crate::grid::ImageGrid;
 use crate::image::{AvifFrame, AvifPixelFormat, AvifPlane};
 use crate::inspect::{build_info, build_info_derived, build_info_grid, AvifInfo};
-use crate::meta::{Property, ITEM_TYPE_IDEN, ITEM_TYPE_IOVL};
+use crate::meta::{Property, ITEM_TYPE_IDEN, ITEM_TYPE_IOVL, ITEM_TYPE_TMAP};
 use crate::parser::{
     classify_brands, parse, parse_header, AvifHeader, ITEM_TYPE_AV01, ITEM_TYPE_GRID,
 };
 use crate::signal::{color_signal_for, labelled_pixel_format, layout_of_record};
 use crate::transform::{clap_extent, crop_top_left, rotation_keeps_layout};
 use oxideav_heif::compose;
+use oxideav_heif::gainmap::{
+    reconstruct_tone_map, GainMapMetadata, DEFAULT_HDR_REFERENCE_WHITE_NITS,
+};
 use oxideav_heif::props as hprops;
 use oxideav_heif::{Chroma, HeifFrame, HeifPixelFormat, HeifPlane};
 
@@ -193,6 +196,12 @@ pub struct AvifDecoder {
     color_signal: Option<ColorSignal>,
     /// The framework label of the last decoded file's frames.
     output_format: Option<PixelFormat>,
+    /// Opt-in gain-map application (av1-avif §4.2.2 / HEIF Amd 1
+    /// §6.6.2.4): decode the `tmap` alternative of the primary instead
+    /// of the base.
+    tone_mapped: bool,
+    /// HDR reference white for a PQ-coded reconstruction (cd/m²).
+    reference_white_nits: f64,
 }
 
 impl AvifDecoder {
@@ -203,7 +212,77 @@ impl AvifDecoder {
             info: None,
             color_signal: None,
             output_format: None,
+            tone_mapped: false,
+            reference_white_nits: DEFAULT_HDR_REFERENCE_WHITE_NITS,
         }
+    }
+
+    /// Build a decoder from a parameter set: the `gain_map` codec
+    /// option (`base`, the default, or `apply`) selects
+    /// [`set_tone_mapped`](Self::set_tone_mapped); `reference_white`
+    /// (cd/m², default 203) sets
+    /// [`set_reference_white`](Self::set_reference_white). Any other
+    /// value is refused.
+    pub fn with_params(params: &CodecParameters) -> Result<Self> {
+        let mut d = Self::new(params.codec_id.clone());
+        match params.options.get("gain_map") {
+            None | Some("base") => {}
+            Some("apply") => d.tone_mapped = true,
+            Some(other) => {
+                return Err(Error::invalid(format!(
+                    "avif: gain_map option '{other}' — expected 'base' or 'apply'"
+                )))
+            }
+        }
+        if let Some(v) = params.options.get("reference_white") {
+            let nits: f64 = v.parse().map_err(|_| {
+                Error::invalid(format!("avif: reference_white '{v}' is not a number"))
+            })?;
+            d.set_reference_white(nits)?;
+        }
+        Ok(d)
+    }
+
+    /// Gain-map application (av1-avif §4.2.2, HEIF Amd 1:2025
+    /// §6.6.2.4, ISO 21496-1 §6): with `true` the decoder yields the
+    /// `tmap` alternative of the primary — the `tmap` item that is the
+    /// primary itself, or the one in an `altr` group with it (MIAF
+    /// Amd 1 §7.3.11.5) whose base input it is — reconstructed with the
+    /// gain map fully applied (the weight of 1.0 / −1.0 of §6.6.2.4.1)
+    /// and re-encoded in the `tmap` item's own `colr` at its `pixi`
+    /// depth (the base's alpha carried over). Default `false`: the
+    /// base image, what readers without tone-map support show. A
+    /// `tmap` that is the input of another derived item is always
+    /// applied (§6.6.2.4.1). Files without a `tmap` decode the same
+    /// either way.
+    pub fn set_tone_mapped(&mut self, tone_mapped: bool) {
+        self.tone_mapped = tone_mapped;
+    }
+
+    /// Builder form of [`set_tone_mapped`](Self::set_tone_mapped).
+    pub fn with_tone_mapped(mut self, tone_mapped: bool) -> Self {
+        self.tone_mapped = tone_mapped;
+        self
+    }
+
+    /// Whether gain maps are applied (see
+    /// [`set_tone_mapped`](Self::set_tone_mapped)).
+    pub fn tone_mapped(&self) -> bool {
+        self.tone_mapped
+    }
+
+    /// The HDR reference white, in cd/m², a PQ-coded reconstruction is
+    /// anchored at (ISO 21496-1 fixes none; 203 is the value its
+    /// headroom definition uses as the example and the default).
+    /// Finite and positive, else refused.
+    pub fn set_reference_white(&mut self, nits: f64) -> Result<()> {
+        if !(nits.is_finite() && nits > 0.0) {
+            return Err(Error::invalid(format!(
+                "avif: reference white {nits} cd/m² is not a positive finite luminance"
+            )));
+        }
+        self.reference_white_nits = nits;
+        Ok(())
     }
 
     /// The colour signal (`oxideav-core` [`ColorSignal`]: range +
@@ -257,6 +336,7 @@ impl AvifDecoder {
             build_info(&img, has_alpha, brands, mif1, file).map_err(core_err)?
         } else if primary_info.item_type == ITEM_TYPE_IOVL
             || primary_info.item_type == ITEM_TYPE_IDEN
+            || primary_info.item_type == ITEM_TYPE_TMAP
         {
             build_info_derived(&hdr, primary_id, brands, mif1).map_err(core_err)?
         } else {
@@ -266,15 +346,36 @@ impl AvifDecoder {
             )));
         };
 
-        let mut ctx = DecodeCtx::default();
-        let image = decode_item_output(&hdr, primary_id, 0, &mut ctx, true)?;
+        let mut ctx = DecodeCtx {
+            tone_mapped: self.tone_mapped,
+            reference_white_nits: self.reference_white_nits,
+            ..DecodeCtx::default()
+        };
+        // Gain-map application: the `tmap` alternative of the primary
+        // (the primary itself when it is one) replaces the primary.
+        let target = if self.tone_mapped {
+            tone_map_of(&hdr, primary_id).unwrap_or(primary_id)
+        } else {
+            primary_id
+        };
+        let image = decode_item_output(&hdr, target, 0, &mut ctx, true)?;
         let bit_depth = image.format.bit_depth;
         let (frame, format) = from_heif(&image).map_err(core_err)?;
         let mut out = avif_to_core_frame(frame);
         // The output image's colour: the primary's `colr` (a derived
         // primary's own, else its first input's — `AvifInfo::colour`
-        // resolves that), MIAF §7.3.6.4 default when absent.
-        let signal = color_signal_for(info.colour.as_ref());
+        // resolves that), MIAF §7.3.6.4 default when absent; a
+        // reconstructed `tmap` carries the `tmap` item's own `colr`
+        // (the alternate colorimetry, HEIF Amd 1 §6.6.2.4.1).
+        let colour = if target != primary_id || primary_info.item_type == ITEM_TYPE_TMAP {
+            match hdr.meta.property_for(target, &COLR) {
+                Some(Property::Colr(c)) => Some(c.clone()),
+                _ => info.colour.clone(),
+            }
+        } else {
+            info.colour.clone()
+        };
+        let signal = color_signal_for(colour.as_ref());
         out.set_color_signal(signal);
         self.color_signal = Some(signal);
         self.output_format = Some(labelled_pixel_format(format, &signal));
@@ -657,6 +758,10 @@ struct DecodeCtx {
     stack: Vec<u32>,
     cache: std::collections::HashMap<(u32, bool), ItemImage>,
     decodes: u32,
+    /// Apply the gain map of a `tmap` primary (else its base).
+    tone_mapped: bool,
+    /// HDR reference white for PQ-coded reconstructions.
+    reference_white_nits: f64,
 }
 
 /// An image item's output image (HEIF §6.3) — the container crate's
@@ -738,6 +843,16 @@ fn decode_item_output_inner(
     let item_type = info.item_type;
     let mut image = if item_type == ITEM_TYPE_AV01 {
         decode_coded_item(hdr, item_id)?
+    } else if item_type == ITEM_TYPE_TMAP {
+        let (base, _gain) = tone_map_inputs(hdr, item_id)?;
+        if depth == 0 && !ctx.tone_mapped {
+            // Not applied: the base image is what a reader without
+            // tone-map support shows (its own output image, its own
+            // `colr` — the `tmap` item's transforms are the
+            // alternative's, not the base's).
+            return decode_item_output(hdr, base, depth + 1, ctx, with_alpha);
+        }
+        decode_tone_map_item(hdr, item_id, depth, ctx, with_alpha)?
     } else if item_type == ITEM_TYPE_GRID {
         decode_grid_item(hdr, item_id, depth, ctx)?
     } else if item_type == ITEM_TYPE_IOVL {
@@ -907,6 +1022,117 @@ fn decode_grid_item(
 
 const COLR: BoxType = b(b"colr");
 const PREM: BoxType = b(b"prem");
+const PIXI: BoxType = b(b"pixi");
+const ALTR: BoxType = b(b"altr");
+
+/// The `tmap` item that is `primary_id`'s alternative: the primary
+/// itself when it is a `tmap`, else a `tmap` whose base input (first
+/// `dimg` target, HEIF Amd 1 §6.6.2.4.1) is the primary — preferring
+/// one that shares an `altr` entity group with it (MIAF Amd 1
+/// §7.3.11.5, av1-avif §4.2.2). `None` when the file carries no such
+/// item.
+fn tone_map_of(hdr: &AvifHeader<'_>, primary_id: u32) -> Option<u32> {
+    let meta = &hdr.meta;
+    if meta.item_by_id(primary_id)?.item_type == ITEM_TYPE_TMAP {
+        return Some(primary_id);
+    }
+    let candidates: Vec<u32> = meta
+        .items
+        .iter()
+        .filter(|i| i.item_type == ITEM_TYPE_TMAP)
+        .filter(|i| meta.iref_targets(&DIMG, i.id).first() == Some(&primary_id))
+        .map(|i| i.id)
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    let groups = meta.groups().unwrap_or_default();
+    candidates
+        .iter()
+        .copied()
+        .find(|&t| {
+            groups.iter().any(|g| {
+                g.grouping_type == ALTR
+                    && g.entity_ids.contains(&t)
+                    && g.entity_ids.contains(&primary_id)
+            })
+        })
+        .or(candidates.first().copied())
+}
+
+/// The `(base, gain map)` inputs of a `tmap` item: exactly two `dimg`
+/// targets, base first (HEIF Amd 1 §6.6.2.4.1 `reference_count` shall
+/// be 2).
+fn tone_map_inputs(hdr: &AvifHeader<'_>, tmap_id: u32) -> Result<(u32, u32)> {
+    let inputs = hdr.meta.iref_targets(&DIMG, tmap_id);
+    match inputs.as_slice() {
+        [base, gain] => Ok((*base, *gain)),
+        other => Err(Error::invalid(format!(
+            "avif: tmap item {tmap_id} has {} dimg inputs, expected exactly 2 (base, gain map) \
+             — HEIF Amd 1 §6.6.2.4.1",
+            other.len()
+        ))),
+    }
+}
+
+/// The `colr` of an item as the container's type, when it has one.
+fn container_colr(hdr: &AvifHeader<'_>, item_id: u32) -> Option<hprops::Colr> {
+    match hdr.meta.property_for(item_id, &COLR) {
+        Some(Property::Colr(c)) => Some(hprops::Colr::from(c)),
+        _ => None,
+    }
+}
+
+/// Decode a `tmap` derived item with its gain map applied (HEIF Amd 1
+/// §6.6.2.4.1 "Reconstruction is done by applying the gain map to the
+/// base image according to the algorithm described in ISO 21496-1";
+/// the item's `colr` describes "the reconstructed image if the gain
+/// map input item is fully applied"): the base's output image (alpha
+/// included when the caller renders alpha) and the gain map's output
+/// image go through the container's normative reconstruction — the
+/// `ToneMapImage` body (version 0 + ISO 21496-1 C.2 metadata), the
+/// base's and the gain map's `colr`, the `tmap` item's `colr` as the
+/// alternate colorimetry, its `pixi` depth (else the base's), the
+/// configured HDR reference white for a PQ alternate.
+fn decode_tone_map_item(
+    hdr: &AvifHeader<'_>,
+    tmap_id: u32,
+    depth: u32,
+    ctx: &mut DecodeCtx,
+    with_alpha: bool,
+) -> Result<ItemImage> {
+    let (base_id, gain_id) = tone_map_inputs(hdr, tmap_id)?;
+    if hdr.meta.location_by_id(tmap_id).is_none() {
+        return Err(Error::invalid("avif: tmap item missing in iloc"));
+    }
+    let body = hdr.item_data(tmap_id).map_err(core_err)?;
+    let metadata = GainMapMetadata::parse_tmap_body(&body).map_err(heif_err)?;
+    let base = decode_item_output(hdr, base_id, depth + 1, ctx, with_alpha)?;
+    let gain = decode_item_output(hdr, gain_id, depth + 1, ctx, false)?;
+    let base_colr = container_colr(hdr, base_id);
+    let gain_colr = container_colr(hdr, gain_id);
+    let alternate_colr = container_colr(hdr, tmap_id);
+    let bit_depth = match hdr.meta.property_for(tmap_id, &PIXI) {
+        Some(Property::Pixi(p)) if p.max_bit_depth() > 0 => p.max_bit_depth(),
+        _ => base.format.bit_depth,
+    };
+    let reference_white = if ctx.reference_white_nits > 0.0 {
+        ctx.reference_white_nits
+    } else {
+        DEFAULT_HDR_REFERENCE_WHITE_NITS
+    };
+    reconstruct_tone_map(
+        &base,
+        base_colr.as_ref(),
+        &gain,
+        gain_colr.as_ref(),
+        alternate_colr.as_ref(),
+        &metadata,
+        bit_depth,
+        reference_white,
+    )
+    .map_err(heif_err)
+}
 
 /// True when `item_id`'s colour samples are signalled pre-multiplied
 /// by its alpha auxiliary — a `prem` item reference in either
@@ -1091,7 +1317,7 @@ impl Decoder for AvifDecoder {
 }
 
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
-    Ok(Box::new(AvifDecoder::new(params.codec_id.clone())))
+    Ok(Box::new(AvifDecoder::with_params(params)?))
 }
 
 #[cfg(test)]
