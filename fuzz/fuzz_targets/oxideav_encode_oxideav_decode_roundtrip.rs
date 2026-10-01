@@ -58,7 +58,7 @@ fuzz_target!(|data: &[u8]| {
         Frame::Video(v) => v,
         other => panic!("expected VideoFrame, got {other:?}"),
     };
-    assert_eq!(vf.planes.len(), 4, "identity RGBA decodes to YUVA 4:4:4");
+    assert_eq!(vf.image_plane_count(), 4, "identity RGBA decodes to YUVA 4:4:4");
 
     // Byte-exact: identity matrix maps Y=G, U=B, V=R; alpha verbatim.
     let n = (width as usize) * (height as usize);

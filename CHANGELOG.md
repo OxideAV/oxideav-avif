@@ -117,6 +117,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tmap` brand and the `altr` [tmap, base] group; the base stays the
   primary); `AvifMuxer::with_tone_map(ToneMapItem)` is the muxer form.
   `inspect` accepts a `tmap` primary.
+- **Low-overhead files (`mini`, HEIF Amd 2:2026 Annex O / `mif3`)**:
+  not adopted — the AVIF specification in `docs/image/avif/`
+  (av1-avif, 2025-10-16) defines no low-overhead profile and lists no
+  `mif3` / `mini` among its brands or boxes (§6, §9.1); this crate's
+  brand rule keeps refusing `mif3` files. The container crate reads
+  and writes them (`oxideav_heif::mini`, an AV1-coded `mini` expands
+  to an `avif`-equivalent `meta`), so a `.hmg` / `image/hif2` file is
+  the `"heif"` demuxer's to open until AVIF defines the profile.
+- **Fuzz**: harnesses rebuilt against the published `oxideav-heif`
+  0.0.5 / core 0.1.37 / av1 0.1.19; plane counting goes through
+  `image_plane_count()` (the colour-signal side channel made the
+  self-roundtrip harness miscount — found and fixed in-session).
 
 - **Container layer by `oxideav-heif`.** The ISOBMFF box reader, the
   `meta` item model (`hdlr` / `pitm` / `iinf` + `infe` / `iloc` /

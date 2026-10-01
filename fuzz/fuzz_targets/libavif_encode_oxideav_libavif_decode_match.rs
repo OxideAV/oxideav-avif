@@ -135,7 +135,7 @@ fuzz_target!(|data: &[u8]| {
     let lib_row = (libavif_rgba.width as usize) * 4;
     let lib_pixels = &libavif_rgba.rgba;
     // Choose the comparison strategy based on plane count.
-    match oxi_vf.planes.len() {
+    match oxi_vf.image_plane_count() {
         1 => {
             // oxideav decoded as Gray8 — compare luma to libavif's G
             // channel (IDENTITY matrix maps Y == G in the lossless

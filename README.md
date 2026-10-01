@@ -140,6 +140,14 @@ passes `audit_mif1`. At this layer the AV1 bitstream is taken
 | AVIS image sequences | **encode** (`encode_sequence` over the container's `SequenceWriter`: `ftyp` `avis`/`msf1`/`av01` (+`avio`), cover still whose primary aliases sample 0, `moov`/`trak` with `pict` handler, `av01` sample entry + `av1C`/`colr`/`clap` + `ccst`, `stts`/`stss`/`stsc`/`stsz`/`stco`; all-intra or KEY + P groups; lossless sequences decode exact through this crate, the external AVIF decoder and ffmpeg) + sample-table walk by the container (`parse_avis` over `oxideav_heif::sequence::parse_movie`; ISO/IEC 14496-12's mandatory `mvhd` / `tkhd` / `mdhd` / `hdlr` / `stts` enforced) + `inspect_avis` aggregator + §3 / §8.2 / §8.3 audits + `edts/elst` edit list (ISO/IEC 14496-12 §8.6.6) + `mdhd` media-timescale plumb + `prft` ProducerReferenceTimeBox (§8.16.5, v0/v1 NTP→Unix, top-level walk) on `AvisMeta::producer_reference_times` + `ssix` SubsegmentIndexBox (§8.16.4, v0; per-subsegment `(level: u8, range_size: u24)` leva-level byte-range partitions for partial-subsegment access, top-level walk) on `AvisMeta::subsegment_indexes` |
 | Sample grouping | `sbgp` (SampleToGroupBox, ISO/IEC 14496-12:2015 §8.9.2, v0/v1) + `csgp` (CompactSampleToGroupBox, :2020 §8.9.5 — 4/8/16/32-bit packed field widths, pattern expansion, `traf` fragment-local msb) + `sgpd` (§8.9.3, v0/v1/v2 default index) which now also **retains + slices per-entry `VisualSampleGroupEntry` payloads** (v1 `default_length` fixed-size or self-describing `description_length`) into `SampleGroupDescription::entries`; typed decoders for the HEIF §6.8.6 bracketing entries (`BracketingEntry`: `aebr` auto-exposure / `wbbr` white-balance / `fobr` focus incl. infinity / `afbr` flash-exposure / `dobr` depth-of-field via `bracketing_entries()`) and the §6.8.1.2.2 `eqiv` `VisualEquivalenceEntry` (`time_offset` + 8.8 `timescale_multiplier`, `equivalence_entries()`); per-sample group-index lookup via `SampleToGroup::group_index_for_sample`, surfaced on `AvisMeta::{sample_to_groups, sample_group_descriptions}` |
 
+## Low-overhead files
+
+AVIF (av1-avif, 2025-10) defines no low-overhead profile: `mif3` /
+`mini` (HEIF Amd 2:2026 Annex O) are not AVIF brands or boxes, so this
+crate's brand rule refuses them. `oxideav-heif` reads and writes
+`mini` files (an AV1-coded one expands to an `avif`-equivalent
+`meta`), which is where a `.hmg` / `image/hif2` file opens.
+
 ## Installation
 
 ```toml

@@ -233,7 +233,7 @@ fn oxideav_decode_yuv444(avif: &[u8]) -> Option<DecodedYuv444> {
         Frame::Video(v) => v,
         _ => return None,
     };
-    if vf.planes.len() != 3 {
+    if vf.image_plane_count() != 3 {
         return None;
     }
     let y = &vf.planes[0];
