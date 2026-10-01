@@ -60,6 +60,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keep the identity matrix); `Encoder::output_params().color_signal`
   reports the signal the file was written with. With nothing signalled
   the encoder's historical defaults are unchanged.
+- **Image-sequence writer by `oxideav-heif`.** `encode_sequence` builds
+  the `avis` file with the container's `SequenceWriter`: this crate's
+  brands through `with_brands`, the cover still as the writer's
+  `still` with `cover_sample = Some(0)` (the primary item's `iloc`
+  aliases sample 0 in the track `mdat` — one copy of the bytes), the
+  `av01` sample entry's `av1C` / `colr` / `clap` as `entry_properties`,
+  and the HEIF §7.2.3.1 **mandatory** `ccst` (all-intra: `(1, 1, 0)`;
+  KEY + P groups: `(0, 1, 15)`) that the local `moov` writer used to
+  omit. The hand-written `mvhd` / `tkhd` / `mdhd` / `hdlr` / `vmhd` /
+  `dinf` / `stsd` / `stts` / `stss` / `stsc` / `stsz` / `stco` writer,
+  its two-pass chunk-offset settlement and the `CoverStill` /
+  `sequence_cover_still` cover helper are gone (−463 lines). The track
+  now precedes the cover still's `meta` in box order, so a demuxer that
+  numbers streams by box order lists the `pict` track first.
+- **Raw metadata through the container.** `AvifMuxer` /
+  `AvifGridMuxer::with_exif` write the Exif item body as is
+  (`HeifWriter::add_exif_raw`) — any `exif_tiff_header_offset`, not only
+  zero (an offset past the payload is refused); `with_xmp` takes the
+  packet in any encoding (`add_xmp_bytes`), the UTF-8 requirement is
+  gone. New `AvifMuxer::with_item_name` (`infe` `item_name` of the
+  primary, `set_item_name`) and `with_entity_group(EntityGroupSpec)`
+  (`grpl` groups with their 24-bit `EntityToGroupBox` flags,
+  `add_entity_group_with_flags`).
 
 - **Container layer by `oxideav-heif`.** The ISOBMFF box reader, the
   `meta` item model (`hdlr` / `pitm` / `iinf` + `infe` / `iloc` /

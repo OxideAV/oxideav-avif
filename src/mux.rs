@@ -32,9 +32,9 @@ use crate::meta::{Amve, Clap, Clli, Colr, Imir, Irot, Mdcv, Pasp};
 
 /// One property with its `essential` flag, as the container writer
 /// takes it.
-type Prop = (HProp, bool);
+pub(crate) type Prop = (HProp, bool);
 
-fn prop_av1c(av1c: &[u8], what: &str) -> Result<Prop> {
+pub(crate) fn prop_av1c(av1c: &[u8], what: &str) -> Result<Prop> {
     if av1c.len() < 4 {
         return Err(Error::invalid(format!(
             "avif mux: {what}av1C configuration record must be at least 4 bytes"
@@ -43,11 +43,11 @@ fn prop_av1c(av1c: &[u8], what: &str) -> Result<Prop> {
     Ok((HProp::Av1C(Av1Config::parse(av1c)?), true))
 }
 
-fn prop_ispe(width: u32, height: u32) -> Prop {
+pub(crate) fn prop_ispe(width: u32, height: u32) -> Prop {
     (HProp::Ispe(hprops::Ispe { width, height }), false)
 }
 
-fn prop_pixi(bits: &[u8]) -> Prop {
+pub(crate) fn prop_pixi(bits: &[u8]) -> Prop {
     (
         HProp::Pixi(hprops::Pixi {
             bits_per_channel: bits.to_vec(),
@@ -56,7 +56,7 @@ fn prop_pixi(bits: &[u8]) -> Prop {
     )
 }
 
-fn prop_colr(colr: &Colr) -> Result<Prop> {
+pub(crate) fn prop_colr(colr: &Colr) -> Result<Prop> {
     if let Colr::Unknown(t) = colr {
         return Err(Error::unsupported(format!(
             "avif mux: cannot emit colr of unknown type '{}'",
@@ -76,7 +76,7 @@ fn prop_pasp(pasp: &Pasp) -> Prop {
     )
 }
 
-fn prop_clap(clap: &Clap) -> Prop {
+pub(crate) fn prop_clap(clap: &Clap) -> Prop {
     (HProp::Clap(hprops::Clap::from(clap)), true)
 }
 
@@ -181,25 +181,28 @@ fn still_brands(profile: ProfileBrand) -> ([u8; 4], Vec<[u8; 4]>) {
     (*b"avif", compat)
 }
 
-/// Add an Exif metadata item from its item body (HEIF Annex A.2.1: a
-/// 4-byte `exif_tiff_header_offset` followed by the Exif payload). The
-/// container writer takes the payload and prepends a zero offset
-/// itself, so only a body whose offset word is zero can be expressed.
+/// Add an Exif metadata item from its complete item body (HEIF Annex
+/// A.2.1: a 4-byte `exif_tiff_header_offset` followed by the Exif
+/// payload) — written as is by the container (`add_exif_raw`), any
+/// offset word, provided it points inside the payload.
 fn add_exif_item(w: &mut HeifWriter, image: u32, payload: &[u8]) -> Result<u32> {
-    match payload.split_first_chunk::<4>() {
-        Some(([0, 0, 0, 0], tiff)) => Ok(w.add_exif(image, tiff)),
-        _ => Err(Error::unsupported(
-            "avif mux: Exif item body must start with a zero exif_tiff_header_offset word \
-             (the container writer prepends its own)",
-        )),
+    let Some((head, rest)) = payload.split_first_chunk::<4>() else {
+        return Err(Error::invalid(
+            "avif mux: Exif item body needs the 4-byte exif_tiff_header_offset word",
+        ));
+    };
+    if u32::from_be_bytes(*head) as usize > rest.len() {
+        return Err(Error::invalid(
+            "avif mux: Exif exif_tiff_header_offset points past the payload (HEIF A.2.1)",
+        ));
     }
+    Ok(w.add_exif_raw(image, payload.to_vec()))
 }
 
-/// Add an XMP metadata item (`mime` / `application/rdf+xml`).
-fn add_xmp_item(w: &mut HeifWriter, image: u32, payload: &[u8]) -> Result<u32> {
-    let xmp = std::str::from_utf8(payload)
-        .map_err(|_| Error::unsupported("avif mux: XMP packet must be UTF-8"))?;
-    Ok(w.add_xmp(image, xmp))
+/// Add an XMP metadata item (`mime` / `application/rdf+xml`) from its
+/// packet bytes, any encoding (`add_xmp_bytes`).
+fn add_xmp_item(w: &mut HeifWriter, image: u32, payload: &[u8]) -> u32 {
+    w.add_xmp_bytes(image, payload.to_vec())
 }
 
 /// Guard: the container assigns item ids in insertion order; the AVIF
@@ -240,6 +243,25 @@ pub struct AvifMuxer {
     layer_selector: Option<u16>,
     operating_point: Option<u8>,
     profile_brand: ProfileBrand,
+    item_name: Option<String>,
+    entity_groups: Vec<EntityGroupSpec>,
+}
+
+/// One `grpl` entity group to write (ISO/IEC 14496-12 §8.18):
+/// `grouping_type`, `group_id`, the 24-bit `EntityToGroupBox` flags
+/// and the entity ids — item ids as this muxer lays them out (the
+/// primary is item 1; the alpha, depth, Exif and XMP items follow in
+/// that order after an `iden` wrapper when one is requested).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EntityGroupSpec {
+    /// `grouping_type` (`altr`, `ster`, `eqiv`, …).
+    pub grouping_type: [u8; 4],
+    /// `group_id` — distinct from every item id and other group id.
+    pub group_id: u32,
+    /// The `EntityToGroupBox` FullBox flags (24 bits).
+    pub flags: u32,
+    /// The entity (item) ids, in the group's order.
+    pub entity_ids: Vec<u32>,
 }
 
 /// Make the primary an `iden` derived item (HEIF §6.6.2.1) over the
@@ -294,7 +316,23 @@ impl AvifMuxer {
             layer_selector: None,
             operating_point: None,
             profile_brand: ProfileBrand::Baseline,
+            item_name: None,
+            entity_groups: Vec::new(),
         }
+    }
+
+    /// `infe` `item_name` of the primary item (a UTF-8 string, written
+    /// NUL-terminated by the container).
+    pub fn with_item_name(mut self, name: &str) -> Self {
+        self.item_name = Some(name.to_owned());
+        self
+    }
+
+    /// Add a `grpl` entity group (ISO/IEC 14496-12 §8.18) with its
+    /// `EntityToGroupBox` flags over the item ids of this layout.
+    pub fn with_entity_group(mut self, group: EntityGroupSpec) -> Self {
+        self.entity_groups.push(group);
+        self
     }
 
     /// `pixi` bits per channel.
@@ -539,7 +577,13 @@ impl AvifMuxer {
             add_exif_item(&mut w, coded, exif)?;
         }
         if let Some(xmp) = &self.xmp {
-            add_xmp_item(&mut w, coded, xmp)?;
+            add_xmp_item(&mut w, coded, xmp);
+        }
+        if let Some(name) = &self.item_name {
+            w.set_item_name(primary_id, name);
+        }
+        for g in self.entity_groups {
+            w.add_entity_group_with_flags(g.grouping_type, g.group_id, g.flags, g.entity_ids);
         }
         w.set_primary(primary_id);
         Ok(w.write_to_vec()?)
@@ -828,7 +872,7 @@ impl AvifGridMuxer {
             add_exif_item(&mut w, grid_id, exif)?;
         }
         if let Some(xmp) = &self.xmp {
-            add_xmp_item(&mut w, grid_id, xmp)?;
+            add_xmp_item(&mut w, grid_id, xmp);
         }
         w.set_primary(grid_id);
         Ok(w.write_to_vec()?)
@@ -1042,69 +1086,6 @@ pub(crate) fn sequence_brands(profile: ProfileBrand, all_sync: bool) -> ([u8; 4]
         ProfileBrand::Bare => {}
     }
     (*b"avis", compat)
-}
-
-/// The cover still of an image sequence: sample 0's coded bytes as one
-/// `av01` item with the track's properties.
-#[cfg(feature = "registry")]
-pub(crate) struct CoverStill<'a> {
-    /// `ftyp` brands of the sequence.
-    pub brands: ([u8; 4], Vec<[u8; 4]>),
-    /// Coded extents.
-    pub width: u32,
-    /// Coded extents.
-    pub height: u32,
-    /// Sample 0.
-    pub payload: Vec<u8>,
-    /// `av1C` record.
-    pub av1c: &'a [u8],
-    /// `pixi` bits per channel.
-    pub pixi: &'a [u8],
-    /// `colr`, when the sequence carries one.
-    pub colr: Option<&'a Colr>,
-    /// `clap`, when the coded extents exceed the picture.
-    pub clap: Option<&'a Clap>,
-}
-
-/// Write the cover still of an image sequence through the container:
-/// the sequence writer appends its `moov` and the remaining samples so
-/// the primary item aliases sample 0. Returns the file bytes and the
-/// primary's payload span inside them.
-#[cfg(feature = "registry")]
-pub(crate) fn sequence_cover_still(cover: CoverStill<'_>) -> Result<(Vec<u8>, (usize, usize))> {
-    let CoverStill {
-        brands,
-        width,
-        height,
-        payload,
-        av1c,
-        pixi,
-        colr,
-        clap,
-    } = cover;
-    let mut w = HeifWriter::new().with_brands(brands.0, brands.1);
-    let mut props = vec![
-        prop_av1c(av1c, "sequence ")?,
-        prop_ispe(width, height),
-        prop_pixi(pixi),
-    ];
-    if let Some(c) = colr {
-        props.push(prop_colr(c)?);
-    }
-    if let Some(c) = clap {
-        props.push(prop_clap(c));
-    }
-    let id = w.add_coded_item(*b"av01", payload, props);
-    w.set_primary(id);
-    let bytes = w.write_to_vec()?;
-    let file = oxideav_heif::HeifFile::parse_borrowed(&bytes)?;
-    let spans = file.item_file_spans(id)?;
-    match spans.as_slice() {
-        [span] => Ok((bytes, *span)),
-        _ => Err(Error::invalid(
-            "avif mux: sequence cover still is not one contiguous span",
-        )),
-    }
 }
 
 #[cfg(test)]
@@ -1329,6 +1310,67 @@ mod tests {
         assert_eq!(got_exif, exif);
         let got_xmp = crate::inspect::item_payload_bytes(&bytes, xmp_id).expect("xmp");
         assert_eq!(got_xmp, xmp);
+    }
+
+    /// The container writes the Exif body as is (`add_exif_raw`): a
+    /// non-zero `exif_tiff_header_offset` (HEIF A.2.1 — bytes before
+    /// the TIFF header) and an XMP packet that is not UTF-8 (UTF-16
+    /// with a BOM, any encoding per `add_xmp_bytes`) both round-trip
+    /// byte-exact; an offset past the payload is refused.
+    #[test]
+    fn raw_exif_offset_and_non_utf8_xmp_round_trip() {
+        let exif = b"\x00\x00\x00\x06Exif\x00\x00II*\x00tiff".to_vec();
+        let xmp: Vec<u8> = b"\xff\xfe<\x00x\x00/\x00>\x00".to_vec();
+        let bytes = AvifMuxer::new(16, 16, b"obu".to_vec(), synth_av1c())
+            .with_exif(exif.clone())
+            .with_xmp(xmp.clone())
+            .build()
+            .expect("mux metadata");
+        let info = crate::inspect::inspect(&bytes).expect("inspect");
+        let exif_id = info.exif_item_id.expect("exif item");
+        let xmp_id = info.xmp_item_id.expect("xmp item");
+        assert_eq!(
+            crate::inspect::item_payload_bytes(&bytes, exif_id).unwrap(),
+            exif
+        );
+        assert_eq!(
+            crate::inspect::item_payload_bytes(&bytes, xmp_id).unwrap(),
+            xmp
+        );
+        let err = AvifMuxer::new(16, 16, b"obu".to_vec(), synth_av1c())
+            .with_exif(b"\x00\x00\x00\x40II*\x00".to_vec())
+            .build()
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)), "{err:?}");
+        assert!(AvifMuxer::new(16, 16, b"obu".to_vec(), synth_av1c())
+            .with_exif(b"\x00\x00".to_vec())
+            .build()
+            .is_err());
+    }
+
+    /// `infe` item name and a flagged `grpl` entity group through the
+    /// container writer (`set_item_name`, `add_entity_group_with_flags`).
+    #[test]
+    fn item_name_and_flagged_entity_group_round_trip() {
+        let bytes = AvifMuxer::new(16, 16, b"obu".to_vec(), synth_av1c())
+            .with_item_name("cover photo")
+            .with_alpha(b"alpha".to_vec(), synth_av1c(), false)
+            .with_entity_group(EntityGroupSpec {
+                grouping_type: *b"altr",
+                group_id: 100,
+                flags: 0x00_00_01,
+                entity_ids: vec![1, 2],
+            })
+            .build()
+            .expect("mux");
+        let hdr = parse_header(&bytes).expect("parse");
+        assert_eq!(hdr.meta.item_by_id(1).unwrap().name, "cover photo");
+        let groups = hdr.meta.groups().expect("grpl");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(&groups[0].grouping_type, b"altr");
+        assert_eq!(groups[0].group_id, 100);
+        assert_eq!(groups[0].flags, 1);
+        assert_eq!(groups[0].entity_ids, vec![1, 2]);
     }
 
     #[test]

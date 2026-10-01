@@ -194,8 +194,8 @@ pub use meta::{
     ITEM_TYPE_URI,
 };
 pub use mux::{
-    encode_still_av1, AvifGridMuxer, AvifMuxer, AvifOverlayMuxer, GridTile, IdentityDerivation,
-    OverlayLayer,
+    encode_still_av1, AvifGridMuxer, AvifMuxer, AvifOverlayMuxer, EntityGroupSpec, GridTile,
+    IdentityDerivation, OverlayLayer,
 };
 pub use overlay::{composite_overlay, OverlayInput, MAX_OVERLAY_CANVAS_PIXELS};
 pub use parser::{

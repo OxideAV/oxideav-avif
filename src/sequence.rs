@@ -28,15 +28,16 @@
 //! sample.
 
 use crate::error::{AvifError as Error, Result};
-use crate::mux::{sequence_brands, sequence_cover_still, CoverStill, ProfileBrand};
+use crate::mux::{
+    prop_av1c, prop_clap, prop_colr, prop_ispe, prop_pixi, sequence_brands, ProfileBrand,
+};
 use crate::still::{
     av1_err, av1c_from_seq, coded_extent, colr_is_full_range, encode_coded_item,
     full_range_temporal_unit, pad_plane, pixi_bits, top_left_clap, StillImage, STILL_MAX_CODED_DIM,
 };
 use oxideav_av1::encoder::inter_frame::{encode_gop_yuv_with_q, GOP_MAX_FRAMES};
 use oxideav_av1::encoder::yuv_frame::YuvFrame;
-use oxideav_heif::boxes::write::{boxed, full_boxed};
-use oxideav_heif::props::{self as hprops, Property as HProp};
+use oxideav_heif::{HeifWriter, SequenceWriter};
 
 /// Tuning for [`encode_sequence`].
 #[derive(Clone, Copy, Debug)]
@@ -192,366 +193,59 @@ pub fn encode_sequence(frames: &[StillImage], opts: &SequenceEncodeOptions) -> R
     let clap = ((pw, ph) != (first.width, first.height))
         .then(|| top_left_clap(first.width, first.height, pw, ph));
     let all_sync = samples.iter().all(|(_, s)| *s);
-    // The cover still — the sequence's own brands, one `av01` item
-    // holding sample 0 — is written by the container; the track's
-    // `moov` and the remaining samples are appended so the still
-    // primary aliases sample 0 (§7.1 of HEIF recommends the cover).
-    let pixi = pixi_bits(first);
-    let (still_file, (sample0_start, sample0_end)) = sequence_cover_still(CoverStill {
-        brands: sequence_brands(profile_brand, all_sync),
-        width: pw,
-        height: ph,
-        payload: samples[0].0.clone(),
-        av1c: &av1c,
-        pixi: &pixi,
-        colr: first.colr.as_ref(),
-        clap: clap.as_ref(),
-    })?;
-    if sample0_end - sample0_start != samples[0].0.len() {
-        return Err(Error::invalid(
-            "avif sequence: cover still payload span does not match sample 0",
-        ));
-    }
-    let sample_sizes: Vec<u32> = samples.iter().map(|(b, _)| b.len() as u32).collect();
-    let sync_samples: Vec<u32> = samples
-        .iter()
-        .enumerate()
-        .filter(|(_, (_, s))| *s)
-        .map(|(i, _)| i as u32 + 1)
-        .collect();
-    let track = TrackLayout {
-        timescale: opts.timescale,
-        frame_duration: opts.frame_duration,
-        coded_width: pw,
-        coded_height: ph,
-        av1c: &av1c,
-        colr: first.colr.as_ref(),
-        clap: clap.as_ref(),
-        sample_sizes: &sample_sizes,
-        sync_samples: if all_sync { None } else { Some(&sync_samples) },
-    };
-    let rest: Vec<u8> = samples[1..]
-        .iter()
-        .flat_map(|(b, _)| b.iter().copied())
-        .collect();
-    let sample0 = sample0_start as u64;
-    let moov = if samples.len() == 1 {
-        build_moov(&track, &[sample0])?
-    } else {
-        // The second chunk follows the `moov`; its offset depends on
-        // the `moov` size, which only changes with the chunk-offset
-        // width (stco / co64) — settle it in at most two passes.
-        let probe = build_moov(&track, &[sample0, 0])?;
-        let rest_offset = still_file.len() as u64 + probe.len() as u64 + 8;
-        let moov = build_moov(&track, &[sample0, rest_offset])?;
-        if moov.len() == probe.len() {
-            moov
-        } else {
-            let rest_offset = still_file.len() as u64 + moov.len() as u64 + 8;
-            build_moov(&track, &[sample0, rest_offset])?
-        }
-    };
-    let mut out = still_file;
-    out.extend_from_slice(&moov);
-    if !rest.is_empty() {
-        out.extend_from_slice(&boxed(b"mdat", &rest));
-    }
-    Ok(out)
-}
-
-/// Big-endian byte writer for the `moov` box fields.
-#[derive(Default)]
-struct W(Vec<u8>);
-
-impl W {
-    fn u16(&mut self, v: u16) {
-        self.0.extend_from_slice(&v.to_be_bytes());
-    }
-    fn u32(&mut self, v: u32) {
-        self.0.extend_from_slice(&v.to_be_bytes());
-    }
-    fn u64(&mut self, v: u64) {
-        self.0.extend_from_slice(&v.to_be_bytes());
-    }
-    fn bytes(&mut self, b: &[u8]) {
-        self.0.extend_from_slice(b);
-    }
-    fn fourcc(&mut self, b: &[u8; 4]) {
-        self.0.extend_from_slice(b);
-    }
-    fn cstr(&mut self, s: &str) {
-        self.0.extend_from_slice(s.as_bytes());
-        self.0.push(0);
-    }
-    fn into_vec(self) -> Vec<u8> {
-        self.0
-    }
-}
-
-/// Everything the `moov` writer needs about the single video track.
-struct TrackLayout<'a> {
-    timescale: u32,
-    frame_duration: u32,
-    coded_width: u32,
-    coded_height: u32,
-    av1c: &'a [u8],
-    colr: Option<&'a crate::meta::Colr>,
-    clap: Option<&'a crate::meta::Clap>,
-    sample_sizes: &'a [u32],
-    /// 1-based sync sample numbers; `None` = every sample is sync (no
-    /// `stss`, 14496-12 §8.6.2).
-    sync_samples: Option<&'a [u32]>,
-}
-
-const UNITY_MATRIX: [u32; 9] = [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x4000_0000];
-
-fn build_moov(t: &TrackLayout<'_>, chunk_offsets: &[u64]) -> Result<Vec<u8>> {
-    let sample_count = t.sample_sizes.len() as u64;
-    let duration = sample_count * u64::from(t.frame_duration);
-    let v1 = duration > u64::from(u32::MAX);
-
-    // mvhd (14496-12 §8.2.2).
-    let mut w = W::default();
-    if v1 {
-        w.u64(0);
-        w.u64(0);
-        w.u32(t.timescale);
-        w.u64(duration);
-    } else {
-        w.u32(0);
-        w.u32(0);
-        w.u32(t.timescale);
-        w.u32(duration as u32);
-    }
-    w.u32(0x0001_0000); // rate 1.0
-    w.u16(0x0100); // volume
-    w.u16(0); // reserved
-    w.u32(0);
-    w.u32(0); // reserved[2]
-    for m in UNITY_MATRIX {
-        w.u32(m);
-    }
-    for _ in 0..6 {
-        w.u32(0); // pre_defined
-    }
-    w.u32(2); // next_track_ID
-    let mvhd = full_boxed(b"mvhd", if v1 { 1 } else { 0 }, 0, &w.into_vec());
-
-    // tkhd (§8.3.2): enabled + in movie; width/height 16.16 fixed.
-    let mut w = W::default();
-    if v1 {
-        w.u64(0);
-        w.u64(0);
-        w.u32(1); // track_ID
-        w.u32(0); // reserved
-        w.u64(duration);
-    } else {
-        w.u32(0);
-        w.u32(0);
-        w.u32(1);
-        w.u32(0);
-        w.u32(duration as u32);
-    }
-    w.u32(0);
-    w.u32(0); // reserved[2]
-    w.u16(0); // layer
-    w.u16(0); // alternate_group
-    w.u16(0); // volume (video)
-    w.u16(0); // reserved
-    for m in UNITY_MATRIX {
-        w.u32(m);
-    }
-    w.u32(t.coded_width << 16);
-    w.u32(t.coded_height << 16);
-    let tkhd = full_boxed(b"tkhd", if v1 { 1 } else { 0 }, 0x000003, &w.into_vec());
-
-    // mdhd (§8.4.2), language 'und' packed 5-bit.
-    let mut w = W::default();
-    if v1 {
-        w.u64(0);
-        w.u64(0);
-        w.u32(t.timescale);
-        w.u64(duration);
-    } else {
-        w.u32(0);
-        w.u32(0);
-        w.u32(t.timescale);
-        w.u32(duration as u32);
-    }
-    let und = ((b'u' - 0x60) as u16) << 10 | ((b'n' - 0x60) as u16) << 5 | (b'd' - 0x60) as u16;
-    w.u16(und);
-    w.u16(0); // pre_defined
-    let mdhd = full_boxed(b"mdhd", if v1 { 1 } else { 0 }, 0, &w.into_vec());
-
-    // hdlr (§8.4.3): 'pict' (av1-avif §3).
-    let mut w = W::default();
-    w.u32(0); // pre_defined
-    w.fourcc(b"pict");
-    w.u32(0);
-    w.u32(0);
-    w.u32(0); // reserved[3]
-    w.cstr("PictureHandler");
-    let hdlr = full_boxed(b"hdlr", 0, 0, &w.into_vec());
-
-    // vmhd (§12.1.2): flags = 1.
-    let mut w = W::default();
-    w.u16(0); // graphicsmode
-    w.u16(0);
-    w.u16(0);
-    w.u16(0); // opcolor
-    let vmhd = full_boxed(b"vmhd", 0, 1, &w.into_vec());
-
-    // dinf / dref / url (§8.7.2): one self-contained entry.
-    let url = full_boxed(b"url ", 0, 1, &[]);
-    let mut w = W::default();
-    w.u32(1);
-    w.bytes(&url);
-    let dref = full_boxed(b"dref", 0, 0, &w.into_vec());
-    let dinf = boxed(b"dinf", &dref);
-
-    // stsd / av01 VisualSampleEntry (§12.1.3 + AV1-ISOBMFF §2.2).
-    if t.coded_width > u32::from(u16::MAX) || t.coded_height > u32::from(u16::MAX) {
+    if pw > u32::from(u16::MAX) || ph > u32::from(u16::MAX) {
         return Err(Error::unsupported(
             "avif sequence: coded extents exceed the 16-bit sample-entry fields",
         ));
     }
-    let mut w = W::default();
-    w.bytes(&[0u8; 6]); // reserved
-    w.u16(1); // data_reference_index
-    w.u16(0); // pre_defined
-    w.u16(0); // reserved
-    w.u32(0);
-    w.u32(0);
-    w.u32(0); // pre_defined[3]
-    w.u16(t.coded_width as u16);
-    w.u16(t.coded_height as u16);
-    w.u32(0x0048_0000); // horizresolution 72 dpi
-    w.u32(0x0048_0000); // vertresolution
-    w.u32(0); // reserved
-    w.u16(1); // frame_count
-    let mut name = [0u8; 32];
-    let label = b"AOM Coding";
-    name[0] = label.len() as u8;
-    name[1..1 + label.len()].copy_from_slice(label);
-    w.bytes(&name); // compressorname (§2.2.4 recommended value)
-    w.u16(0x0018); // depth
-    w.u16(0xFFFF); // pre_defined = -1
-    w.bytes(&boxed(b"av1C", t.av1c));
-    if let Some(colr) = t.colr {
-        if let crate::meta::Colr::Unknown(t) = colr {
-            return Err(Error::unsupported(format!(
-                "avif sequence: cannot emit colr of unknown type '{}'",
-                String::from_utf8_lossy(t)
-            )));
-        }
-        w.bytes(&hprops::write::property_box(&HProp::Colr(
-            hprops::Colr::from(colr),
-        )));
+    // The file is the container's `SequenceWriter`: `ftyp` with this
+    // crate's brands, the cover still (one `av01` item with the
+    // track's properties, its `iloc` aliasing sample 0 in the track
+    // `mdat` — HEIF §7.1 recommends the cover, av1-avif §6.3 NOTE
+    // requires the item), `moov` / `trak` with the `pict` handler,
+    // the `av01` sample entry carrying `av1C` (+ `colr`, + `clap`)
+    // and the mandatory `ccst` (HEIF §7.2.3.1), `stts` / `stsc` /
+    // `stsz` / `stco`, `stss` only when a sample is not sync.
+    let pixi = pixi_bits(first);
+    let mut props = vec![
+        prop_av1c(&av1c, "sequence ")?,
+        prop_ispe(pw, ph),
+        prop_pixi(&pixi),
+    ];
+    let mut entry_properties = Vec::new();
+    if let Some(c) = first.colr.as_ref() {
+        let (colr, _) = prop_colr(c)?;
+        entry_properties.push(colr.clone());
+        props.push((colr, false));
     }
-    if let Some(clap) = t.clap {
-        w.bytes(&hprops::write::property_box(&HProp::Clap(
-            hprops::Clap::from(clap),
-        )));
+    if let Some(c) = clap.as_ref() {
+        let (clap, essential) = prop_clap(c);
+        entry_properties.push(clap.clone());
+        props.push((clap, essential));
     }
-    let av01 = boxed(b"av01", &w.into_vec());
-    let mut w = W::default();
-    w.u32(1); // entry_count
-    w.bytes(&av01);
-    let stsd = full_boxed(b"stsd", 0, 0, &w.into_vec());
-
-    // stts (§8.6.1.2): one run.
-    let mut w = W::default();
-    w.u32(1);
-    w.u32(sample_count as u32);
-    w.u32(t.frame_duration);
-    let stts = full_boxed(b"stts", 0, 0, &w.into_vec());
-
-    // stss (§8.6.2) only when not every sample is sync.
-    let stss = t.sync_samples.map(|sync| {
-        let mut w = W::default();
-        w.u32(sync.len() as u32);
-        for &s in sync {
-            w.u32(s);
-        }
-        full_boxed(b"stss", 0, 0, &w.into_vec())
-    });
-
-    // stsc (§8.7.4): one chunk holding every sample.
-    // Chunk 1 holds sample 0 (the cover still's payload); chunk 2, when
-    // present, holds every other sample.
-    let mut w = W::default();
-    if chunk_offsets.len() > 1 && sample_count > 1 {
-        w.u32(2);
-        w.u32(1); // first_chunk
-        w.u32(1); // samples_per_chunk
-        w.u32(1); // sample_description_index
-        w.u32(2);
-        w.u32((sample_count - 1) as u32);
-        w.u32(1);
+    let (av1c_prop, _) = prop_av1c(&av1c, "sequence ")?;
+    let (major, compat) = sequence_brands(profile_brand, all_sync);
+    let mut writer = SequenceWriter::new(*b"av01", av1c_prop, pw as u16, ph as u16, opts.timescale)
+        .with_brands(major, compat);
+    writer.entry_properties = entry_properties;
+    // `ccst` (HEIF §7.2.3.4): all-intra tracks have no inter-predicted
+    // image (every reference is vacuously a sync sample, no reference
+    // pictures); the KEY + P groups predict from the previous frame,
+    // intra prediction may be used, any number of references the
+    // sample entry permits (15).
+    writer.coding_constraints = if all_sync {
+        (true, true, 0)
     } else {
-        w.u32(1);
-        w.u32(1); // first_chunk
-        w.u32(sample_count as u32); // samples_per_chunk
-        w.u32(1); // sample_description_index
-    }
-    let stsc = full_boxed(b"stsc", 0, 0, &w.into_vec());
-
-    // stsz (§8.7.3.2): per-sample table.
-    let mut w = W::default();
-    w.u32(0); // sample_size = 0 → table follows
-    w.u32(sample_count as u32);
-    for &s in t.sample_sizes {
-        w.u32(s);
-    }
-    let stsz = full_boxed(b"stsz", 0, 0, &w.into_vec());
-
-    // stco / co64 (§8.7.5): the single chunk.
-    let stco = if chunk_offsets.iter().any(|&o| o > u64::from(u32::MAX)) {
-        let mut w = W::default();
-        w.u32(chunk_offsets.len() as u32);
-        for &o in chunk_offsets {
-            w.u64(o);
-        }
-        full_boxed(b"co64", 0, 0, &w.into_vec())
-    } else {
-        let mut w = W::default();
-        w.u32(chunk_offsets.len() as u32);
-        for &o in chunk_offsets {
-            w.u32(o as u32);
-        }
-        full_boxed(b"stco", 0, 0, &w.into_vec())
+        (false, true, 15)
     };
-
-    let mut stbl = Vec::new();
-    stbl.extend_from_slice(&stsd);
-    stbl.extend_from_slice(&stts);
-    if let Some(stss) = &stss {
-        stbl.extend_from_slice(stss);
+    let mut still = HeifWriter::new();
+    // The body is ignored: `cover_sample` points the item at sample 0.
+    let cover = still.add_coded_item(*b"av01", Vec::new(), props);
+    still.set_primary(cover);
+    writer.still = Some(still);
+    writer.cover_sample = Some(0);
+    for (data, sync) in samples {
+        writer.push_sample(data, opts.frame_duration, sync);
     }
-    stbl.extend_from_slice(&stsc);
-    stbl.extend_from_slice(&stsz);
-    stbl.extend_from_slice(&stco);
-    let stbl = boxed(b"stbl", &stbl);
-
-    let mut minf = Vec::new();
-    minf.extend_from_slice(&vmhd);
-    minf.extend_from_slice(&dinf);
-    minf.extend_from_slice(&stbl);
-    let minf = boxed(b"minf", &minf);
-
-    let mut mdia = Vec::new();
-    mdia.extend_from_slice(&mdhd);
-    mdia.extend_from_slice(&hdlr);
-    mdia.extend_from_slice(&minf);
-    let mdia = boxed(b"mdia", &mdia);
-
-    let mut trak = Vec::new();
-    trak.extend_from_slice(&tkhd);
-    trak.extend_from_slice(&mdia);
-    let trak = boxed(b"trak", &trak);
-
-    let mut moov = Vec::new();
-    moov.extend_from_slice(&mvhd);
-    moov.extend_from_slice(&trak);
-    Ok(boxed(b"moov", &moov))
+    Ok(writer.write_to_vec()?)
 }

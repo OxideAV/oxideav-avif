@@ -1013,12 +1013,39 @@ fn avis_sequence_gop_10bit_round_trips_exact() {
     let in_path = tmp.join("seq.avif");
     let out_path = tmp.join("seq.raw");
     std::fs::write(&in_path, &avif).expect("write");
-    // The file exposes the still primary as stream 0 and the `pict`
-    // track as stream 1; map the track.
+    // The file exposes both the cover still (one frame at 1 fps) and
+    // the `pict` track (30 fps, the movie timescale); the order the
+    // demuxer lists them in follows the box order, so pick the track
+    // by its frame rate rather than by index.
+    let track_index = match std::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v",
+            "-show_entries",
+            "stream=index,avg_frame_rate",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(&in_path)
+        .output()
+    {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => panic!("spawn failed: {e}"),
+        Ok(out) => String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| {
+                let (idx, rate) = l.trim().split_once(',')?;
+                (rate == "30/1").then(|| idx.to_owned())
+            })
+            .next(),
+    };
+    let map = format!("0:{}", track_index.as_deref().unwrap_or("1"));
     match std::process::Command::new("ffmpeg")
         .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
         .arg(&in_path)
-        .args(["-map", "0:1", "-f", "rawvideo", "-pix_fmt", "yuv420p10le"])
+        .args(["-map", &map, "-f", "rawvideo", "-pix_fmt", "yuv420p10le"])
         .arg(&out_path)
         .output()
     {
