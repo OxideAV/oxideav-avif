@@ -152,7 +152,7 @@ fn yuv420_8bit_lossless_round_trips_exact() {
 
     // Pixel-exact round-trip.
     let vf = decode_own("yuv420 lossless", &avif);
-    assert_eq!(vf.planes.len(), 3);
+    assert_eq!(vf.image_plane_count(), 3);
     assert_eq!(vf.planes[0].data, narrow(&img.y), "Y");
     assert_eq!(vf.planes[1].data, narrow(&img.u), "U");
     assert_eq!(vf.planes[2].data, narrow(&img.v), "V");
@@ -214,7 +214,7 @@ fn depth_format_matrix_round_trips_exact() {
             // Sample-exact decode-back through this crate's own
             // decoder + composition layer, at every depth.
             let vf = decode_own(&label, &avif);
-            assert_eq!(vf.planes.len(), nplanes, "{label}: planes");
+            assert_eq!(vf.image_plane_count(), nplanes, "{label}: planes");
             if bit_depth == 8 {
                 assert_eq!(vf.planes[0].data, narrow(&img.y), "{label}: Y");
                 if nplanes == 3 {
@@ -303,7 +303,7 @@ fn rgb8_identity_round_trips_exact() {
     assert!(parsed.compatible_brands.iter().any(|b| b == b"MA1A"));
 
     let vf = decode_own("rgb8", &avif);
-    assert_eq!(vf.planes.len(), 3);
+    assert_eq!(vf.image_plane_count(), 3);
     let n = (w * h) as usize;
     let mut out = Vec::with_capacity(n * 3);
     for i in 0..n {
@@ -332,7 +332,7 @@ fn rgba8_alpha_round_trips_exact() {
     }
 
     let vf = decode_own("rgba8", &avif);
-    assert_eq!(vf.planes.len(), 4, "YUV + A");
+    assert_eq!(vf.image_plane_count(), 4, "YUV + A");
     let n = (w * h) as usize;
     let mut out = Vec::with_capacity(n * 4);
     for i in 0..n {
@@ -365,7 +365,7 @@ fn yuv420_alpha_premultiplied_round_trips() {
         "prem iref present"
     );
     let vf = decode_own("420+alpha", &avif);
-    assert_eq!(vf.planes.len(), 4);
+    assert_eq!(vf.image_plane_count(), 4);
     assert_eq!(vf.planes[3].data, narrow(&alpha), "alpha exact");
     assert_eq!(vf.planes[0].data, narrow(&img.y), "Y exact");
 }
@@ -441,7 +441,7 @@ fn ten_bit_alpha_matches_master_depth_and_round_trips() {
 
     // Composited decode: Y U V A planes, all sample-exact at 10 bits.
     let vf = decode_own("10-bit 420 + alpha", &avif);
-    assert_eq!(vf.planes.len(), 4, "YUV + A");
+    assert_eq!(vf.image_plane_count(), 4, "YUV + A");
     assert_eq!(le_u16(&vf.planes[0].data), img.y, "Y");
     assert_eq!(le_u16(&vf.planes[1].data), img.u, "U");
     assert_eq!(le_u16(&vf.planes[2].data), img.v, "V");
@@ -462,7 +462,7 @@ fn ten_bit_alpha_matches_master_depth_and_round_trips() {
         Frame::Video(v) => v,
         other => panic!("expected VideoFrame, got {other:?}"),
     };
-    assert_eq!(af.planes.len(), 1, "monochrome alpha");
+    assert_eq!(af.image_plane_count(), 1, "monochrome alpha");
     assert_eq!(le_u16(&af.planes[0].data), alpha, "alpha samples exact");
 }
 
@@ -488,7 +488,7 @@ fn twelve_bit_alpha_premultiplied_round_trips() {
         "prem iref present"
     );
     let vf = decode_own("12-bit 444 + prem alpha", &avif);
-    assert_eq!(vf.planes.len(), 4);
+    assert_eq!(vf.image_plane_count(), 4);
     assert_eq!(le_u16(&vf.planes[0].data), img.y, "Y exact");
     assert_eq!(le_u16(&vf.planes[3].data), alpha, "alpha exact");
 }
@@ -1186,7 +1186,7 @@ fn grid_encode_with_alpha_round_trips_exact() {
         );
 
         let vf = decode_own(&label, &avif);
-        assert_eq!(vf.planes.len(), 4, "{label}: Yuva");
+        assert_eq!(vf.image_plane_count(), 4, "{label}: Yuva");
         let alpha = img.alpha.as_ref().unwrap();
         if depth == 8 {
             assert_eq!(vf.planes[0].data, narrow(&img.y), "{label}: Y");
@@ -1273,11 +1273,11 @@ fn depth_map_auxiliary_round_trips_exact() {
     let Frame::Video(vf) = d.receive_frame().expect("depth frame") else {
         panic!("non-video");
     };
-    assert_eq!(vf.planes.len(), 1, "monochrome depth");
+    assert_eq!(vf.image_plane_count(), 1, "monochrome depth");
     assert_eq!(le_u16(&vf.planes[0].data), depth_map, "depth samples exact");
     // The primary decode is unaffected (depth is not composited).
     let vf = decode_own("depth primary", &avif);
-    assert_eq!(vf.planes.len(), 3);
+    assert_eq!(vf.image_plane_count(), 3);
     assert_eq!(le_u16(&vf.planes[0].data), img.y);
 }
 
@@ -1518,7 +1518,7 @@ fn hbd_avis_sequence_decodes_sample_exact() {
             Frame::Video(v) => v,
             other => panic!("frame {i}: expected VideoFrame, got {other:?}"),
         };
-        assert_eq!(vf.planes.len(), 3, "frame {i}: planes");
+        assert_eq!(vf.image_plane_count(), 3, "frame {i}: planes");
         assert_eq!(le_u16(&vf.planes[0].data), img.y, "frame {i}: Y");
         assert_eq!(le_u16(&vf.planes[1].data), img.u, "frame {i}: U");
         assert_eq!(le_u16(&vf.planes[2].data), img.v, "frame {i}: V");
@@ -1722,7 +1722,7 @@ fn black_box_external_encoder_files_decode_exact() {
         let avif = std::fs::read(&avif_path).expect("read avif");
 
         let vf = decode_own(&label, &avif);
-        assert_eq!(vf.planes.len(), 3, "{label}: planes");
+        assert_eq!(vf.image_plane_count(), 3, "{label}: planes");
         if depth == 8 {
             assert_eq!(vf.planes[0].data, narrow(&img.y), "{label}: Y exact");
             assert_eq!(vf.planes[1].data, narrow(&img.u), "{label}: U exact");

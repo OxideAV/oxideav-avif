@@ -12,7 +12,7 @@ use crate::meta::{
     Amve, Cclv, Clli, Colr, IlocExtent, Ispe, ItemInfo, ItemLocation, Mdcv, Meta, Pasp, Pixi,
     Property,
 };
-use oxideav_heif::{FileType, HeifFile};
+use oxideav_heif::{FileType, HeifFile, HeifFileRef};
 
 const FTYP: BoxType = b(b"ftyp");
 const META: BoxType = b(b"meta");
@@ -94,8 +94,10 @@ pub struct AvifHeader<'a> {
     /// The container crate's parsed view of the same bytes — the source
     /// of truth for item payload resolution across every `iloc`
     /// construction method (file offset, `idat`, item offset). The
-    /// `meta` above is the AVIF-side model derived from it.
-    pub heif: HeifFile,
+    /// `meta` above is the AVIF-side model derived from it. Borrows
+    /// `file` (`HeifFile::parse_borrowed`): the header never copies
+    /// the input.
+    pub heif: HeifFileRef<'a>,
 }
 
 impl AvifHeader<'_> {
@@ -120,7 +122,7 @@ pub fn parse_header(file: &[u8]) -> Result<AvifHeader<'_>> {
         find_box(file, &FTYP)?.ok_or_else(|| Error::invalid("avif: missing ftyp"))?;
     let (major_brand, minor_version, compatible_brands) = parse_ftyp(ftyp_payload)?;
     classify_brands(&major_brand, &compatible_brands)?;
-    let heif = HeifFile::parse(file)?;
+    let heif = HeifFile::parse_borrowed(file)?;
     let container = heif
         .meta
         .as_ref()
@@ -383,7 +385,11 @@ pub(crate) fn parse_ftyp(payload: &[u8]) -> Result<(BoxType, u32, Vec<BoxType>)>
 /// The primary item's payload: zero-copy into `file` when the container
 /// reports one contiguous file-offset span, otherwise the concatenated
 /// (or `idat` / item-offset resolved) bytes, owned.
-fn primary_payload<'a>(file: &'a [u8], heif: &HeifFile, item_id: u32) -> Result<Cow<'a, [u8]>> {
+fn primary_payload<'a>(
+    file: &'a [u8],
+    heif: &HeifFileRef<'_>,
+    item_id: u32,
+) -> Result<Cow<'a, [u8]>> {
     if let Ok(spans) = heif.item_file_spans(item_id) {
         if let [(start, end)] = spans.as_slice() {
             if let Some(slice) = file.get(*start..*end) {

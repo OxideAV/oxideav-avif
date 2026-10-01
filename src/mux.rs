@@ -1097,7 +1097,7 @@ pub(crate) fn sequence_cover_still(cover: CoverStill<'_>) -> Result<(Vec<u8>, (u
     let id = w.add_coded_item(*b"av01", payload, props);
     w.set_primary(id);
     let bytes = w.write_to_vec()?;
-    let file = oxideav_heif::HeifFile::parse(&bytes)?;
+    let file = oxideav_heif::HeifFile::parse_borrowed(&bytes)?;
     let spans = file.item_file_spans(id)?;
     match spans.as_slice() {
         [span] => Ok((bytes, *span)),

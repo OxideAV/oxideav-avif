@@ -23,6 +23,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   conversion's "typed unexpectedly" error is gone. New
   `Meta::properties_for(item_id)` lists an item's properties in `ipma`
   order.
+- **Zero-copy header.** `parse_header` / `parse` / `parse_avis` and
+  the decoder build the container view with `HeifFile::parse_borrowed`:
+  `AvifHeader::heif` is now `HeifFileRef<'a>` (`HeifFile<&[u8]>`, every
+  reader generic over the storage) and the input is never copied by
+  the header walk.
+- **Colour signalling through oxideav-core 0.1.37.** Every frame the
+  `"avif"` decoder emits carries a `ColorSignal` side channel — the
+  primary's output `colr` (`nclx` code points as signalled, else the
+  MIAF §7.3.6.4 default: BT.709 / sRGB / BT.601, **full range**; MIAF
+  §7.3.6.4 NOTE 1 makes the property, not the bitstream, authoritative)
+  for a still, the `av01` sample entry's `colr` for a sequence
+  (`AvisMeta::colr`). A full-range 10-bit still is no longer taken as
+  limited downstream. `AvifDecoder::color_signal()` and
+  `AvifDecoder::output_format()` read back the last decode's signal and
+  framework label; the new `signal` module (`color_signal_for`,
+  `labelled_pixel_format`, `miaf_default_signal`) is the rule. Because
+  the frame now ends in a side-channel plane, plane counting goes
+  through `VideoFrame::image_plane_count()` / `image_planes()`; the
+  `From<VideoFrame> for AvifFrame` conversion and the encoder's input
+  checks drop / skip side-channel records instead of counting them.
+- **Identity-matrix items are planar RGB on the framework surface.** An
+  item whose effective `colr` has `matrix_coefficients = 0` (H.273
+  §8.3: Y = G, Cb = B, Cr = R — e.g. a lossless `heif-enc -A -L -p
+  chroma=444` or `avifenc --lossless` file) decoded in 4:4:4 is
+  labelled `Gbrp8` / `Gbrp10Le` / `Gbrp12Le` (`Gbrap*` with alpha, plane
+  order G B R [A]) instead of a Y′CbCr layout; a full-range 8-bit
+  Y′CbCr still without alpha is labelled `YuvJ420P` / `YuvJ422P` /
+  `YuvJ444P`. The crate-local `AvifPixelFormat` stays the storage
+  layout. The framework encoder accepts the same planar RGB family as
+  input (`Gbrp8` / `Gbrap8` / `Gbrp10Le` / `Gbrap10Le` / `Gbrp12Le` /
+  `Gbrap12Le`, identity 4:4:4, lossless stays exact) and honours
+  `CodecParameters::color_signal`: a specified range writes
+  `full_range_flag` (and the AV1 `color_range` bit), specified
+  primaries / transfer / matrix are written as given (the RGB layouts
+  keep the identity matrix); `Encoder::output_params().color_signal`
+  reports the signal the file was written with. With nothing signalled
+  the encoder's historical defaults are unchanged.
 
 - **Container layer by `oxideav-heif`.** The ISOBMFF box reader, the
   `meta` item model (`hdlr` / `pitm` / `iinf` + `infe` / `iloc` /

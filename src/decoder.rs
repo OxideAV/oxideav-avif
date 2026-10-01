@@ -20,7 +20,9 @@
 
 use oxideav_core::frame::{VideoFrame, VideoPlane};
 use oxideav_core::Decoder;
-use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Result, TimeBase};
+use oxideav_core::{
+    CodecId, CodecParameters, ColorSignal, Error, Frame, Packet, PixelFormat, Result, TimeBase,
+};
 
 use crate::av1_config::{parse_av1c, Av1CodecConfig};
 
@@ -37,6 +39,7 @@ use crate::meta::{Property, ITEM_TYPE_IDEN, ITEM_TYPE_IOVL};
 use crate::parser::{
     classify_brands, parse, parse_header, AvifHeader, ITEM_TYPE_AV01, ITEM_TYPE_GRID,
 };
+use crate::signal::{color_signal_for, labelled_pixel_format, layout_of_record};
 use crate::transform::{clap_extent, crop_top_left, rotation_keeps_layout};
 use oxideav_heif::compose;
 use oxideav_heif::props as hprops;
@@ -61,11 +64,16 @@ fn from_core_pix(fmt: PixelFormat) -> Result<AvifPixelFormat> {
 /// the crate-local [`AvifFrame`] the composition layer consumes. Plane
 /// data is moved, not copied.
 fn core_to_avif_frame(vf: VideoFrame) -> AvifFrame {
+    // Only the image planes: a side-channel record the AV1 decoder
+    // may attach (significant bits, colour signal) is not a plane the
+    // composition layer can place.
+    let image_planes = vf.image_plane_count();
     AvifFrame {
         pts: vf.pts,
         planes: vf
             .planes
             .into_iter()
+            .take(image_planes)
             .map(|p| AvifPlane {
                 stride: p.stride,
                 data: p.data,
@@ -112,7 +120,7 @@ fn infer_av1_pixmap(frame: &VideoFrame, cfg: &Av1CodecConfig) -> Result<(PixelFo
     }
     let width = (y.stride / bps) as u32;
     let height = (y.data.len() / y.stride) as u32;
-    let format = match frame.planes.len() {
+    let format = match frame.image_plane_count() {
         1 => match depth {
             8 => PixelFormat::Gray8,
             10 => PixelFormat::Gray10Le,
@@ -180,6 +188,11 @@ pub struct AvifDecoder {
     pending: Vec<Frame>,
     /// The AvifInfo of the last decoded file, retained for `info()`.
     info: Option<AvifInfo>,
+    /// The colour signal of the last decoded file (still: the
+    /// primary's output image; sequence: the sample entry's `colr`).
+    color_signal: Option<ColorSignal>,
+    /// The framework label of the last decoded file's frames.
+    output_format: Option<PixelFormat>,
 }
 
 impl AvifDecoder {
@@ -188,7 +201,31 @@ impl AvifDecoder {
             codec_id,
             pending: Vec::new(),
             info: None,
+            color_signal: None,
+            output_format: None,
         }
+    }
+
+    /// The colour signal (`oxideav-core` [`ColorSignal`]: range +
+    /// H.273 primaries / transfer / matrix) of the last decoded file —
+    /// the primary item's effective `colr` under MIAF §7.3.6.4 (its
+    /// `nclx`, else the MIAF default: full range, BT.709 / sRGB /
+    /// BT.601) for a still, the `av01` sample entry's `colr` for a
+    /// sequence. Every frame this decoder emits carries the same value
+    /// as its colour-signal side channel. `None` before the first
+    /// decode.
+    pub fn color_signal(&self) -> Option<ColorSignal> {
+        self.color_signal
+    }
+
+    /// The framework pixel-format label of the frames of the last
+    /// decoded file: planar RGB (`Gbrp*` / `Gbrap*`, planes G B R [A])
+    /// for an identity-matrix 4:4:4 picture, `YuvJ*` for a full-range
+    /// 8-bit Y′CbCr still, the storage layout otherwise (see
+    /// [`crate::signal::labelled_pixel_format`]). `None` before the
+    /// first decode.
+    pub fn output_format(&self) -> Option<PixelFormat> {
+        self.output_format
     }
 
     /// Parse an AVIF file and decode the primary item's **output
@@ -234,6 +271,13 @@ impl AvifDecoder {
         let bit_depth = image.format.bit_depth;
         let (frame, format) = from_heif(&image).map_err(core_err)?;
         let mut out = avif_to_core_frame(frame);
+        // The output image's colour: the primary's `colr` (a derived
+        // primary's own, else its first input's — `AvifInfo::colour`
+        // resolves that), MIAF §7.3.6.4 default when absent.
+        let signal = color_signal_for(info.colour.as_ref());
+        out.set_color_signal(signal);
+        self.color_signal = Some(signal);
+        self.output_format = Some(labelled_pixel_format(format, &signal));
         // A composited 10/12-bit monochrome + alpha frame rides the
         // 16-bit `Ya16Le` storage with the coded values in the low
         // bits; surface the effective depth through the core per-plane
@@ -293,6 +337,9 @@ impl AvifDecoder {
         // step involved.
         let cfg = parse_av1c(&av1c)?;
         validate_av1_config(&cfg)?;
+        let signal = color_signal_for(meta.colr.as_ref());
+        self.color_signal = Some(signal);
+        self.output_format = layout_of_record(&cfg).map(|l| labelled_pixel_format(l, &signal));
 
         let timescale = if meta.timescale == 0 {
             1
@@ -337,7 +384,7 @@ impl AvifDecoder {
             loop {
                 match av1.receive_frame() {
                     Ok(frame) => {
-                        self.pending.push(frame);
+                        self.pending.push(with_signal(frame, signal));
                         frames_queued += 1;
                     }
                     Err(Error::NeedMore) => break,
@@ -352,7 +399,7 @@ impl AvifDecoder {
         loop {
             match av1.receive_frame() {
                 Ok(frame) => {
-                    self.pending.push(frame);
+                    self.pending.push(with_signal(frame, signal));
                     frames_queued += 1;
                 }
                 Err(Error::NeedMore) => break,
@@ -360,6 +407,14 @@ impl AvifDecoder {
             }
         }
         Ok(frames_queued)
+    }
+}
+
+/// Attach the sequence's colour signal to a decoded sample frame.
+fn with_signal(frame: Frame, signal: ColorSignal) -> Frame {
+    match frame {
+        Frame::Video(v) => Frame::Video(v.with_color_signal(signal)),
+        other => other,
     }
 }
 
@@ -1029,6 +1084,8 @@ impl Decoder for AvifDecoder {
     fn reset(&mut self) -> Result<()> {
         self.pending.clear();
         self.info = None;
+        self.color_signal = None;
+        self.output_format = None;
         Ok(())
     }
 }
@@ -1142,7 +1199,7 @@ mod tests {
         };
         // Monochrome primary, no alpha auxiliary → exactly one plane
         // at the fixture's 1280×720 extent.
-        assert_eq!(vf.planes.len(), 1);
+        assert_eq!(vf.image_plane_count(), 1);
         let y = &vf.planes[0];
         assert_eq!(y.stride, 1280);
         assert_eq!(y.data.len() / y.stride, 720);

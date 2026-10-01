@@ -148,6 +148,8 @@ pub mod encoder;
 #[cfg(feature = "registry")]
 pub mod sequence;
 #[cfg(feature = "registry")]
+pub mod signal;
+#[cfg(feature = "registry")]
 pub mod still;
 
 pub use alpha::{composite_alpha, find_alpha_item_id, ALPHA_URN_PREFIX};
@@ -221,6 +223,9 @@ pub use encoder::{make_encoder, AvifEncoder};
 
 #[cfg(feature = "registry")]
 pub use sequence::{encode_sequence, SequenceEncodeOptions};
+
+#[cfg(feature = "registry")]
+pub use signal::{color_signal_for, labelled_pixel_format, miaf_default_signal};
 
 #[cfg(feature = "registry")]
 pub use still::{

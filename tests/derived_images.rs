@@ -259,7 +259,7 @@ fn overlay_8bit_420_two_opaque_layers_round_trips_exact() {
 
     // Pixels: own decoder.
     let vf = decode_own("overlay 420", &avif);
-    assert_eq!(vf.planes.len(), 3);
+    assert_eq!(vf.image_plane_count(), 3);
     let expect_y = expected_luma(32, 24, &[(&base, 0, 0), (&stamp, 8, 8)], None);
     let got_y = words(&vf.planes[0].data, false);
     assert_eq!(got_y.len(), 32 * 24);
@@ -322,7 +322,7 @@ fn overlay_10bit_422_clipped_stamp_round_trips_exact() {
     let avif = encode_still_overlay(&canvas, &layers, &StillEncodeOptions::default())
         .expect("overlay encode");
     let vf = decode_own("overlay 422p10", &avif);
-    assert_eq!(vf.planes.len(), 3);
+    assert_eq!(vf.image_plane_count(), 3);
     let expect_y = expected_luma(24, 16, &[(&base, 0, 0), (&stamp, -2, 12)], None);
     let got_y = words(&vf.planes[0].data, true);
     for (i, (g, e)) in got_y.iter().zip(&expect_y).enumerate() {
@@ -392,7 +392,7 @@ fn overlay_rgba_identity_alpha_over_and_transparent_fill() {
     assert!(info.overlay_resolutions[0].canvas_partially_filled());
 
     let vf = decode_own("overlay rgba", &avif);
-    assert_eq!(vf.planes.len(), 4, "Yuva444P expected");
+    assert_eq!(vf.image_plane_count(), 4, "Yuva444P expected");
     let g = |p: usize| words(&vf.planes[p].data, false);
     let (oy, ou, ov, oa) = (g(0), g(1), g(2), g(3));
     for y in 0..12u32 {
@@ -485,7 +485,7 @@ fn overlay_12bit_mono_odd_offset_with_irot() {
         "irot swaps the canvas extents"
     );
     let vf = decode_own("overlay mono12 irot", &avif);
-    assert_eq!(vf.planes.len(), 1);
+    assert_eq!(vf.image_plane_count(), 1);
     let got = words(&vf.planes[0].data, true);
     let unrotated = expected_luma(12, 10, &[(&base, 0, 0), (&stamp, 3, 5)], None);
     // irot angle 1 = 90° anti-clockwise: out(x, y) = in(W-1-y, x) with
@@ -672,7 +672,11 @@ fn identity_derivation_clap_imir_with_alpha() {
     let info = inspect(&avif).expect("inspect");
     assert_eq!((info.width, info.height), (8, 4));
     let vf = decode_own("iden clap imir alpha", &avif);
-    assert_eq!(vf.planes.len(), 4, "alpha inherited through the iden");
+    assert_eq!(
+        vf.image_plane_count(),
+        4,
+        "alpha inherited through the iden"
+    );
     let alpha = img.alpha.as_ref().unwrap();
     let got_a = words(&vf.planes[3].data, false);
     let got_y = words(&vf.planes[0].data, false);

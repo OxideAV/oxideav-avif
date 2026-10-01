@@ -335,12 +335,22 @@ impl From<AvifFrame> for oxideav_core::frame::VideoFrame {
     }
 }
 
+/// The framework frame's **image** planes become the crate-local
+/// frame; its side-channel records (colour signal, significant bits,
+/// palette, layer identity) are dropped — [`AvifFrame`] carries pixel
+/// planes only.
 #[cfg(feature = "registry")]
 impl From<oxideav_core::frame::VideoFrame> for AvifFrame {
     fn from(vf: oxideav_core::frame::VideoFrame) -> Self {
+        let image_planes = vf.image_plane_count();
         AvifFrame {
             pts: vf.pts,
-            planes: vf.planes.into_iter().map(Into::into).collect(),
+            planes: vf
+                .planes
+                .into_iter()
+                .take(image_planes)
+                .map(Into::into)
+                .collect(),
         }
     }
 }

@@ -18,7 +18,8 @@
 use crate::error::{AvifError as Error, Result};
 
 use crate::box_parser::{b, find_box, iter_boxes, parse_full_box, read_u32, read_u64, BoxType};
-use oxideav_heif::{sequence, HeifFile};
+use oxideav_heif::props as hprops;
+use oxideav_heif::{sequence, HeifFile, HeifFileRef};
 
 const MOOV: BoxType = b(b"moov");
 const TRAK: BoxType = b(b"trak");
@@ -417,6 +418,11 @@ pub struct AvisMeta {
     /// Required by the AV1 decoder to bootstrap the sequence header.
     /// Spec: AV1-AVIF §2.2.1, ISO/IEC 14496-12 §8.5.2 (`stsd`).
     pub av1_codec_config: Option<Vec<u8>>,
+    /// Colour information of the first `av01` sample entry (`colr`
+    /// child of the sample entry, ISO/IEC 14496-12 §12.1.5): the
+    /// `nclx` one when the entry carries several, else the first.
+    /// `None` when the entry has no `colr`.
+    pub colr: Option<crate::meta::Colr>,
     /// `handler_type` four-CC extracted from the track's
     /// `mdia/hdlr` box (ISO/IEC 14496-12 §8.4.3). `None` when the
     /// `hdlr` box is missing or its body is truncated. av1-avif v1.2.0
@@ -486,7 +492,7 @@ pub fn parse_avis(file: &[u8]) -> Result<AvisMeta> {
     if find_box(file, &MOOV)?.is_none() {
         return Err(Error::InvalidData("avis: missing moov".to_string()));
     }
-    let heif = HeifFile::parse(file)?;
+    let heif = HeifFile::parse_borrowed(file)?;
     let movie = sequence::parse_movie(&heif)?
         .ok_or_else(|| Error::InvalidData("avis: missing moov".to_string()))?;
     let track = movie
@@ -508,6 +514,18 @@ pub fn parse_avis(file: &[u8]) -> Result<AvisMeta> {
         .iter()
         .find(|e| e.entry_type == AV01)
         .and_then(|e| e.av1c.as_ref().map(|c| c.raw.clone()));
+    let colr = track
+        .sample_entries
+        .iter()
+        .find(|e| e.entry_type == AV01)
+        .and_then(|e| {
+            e.colr
+                .iter()
+                .find(|c| matches!(c, hprops::Colr::Nclx { .. }))
+                .or_else(|| e.colr.first())
+                .cloned()
+        })
+        .map(crate::meta::Colr::from);
     let sample_description_types = track.sample_entries.iter().map(|e| e.entry_type).collect();
     let edit_list = track
         .edits
@@ -534,6 +552,7 @@ pub fn parse_avis(file: &[u8]) -> Result<AvisMeta> {
         display_dims: Some((track.width, track.height)),
         samples,
         av1_codec_config,
+        colr,
         handler: Some(track.handler),
         sample_description_types,
         edit_list,
@@ -547,7 +566,7 @@ pub fn parse_avis(file: &[u8]) -> Result<AvisMeta> {
 /// The raw `stbl` payload of the first track, located through the
 /// container's flattened box walk (`moov` → `trak` → `mdia` → `minf`
 /// → `stbl`), for the sample-group boxes this crate parses itself.
-fn first_track_stbl<'a>(heif: &HeifFile, file: &'a [u8]) -> Option<&'a [u8]> {
+fn first_track_stbl<'a>(heif: &HeifFileRef<'_>, file: &'a [u8]) -> Option<&'a [u8]> {
     let walk = heif.box_walk().ok()?;
     let mut in_first_trak = false;
     for entry in &walk {
@@ -1828,6 +1847,7 @@ mod tests {
                 },
             ],
             av1_codec_config: Some(vec![0x81, 0x04, 0x0c, 0x00]),
+            colr: None,
             handler: Some(HANDLER_PICT),
             sample_description_types: vec![AV01],
             edit_list: Vec::new(),
@@ -1855,6 +1875,7 @@ mod tests {
             display_dims: None,
             samples: Vec::new(),
             av1_codec_config: None,
+            colr: None,
             handler: Some(*b"vide"),
             sample_description_types: vec![AV01],
             edit_list: Vec::new(),
@@ -1880,6 +1901,7 @@ mod tests {
             display_dims: None,
             samples: Vec::new(),
             av1_codec_config: None,
+            colr: None,
             handler: None,
             sample_description_types: vec![AV01],
             edit_list: Vec::new(),
@@ -1902,6 +1924,7 @@ mod tests {
             display_dims: None,
             samples: Vec::new(),
             av1_codec_config: None,
+            colr: None,
             handler: Some(HANDLER_PICT),
             sample_description_types: vec![AV01, AV01],
             edit_list: Vec::new(),
@@ -1928,6 +1951,7 @@ mod tests {
             display_dims: None,
             samples: Vec::new(),
             av1_codec_config: None,
+            colr: None,
             handler: Some(HANDLER_PICT),
             sample_description_types: Vec::new(),
             edit_list: Vec::new(),
@@ -1955,6 +1979,7 @@ mod tests {
             display_dims: None,
             samples: Vec::new(),
             av1_codec_config: None,
+            colr: None,
             handler: Some(HANDLER_PICT),
             sample_description_types: vec![*b"hvc1"],
             edit_list: Vec::new(),
@@ -2002,6 +2027,7 @@ mod tests {
                 },
             ],
             av1_codec_config: None,
+            colr: None,
             handler: Some(HANDLER_PICT),
             sample_description_types: vec![AV01],
             edit_list: Vec::new(),
@@ -2032,6 +2058,7 @@ mod tests {
                 is_sync: true,
             }],
             av1_codec_config: None,
+            colr: None,
             handler: Some(HANDLER_PICT),
             sample_description_types: vec![AV01],
             edit_list: Vec::new(),
@@ -2061,6 +2088,7 @@ mod tests {
                 is_sync: true,
             }],
             av1_codec_config: None,
+            colr: None,
             handler: Some(HANDLER_PICT),
             sample_description_types: vec![AV01],
             edit_list: Vec::new(),
@@ -2101,6 +2129,7 @@ mod tests {
                 },
             ],
             av1_codec_config: None,
+            colr: None,
             handler: Some(HANDLER_PICT),
             sample_description_types: vec![AV01],
             edit_list: Vec::new(),
@@ -2198,6 +2227,7 @@ mod tests {
             display_dims: None,
             samples: Vec::new(),
             av1_codec_config: av1c,
+            colr: None,
             handler: Some(HANDLER_PICT),
             sample_description_types: vec![AV01],
             edit_list: Vec::new(),

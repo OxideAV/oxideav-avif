@@ -1002,7 +1002,7 @@ fn real_world_fixtures_decode_end_to_end() {
         assert!(!vf.planes.is_empty(), "{name}: no planes");
         if expect_alpha {
             assert_eq!(
-                vf.planes.len(),
+                vf.image_plane_count(),
                 4,
                 "{name}: alpha auxiliary must composite to a 4-plane frame"
             );
@@ -1024,7 +1024,7 @@ fn real_world_fixtures_decode_end_to_end() {
         assert_eq!(y.stride as u32, expected_w, "{name}: width mismatch");
         let inferred_h = y.data.len().checked_div(y.stride).unwrap_or(0) as u32;
         assert_eq!(inferred_h, expected_h, "{name}: height mismatch");
-        for (pi, p) in vf.planes.iter().enumerate() {
+        for (pi, p) in vf.image_planes().iter().enumerate() {
             assert!(
                 p.data.len() >= p.stride,
                 "{name}: plane {pi} data shorter than one row"
@@ -1065,9 +1065,9 @@ fn decodes_small_fixtures_end_to_end() {
         assert_eq!(y.stride as u32, *w, "{name}: frame width");
         let inferred_h = y.data.len().checked_div(y.stride).unwrap_or(0) as u32;
         assert_eq!(inferred_h, *h, "{name}: frame height");
-        assert_eq!(vf.planes.len(), *nplanes, "{name}: plane count");
+        assert_eq!(vf.image_plane_count(), *nplanes, "{name}: plane count");
         // Each plane must carry at least stride*h bytes.
-        for (pi, p) in vf.planes.iter().enumerate() {
+        for (pi, p) in vf.image_planes().iter().enumerate() {
             assert!(
                 p.data.len() >= p.stride,
                 "{name}: plane {pi} data shorter than one row"
@@ -1097,7 +1097,11 @@ fn decodes_flat_gray_to_mid_value() {
         other => panic!("expected VideoFrame, got {other:?}"),
     };
     // 1 plane, mean close to 128, very small deviation.
-    assert_eq!(vf.planes.len(), 1, "monochrome AVIF decodes to 1 plane");
+    assert_eq!(
+        vf.image_plane_count(),
+        1,
+        "monochrome AVIF decodes to 1 plane"
+    );
     let p = &vf.planes[0];
     let sum: u64 = p.data.iter().map(|&x| x as u64).sum();
     let mean = sum as f64 / p.data.len() as f64;
@@ -1130,7 +1134,7 @@ fn end_to_end_decode_then_irot_roundtrips() {
 
     let decoded: AvifFrame = {
         let vf = decode_video("red64 (irot)", RED64);
-        assert_eq!(vf.planes.len(), 3, "red64 expects 3 planes");
+        assert_eq!(vf.image_plane_count(), 3, "red64 expects 3 planes");
         assert_eq!(vf.planes[0].stride, 64, "Y stride");
         assert_eq!(vf.planes[1].stride, 64, "U stride (4:4:4)");
         vf.into()
@@ -1682,7 +1686,7 @@ fn end_to_end_decode_then_clap_centre_crop() {
 
     let vf: AvifFrame = {
         let vf = decode_video("red64 (clap)", RED64);
-        assert_eq!(vf.planes.len(), 3);
+        assert_eq!(vf.image_plane_count(), 3);
         vf.into()
     };
 

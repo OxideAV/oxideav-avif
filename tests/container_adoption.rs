@@ -7,7 +7,7 @@
 
 use oxideav_avif::meta::Property;
 use oxideav_avif::{inspect, parse, parse_header, AvifDecoder};
-use oxideav_core::{CodecId, Decoder, Frame, Packet, TimeBase};
+use oxideav_core::{CodecId, CodecParameters, Decoder, Frame, Packet, TimeBase};
 use oxideav_heif::boxes::FourCc;
 use oxideav_heif::props::{self as hprops, Property as HProp};
 use oxideav_heif::{Av1Config, HeifWriter};
@@ -241,10 +241,14 @@ fn amendment_properties_leave_inspect_and_decode_unchanged() {
     let file = amendment_file();
     let info = inspect(&file).expect("inspect");
     assert_eq!(info.bits_per_channel, vec![8, 8, 8]);
-    let reference = decode_own(RED);
-    let frame = decode_own(&file);
-    assert_eq!(frame.planes.len(), reference.planes.len());
-    for (a, b) in frame.planes.iter().zip(&reference.planes) {
+    let mut reference = decode_own(RED);
+    let mut frame = decode_own(&file);
+    // The container-authored file carries no `colr` (the fixture's
+    // is an identity triple), so only the pixel planes are compared.
+    reference.take_color_signal();
+    frame.take_color_signal();
+    assert_eq!(frame.image_plane_count(), reference.image_plane_count());
+    for (a, b) in frame.image_planes().iter().zip(reference.image_planes()) {
         assert_eq!(a.stride, b.stride);
         assert_eq!(a.data, b.data);
     }
@@ -335,4 +339,239 @@ fn malformed_opaque_property_stays_raw() {
         .find(|p| &p.kind() == b"ndwt")
         .expect("ndwt still associated");
     assert!(matches!(raw, Property::Other(_, _)), "got {raw:?}");
+}
+
+// ---------------------------------------------------------------------
+// Item 2: zero-copy header, colour signal on frames, identity-matrix
+// items as planar RGB.
+// ---------------------------------------------------------------------
+
+use oxideav_core::{
+    ColorPrimaries, ColorRange, ColorSignal, MatrixCoefficients, PixelFormat,
+    TransferCharacteristics,
+};
+use oxideav_heif::HeifFileRef;
+
+/// `heif-enc -A -L -p chroma=444` of a 24×16 red→blue gradient: an
+/// identity-matrix (`nclx` 1 / 13 / 0, full range) lossless AV1 item.
+const IDENTITY_RGB: &[u8] = include_bytes!("fixtures/identity_rgb_lossless.avif");
+/// The gradient's interleaved RGB bytes (24 × 16 × 3).
+const IDENTITY_RGB_REF: &[u8] = include_bytes!("fixtures/identity_rgb_lossless.rgb");
+/// A black-box encoder's 20×12 10-bit 4:2:0 still signalled `nclx`
+/// 9 / 16 / 9 with `full_range_flag = 1`.
+const YUV420_10BIT_FULL: &[u8] = include_bytes!("fixtures/yuv420_10bit_full.avif");
+const MONOCHROME: &[u8] = include_bytes!("fixtures/monochrome.avif");
+
+fn decoder_after(file: &[u8]) -> (AvifDecoder, oxideav_core::frame::VideoFrame) {
+    let mut d = AvifDecoder::new(CodecId::new(oxideav_avif::CODEC_ID_STR));
+    let pkt = Packet::new(0, TimeBase::new(1, 1), file.to_vec());
+    d.send_packet(&pkt).expect("send_packet");
+    let frame = match d.receive_frame() {
+        Ok(Frame::Video(v)) => v,
+        other => panic!("expected a video frame, got {other:?}"),
+    };
+    (d, frame)
+}
+
+/// The header borrows the caller's bytes — the container view is the
+/// zero-copy `HeifFileRef`, and the primary payload of a one-span
+/// item is a borrowed slice of the input.
+#[test]
+fn header_borrows_the_input() {
+    let hdr = parse_header(RED).expect("parse_header");
+    let view: &HeifFileRef<'_> = &hdr.heif;
+    assert!(view.meta.is_some());
+    let img = parse(RED).expect("parse");
+    assert!(matches!(
+        img.primary_item_data,
+        std::borrow::Cow::Borrowed(_)
+    ));
+    let payload: &[u8] = &img.primary_item_data;
+    let start = payload.as_ptr() as usize - RED.as_ptr() as usize;
+    assert!(
+        start + payload.len() <= RED.len(),
+        "payload lies inside the input"
+    );
+}
+
+/// A full-range 10-bit still is announced full range: the frame's
+/// colour-signal side channel and the decoder's `color_signal()` carry
+/// the item's `nclx` (9 / 16 / 9, full), and the label stays the
+/// 10-bit storage layout.
+#[test]
+fn full_range_ten_bit_still_reads_as_full_range() {
+    let (d, frame) = decoder_after(YUV420_10BIT_FULL);
+    let expected = ColorSignal::from_code_points(9, 16, 9, true);
+    assert_eq!(frame.color_signal(), Some(expected));
+    assert_eq!(d.color_signal(), Some(expected));
+    assert_eq!(d.output_format(), Some(PixelFormat::Yuv420P10Le));
+    assert_eq!(expected.range, ColorRange::Full);
+}
+
+/// Without a `colr`, the MIAF §7.3.6.4 default applies: full range,
+/// BT.709 primaries, sRGB transfer, BT.601 matrix — never limited.
+#[test]
+fn absent_colr_is_the_miaf_full_range_default() {
+    let (d, frame) = decoder_after(MONOCHROME);
+    let sig = frame.color_signal().expect("signal attached");
+    assert_eq!(sig.range, ColorRange::Full);
+    assert_eq!(sig.primaries, ColorPrimaries(1));
+    assert_eq!(sig.transfer, TransferCharacteristics(13));
+    assert_eq!(sig.matrix, MatrixCoefficients(6));
+    assert_eq!(d.output_format(), Some(PixelFormat::Gray8));
+}
+
+/// An identity-matrix lossless item from a black-box encoder decodes
+/// as planar RGB: `Gbrp8`, planes G / B / R equal to the source
+/// gradient's channels, and the signal says matrix 0 / full range.
+#[test]
+fn identity_matrix_item_is_planar_rgb() {
+    let (d, frame) = decoder_after(IDENTITY_RGB);
+    assert_eq!(d.output_format(), Some(PixelFormat::Gbrp8));
+    let sig = frame.color_signal().expect("signal attached");
+    assert_eq!(sig, ColorSignal::srgb());
+    assert_eq!(frame.image_plane_count(), 3, "G, B, R planes");
+    let (w, h) = (24usize, 16usize);
+    let chan = |c: usize| -> Vec<u8> { IDENTITY_RGB_REF.chunks_exact(3).map(|p| p[c]).collect() };
+    let plane = |i: usize| -> Vec<u8> {
+        let p = &frame.planes[i];
+        (0..h)
+            .flat_map(|r| p.data[r * p.stride..r * p.stride + w].to_vec())
+            .collect()
+    };
+    assert_eq!(plane(0), chan(1), "plane 0 is G");
+    assert_eq!(plane(1), chan(2), "plane 1 is B");
+    assert_eq!(plane(2), chan(0), "plane 2 is R");
+}
+
+/// Encoder side: the stream's `color_signal` is written as the item's
+/// `colr` and coded into the AV1 range bit; a 10-bit planar input
+/// signalled full range round-trips as a full-range 10-bit still.
+#[test]
+fn encoder_writes_the_signalled_colr_and_range() {
+    let (w, h) = (16u32, 8u32);
+    let mut params = CodecParameters::video(CodecId::new(oxideav_avif::CODEC_ID_STR));
+    params.width = Some(w);
+    params.height = Some(h);
+    params.pixel_format = Some(PixelFormat::Yuv420P10Le);
+    params.color_signal = ColorSignal::from_code_points(9, 16, 9, true);
+    let mut enc = oxideav_avif::make_encoder(&params).expect("encoder");
+    let plane16 = |n: usize, v: u16| -> Vec<u8> { (0..n).flat_map(|_| v.to_le_bytes()).collect() };
+    let frame = oxideav_core::frame::VideoFrame {
+        pts: Some(0),
+        planes: vec![
+            oxideav_core::frame::VideoPlane {
+                stride: w as usize * 2,
+                data: plane16((w * h) as usize, 1000),
+            },
+            oxideav_core::frame::VideoPlane {
+                stride: w as usize,
+                data: plane16((w * h / 4) as usize, 512),
+            },
+            oxideav_core::frame::VideoPlane {
+                stride: w as usize,
+                data: plane16((w * h / 4) as usize, 512),
+            },
+        ],
+    };
+    enc.send_frame(&Frame::Video(frame)).expect("send_frame");
+    let pkt = enc.receive_packet().expect("packet");
+    assert_eq!(
+        enc.output_params().color_signal,
+        ColorSignal::from_code_points(9, 16, 9, true)
+    );
+    let info = inspect(&pkt.data).expect("inspect");
+    assert!(
+        matches!(
+            info.colour,
+            Some(oxideav_avif::Colr::Nclx {
+                colour_primaries: 9,
+                transfer_characteristics: 16,
+                matrix_coefficients: 9,
+                full_range: true,
+            })
+        ),
+        "{:?}",
+        info.colour
+    );
+    let (d, out) = decoder_after(&pkt.data);
+    assert_eq!(d.output_format(), Some(PixelFormat::Yuv420P10Le));
+    assert_eq!(
+        out.color_signal(),
+        Some(ColorSignal::from_code_points(9, 16, 9, true))
+    );
+    // Lossless: the constant planes come back exactly.
+    assert!(out.planes[0]
+        .data
+        .chunks_exact(2)
+        .all(|c| u16::from_le_bytes([c[0], c[1]]) == 1000));
+    // A limited-range signal writes full_range_flag = 0.
+    params.color_signal = ColorSignal::bt709_limited();
+    let mut enc = oxideav_avif::make_encoder(&params).expect("encoder");
+    let frame = oxideav_core::frame::VideoFrame {
+        pts: Some(0),
+        planes: vec![
+            oxideav_core::frame::VideoPlane {
+                stride: w as usize * 2,
+                data: plane16((w * h) as usize, 600),
+            },
+            oxideav_core::frame::VideoPlane {
+                stride: w as usize,
+                data: plane16((w * h / 4) as usize, 512),
+            },
+            oxideav_core::frame::VideoPlane {
+                stride: w as usize,
+                data: plane16((w * h / 4) as usize, 512),
+            },
+        ],
+    };
+    enc.send_frame(&Frame::Video(frame)).expect("send_frame");
+    let pkt = enc.receive_packet().expect("packet");
+    let (d, out) = decoder_after(&pkt.data);
+    assert_eq!(out.color_signal(), Some(ColorSignal::bt709_limited()));
+    assert_eq!(d.color_signal().map(|s| s.range), Some(ColorRange::Limited));
+}
+
+/// Planar RGB input (`Gbrp8` / `Gbrp10Le`) is coded as an identity
+/// 4:4:4 item and comes back as the same planar RGB, sample-exact.
+#[test]
+fn planar_rgb_input_round_trips_as_planar_rgb() {
+    let (w, h) = (12u32, 10u32);
+    for (fmt, depth) in [(PixelFormat::Gbrp8, 8u8), (PixelFormat::Gbrp10Le, 10u8)] {
+        let mut params = CodecParameters::video(CodecId::new(oxideav_avif::CODEC_ID_STR));
+        params.width = Some(w);
+        params.height = Some(h);
+        params.pixel_format = Some(fmt);
+        let mut enc = oxideav_avif::make_encoder(&params).expect("encoder");
+        let n = (w * h) as usize;
+        let max = (1u32 << depth) - 1;
+        let sample = |i: usize, k: u32| -> u16 { ((i as u32 * 37 + k * 101) % (max + 1)) as u16 };
+        let planes: Vec<oxideav_core::frame::VideoPlane> = (0..3)
+            .map(|k| {
+                let data: Vec<u8> = if depth == 8 {
+                    (0..n).map(|i| sample(i, k) as u8).collect()
+                } else {
+                    (0..n).flat_map(|i| sample(i, k).to_le_bytes()).collect()
+                };
+                oxideav_core::frame::VideoPlane {
+                    stride: w as usize * if depth == 8 { 1 } else { 2 },
+                    data,
+                }
+            })
+            .collect();
+        let frame = oxideav_core::frame::VideoFrame {
+            pts: Some(0),
+            planes: planes.clone(),
+        };
+        enc.send_frame(&Frame::Video(frame)).expect("send_frame");
+        let pkt = enc.receive_packet().expect("packet");
+        assert_eq!(enc.output_params().color_signal, ColorSignal::srgb());
+        let (d, out) = decoder_after(&pkt.data);
+        assert_eq!(d.output_format(), Some(fmt), "{fmt:?}");
+        assert_eq!(out.color_signal(), Some(ColorSignal::srgb()));
+        for (k, (got, want)) in out.image_planes().iter().zip(&planes).enumerate() {
+            assert_eq!(got.stride, want.stride);
+            assert_eq!(got.data, want.data, "{fmt:?} plane {k}");
+        }
+    }
 }

@@ -24,8 +24,28 @@
 //!   the H.273 identity matrix in 4:4:4 (lossless-capable; see
 //!   [`crate::still::StillImage::rgb8`]); the alpha channel becomes
 //!   an alpha auxiliary item.
+//! * Planar RGB(A): `Gbrp8` / `Gbrap8` / `Gbrp10Le` / `Gbrap10Le` /
+//!   `Gbrp12Le` / `Gbrap12Le` (planes G, B, R [, A] — the layout the
+//!   decoder labels an identity-matrix item with): coded as an
+//!   identity-matrix 4:4:4 item at the input depth, alpha as the
+//!   auxiliary.
 //! * Alpha-carrying planar: `Yuva420P` (four planes, full-resolution
 //!   alpha) and `Ya8` (interleaved luma + alpha).
+//!
+//! # Colour signal
+//!
+//! [`CodecParameters::color_signal`] (oxideav-core 0.1.37) decides the
+//! `colr` `nclx` the item is written with: a specified range writes
+//! `full_range_flag` (and codes the AV1 `color_range` bit to match),
+//! specified primaries / transfer / matrix code points are written as
+//! given. The `YuvJ*` labels imply full range and the RGB layouts the
+//! identity matrix (a signalled matrix cannot override it — the planes
+//! *are* G B R); with nothing signalled the item keeps this crate's
+//! historical defaults (no `colr` for Y′CbCr input, `1 / 13 / 0` full
+//! range for RGB). An item that carries primaries / transfer but no
+//! range is written limited (H.273's inferred `VideoFullRangeFlag`).
+//! The encoder's [`Encoder::output_params`] carry the signal the file
+//! was written with.
 //!
 //! # Options
 //!
@@ -39,10 +59,14 @@
 
 use oxideav_core::frame::VideoFrame;
 use oxideav_core::{
-    CodecId, CodecParameters, Encoder, Error, Frame, Packet, PixelFormat, Result, TimeBase,
+    CodecId, CodecParameters, ColorRange, ColorSignal, Encoder, Error, Frame, Packet, PixelFormat,
+    Result, TimeBase,
 };
 
-use crate::still::{encode_still, StillChroma, StillEncodeOptions, StillImage};
+use crate::meta::Colr;
+use crate::still::{
+    encode_still, identity_full_range_colr, StillChroma, StillEncodeOptions, StillImage,
+};
 
 /// Frame-to-AVIF encoder: every video frame becomes one complete AVIF
 /// file packet. See the module docs for the input-format mapping and
@@ -140,15 +164,76 @@ impl AvifEncoder {
             PixelFormat::Bgra => packed_rgb(vf, width, height, 4, [2, 1, 0])?,
             PixelFormat::Yuva420P => yuva420(vf, width, height)?,
             PixelFormat::Ya8 => ya8(vf, width, height)?,
+            PixelFormat::Gbrp8 => planar_gbr(vf, width, height, 8, false)?,
+            PixelFormat::Gbrap8 => planar_gbr(vf, width, height, 8, true)?,
+            PixelFormat::Gbrp10Le => planar_gbr(vf, width, height, 10, false)?,
+            PixelFormat::Gbrap10Le => planar_gbr(vf, width, height, 10, true)?,
+            PixelFormat::Gbrp12Le => planar_gbr(vf, width, height, 12, false)?,
+            PixelFormat::Gbrap12Le => planar_gbr(vf, width, height, 12, true)?,
             other => {
                 return Err(Error::unsupported(format!(
                     "avif encode: pixel format {other:?} is not supported \
-                     (planar YUV 8/10/12-bit, Gray, RGB(A)/BGR(A), Yuva420P, Ya8)"
+                     (planar YUV 8/10/12-bit, Gray, RGB(A)/BGR(A), Gbrp(a) 8/10/12-bit, \
+                     Yuva420P, Ya8)"
                 )))
             }
         };
-        Ok(img)
+        Ok(apply_color_signal(img, &self.params))
     }
+}
+
+/// Fold the stream's [`CodecParameters::color_signal`] into the item's
+/// `colr` (see the module docs): the layout's own implications (`YuvJ*`
+/// full range, RGB identity) stay, every specified field of the signal
+/// is written, and with nothing specified the image is left as built.
+fn apply_color_signal(mut img: StillImage, params: &CodecParameters) -> StillImage {
+    let signal = params.color_signal;
+    let range = params.resolved_color_range();
+    if signal.is_unspecified() && range.is_unspecified() {
+        return img;
+    }
+    let (mut p, mut t, mut m, mut full) = match img.colr {
+        Some(Colr::Nclx {
+            colour_primaries,
+            transfer_characteristics,
+            matrix_coefficients,
+            full_range,
+        }) => (
+            colour_primaries,
+            transfer_characteristics,
+            matrix_coefficients,
+            full_range,
+        ),
+        _ => (2, 2, 2, false),
+    };
+    let rgb = m == 0;
+    if !signal.primaries.is_unspecified() {
+        p = u16::from(signal.primaries.0);
+    }
+    if !signal.transfer.is_unspecified() {
+        t = u16::from(signal.transfer.0);
+    }
+    if !rgb && !signal.matrix.is_unspecified() {
+        m = u16::from(signal.matrix.0);
+    }
+    match range {
+        ColorRange::Full => full = true,
+        ColorRange::Limited => full = false,
+        _ => {}
+    }
+    img.colr = Some(Colr::Nclx {
+        colour_primaries: p,
+        transfer_characteristics: t,
+        matrix_coefficients: m,
+        full_range: full,
+    });
+    img
+}
+
+/// The colour signal an encoded item carries, from its `colr` —
+/// what [`Encoder::output_params`] announce.
+fn signal_of(img: &StillImage) -> ColorSignal {
+    crate::signal::color_signal_for(img.colr.as_ref())
 }
 
 /// Extract one tightly-packed plane (`w × h` samples, 1 byte each)
@@ -209,10 +294,10 @@ fn planar8(
     } else {
         3
     };
-    if vf.planes.len() != planes_needed {
+    if vf.image_plane_count() != planes_needed {
         return Err(Error::invalid(format!(
             "avif encode: {chroma:?} expects {planes_needed} planes, got {}",
-            vf.planes.len()
+            vf.image_plane_count()
         )));
     }
     let (sx, sy) = chroma_shift(chroma);
@@ -250,10 +335,10 @@ fn planar16(
     } else {
         3
     };
-    if vf.planes.len() != planes_needed {
+    if vf.image_plane_count() != planes_needed {
         return Err(Error::invalid(format!(
             "avif encode: {chroma:?} {bit_depth}-bit expects {planes_needed} planes, got {}",
-            vf.planes.len()
+            vf.image_plane_count()
         )));
     }
     let (sx, sy) = chroma_shift(chroma);
@@ -280,10 +365,10 @@ fn packed_rgb(
     bpp: usize,
     rgb_at: [usize; 3],
 ) -> Result<StillImage> {
-    if vf.planes.len() != 1 {
+    if vf.image_plane_count() != 1 {
         return Err(Error::invalid(format!(
             "avif encode: packed RGB expects 1 plane, got {}",
-            vf.planes.len()
+            vf.image_plane_count()
         )));
     }
     let plane = &vf.planes[0];
@@ -320,11 +405,47 @@ fn packed_rgb(
     }
 }
 
+/// Planar RGB(A) (`Gbrp*` / `Gbrap*`: planes G, B, R [, A]) → an
+/// identity-matrix 4:4:4 item (Y = G, Cb = B, Cr = R, H.273 §8.3) at
+/// `bit_depth`, the alpha plane as the auxiliary.
+fn planar_gbr(
+    vf: &VideoFrame,
+    width: u32,
+    height: u32,
+    bit_depth: u8,
+    alpha: bool,
+) -> Result<StillImage> {
+    let planes_needed = if alpha { 4 } else { 3 };
+    if vf.image_plane_count() != planes_needed {
+        return Err(Error::invalid(format!(
+            "avif encode: planar RGB{} {bit_depth}-bit expects {planes_needed} planes, got {}",
+            if alpha { "A" } else { "" },
+            vf.image_plane_count()
+        )));
+    }
+    let (w, h) = (width as usize, height as usize);
+    let pack = |i: usize| -> Result<Vec<u16>> {
+        if bit_depth == 8 {
+            pack8(&vf.planes[i], w, h)
+        } else {
+            pack16le(&vf.planes[i], w, h)
+        }
+    };
+    let (g, b, r) = (pack(0)?, pack(1)?, pack(2)?);
+    let img = StillImage::yuv(width, height, bit_depth, StillChroma::Yuv444, g, b, r)?
+        .with_colr(identity_full_range_colr());
+    if alpha {
+        Ok(img.with_alpha(pack(3)?)?)
+    } else {
+        Ok(img)
+    }
+}
+
 fn yuva420(vf: &VideoFrame, width: u32, height: u32) -> Result<StillImage> {
-    if vf.planes.len() != 4 {
+    if vf.image_plane_count() != 4 {
         return Err(Error::invalid(format!(
             "avif encode: Yuva420P expects 4 planes, got {}",
-            vf.planes.len()
+            vf.image_plane_count()
         )));
     }
     let (w, h) = (width as usize, height as usize);
@@ -342,10 +463,10 @@ fn yuva420(vf: &VideoFrame, width: u32, height: u32) -> Result<StillImage> {
 }
 
 fn ya8(vf: &VideoFrame, width: u32, height: u32) -> Result<StillImage> {
-    if vf.planes.len() != 1 {
+    if vf.image_plane_count() != 1 {
         return Err(Error::invalid(format!(
             "avif encode: Ya8 expects 1 interleaved plane, got {}",
-            vf.planes.len()
+            vf.image_plane_count()
         )));
     }
     let plane = &vf.planes[0];
@@ -397,6 +518,7 @@ impl Encoder for AvifEncoder {
             }
         };
         let img = self.frame_to_still(vf)?;
+        self.params.color_signal = signal_of(&img);
         let bytes = encode_still(&img, &self.opts)?;
         let mut pkt = Packet::new(0, TimeBase::new(1, 90_000), bytes);
         if let Some(pts) = vf.pts {
@@ -491,7 +613,7 @@ mod tests {
             Frame::Video(v) => v,
             _ => unreachable!(),
         };
-        assert_eq!(vf.planes.len(), 3);
+        assert_eq!(vf.image_plane_count(), 3);
         for i in 0..3 {
             assert_eq!(vf.planes[i].data, src.planes[i].data, "plane {i}");
         }

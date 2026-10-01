@@ -511,7 +511,7 @@ fn widen(p: &[u8]) -> Vec<u16> {
 
 /// The `colr` `nclx` triple the RGB constructors signal: BT.709
 /// primaries, sRGB transfer, H.273 identity matrix, full range.
-fn identity_full_range_colr() -> Colr {
+pub(crate) fn identity_full_range_colr() -> Colr {
     Colr::Nclx {
         colour_primaries: 1,
         transfer_characteristics: 13,
