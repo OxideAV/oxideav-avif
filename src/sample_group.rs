@@ -57,6 +57,7 @@ const MAX_RUNS: usize = 1 << 20;
 /// fragment-local bit is decoded on demand via
 /// [`SampleToGroupRun::is_fragment_local`] /
 /// [`SampleToGroupRun::description_index`].
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SampleToGroupRun {
     /// Number of consecutive samples covered by this run.
@@ -66,6 +67,20 @@ pub struct SampleToGroupRun {
     /// fragment-local flag in its msb — see
     /// [`Self::is_fragment_local`].
     pub group_description_index: u32,
+}
+
+impl SampleToGroupRun {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(sample_count: u32, group_description_index: u32) -> Self {
+        Self {
+            sample_count,
+            group_description_index,
+        }
+    }
 }
 
 impl SampleToGroupRun {
@@ -100,6 +115,7 @@ impl SampleToGroupRun {
 }
 
 /// Which on-wire box a [`SampleToGroup`] was decoded from.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SampleToGroupKind {
     /// ISO/IEC 14496-12:2015 §8.9.2 `sbgp` (run-length table).
@@ -115,6 +131,7 @@ pub enum SampleToGroupKind {
 /// [`SampleToGroupRun`]s covering the samples in declaration order. The
 /// per-sample group index is recovered with
 /// [`Self::group_index_for_sample`].
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SampleToGroup {
     /// Which box produced this mapping.
@@ -133,6 +150,29 @@ pub struct SampleToGroup {
     pub index_bits: u32,
     /// The ordered `(sample_count, index)` runs.
     pub runs: Vec<SampleToGroupRun>,
+}
+
+impl SampleToGroup {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        kind: SampleToGroupKind,
+        grouping_type: BoxType,
+        grouping_type_parameter: Option<u32>,
+        index_bits: u32,
+        runs: Vec<SampleToGroupRun>,
+    ) -> Self {
+        Self {
+            kind,
+            grouping_type,
+            grouping_type_parameter,
+            index_bits,
+            runs,
+        }
+    }
 }
 
 impl SampleToGroup {
@@ -180,6 +220,7 @@ impl SampleToGroup {
 /// `default_length` (v1), and its `default_group_description_index`
 /// (v2): the latter is the index assigned to any sample not explicitly
 /// covered by an `sbgp`/`csgp` run (§8.9.3.3).
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SampleGroupDescription {
     /// FullBox version (0, 1, or 2 in the staged editions).
@@ -212,6 +253,31 @@ pub struct SampleGroupDescription {
     /// `group_description_index` from an `sbgp`/`csgp` run selects
     /// `entries[index - 1]`.
     pub entries: Vec<Vec<u8>>,
+}
+
+impl SampleGroupDescription {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        version: u8,
+        grouping_type: BoxType,
+        default_length: Option<u32>,
+        default_group_description_index: Option<u32>,
+        entry_count: u32,
+        entries: Vec<Vec<u8>>,
+    ) -> Self {
+        Self {
+            version,
+            grouping_type,
+            default_length,
+            default_group_description_index,
+            entry_count,
+            entries,
+        }
+    }
 }
 
 /// Decode an `sbgp` (`SampleToGroupBox`) payload — the FullBox body
@@ -572,6 +638,7 @@ impl<'a> BitReader<'a> {
 /// selected by the 1-based `group_description_index` from an
 /// `sbgp`/`csgp` run indexing into
 /// [`SampleGroupDescription::entries`].
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BracketingEntry {
     /// `'aebr'` AutoExposureBracketingEntry (§6.8.6.2.2). The exposure
@@ -709,6 +776,7 @@ impl SampleGroupDescription {
 /// entity group: the image time `T = C + O/(M/256)` where `C` is the
 /// sample composition time, `O` is [`time_offset`](Self::time_offset),
 /// and `M` is [`timescale_multiplier`](Self::timescale_multiplier).
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VisualEquivalenceEntry {
     /// `signed int(16) time_offset` — the difference, expressed in the
@@ -723,6 +791,20 @@ pub struct VisualEquivalenceEntry {
     /// value is `1.0` (`1 << 8`); the value `0` is reserved and `shall`
     /// not be used.
     pub timescale_multiplier: u16,
+}
+
+impl VisualEquivalenceEntry {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(time_offset: i16, timescale_multiplier: u16) -> Self {
+        Self {
+            time_offset,
+            timescale_multiplier,
+        }
+    }
 }
 
 impl VisualEquivalenceEntry {

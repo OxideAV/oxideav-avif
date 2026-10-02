@@ -253,40 +253,34 @@ fn authored() -> (StillImage, Vec<u8>) {
         matrix_coefficients: 2,
         full_range: true,
     });
-    let metadata = GainMapMetadata {
-        minimum_version: 0,
-        writer_version: 0,
-        is_multichannel: false,
-        use_base_colour_space: true,
-        base_hdr_headroom: rational(0, 1),
-        alternate_hdr_headroom: rational(3, 1),
-        channels: vec![GainMapChannel {
-            gain_map_min: rational(0, 1),
-            gain_map_max: rational(3, 1),
-            gamma: rational(1, 1),
-            base_offset: rational(1, 64),
-            alternate_offset: rational(1, 64),
-        }],
-    };
-    base.props = StillProperties {
-        gain_map: Some(Box::new(GainMapSpec {
-            map,
-            metadata,
-            alternate_colr: Colr::Nclx {
-                colour_primaries: 9,
-                transfer_characteristics: 16,
-                matrix_coefficients: 9,
-                full_range: true,
-            },
-            alternate_clli: Some(oxideav_avif::meta::Clli {
-                max_content_light_level: 1600,
-                max_pic_average_light_level: 400,
-            }),
-            alternate_bit_depth: Some(10),
-            q: 0,
-        })),
-        ..Default::default()
-    };
+    let metadata = GainMapMetadata::new(
+        0,
+        0,
+        false,
+        true,
+        rational(0, 1),
+        rational(3, 1),
+        vec![GainMapChannel::new(
+            rational(0, 1),
+            rational(3, 1),
+            rational(1, 1),
+            rational(1, 64),
+            rational(1, 64),
+        )],
+    );
+    base.props = StillProperties::default().with_gain_map(Some(Box::new(GainMapSpec::new(
+        map,
+        metadata,
+        Colr::Nclx {
+            colour_primaries: 9,
+            transfer_characteristics: 16,
+            matrix_coefficients: 9,
+            full_range: true,
+        },
+        Some(oxideav_avif::meta::Clli::new(1600, 400)),
+        Some(10),
+        0,
+    ))));
     let file = encode_still(&base, &StillEncodeOptions::default()).expect("encode_still");
     (base, file)
 }

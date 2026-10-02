@@ -45,12 +45,29 @@ pub const HANDLER_PICT: BoxType = *b"pict";
 /// the movie's timescale (see [`AvisMeta::timescale`]). `is_sync` flags
 /// sync samples — keyframes that can be decoded standalone. When `stss`
 /// is absent every sample is a sync sample.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Sample {
     pub offset: u64,
     pub size: u32,
     pub duration: u32,
     pub is_sync: bool,
+}
+
+impl Sample {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(offset: u64, size: u32, duration: u32, is_sync: bool) -> Self {
+        Self {
+            offset,
+            size,
+            duration,
+            is_sync,
+        }
+    }
 }
 
 /// One `elst` entry: a single segment of the track's presentation
@@ -76,6 +93,7 @@ pub struct Sample {
 /// v1 64-bit shape so the entry shape stays version-agnostic for
 /// callers. `media_rate_fraction` is preserved as a diagnostic — the
 /// spec sets it to `0` and gives no use for non-zero values.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EditListEntry {
     /// `segment_duration` in movie-timescale (`mvhd::timescale`) units.
@@ -91,6 +109,27 @@ pub struct EditListEntry {
     /// equation: rate = `integer + fraction / 65536`. Almost always
     /// `0`).
     pub media_rate_fraction: i16,
+}
+
+impl EditListEntry {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        segment_duration: u64,
+        media_time: i64,
+        media_rate_integer: i16,
+        media_rate_fraction: i16,
+    ) -> Self {
+        Self {
+            segment_duration,
+            media_time,
+            media_rate_integer,
+            media_rate_fraction,
+        }
+    }
 }
 
 impl EditListEntry {
@@ -154,6 +193,7 @@ impl EditListEntry {
 ///
 /// All fields are widened to their largest version shape (`u64`
 /// `media_time`) so callers stay version-agnostic.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProducerReferenceTime {
     /// FullBox `version` (`0` or `1`). v0 carries a 32-bit `media_time`;
@@ -174,6 +214,29 @@ pub struct ProducerReferenceTime {
     /// timescale (`mdhd::timescale`). v0 sources this from a 32-bit
     /// field; v1 from a 64-bit field.
     pub media_time: u64,
+}
+
+impl ProducerReferenceTime {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        version: u8,
+        flags: u32,
+        reference_track_id: u32,
+        ntp_timestamp: u64,
+        media_time: u64,
+    ) -> Self {
+        Self {
+            version,
+            flags,
+            reference_track_id,
+            ntp_timestamp,
+            media_time,
+        }
+    }
 }
 
 impl ProducerReferenceTime {
@@ -281,6 +344,7 @@ pub fn parse_producer_reference_times(file: &[u8]) -> Vec<ProducerReferenceTime>
 /// slice of the subsegment. Ranges within a subsegment are contiguous
 /// and together cover every byte of it, so a client can fetch a partial
 /// subsegment (e.g. just the base layer) by summing leading ranges.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SubsegmentRange {
     /// Level (per the `leva` Level Assignment Box) to which this partial
@@ -289,6 +353,17 @@ pub struct SubsegmentRange {
     /// Size in bytes of this level's contiguous byte range within the
     /// subsegment. `unsigned int(24)` on the wire (max 16 MiB − 1).
     pub range_size: u32,
+}
+
+impl SubsegmentRange {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(level: u8, range_size: u32) -> Self {
+        Self { level, range_size }
+    }
 }
 
 /// One `ssix` SubsegmentIndexBox (ISO/IEC 14496-12 §8.16.4).
@@ -305,12 +380,24 @@ pub struct SubsegmentRange {
 ///
 /// `subsegment_count` shall equal the `reference_count` of the preceding
 /// `sidx`; each subsegment's `range_count` shall be ≥ 2.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubsegmentIndex {
     /// One entry per indexed subsegment, in bitstream order. Each is the
     /// ordered list of `(level, range_size)` partitions covering that
     /// subsegment. The outer length is the box's `subsegment_count`.
     pub subsegments: Vec<Vec<SubsegmentRange>>,
+}
+
+impl SubsegmentIndex {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(subsegments: Vec<Vec<SubsegmentRange>>) -> Self {
+        Self { subsegments }
+    }
 }
 
 /// Parse a single `ssix` box payload (the bytes after the size/type
@@ -391,6 +478,7 @@ pub fn parse_subsegment_indexes(file: &[u8]) -> Vec<SubsegmentIndex> {
 }
 
 /// Container-side description of an AVIS image sequence.
+#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct AvisMeta {
     /// Movie timescale from `mvhd`. A duration of `timescale` == 1s.
@@ -471,6 +559,45 @@ pub struct AvisMeta {
     /// non-fragmented AVIS (the common case) — `ssix` only appears in
     /// `sidx`-indexed fragmented / segmented files.
     pub subsegment_indexes: Vec<SubsegmentIndex>,
+}
+
+impl AvisMeta {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        timescale: u32,
+        media_timescale: Option<u32>,
+        display_dims: Option<(u32, u32)>,
+        samples: Vec<Sample>,
+        av1_codec_config: Option<Vec<u8>>,
+        colr: Option<crate::meta::Colr>,
+        handler: Option<BoxType>,
+        sample_description_types: Vec<BoxType>,
+        edit_list: Vec<EditListEntry>,
+        sample_to_groups: Vec<crate::sample_group::SampleToGroup>,
+        sample_group_descriptions: Vec<crate::sample_group::SampleGroupDescription>,
+        producer_reference_times: Vec<ProducerReferenceTime>,
+        subsegment_indexes: Vec<SubsegmentIndex>,
+    ) -> Self {
+        Self {
+            timescale,
+            media_timescale,
+            display_dims,
+            samples,
+            av1_codec_config,
+            colr,
+            handler,
+            sample_description_types,
+            edit_list,
+            sample_to_groups,
+            sample_group_descriptions,
+            producer_reference_times,
+            subsegment_indexes,
+        }
+    }
 }
 
 /// Walk the container and build a sample table. The input buffer must
@@ -641,6 +768,7 @@ pub fn sample_bytes<'a>(file: &'a [u8], sample: &Sample) -> Result<&'a [u8]> {
 /// record is a single-instance audit (one record per file): unlike
 /// the per-item `'av01'` audits in [`crate::derived`], an AVIS file
 /// has at most one image-sequence track.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct AvisSequenceCompliance {
     /// `true` when the first track's `mdia/hdlr/handler_type` equals
@@ -674,6 +802,35 @@ pub struct AvisSequenceCompliance {
     /// samples are skipped for the SH-OBU walk and do not flip
     /// [`Self::sequence_headers_identical`].
     pub samples_out_of_range: u32,
+}
+
+impl AvisSequenceCompliance {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        handler_is_pict: bool,
+        single_sample_description: bool,
+        sample_description_is_av01: bool,
+        sequence_headers_identical: bool,
+        observed_handler: Option<BoxType>,
+        sample_description_count: u32,
+        sequence_header_obu_count: u32,
+        samples_out_of_range: u32,
+    ) -> Self {
+        Self {
+            handler_is_pict,
+            single_sample_description,
+            sample_description_is_av01,
+            sequence_headers_identical,
+            observed_handler,
+            sample_description_count,
+            sequence_header_obu_count,
+            samples_out_of_range,
+        }
+    }
 }
 
 impl AvisSequenceCompliance {
@@ -794,6 +951,7 @@ pub fn audit_avis_sequence(meta: &AvisMeta, file: &[u8]) -> AvisSequenceComplian
 /// fan-out from the still-image audit collapses to per-`(track, profile)`
 /// here. AVIS files declaring neither `MA1B` nor `MA1A` skip the audit
 /// entirely — [`audit_avis_profile_compliance`] returns an empty vector.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AvisProfileCompliance {
     /// Which AVIF profile this record is checking the sequence track
@@ -811,6 +969,27 @@ pub struct AvisProfileCompliance {
     /// from a present-but-truncated `av1C`, which surfaces as both fields
     /// `None` without setting this flag.)
     pub missing_av1c: bool,
+}
+
+impl AvisProfileCompliance {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        profile: crate::derived::AvifProfile,
+        seq_profile: Option<u8>,
+        seq_level_idx_0: Option<u8>,
+        missing_av1c: bool,
+    ) -> Self {
+        Self {
+            profile,
+            seq_profile,
+            seq_level_idx_0,
+            missing_av1c,
+        }
+    }
 }
 
 impl AvisProfileCompliance {
@@ -951,6 +1130,7 @@ pub fn audit_avis_profile_compliance(
 /// callers wanting a single-record summary. An AVIS file without an
 /// `edts/elst` (the implicit-identity case) produces a record where
 /// every `shall` passes vacuously.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct EditListCompliance {
     /// `true` when no entry's `media_rate_integer` is outside the
@@ -977,6 +1157,31 @@ pub struct EditListCompliance {
     /// Diagnostic — number of entries flagged for
     /// [`Self::media_rate_in_range`]. `0` when every entry passes.
     pub out_of_range_rate_count: u32,
+}
+
+impl EditListCompliance {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        media_rate_in_range: bool,
+        last_entry_not_empty: bool,
+        entry_count: u32,
+        empty_edit_count: u32,
+        dwell_entry_count: u32,
+        out_of_range_rate_count: u32,
+    ) -> Self {
+        Self {
+            media_rate_in_range,
+            last_entry_not_empty,
+            entry_count,
+            empty_edit_count,
+            dwell_entry_count,
+            out_of_range_rate_count,
+        }
+    }
 }
 
 impl EditListCompliance {
@@ -1165,6 +1370,7 @@ fn walk_sequence_header_obus(payload: &[u8]) -> Vec<Vec<u8>> {
 /// — those remain accessible via [`parse_avis`] when needed. The
 /// fields surfaced here are summary signals + the three compliance
 /// records.
+#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct AvisInfo {
     /// `mvhd::timescale` — clock-ticks per second for the movie
@@ -1229,6 +1435,47 @@ pub struct AvisInfo {
     /// file without an `edts` produces a vacuously-compliant record
     /// (both `shall`s trivially satisfied).
     pub edit_list_compliance: EditListCompliance,
+}
+
+impl AvisInfo {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        timescale: u32,
+        media_timescale: Option<u32>,
+        display_dims: Option<(u32, u32)>,
+        sample_count: u32,
+        total_sample_duration: u64,
+        has_av1_codec_config: bool,
+        handler: Option<BoxType>,
+        sample_description_types: Vec<BoxType>,
+        brands: crate::parser::BrandClass,
+        has_edit_list: bool,
+        sample_to_group_count: u32,
+        sequence_compliance: AvisSequenceCompliance,
+        profile_compliance: Vec<AvisProfileCompliance>,
+        edit_list_compliance: EditListCompliance,
+    ) -> Self {
+        Self {
+            timescale,
+            media_timescale,
+            display_dims,
+            sample_count,
+            total_sample_duration,
+            has_av1_codec_config,
+            handler,
+            sample_description_types,
+            brands,
+            has_edit_list,
+            sample_to_group_count,
+            sequence_compliance,
+            profile_compliance,
+            edit_list_compliance,
+        }
+    }
 }
 
 impl AvisInfo {

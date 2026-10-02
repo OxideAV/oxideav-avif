@@ -107,6 +107,7 @@ impl StillChroma {
 /// Samples are carried as `u16` regardless of bit depth (values must
 /// fit `bit_depth` bits); the 8-bit constructors widen for you. Planes
 /// are tightly packed row-major at their natural (subsampled) extents.
+#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct StillImage {
     /// Luma width in pixels (≥ 1).
@@ -139,6 +140,41 @@ pub struct StillImage {
     pub props: StillProperties,
 }
 
+impl StillImage {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        width: u32,
+        height: u32,
+        bit_depth: u8,
+        chroma: StillChroma,
+        y: Vec<u16>,
+        u: Vec<u16>,
+        v: Vec<u16>,
+        alpha: Option<Vec<u16>>,
+        depth_map: Option<Vec<u16>>,
+        colr: Option<Colr>,
+        props: StillProperties,
+    ) -> Self {
+        Self {
+            width,
+            height,
+            bit_depth,
+            chroma,
+            y,
+            u,
+            v,
+            alpha,
+            depth_map,
+            colr,
+            props,
+        }
+    }
+}
+
 /// Pass-through container properties for [`encode_still`] — carried
 /// straight to the muxer, no pixel-path involvement.
 ///
@@ -151,6 +187,7 @@ pub struct StillImage {
 ///   properties (HEIF §6.5.10 application order `clap` → `irot` →
 ///   `imir`; the encoder's own padding `clap` composes with them).
 /// * `pasp` — pixel aspect ratio.
+#[non_exhaustive]
 #[derive(Clone, Debug, Default)]
 pub struct StillProperties {
     /// Exif payload (av1-avif §5.2).
@@ -180,6 +217,92 @@ pub struct StillProperties {
     pub gain_map: Option<Box<GainMapSpec>>,
 }
 
+impl StillProperties {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        exif: Option<Vec<u8>>,
+        xmp: Option<Vec<u8>>,
+        mdcv: Option<crate::meta::Mdcv>,
+        clli: Option<crate::meta::Clli>,
+        amve: Option<crate::meta::Amve>,
+        irot: Option<u8>,
+        imir: Option<u8>,
+        pasp: Option<crate::meta::Pasp>,
+        identity_derivation: Option<IdentityDerivation>,
+        gain_map: Option<Box<GainMapSpec>>,
+    ) -> Self {
+        Self {
+            exif,
+            xmp,
+            mdcv,
+            clli,
+            amve,
+            irot,
+            imir,
+            pasp,
+            identity_derivation,
+            gain_map,
+        }
+    }
+    /// Setter: replace `exif`.
+    pub fn with_exif(mut self, exif: Option<Vec<u8>>) -> Self {
+        self.exif = exif;
+        self
+    }
+    /// Setter: replace `xmp`.
+    pub fn with_xmp(mut self, xmp: Option<Vec<u8>>) -> Self {
+        self.xmp = xmp;
+        self
+    }
+    /// Setter: replace `mdcv`.
+    pub fn with_mdcv(mut self, mdcv: Option<crate::meta::Mdcv>) -> Self {
+        self.mdcv = mdcv;
+        self
+    }
+    /// Setter: replace `clli`.
+    pub fn with_clli(mut self, clli: Option<crate::meta::Clli>) -> Self {
+        self.clli = clli;
+        self
+    }
+    /// Setter: replace `amve`.
+    pub fn with_amve(mut self, amve: Option<crate::meta::Amve>) -> Self {
+        self.amve = amve;
+        self
+    }
+    /// Setter: replace `irot`.
+    pub fn with_irot(mut self, irot: Option<u8>) -> Self {
+        self.irot = irot;
+        self
+    }
+    /// Setter: replace `imir`.
+    pub fn with_imir(mut self, imir: Option<u8>) -> Self {
+        self.imir = imir;
+        self
+    }
+    /// Setter: replace `pasp`.
+    pub fn with_pasp(mut self, pasp: Option<crate::meta::Pasp>) -> Self {
+        self.pasp = pasp;
+        self
+    }
+    /// Setter: replace `identity_derivation`.
+    pub fn with_identity_derivation(
+        mut self,
+        identity_derivation: Option<IdentityDerivation>,
+    ) -> Self {
+        self.identity_derivation = identity_derivation;
+        self
+    }
+    /// Setter: replace `gain_map`.
+    pub fn with_gain_map(mut self, gain_map: Option<Box<GainMapSpec>>) -> Self {
+        self.gain_map = gain_map;
+        self
+    }
+}
+
 /// A gain map to author alongside a still (`StillProperties::gain_map`):
 /// the map picture is coded as a hidden `av01` item (its own size,
 /// depth and chroma; its `colr` matrix / range as given with
@@ -188,6 +311,7 @@ pub struct StillProperties {
 /// `tmap` item's own `colr` (the fully-applied rendition's
 /// colorimetry), and the `tmap` is placed in an `altr` group with the
 /// base, which stays the primary.
+#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct GainMapSpec {
     /// The gain map picture (monochrome, or 3-channel when the
@@ -205,6 +329,61 @@ pub struct GainMapSpec {
     pub alternate_bit_depth: Option<u8>,
     /// AV1 `base_q_idx` for the gain map (`0` = lossless).
     pub q: u8,
+}
+
+impl GainMapSpec {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        map: StillImage,
+        metadata: oxideav_heif::gainmap::GainMapMetadata,
+        alternate_colr: Colr,
+        alternate_clli: Option<crate::meta::Clli>,
+        alternate_bit_depth: Option<u8>,
+        q: u8,
+    ) -> Self {
+        Self {
+            map,
+            metadata,
+            alternate_colr,
+            alternate_clli,
+            alternate_bit_depth,
+            q,
+        }
+    }
+    /// Setter: replace `map`.
+    pub fn with_map(mut self, map: StillImage) -> Self {
+        self.map = map;
+        self
+    }
+    /// Setter: replace `metadata`.
+    pub fn with_metadata(mut self, metadata: oxideav_heif::gainmap::GainMapMetadata) -> Self {
+        self.metadata = metadata;
+        self
+    }
+    /// Setter: replace `alternate_colr`.
+    pub fn with_alternate_colr(mut self, alternate_colr: Colr) -> Self {
+        self.alternate_colr = alternate_colr;
+        self
+    }
+    /// Setter: replace `alternate_clli`.
+    pub fn with_alternate_clli(mut self, alternate_clli: Option<crate::meta::Clli>) -> Self {
+        self.alternate_clli = alternate_clli;
+        self
+    }
+    /// Setter: replace `alternate_bit_depth`.
+    pub fn with_alternate_bit_depth(mut self, alternate_bit_depth: Option<u8>) -> Self {
+        self.alternate_bit_depth = alternate_bit_depth;
+        self
+    }
+    /// Setter: replace `q`.
+    pub fn with_q(mut self, q: u8) -> Self {
+        self.q = q;
+        self
+    }
 }
 
 impl StillImage {
@@ -460,6 +639,7 @@ impl StillImage {
 /// Tuning for [`encode_still`] / [`encode_still_grid`]. The default
 /// is a lossless colour encode (`base_q_idx = 0`), lossless alpha,
 /// straight (non-premultiplied) alpha signalling.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StillEncodeOptions {
     /// AV1 `base_q_idx` for the colour planes. `0` = lossless
@@ -473,6 +653,36 @@ pub struct StillEncodeOptions {
     /// by alpha (HEIF §6.10.1.1). Signalling only — the samples are
     /// stored as given.
     pub premultiplied_alpha: bool,
+}
+
+impl StillEncodeOptions {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(base_q_idx: u8, alpha_q_idx: u8, premultiplied_alpha: bool) -> Self {
+        Self {
+            base_q_idx,
+            alpha_q_idx,
+            premultiplied_alpha,
+        }
+    }
+    /// Setter: replace `base_q_idx`.
+    pub fn with_base_q_idx(mut self, base_q_idx: u8) -> Self {
+        self.base_q_idx = base_q_idx;
+        self
+    }
+    /// Setter: replace `alpha_q_idx`.
+    pub fn with_alpha_q_idx(mut self, alpha_q_idx: u8) -> Self {
+        self.alpha_q_idx = alpha_q_idx;
+        self
+    }
+    /// Setter: replace `premultiplied_alpha`.
+    pub fn with_premultiplied_alpha(mut self, premultiplied_alpha: bool) -> Self {
+        self.premultiplied_alpha = premultiplied_alpha;
+        self
+    }
 }
 
 /// Per-axis coded-extent bound of the single-item encode (mirrors the
@@ -1099,6 +1309,7 @@ pub fn encode_still_grid(
 }
 
 /// The canvas of an overlay-derived encode ([`encode_still_overlay`]).
+#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct OverlayCanvas {
     /// `output_width` of the `iovl` descriptor (HEIF §6.6.2.2.3).
@@ -1118,6 +1329,39 @@ pub struct OverlayCanvas {
 }
 
 impl OverlayCanvas {
+    /// Setter: replace `width`.
+    pub fn with_width(mut self, width: u32) -> Self {
+        self.width = width;
+        self
+    }
+    /// Setter: replace `height`.
+    pub fn with_height(mut self, height: u32) -> Self {
+        self.height = height;
+        self
+    }
+    /// Setter: replace `fill_rgba`.
+    pub fn with_fill_rgba(mut self, fill_rgba: [u16; 4]) -> Self {
+        self.fill_rgba = fill_rgba;
+        self
+    }
+    /// Setter: replace `colr`.
+    pub fn with_colr(mut self, colr: Option<Colr>) -> Self {
+        self.colr = colr;
+        self
+    }
+    /// Setter: replace `irot`.
+    pub fn with_irot(mut self, irot: Option<u8>) -> Self {
+        self.irot = irot;
+        self
+    }
+    /// Setter: replace `imir`.
+    pub fn with_imir(mut self, imir: Option<u8>) -> Self {
+        self.imir = imir;
+        self
+    }
+}
+
+impl OverlayCanvas {
     /// An opaque-black canvas of the given extents.
     pub fn new(width: u32, height: u32) -> Self {
         Self {
@@ -1134,6 +1378,7 @@ impl OverlayCanvas {
 /// One layer of an overlay-derived encode: a still image and the
 /// canvas position of its top-left corner (signed — partially or
 /// wholly off-canvas placements are legal and clipped, §6.6.2.2.3).
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug)]
 pub struct OverlayLayerImage<'a> {
     /// The layer's pixels (alpha optional, encoded as its auxiliary).
@@ -1142,6 +1387,32 @@ pub struct OverlayLayerImage<'a> {
     pub x: i32,
     /// `vertical_offset`.
     pub y: i32,
+}
+
+impl<'a> OverlayLayerImage<'a> {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(image: &'a StillImage, x: i32, y: i32) -> Self {
+        Self { image, x, y }
+    }
+    /// Setter: replace `image`.
+    pub fn with_image(mut self, image: &'a StillImage) -> Self {
+        self.image = image;
+        self
+    }
+    /// Setter: replace `x`.
+    pub fn with_x(mut self, x: i32) -> Self {
+        self.x = x;
+        self
+    }
+    /// Setter: replace `y`.
+    pub fn with_y(mut self, y: i32) -> Self {
+        self.y = y;
+        self
+    }
 }
 
 /// Encode `layers` (bottom-most first) as an **overlay-derived** AVIF:

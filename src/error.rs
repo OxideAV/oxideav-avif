@@ -13,6 +13,7 @@
 use core::fmt;
 
 /// Crate-local error type for the AVIF parser + decoder pipeline.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AvifError {
     /// Bitstream / box layout / property was malformed.
@@ -55,6 +56,9 @@ impl From<oxideav_heif::HeifError> for AvifError {
             oxideav_heif::HeifError::InvalidData(s) => Self::InvalidData(s),
             oxideav_heif::HeifError::Unsupported(s) => Self::Unsupported(s),
             oxideav_heif::HeifError::ResourceExhausted(s) => Self::InvalidData(s),
+            // An error class the container adds later is still a
+            // refusal of the input from this crate's point of view.
+            other => Self::InvalidData(other.to_string()),
         }
     }
 }

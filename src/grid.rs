@@ -25,6 +25,7 @@ use crate::image::AvifPlane as VideoPlane;
 use crate::image::{AvifFrame as VideoFrame, AvifPixelFormat as PixelFormat};
 
 /// The `ImageGrid` descriptor (HEIF §6.6.2.3.2).
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ImageGrid {
     pub version: u8,
@@ -33,6 +34,61 @@ pub struct ImageGrid {
     pub columns: u16,
     pub output_width: u32,
     pub output_height: u32,
+}
+
+impl ImageGrid {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        version: u8,
+        flags: u8,
+        rows: u16,
+        columns: u16,
+        output_width: u32,
+        output_height: u32,
+    ) -> Self {
+        Self {
+            version,
+            flags,
+            rows,
+            columns,
+            output_width,
+            output_height,
+        }
+    }
+    /// Setter: replace `version`.
+    pub fn with_version(mut self, version: u8) -> Self {
+        self.version = version;
+        self
+    }
+    /// Setter: replace `flags`.
+    pub fn with_flags(mut self, flags: u8) -> Self {
+        self.flags = flags;
+        self
+    }
+    /// Setter: replace `rows`.
+    pub fn with_rows(mut self, rows: u16) -> Self {
+        self.rows = rows;
+        self
+    }
+    /// Setter: replace `columns`.
+    pub fn with_columns(mut self, columns: u16) -> Self {
+        self.columns = columns;
+        self
+    }
+    /// Setter: replace `output_width`.
+    pub fn with_output_width(mut self, output_width: u32) -> Self {
+        self.output_width = output_width;
+        self
+    }
+    /// Setter: replace `output_height`.
+    pub fn with_output_height(mut self, output_height: u32) -> Self {
+        self.output_height = output_height;
+        self
+    }
 }
 
 impl ImageGrid {
@@ -155,12 +211,7 @@ pub(crate) fn composite_grid_frames(
         u32::try_from(full_w).map_err(|_| Error::invalid("avif grid: canvas width overflow"))?,
         u32::try_from(full_h).map_err(|_| Error::invalid("avif grid: canvas height overflow"))?,
     );
-    let full = GridDescriptor {
-        rows: grid.rows,
-        columns: grid.columns,
-        output_width: full_w,
-        output_height: full_h,
-    };
+    let full = GridDescriptor::new(grid.rows, grid.columns, full_w, full_h);
     let composed = compose::composite_grid(&full, tiles)?;
     trim_top_left(&composed, grid.output_width, grid.output_height)
 }

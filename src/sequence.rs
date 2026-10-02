@@ -40,6 +40,7 @@ use oxideav_av1::encoder::yuv_frame::YuvFrame;
 use oxideav_heif::{HeifWriter, SequenceWriter};
 
 /// Tuning for [`encode_sequence`].
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug)]
 pub struct SequenceEncodeOptions {
     /// Movie / media timescale in ticks per second (`mvhd` / `mdhd`).
@@ -54,6 +55,54 @@ pub struct SequenceEncodeOptions {
     /// Frames per KEY + P group, 1..=`GOP_MAX_FRAMES` (64). Ignored
     /// when `all_intra`.
     pub gop_length: usize,
+}
+
+impl SequenceEncodeOptions {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        timescale: u32,
+        frame_duration: u32,
+        base_q_idx: u8,
+        all_intra: bool,
+        gop_length: usize,
+    ) -> Self {
+        Self {
+            timescale,
+            frame_duration,
+            base_q_idx,
+            all_intra,
+            gop_length,
+        }
+    }
+    /// Setter: replace `timescale`.
+    pub fn with_timescale(mut self, timescale: u32) -> Self {
+        self.timescale = timescale;
+        self
+    }
+    /// Setter: replace `frame_duration`.
+    pub fn with_frame_duration(mut self, frame_duration: u32) -> Self {
+        self.frame_duration = frame_duration;
+        self
+    }
+    /// Setter: replace `base_q_idx`.
+    pub fn with_base_q_idx(mut self, base_q_idx: u8) -> Self {
+        self.base_q_idx = base_q_idx;
+        self
+    }
+    /// Setter: replace `all_intra`.
+    pub fn with_all_intra(mut self, all_intra: bool) -> Self {
+        self.all_intra = all_intra;
+        self
+    }
+    /// Setter: replace `gop_length`.
+    pub fn with_gop_length(mut self, gop_length: usize) -> Self {
+        self.gop_length = gop_length;
+        self
+    }
 }
 
 impl Default for SequenceEncodeOptions {

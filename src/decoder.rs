@@ -908,14 +908,11 @@ fn decode_item_output_inner(
                     let (sx, sy) = image.format.chroma.shift();
                     rotation_keeps_layout((sx as u8, sy as u8), turns).map_err(core_err)?;
                 }
-                compose::apply_irot(&image, &hprops::Irot { angle: turns })
+                compose::apply_irot(&image, &hprops::Irot::new(turns))
             }
-            Property::Imir(imir) => compose::apply_imir(
-                &image,
-                &hprops::Imir {
-                    axis: imir.axis & 0x01,
-                },
-            ),
+            Property::Imir(imir) => {
+                compose::apply_imir(&image, &hprops::Imir::new(imir.axis & 0x01))
+            }
             _ => continue,
         }
         .map_err(heif_err)?;
@@ -1205,10 +1202,7 @@ fn decode_overlay_item(
     let colr = effective_cicp(colr.as_ref()).to_colr();
     let overlay_inputs: Vec<compose::OverlayInput<'_>> = inputs
         .iter()
-        .map(|(frame, premultiplied)| compose::OverlayInput {
-            frame,
-            premultiplied: *premultiplied,
-        })
+        .map(|(frame, premultiplied)| compose::OverlayInput::new(frame, *premultiplied))
         .collect();
     crate::overlay::composite_overlay_frames(&desc, &overlay_inputs, &colr).map_err(core_err)
 }

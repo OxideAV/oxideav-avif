@@ -9,6 +9,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **API hygiene (a minor bump): `#[non_exhaustive]` on every public
+  record and growing enum, `Type::new(<every field, in declaration
+  order>)` constructors, `with_<field>` setters on the option records.**
+  Records callers used to build by struct literal now take `new(..)`
+  (or `Default` where one exists) and keep their `pub` fields for
+  reading / assignment; `..Default::default()` struct update is no
+  longer available from outside the crate — use the setters or
+  assign. By module: `meta` (`Ispe` `Pixi` `Pasp` `Clap` `Irot` `Imir`
+  `AuxC` `Rloc` `Lsel` `A1op` `A1lx` `Mdcv` `Clli` `Cclv` `Amve` `Iscl`
+  `Rref` `Crtt` `Mdft` `Udes` `Altt` `Aebr` `Wbbr` `Fobr` `Afbr` `Dobr`
+  `Pano` `PanoGrid` `Subs` `SubsEntry` `Tols` `Prdi` `Txlo` `Elng`
+  `Fnch` `MaskC` `Cmex` `Cmin` `Wipe` `Zoom` `Fade` `Splt` `Stpe` `Ssld`
+  `ItemInfo` `IlocExtent` `ItemLocation` `ItemPropertyAssociation`
+  `PropertyAssociation` `IrefEntry` `Meta`), `derived` (`OverlayEntry`
+  `ImageOverlay` `EntityGroup` `SampleTransform` `GainMapRational`
+  `GainMapChannel` `GainMapMetadata`, every `*Compliance` / `*Audit` /
+  `*Resolution` / `*Placement` record, `DerivationNode`
+  `DerivationGraph`), `grid::ImageGrid`, `inspect` (`AvifInfo`
+  `ResolvedRegionItem` `ResolvedTextItem` `CodedItemDependencies`),
+  `parser` (`AvifImage` `AvifHeader` `BrandClass`), `avis` (`Sample`
+  `EditListEntry` `ProducerReferenceTime` `SubsegmentRange`
+  `SubsegmentIndex` `AvisMeta` `AvisInfo`, the compliance records),
+  `region` (`RegionItem` `DerivedRegionItem`), `sample_group`
+  (`SampleToGroupRun` `SampleToGroup` `SampleGroupDescription`
+  `VisualEquivalenceEntry`), `cicp::CicpTriple`, `overlay`
+  (`OverlayInput` `SamplePlanes`), `mux` (`ToneMapItem` `EntityGroupSpec`
+  `IdentityDerivation` `GridTile` `OverlayLayer`), `still` (`StillImage`
+  `StillProperties` `GainMapSpec` `StillEncodeOptions` `OverlayCanvas`
+  `OverlayLayerImage`), `sequence::SequenceEncodeOptions`. Setters
+  (`with_<field>`, one per field) on `StillProperties`
+  `StillEncodeOptions` `SequenceEncodeOptions` `GainMapSpec`
+  `IdentityDerivation` `EntityGroupSpec` `ToneMapItem` `GridTile`
+  `OverlayLayer` `OverlayCanvas` `OverlayLayerImage` `ImageGrid`
+  `ImageOverlay` `OverlayEntry` — e.g.
+  `StillProperties::default().with_irot(Some(1))`. Enums that grow with
+  the standard are `#[non_exhaustive]` (match them with a `_` arm):
+  `Property` `Colr` `AvifError` `AuxKind` `DerivationKind`
+  `RegionGeometry` `BracketingKind` `BracketingEntry`
+  `SampleToGroupKind` `Token` `AvifProfile` `DimTransform`. Kept plain
+  on purpose: `AvifFrame` / `AvifPlane` / `AvifPixelFormat` (the
+  sample model, closed by AV1), `StillChroma` (AV1's four layouts),
+  the builders with private fields (`AvifMuxer` family, `AvifDecoder`,
+  `AvifEncoder`).
+- **`oxideav-heif = "0.0.7"` minimum** (was 0.0.5 earlier in this
+  cycle): the container's records are `#[non_exhaustive]` with `new`
+  constructors, so every property / descriptor / `RawProperty` /
+  `OverlayInput` / gain-map record this crate builds goes through
+  `::new(..)`, and the matches on the container's `Colr` and
+  `HeifError` carry a `_` arm (a future `colr` type reads as
+  `Colr::Unknown`, a future error class as `InvalidData`).
 - **`oxideav-heif = "0.0.5"` minimum.** The container's HEIF Amd 1:2025
   / Amd 2:2026 typed properties no longer make the property conversion
   refuse a file: the Amd 2 per-channel `pixi` (`px_flags & 1`) lands on

@@ -70,6 +70,7 @@ use crate::image::{AvifFrame, AvifPixelFormat, AvifPlane};
 pub const MAX_OVERLAY_CANVAS_PIXELS: u64 = 1 << 26;
 
 /// One input image of an overlay, in `dimg` order (bottom-most first).
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug)]
 pub struct OverlayInput<'a> {
     /// The input's output image (HEIF §6.3) — its own transforms and
@@ -94,9 +95,39 @@ pub struct OverlayInput<'a> {
     pub premultiplied: bool,
 }
 
+impl<'a> OverlayInput<'a> {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        frame: &'a AvifFrame,
+        format: AvifPixelFormat,
+        bit_depth: u8,
+        width: u32,
+        height: u32,
+        offset_x: i64,
+        offset_y: i64,
+        premultiplied: bool,
+    ) -> Self {
+        Self {
+            frame,
+            format,
+            bit_depth,
+            width,
+            height,
+            offset_x,
+            offset_y,
+            premultiplied,
+        }
+    }
+}
+
 /// A frame unpacked into `u16` sample planes at the coded depth —
 /// the working representation of the compositor. Public for the
 /// decoder's other composition steps; not a stable surface.
+#[non_exhaustive]
 #[doc(hidden)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SamplePlanes {
@@ -111,6 +142,39 @@ pub struct SamplePlanes {
     pub v: Vec<u16>,
     /// Full-resolution alpha at the coded depth, when present.
     pub alpha: Option<Vec<u16>>,
+}
+
+impl SamplePlanes {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        width: u32,
+        height: u32,
+        bit_depth: u8,
+        sx: u8,
+        sy: u8,
+        gray: bool,
+        y: Vec<u16>,
+        u: Vec<u16>,
+        v: Vec<u16>,
+        alpha: Option<Vec<u16>>,
+    ) -> Self {
+        Self {
+            width,
+            height,
+            bit_depth,
+            sx,
+            sy,
+            gray,
+            y,
+            u,
+            v,
+            alpha,
+        }
+    }
 }
 
 impl SamplePlanes {
@@ -399,10 +463,7 @@ pub fn composite_overlay(
     let heif_inputs: Vec<compose::OverlayInput<'_>> = frames
         .iter()
         .zip(inputs)
-        .map(|(frame, inp)| compose::OverlayInput {
-            frame,
-            premultiplied: inp.premultiplied,
-        })
+        .map(|(frame, inp)| compose::OverlayInput::new(frame, inp.premultiplied))
         .collect();
     let colr = cicp.to_colr();
     let composed = composite_overlay_frames(desc, &heif_inputs, &colr)?;

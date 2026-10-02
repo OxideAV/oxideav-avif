@@ -44,16 +44,11 @@ pub(crate) fn prop_av1c(av1c: &[u8], what: &str) -> Result<Prop> {
 }
 
 pub(crate) fn prop_ispe(width: u32, height: u32) -> Prop {
-    (HProp::Ispe(hprops::Ispe { width, height }), false)
+    (HProp::Ispe(hprops::Ispe::new(width, height)), false)
 }
 
 pub(crate) fn prop_pixi(bits: &[u8]) -> Prop {
-    (
-        HProp::Pixi(hprops::Pixi {
-            bits_per_channel: bits.to_vec(),
-        }),
-        false,
-    )
+    (HProp::Pixi(hprops::Pixi::new(bits.to_vec())), false)
 }
 
 pub(crate) fn prop_colr(colr: &Colr) -> Result<Prop> {
@@ -68,10 +63,7 @@ pub(crate) fn prop_colr(colr: &Colr) -> Result<Prop> {
 
 fn prop_pasp(pasp: &Pasp) -> Prop {
     (
-        HProp::Pasp(hprops::Pasp {
-            h_spacing: pasp.h_spacing,
-            v_spacing: pasp.v_spacing,
-        }),
+        HProp::Pasp(hprops::Pasp::new(pasp.h_spacing, pasp.v_spacing)),
         false,
     )
 }
@@ -81,29 +73,16 @@ pub(crate) fn prop_clap(clap: &Clap) -> Prop {
 }
 
 fn prop_irot(irot: &Irot) -> Prop {
-    (
-        HProp::Irot(hprops::Irot {
-            angle: irot.angle & 0x03,
-        }),
-        true,
-    )
+    (HProp::Irot(hprops::Irot::new(irot.angle & 0x03)), true)
 }
 
 fn prop_imir(imir: &Imir) -> Prop {
-    (
-        HProp::Imir(hprops::Imir {
-            axis: imir.axis & 0x01,
-        }),
-        true,
-    )
+    (HProp::Imir(hprops::Imir::new(imir.axis & 0x01)), true)
 }
 
 fn prop_auxc(urn: &str) -> Prop {
     (
-        HProp::AuxC(hprops::AuxC {
-            aux_type: urn.to_string(),
-            aux_subtype: Vec::new(),
-        }),
+        HProp::AuxC(hprops::AuxC::new(urn.to_string(), Vec::new())),
         false,
     )
 }
@@ -111,20 +90,17 @@ fn prop_auxc(urn: &str) -> Prop {
 fn prop_a1lx(layer_size: [u32; 3]) -> Prop {
     let large_size = layer_size.iter().any(|&v| v > u32::from(u16::MAX));
     (
-        HProp::A1lx(hprops::A1lx {
-            large_size,
-            layer_size,
-        }),
+        HProp::A1lx(hprops::A1lx::new(large_size, layer_size)),
         false,
     )
 }
 
 fn prop_lsel(layer_id: u16) -> Prop {
-    (HProp::Lsel(hprops::Lsel { layer_id }), true)
+    (HProp::Lsel(hprops::Lsel::new(layer_id)), true)
 }
 
 fn prop_a1op(op_index: u8) -> Prop {
-    (HProp::A1op(hprops::A1op { op_index }), true)
+    (HProp::A1op(hprops::A1op::new(op_index)), true)
 }
 
 /// `mdcv` in the layout this crate reads (ISO/IEC 14496-12
@@ -143,12 +119,12 @@ fn prop_mdcv(m: &Mdcv) -> Prop {
     body.extend_from_slice(&m.max_display_mastering_luminance.to_be_bytes());
     body.extend_from_slice(&m.min_display_mastering_luminance.to_be_bytes());
     (
-        HProp::Unknown(RawProperty {
-            box_type: *b"mdcv",
-            user_type: None,
-            box_size: body.len() + 8,
-            body,
-        }),
+        HProp::Unknown(RawProperty::new(
+            *b"mdcv",
+            None,
+            body.clone(),
+            body.len() + 8,
+        )),
         false,
     )
 }
@@ -257,6 +233,7 @@ pub struct AvifMuxer {
 /// metadata) in `idat`, the essential alternate `colr`, an `ispe` of
 /// the base's size, the `tmap` brand and the `altr` [tmap, base]
 /// group (MIAF Amd 1 §7.3.11.5); the primary stays the base.
+#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct ToneMapItem {
     /// The gain map's coded AV1 Image Item Data.
@@ -284,11 +261,95 @@ pub struct ToneMapItem {
     pub alternate_pixi: Option<Vec<u8>>,
 }
 
+impl ToneMapItem {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        payload: Vec<u8>,
+        av1c: Vec<u8>,
+        width: u32,
+        height: u32,
+        pixi: Option<Vec<u8>>,
+        colr: Colr,
+        metadata: oxideav_heif::gainmap::GainMapMetadata,
+        alternate_colr: Colr,
+        alternate_clli: Option<Clli>,
+        alternate_pixi: Option<Vec<u8>>,
+    ) -> Self {
+        Self {
+            payload,
+            av1c,
+            width,
+            height,
+            pixi,
+            colr,
+            metadata,
+            alternate_colr,
+            alternate_clli,
+            alternate_pixi,
+        }
+    }
+    /// Setter: replace `payload`.
+    pub fn with_payload(mut self, payload: Vec<u8>) -> Self {
+        self.payload = payload;
+        self
+    }
+    /// Setter: replace `av1c`.
+    pub fn with_av1c(mut self, av1c: Vec<u8>) -> Self {
+        self.av1c = av1c;
+        self
+    }
+    /// Setter: replace `width`.
+    pub fn with_width(mut self, width: u32) -> Self {
+        self.width = width;
+        self
+    }
+    /// Setter: replace `height`.
+    pub fn with_height(mut self, height: u32) -> Self {
+        self.height = height;
+        self
+    }
+    /// Setter: replace `pixi`.
+    pub fn with_pixi(mut self, pixi: Option<Vec<u8>>) -> Self {
+        self.pixi = pixi;
+        self
+    }
+    /// Setter: replace `colr`.
+    pub fn with_colr(mut self, colr: Colr) -> Self {
+        self.colr = colr;
+        self
+    }
+    /// Setter: replace `metadata`.
+    pub fn with_metadata(mut self, metadata: oxideav_heif::gainmap::GainMapMetadata) -> Self {
+        self.metadata = metadata;
+        self
+    }
+    /// Setter: replace `alternate_colr`.
+    pub fn with_alternate_colr(mut self, alternate_colr: Colr) -> Self {
+        self.alternate_colr = alternate_colr;
+        self
+    }
+    /// Setter: replace `alternate_clli`.
+    pub fn with_alternate_clli(mut self, alternate_clli: Option<Clli>) -> Self {
+        self.alternate_clli = alternate_clli;
+        self
+    }
+    /// Setter: replace `alternate_pixi`.
+    pub fn with_alternate_pixi(mut self, alternate_pixi: Option<Vec<u8>>) -> Self {
+        self.alternate_pixi = alternate_pixi;
+        self
+    }
+}
+
 /// One `grpl` entity group to write (ISO/IEC 14496-12 §8.18):
 /// `grouping_type`, `group_id`, the 24-bit `EntityToGroupBox` flags
 /// and the entity ids — item ids as this muxer lays them out (the
 /// primary is item 1; the alpha, depth, Exif and XMP items follow in
 /// that order after an `iden` wrapper when one is requested).
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EntityGroupSpec {
     /// `grouping_type` (`altr`, `ster`, `eqiv`, …).
@@ -301,8 +362,45 @@ pub struct EntityGroupSpec {
     pub entity_ids: Vec<u32>,
 }
 
+impl EntityGroupSpec {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(grouping_type: [u8; 4], group_id: u32, flags: u32, entity_ids: Vec<u32>) -> Self {
+        Self {
+            grouping_type,
+            group_id,
+            flags,
+            entity_ids,
+        }
+    }
+    /// Setter: replace `grouping_type`.
+    pub fn with_grouping_type(mut self, grouping_type: [u8; 4]) -> Self {
+        self.grouping_type = grouping_type;
+        self
+    }
+    /// Setter: replace `group_id`.
+    pub fn with_group_id(mut self, group_id: u32) -> Self {
+        self.group_id = group_id;
+        self
+    }
+    /// Setter: replace `flags`.
+    pub fn with_flags(mut self, flags: u32) -> Self {
+        self.flags = flags;
+        self
+    }
+    /// Setter: replace `entity_ids`.
+    pub fn with_entity_ids(mut self, entity_ids: Vec<u32>) -> Self {
+        self.entity_ids = entity_ids;
+        self
+    }
+}
+
 /// Make the primary an `iden` derived item (HEIF §6.6.2.1) over the
 /// coded `av01` item, carrying these transformative properties.
+#[non_exhaustive]
 #[derive(Clone, Debug, Default)]
 pub struct IdentityDerivation {
     /// `clap` on the identity item.
@@ -311,6 +409,32 @@ pub struct IdentityDerivation {
     pub irot: Option<u8>,
     /// `imir` axis on the identity item.
     pub imir: Option<u8>,
+}
+
+impl IdentityDerivation {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(clap: Option<Clap>, irot: Option<u8>, imir: Option<u8>) -> Self {
+        Self { clap, irot, imir }
+    }
+    /// Setter: replace `clap`.
+    pub fn with_clap(mut self, clap: Option<Clap>) -> Self {
+        self.clap = clap;
+        self
+    }
+    /// Setter: replace `irot`.
+    pub fn with_irot(mut self, irot: Option<u8>) -> Self {
+        self.irot = irot;
+        self
+    }
+    /// Setter: replace `imir`.
+    pub fn with_imir(mut self, imir: Option<u8>) -> Self {
+        self.imir = imir;
+        self
+    }
 }
 
 struct AuxCoded {
@@ -687,6 +811,7 @@ pub fn encode_still_av1(
 }
 
 /// One coded tile of a grid.
+#[non_exhaustive]
 pub struct GridTile {
     /// Coded tile width.
     pub width: u32,
@@ -696,6 +821,42 @@ pub struct GridTile {
     pub payload: Vec<u8>,
     /// `av1C` record.
     pub av1c: Vec<u8>,
+}
+
+impl GridTile {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(width: u32, height: u32, payload: Vec<u8>, av1c: Vec<u8>) -> Self {
+        Self {
+            width,
+            height,
+            payload,
+            av1c,
+        }
+    }
+    /// Setter: replace `width`.
+    pub fn with_width(mut self, width: u32) -> Self {
+        self.width = width;
+        self
+    }
+    /// Setter: replace `height`.
+    pub fn with_height(mut self, height: u32) -> Self {
+        self.height = height;
+        self
+    }
+    /// Setter: replace `payload`.
+    pub fn with_payload(mut self, payload: Vec<u8>) -> Self {
+        self.payload = payload;
+        self
+    }
+    /// Setter: replace `av1c`.
+    pub fn with_av1c(mut self, av1c: Vec<u8>) -> Self {
+        self.av1c = av1c;
+        self
+    }
 }
 
 /// Builder for a `grid` primary (HEIF §6.6.2.3) over hidden `av01`
@@ -872,12 +1033,12 @@ impl AvifGridMuxer {
         }
         let (major, compat) = still_brands(self.profile_brand);
         let mut w = HeifWriter::new().with_brands(major, compat);
-        let desc = GridDescriptor {
-            rows: self.rows,
-            columns: self.columns,
-            output_width: self.output_width,
-            output_height: self.output_height,
-        };
+        let desc = GridDescriptor::new(
+            self.rows,
+            self.columns,
+            self.output_width,
+            self.output_height,
+        );
         let mut grid_props = vec![prop_ispe(self.output_width, self.output_height)];
         if let Some(bits) = &self.pixi {
             grid_props.push(prop_pixi(bits));
@@ -964,6 +1125,7 @@ impl AvifGridMuxer {
 
 /// One layer of an overlay: a hidden `av01` item placed at
 /// `(offset_x, offset_y)`, with an optional alpha auxiliary.
+#[non_exhaustive]
 pub struct OverlayLayer {
     /// Coded width.
     pub width: u32,
@@ -989,6 +1151,103 @@ pub struct OverlayLayer {
     pub offset_x: i32,
     /// Vertical offset on the canvas.
     pub offset_y: i32,
+}
+
+impl OverlayLayer {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        width: u32,
+        height: u32,
+        payload: Vec<u8>,
+        av1c: Vec<u8>,
+        pixi: Option<Vec<u8>>,
+        colr: Option<Colr>,
+        clap: Option<Clap>,
+        alpha: Option<(Vec<u8>, Vec<u8>)>,
+        alpha_pixi: Option<Vec<u8>>,
+        premultiplied: bool,
+        offset_x: i32,
+        offset_y: i32,
+    ) -> Self {
+        Self {
+            width,
+            height,
+            payload,
+            av1c,
+            pixi,
+            colr,
+            clap,
+            alpha,
+            alpha_pixi,
+            premultiplied,
+            offset_x,
+            offset_y,
+        }
+    }
+    /// Setter: replace `width`.
+    pub fn with_width(mut self, width: u32) -> Self {
+        self.width = width;
+        self
+    }
+    /// Setter: replace `height`.
+    pub fn with_height(mut self, height: u32) -> Self {
+        self.height = height;
+        self
+    }
+    /// Setter: replace `payload`.
+    pub fn with_payload(mut self, payload: Vec<u8>) -> Self {
+        self.payload = payload;
+        self
+    }
+    /// Setter: replace `av1c`.
+    pub fn with_av1c(mut self, av1c: Vec<u8>) -> Self {
+        self.av1c = av1c;
+        self
+    }
+    /// Setter: replace `pixi`.
+    pub fn with_pixi(mut self, pixi: Option<Vec<u8>>) -> Self {
+        self.pixi = pixi;
+        self
+    }
+    /// Setter: replace `colr`.
+    pub fn with_colr(mut self, colr: Option<Colr>) -> Self {
+        self.colr = colr;
+        self
+    }
+    /// Setter: replace `clap`.
+    pub fn with_clap(mut self, clap: Option<Clap>) -> Self {
+        self.clap = clap;
+        self
+    }
+    /// Setter: replace `alpha`.
+    pub fn with_alpha(mut self, alpha: Option<(Vec<u8>, Vec<u8>)>) -> Self {
+        self.alpha = alpha;
+        self
+    }
+    /// Setter: replace `alpha_pixi`.
+    pub fn with_alpha_pixi(mut self, alpha_pixi: Option<Vec<u8>>) -> Self {
+        self.alpha_pixi = alpha_pixi;
+        self
+    }
+    /// Setter: replace `premultiplied`.
+    pub fn with_premultiplied(mut self, premultiplied: bool) -> Self {
+        self.premultiplied = premultiplied;
+        self
+    }
+    /// Setter: replace `offset_x`.
+    pub fn with_offset_x(mut self, offset_x: i32) -> Self {
+        self.offset_x = offset_x;
+        self
+    }
+    /// Setter: replace `offset_y`.
+    pub fn with_offset_y(mut self, offset_y: i32) -> Self {
+        self.offset_y = offset_y;
+        self
+    }
 }
 
 /// Builder for an `iovl` primary (HEIF §6.6.2.2) over hidden `av01`
@@ -1082,16 +1341,15 @@ impl AvifOverlayMuxer {
         }
         let (major, compat) = still_brands(self.profile_brand);
         let mut w = HeifWriter::new().with_brands(major, compat);
-        let desc = OverlayDescriptor {
-            canvas_fill: self.fill,
-            output_width: self.output_width,
-            output_height: self.output_height,
-            offsets: self
-                .layers
+        let desc = OverlayDescriptor::new(
+            self.fill,
+            self.output_width,
+            self.output_height,
+            self.layers
                 .iter()
                 .map(|l| (l.offset_x, l.offset_y))
                 .collect(),
-        };
+        );
         let mut props = vec![prop_ispe(self.output_width, self.output_height)];
         if let Some(bits) = &self.pixi {
             props.push(prop_pixi(bits));

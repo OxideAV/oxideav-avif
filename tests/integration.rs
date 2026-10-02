@@ -276,19 +276,9 @@ fn avis_sample_bytes_resolves_first_obu() {
 #[test]
 fn avis_sample_bytes_rejects_out_of_range() {
     use oxideav_avif::{sample_bytes, Sample};
-    let bogus = Sample {
-        offset: u64::MAX - 10,
-        size: 1024,
-        duration: 0,
-        is_sync: true,
-    };
+    let bogus = Sample::new(u64::MAX - 10, 1024, 0, true);
     assert!(sample_bytes(ALPHA_VIDEO_AVIS, &bogus).is_err());
-    let past_eof = Sample {
-        offset: ALPHA_VIDEO_AVIS.len() as u64 - 1,
-        size: 100,
-        duration: 0,
-        is_sync: true,
-    };
+    let past_eof = Sample::new(ALPHA_VIDEO_AVIS.len() as u64 - 1, 100, 0, true);
     assert!(sample_bytes(ALPHA_VIDEO_AVIS, &past_eof).is_err());
 }
 
@@ -1152,7 +1142,7 @@ fn end_to_end_decode_then_irot_roundtrips() {
         let (mut w, mut h) = (64u32, 64u32);
         for turn in 0..4 {
             let (next, nw, nh) =
-                apply_irot(&frame, AvifPixelFormat::Yuv444P, w, h, &Irot { angle: 1 }).unwrap();
+                apply_irot(&frame, AvifPixelFormat::Yuv444P, w, h, &Irot::new(1)).unwrap();
             // Odd turn parity swaps dims; for a square 64x64 the swap
             // is a no-op, but the property still holds.
             assert_eq!(nw, h, "{subject} turn {turn}: width swap");
@@ -1172,8 +1162,7 @@ fn end_to_end_decode_then_irot_roundtrips() {
     // same source frame so the assertion is independent of av1's
     // current capability surface.
     let vf2: AvifFrame = decode_video("red64 (irot 180)", RED64).into();
-    let (rot180, _, _) =
-        apply_irot(&vf2, AvifPixelFormat::Yuv444P, 64, 64, &Irot { angle: 2 }).unwrap();
+    let (rot180, _, _) = apply_irot(&vf2, AvifPixelFormat::Yuv444P, 64, 64, &Irot::new(2)).unwrap();
     // For a flat-color fixture (red), every pixel is identical, so
     // 180° leaves the buffer numerically equal — but we still validate
     // the plane geometry holds.
@@ -1206,14 +1195,14 @@ fn synthetic_yuv444_frame(w: u32, h: u32) -> oxideav_avif::AvifFrame {
             v.push(((row.wrapping_mul(29) ^ col.wrapping_mul(41)) & 0xff) as u8);
         }
     }
-    AvifFrame {
-        pts: None,
-        planes: vec![
-            AvifPlane { stride, data: y },
-            AvifPlane { stride, data: u },
-            AvifPlane { stride, data: v },
+    AvifFrame::new(
+        None,
+        vec![
+            AvifPlane::new(stride, y),
+            AvifPlane::new(stride, u),
+            AvifPlane::new(stride, v),
         ],
-    }
+    )
 }
 
 /// `transforms_for` walks the property-association table for a given
@@ -1470,11 +1459,11 @@ fn end_to_end_decode_then_imir_roundtrips() {
 
         // Two flips along the same axis must recover the original.
         let (mid, w1, h1) =
-            apply_imir(&vf, AvifPixelFormat::Yuv444P, 64, 64, &Imir { axis }).unwrap();
+            apply_imir(&vf, AvifPixelFormat::Yuv444P, 64, 64, &Imir::new(axis)).unwrap();
         assert_eq!(w1, 64, "imir preserves width");
         assert_eq!(h1, 64, "imir preserves height");
         let (back, w2, h2) =
-            apply_imir(&mid, AvifPixelFormat::Yuv444P, w1, h1, &Imir { axis }).unwrap();
+            apply_imir(&mid, AvifPixelFormat::Yuv444P, w1, h1, &Imir::new(axis)).unwrap();
         assert_eq!(w2, 64);
         assert_eq!(h2, 64);
         assert_eq!(
@@ -1542,18 +1531,14 @@ fn inspect_surfaces_pixi_bit_depth() {
 /// fixtures omit it (square pixel is implicit).
 #[test]
 fn inspect_surfaces_pasp_when_present() {
-    use oxideav_avif::Pasp;
     // kimono_rotate90 is the only fixture in the suite that ships
     // a `pasp` box explicitly; everything else relies on the implicit
     // square-pixel default.
     let info = inspect(KIMONO_ROT90).expect("inspect kimono");
     match info.pasp {
-        Some(Pasp {
-            h_spacing,
-            v_spacing,
-        }) => {
-            assert_eq!(h_spacing, 1, "kimono pasp h");
-            assert_eq!(v_spacing, 1, "kimono pasp v");
+        Some(pasp) => {
+            assert_eq!(pasp.h_spacing, 1, "kimono pasp h");
+            assert_eq!(pasp.v_spacing, 1, "kimono pasp v");
         }
         None => panic!("kimono_rotate90 should carry a pasp(1:1) property"),
     }
@@ -1577,13 +1562,7 @@ fn inspect_surfaces_anamorphic_pasp() {
     let bytes = build_synthetic_grid_avif_with_pasp(16, 11);
     let info = inspect(&bytes).expect("inspect synthetic anamorphic");
     let pasp = info.pasp.expect("synthetic file should expose pasp");
-    assert_eq!(
-        pasp,
-        Pasp {
-            h_spacing: 16,
-            v_spacing: 11,
-        }
-    );
+    assert_eq!(pasp, Pasp::new(16, 11));
     assert!(!pasp.is_square());
     assert!(!info.has_square_pixels());
     let r = pasp.ratio().unwrap();
@@ -1693,16 +1672,7 @@ fn end_to_end_decode_then_clap_centre_crop() {
     // Pull a 32x32 centre crop from the 64x64 source. clap uses
     // signed rationals — width=32/1, height=32/1, offsets=(0,0)
     // centres the crop on the existing midpoint.
-    let clap = Clap {
-        clean_aperture_width_n: 32,
-        clean_aperture_width_d: 1,
-        clean_aperture_height_n: 32,
-        clean_aperture_height_d: 1,
-        horiz_off_n: 0,
-        horiz_off_d: 1,
-        vert_off_n: 0,
-        vert_off_d: 1,
-    };
+    let clap = Clap::new(32, 1, 32, 1, 0, 1, 0, 1);
     let src_y = vf.planes[0].data.clone();
     let src_stride = vf.planes[0].stride;
     let (cropped, cw, ch) =
@@ -1739,16 +1709,8 @@ fn clap_with_zero_denominator_is_passthrough() {
     use oxideav_avif::{AvifFrame, AvifPixelFormat, Clap};
 
     let vf: AvifFrame = decode_video("red64 (clap zero-denom)", RED64).into();
-    let degenerate = Clap {
-        clean_aperture_width_n: 32,
-        clean_aperture_width_d: 0, // <-- forces no-op
-        clean_aperture_height_n: 32,
-        clean_aperture_height_d: 1,
-        horiz_off_n: 0,
-        horiz_off_d: 1,
-        vert_off_n: 0,
-        vert_off_d: 1,
-    };
+    // width_d = 0 forces the no-op.
+    let degenerate = Clap::new(32, 0, 32, 1, 0, 1, 0, 1);
     let (out, w, h) =
         apply_clap(&vf, AvifPixelFormat::Yuv444P, 64, 64, &degenerate).expect("clap no-op");
     assert_eq!(w, 64, "no-op clap preserves width");
@@ -3188,12 +3150,7 @@ fn effective_cicp_grid_test() {
     // Reference: a non-grid synthetic AV01 with the same CICP triple
     // returns `(1, 13, 6) full_range=false`. Make sure all four
     // grid-attachment placements match.
-    let want = CicpTriple {
-        colour_primaries: 1,
-        transfer_characteristics: 13,
-        matrix_coefficients: 6,
-        full_range: false,
-    };
+    let want = CicpTriple::new(1, 13, 6, false);
 
     for placement in [
         PropPlacement::GridOnly,

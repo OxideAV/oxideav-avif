@@ -152,6 +152,7 @@ pub const ITEM_TYPE_TMAP: BoxType = b(b"tmap");
 ///   iPhone-emitted HEIC files).
 /// * `Other` — recognised auxC carrier but the URN is one we don't
 ///   classify. The raw URN is still available on `AuxC.aux_type`.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuxKind {
     Alpha,
@@ -188,6 +189,7 @@ pub const AUX_URN_HDR_GAINMAP: &str = "urn:com:apple:photo:2020:aux:hdrgainmap";
 /// For every other `item_type` (`av01`, `grid`, `Exif`, `auxl` targets,
 /// …) these fields are `None` and the payload bytes (resolved through
 /// the matching [`ItemLocation`]) are interpreted by the consumer.
+#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct ItemInfo {
     pub id: u32,
@@ -212,6 +214,33 @@ pub struct ItemInfo {
 }
 
 impl ItemInfo {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        id: u32,
+        item_type: BoxType,
+        name: String,
+        content_type: Option<String>,
+        content_encoding: Option<String>,
+        item_uri_type: Option<String>,
+        flags: u32,
+    ) -> Self {
+        Self {
+            id,
+            item_type,
+            name,
+            content_type,
+            content_encoding,
+            item_uri_type,
+            flags,
+        }
+    }
+}
+
+impl ItemInfo {
     /// True when bit 0 of the `infe` `flags` is set — the HEIF
     /// hidden-image-item signal (ISO/IEC 23008-12 §6.4.2 + ISO/IEC
     /// 14496-12 §8.11.6.1). Hidden items shall not be presented
@@ -233,6 +262,7 @@ impl ItemInfo {
 /// the field is unused and left at its default of `0`; the parser also
 /// records `0` when the box's `index_size` is `0`, in which case the spec
 /// implies the value `1` for cm=2 resolution.
+#[non_exhaustive]
 #[derive(Clone, Debug, Default)]
 pub struct IlocExtent {
     pub offset: u64,
@@ -242,7 +272,23 @@ pub struct IlocExtent {
     pub extent_index: u64,
 }
 
+impl IlocExtent {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(offset: u64, length: u64, extent_index: u64) -> Self {
+        Self {
+            offset,
+            length,
+            extent_index,
+        }
+    }
+}
+
 /// One `iloc` entry.
+#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct ItemLocation {
     pub id: u32,
@@ -253,7 +299,31 @@ pub struct ItemLocation {
     pub extents: Vec<IlocExtent>,
 }
 
+impl ItemLocation {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        id: u32,
+        construction_method: u8,
+        data_reference_index: u16,
+        base_offset: u64,
+        extents: Vec<IlocExtent>,
+    ) -> Self {
+        Self {
+            id,
+            construction_method,
+            data_reference_index,
+            base_offset,
+            extents,
+        }
+    }
+}
+
 /// One property association list (for a single item).
+#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct ItemPropertyAssociation {
     pub item_id: u32,
@@ -262,17 +332,52 @@ pub struct ItemPropertyAssociation {
     pub entries: Vec<PropertyAssociation>,
 }
 
+impl ItemPropertyAssociation {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(item_id: u32, entries: Vec<PropertyAssociation>) -> Self {
+        Self { item_id, entries }
+    }
+}
+
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug)]
 pub struct PropertyAssociation {
     pub index: u16,
     pub essential: bool,
 }
 
+impl PropertyAssociation {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(index: u16, essential: bool) -> Self {
+        Self { index, essential }
+    }
+}
+
 /// AVIF image spatial extent (`ispe`): unrotated pixel dimensions.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug)]
 pub struct Ispe {
     pub width: u32,
     pub height: u32,
+}
+
+impl Ispe {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(width: u32, height: u32) -> Self {
+        Self { width, height }
+    }
 }
 
 /// Pixel information (`pixi`) — per-channel bit depth.
@@ -284,6 +389,7 @@ pub struct Ispe {
 ///   * RGB / Y'CbCr 8-bit: `[8, 8, 8]`
 ///   * 10-bit HDR: `[10, 10, 10]`
 ///   * 12-bit HDR: `[12, 12, 12]`
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Pixi {
     pub bits_per_channel: Vec<u8>,
@@ -291,6 +397,20 @@ pub struct Pixi {
     /// & 1`: content, component format, subsampling, label), one per
     /// entry of `bits_per_channel`; empty for the plain `pixi` form.
     pub channels: Vec<hprops::PixiChannel>,
+}
+
+impl Pixi {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(bits_per_channel: Vec<u8>, channels: Vec<hprops::PixiChannel>) -> Self {
+        Self {
+            bits_per_channel,
+            channels,
+        }
+    }
 }
 
 impl Pixi {
@@ -321,10 +441,25 @@ impl Pixi {
 /// `h_spacing / v_spacing` is the *horizontal-to-vertical* sample spacing
 /// of a single pixel in display geometry. A square-pixel image has
 /// `h_spacing == v_spacing` (most commonly `1:1`).
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Pasp {
     pub h_spacing: u32,
     pub v_spacing: u32,
+}
+
+impl Pasp {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(h_spacing: u32, v_spacing: u32) -> Self {
+        Self {
+            h_spacing,
+            v_spacing,
+        }
+    }
 }
 
 impl Pasp {
@@ -347,6 +482,7 @@ impl Pasp {
 }
 
 /// Colour information (`colr`): NCLX or ICC bytes as-is.
+#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub enum Colr {
     Nclx {
@@ -360,21 +496,46 @@ pub enum Colr {
 }
 
 /// Image rotation (`irot`) — counter-clockwise, 0..3 × 90°.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug)]
 pub struct Irot {
     pub angle: u8,
 }
 
+impl Irot {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(angle: u8) -> Self {
+        Self { angle }
+    }
+}
+
 /// Image mirror (`imir`). `axis == 0` flips about the horizontal axis
 /// (top↔bottom); `axis == 1` flips about the vertical axis (left↔right).
 /// This follows AVIF 1.1 / HEIF convention.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug)]
 pub struct Imir {
     pub axis: u8,
 }
 
+impl Imir {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(axis: u8) -> Self {
+        Self { axis }
+    }
+}
+
 /// Clean aperture (`clap`). Eight 32-bit signed rationals (num/den pairs)
 /// describing crop width, crop height, horizontal offset, vertical offset.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug)]
 pub struct Clap {
     pub clean_aperture_width_n: i32,
@@ -387,13 +548,57 @@ pub struct Clap {
     pub vert_off_d: i32,
 }
 
+impl Clap {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        clean_aperture_width_n: i32,
+        clean_aperture_width_d: i32,
+        clean_aperture_height_n: i32,
+        clean_aperture_height_d: i32,
+        horiz_off_n: i32,
+        horiz_off_d: i32,
+        vert_off_n: i32,
+        vert_off_d: i32,
+    ) -> Self {
+        Self {
+            clean_aperture_width_n,
+            clean_aperture_width_d,
+            clean_aperture_height_n,
+            clean_aperture_height_d,
+            horiz_off_n,
+            horiz_off_d,
+            vert_off_n,
+            vert_off_d,
+        }
+    }
+}
+
 /// Auxiliary item type (`auxC`) — carries a NUL-terminated URN identifying
 /// the auxiliary use. For AVIF alpha this is
 /// `urn:mpeg:mpegB:cicp:systems:auxiliary:alpha`.
+#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct AuxC {
     pub aux_type: String,
     pub aux_subtype: Vec<u8>,
+}
+
+impl AuxC {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(aux_type: String, aux_subtype: Vec<u8>) -> Self {
+        Self {
+            aux_type,
+            aux_subtype,
+        }
+    }
 }
 
 impl AuxC {
@@ -439,10 +644,25 @@ impl AuxC {
 ///
 /// Spec: ISO/IEC 23008-12 §6.5.7.2 — `unsigned int(32) horizontal_offset;`
 /// + `unsigned int(32) vertical_offset;` inside a FullBox header.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rloc {
     pub horizontal_offset: u32,
     pub vertical_offset: u32,
+}
+
+impl Rloc {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(horizontal_offset: u32, vertical_offset: u32) -> Self {
+        Self {
+            horizontal_offset,
+            vertical_offset,
+        }
+    }
 }
 
 /// Layer-selector item property (`lsel`) — HEIF §6.5.11.
@@ -452,9 +672,21 @@ pub struct Rloc {
 ///
 /// Spec: ISO/IEC 23008-12 §6.5.11.2 — `unsigned int(16) layer_id;`
 /// inside an ItemProperty (no FullBox header).
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Lsel {
     pub layer_id: u16,
+}
+
+impl Lsel {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(layer_id: u16) -> Self {
+        Self { layer_id }
+    }
 }
 
 /// Operating Point Selector item property (`a1op`) — av1-avif §2.3.2.1.
@@ -469,10 +701,22 @@ pub struct Lsel {
 /// Syntax: `ItemProperty('a1op')` (NO FullBox header) carrying a single
 /// `unsigned int(8) op_index`. `op_index` shall be in
 /// `0..=operating_points_cnt_minus_1` of the AV1 sequence header.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct A1op {
     /// Index of the operating point to be processed for this item.
     pub op_index: u8,
+}
+
+impl A1op {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(op_index: u8) -> Self {
+        Self { op_index }
+    }
 }
 
 /// AV1 Layered Image Indexing item property (`a1lx`) — av1-avif §2.3.2.3.
@@ -498,6 +742,7 @@ pub struct A1op {
 /// (av1-avif §2.3.2.3.4). The size of the final layer is implicit (item
 /// payload length minus the documented prefix), so it is never stored
 /// here.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct A1lx {
     /// `false` → 16-bit `layer_size` fields; `true` → 32-bit fields.
@@ -506,6 +751,20 @@ pub struct A1lx {
     /// zero entry, and every entry after it, is unused (the layer is
     /// either absent or the final, implicitly-sized layer).
     pub layer_size: [u32; 3],
+}
+
+impl A1lx {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(large_size: bool, layer_size: [u32; 3]) -> Self {
+        Self {
+            large_size,
+            layer_size,
+        }
+    }
 }
 
 impl A1lx {
@@ -525,6 +784,7 @@ impl A1lx {
 /// `u16` units of `1/50000` (CIE 1931). `white_point_xy` is the
 /// white-point in the same units. Luminance values are in `u32` units
 /// of `1/10000 cd/m²`.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Mdcv {
     /// Display primaries (R, G, B) in chromaticity units × 50000.
@@ -537,15 +797,51 @@ pub struct Mdcv {
     pub min_display_mastering_luminance: u32,
 }
 
+impl Mdcv {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        display_primaries_xy: [(u16, u16); 3],
+        white_point_xy: (u16, u16),
+        max_display_mastering_luminance: u32,
+        min_display_mastering_luminance: u32,
+    ) -> Self {
+        Self {
+            display_primaries_xy,
+            white_point_xy,
+            max_display_mastering_luminance,
+            min_display_mastering_luminance,
+        }
+    }
+}
+
 /// Content light level info (`clli`) — maximum frame-average and
 /// maximum content light levels. Spec: ISO/IEC 14496-12 §12.1.5.4
 /// (ContentLightLevelBox). Both values are in cd/m².
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Clli {
     /// Max content light level (MaxCLL) in cd/m².
     pub max_content_light_level: u16,
     /// Max frame-average light level (MaxFALL) in cd/m².
     pub max_pic_average_light_level: u16,
+}
+
+impl Clli {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(max_content_light_level: u16, max_pic_average_light_level: u16) -> Self {
+        Self {
+            max_content_light_level,
+            max_pic_average_light_level,
+        }
+    }
 }
 
 /// Colour volume luminance (`cclv`) — supplemental HDR luminance hint.
@@ -556,12 +852,27 @@ pub struct Clli {
 /// Encoders that implement the draft sometimes write `cclv` alongside
 /// or in place of `clli`; both carry identical semantics — treat them
 /// the same downstream.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cclv {
     /// Max content light level in cd/m².
     pub max_content_light_level: u16,
     /// Max frame-average light level in cd/m².
     pub max_pic_average_light_level: u16,
+}
+
+impl Cclv {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(max_content_light_level: u16, max_pic_average_light_level: u16) -> Self {
+        Self {
+            max_content_light_level,
+            max_pic_average_light_level,
+        }
+    }
 }
 
 /// Ambient Viewing Environment (`amve`) — the nominal viewing-environment
@@ -588,6 +899,7 @@ pub struct Cclv {
 /// Unlike `mdcv`/`clli`, which describe the *content's* mastering
 /// environment, `amve` describes the *viewer's* nominal ambient
 /// environment, so the two are complementary.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Amve {
     /// Environmental illuminance of the ambient viewing environment, in
@@ -600,6 +912,21 @@ pub struct Amve {
     /// Normalised CIE 1931 *y* chromaticity of the ambient light, in
     /// units of 0.00002 (`y = value * 0.00002`); range 0..=50000.
     pub ambient_light_y: u16,
+}
+
+impl Amve {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(ambient_illuminance: u32, ambient_light_x: u16, ambient_light_y: u16) -> Self {
+        Self {
+            ambient_illuminance,
+            ambient_light_x,
+            ambient_light_y,
+        }
+    }
 }
 
 impl Amve {
@@ -646,6 +973,7 @@ impl Amve {
 /// [`Iscl::is_well_formed`] helper exposes the §6.5.13.3 check
 /// without conflating "syntactically parseable" with "semantically
 /// valid" — both are useful signals at distinct layers.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Iscl {
     /// Numerator of the horizontal scaling ratio.
@@ -656,6 +984,27 @@ pub struct Iscl {
     pub target_height_numerator: u16,
     /// Denominator of the vertical scaling ratio.
     pub target_height_denominator: u16,
+}
+
+impl Iscl {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        target_width_numerator: u16,
+        target_width_denominator: u16,
+        target_height_numerator: u16,
+        target_height_denominator: u16,
+    ) -> Self {
+        Self {
+            target_width_numerator,
+            target_width_denominator,
+            target_height_numerator,
+            target_height_denominator,
+        }
+    }
 }
 
 impl Iscl {
@@ -735,12 +1084,24 @@ fn div_ceil_u64(n: u64, d: u64) -> u64 {
 /// Each `reference_type[i]` is a four-CC carried as a big-endian
 /// `u32`; the four ASCII bytes (high → low byte order) form the
 /// `BoxType` of the required iref category.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rref {
     /// The list of required `iref` four-CCs in declaration order.
     /// The §6.5.17.2 `reference_type_count` is captured implicitly
     /// as `reference_types.len()`.
     pub reference_types: Vec<BoxType>,
+}
+
+impl Rref {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(reference_types: Vec<BoxType>) -> Self {
+        Self { reference_types }
+    }
 }
 
 impl Rref {
@@ -778,10 +1139,22 @@ impl Rref {
 /// ```text
 /// unsigned int(64) creation_time;
 /// ```
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Crtt {
     /// Creation time in microseconds since midnight, Jan. 1, 1904 UTC.
     pub creation_time: u64,
+}
+
+impl Crtt {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(creation_time: u64) -> Self {
+        Self { creation_time }
+    }
 }
 
 /// Number of whole seconds between the 1904-01-01 UTC epoch used by
@@ -842,10 +1215,22 @@ impl Crtt {
 /// ```text
 /// unsigned int(64) modification_time;
 /// ```
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Mdft {
     /// Modification time in microseconds since midnight, Jan. 1, 1904 UTC.
     pub modification_time: u64,
+}
+
+impl Mdft {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(modification_time: u64) -> Self {
+        Self { modification_time }
+    }
 }
 
 impl Mdft {
@@ -914,6 +1299,7 @@ impl Mdft {
 ///
 /// Spec: ISO/IEC 23008-12 §6.5.20.2 — FullBox(`udes`, version=0,
 /// flags=0).
+#[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Udes {
     /// RFC 5646 language tag (e.g. `"en-US"`); empty = unknown.
@@ -925,6 +1311,22 @@ pub struct Udes {
     pub description: String,
     /// Comma-separated user-defined tags; empty = absent.
     pub tags: String,
+}
+
+impl Udes {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(lang: String, name: String, description: String, tags: String) -> Self {
+        Self {
+            lang,
+            name,
+            description,
+            tags,
+        }
+    }
 }
 
 impl Udes {
@@ -1034,6 +1436,7 @@ impl Udes {
 ///
 /// Spec: ISO/IEC 23008-12 §6.5.21.2 — FullBox(`altt`, version=0,
 /// flags=0).
+#[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Altt {
     /// Alternate text for the associated image (HTML-`alt`-style).
@@ -1043,6 +1446,17 @@ pub struct Altt {
     /// RFC 5646 language tag for [`Self::alt_text`]; empty = the
     /// language is unknown/undefined (§6.5.21.3).
     pub alt_lang: String,
+}
+
+impl Altt {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(alt_text: String, alt_lang: String) -> Self {
+        Self { alt_text, alt_lang }
+    }
 }
 
 impl Altt {
@@ -1115,6 +1529,7 @@ impl Altt {
 ///
 /// Spec: ISO/IEC 23008-12 §6.5.22.2 — FullBox(`aebr`, version=0,
 /// flags=0).
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Aebr {
     /// Bracketing increment selector. Defined values per §6.5.22.3
@@ -1125,6 +1540,20 @@ pub struct Aebr {
     /// Exposure numerator. The exposure offset in stops is
     /// `exposure_numerator / exposure_step` (§6.5.22.3).
     pub exposure_numerator: i8,
+}
+
+impl Aebr {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(exposure_step: i8, exposure_numerator: i8) -> Self {
+        Self {
+            exposure_step,
+            exposure_numerator,
+        }
+    }
 }
 
 impl Aebr {
@@ -1209,6 +1638,7 @@ impl Aebr {
 ///
 /// Spec: ISO/IEC 23008-12 §6.5.23.2 — FullBox(`wbbr`, version=0,
 /// flags=0).
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Wbbr {
     /// Colour-temperature component of the white balance in Kelvin
@@ -1224,6 +1654,20 @@ pub struct Wbbr {
     /// verbatim. See [`Wbbr::green_magenta_duv`] for the Duv-unit
     /// projection.
     pub green_magenta: i8,
+}
+
+impl Wbbr {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(blue_amber: u16, green_magenta: i8) -> Self {
+        Self {
+            blue_amber,
+            green_magenta,
+        }
+    }
 }
 
 impl Wbbr {
@@ -1288,6 +1732,7 @@ impl Wbbr {
 ///
 /// Spec: ISO/IEC 23008-12 §6.5.24.2 — FullBox(`fobr`, version=0,
 /// flags=0).
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Fobr {
     /// Numerator of the focus-distance ratio (§6.5.24.3). Unsigned
@@ -1302,6 +1747,20 @@ pub struct Fobr {
     /// in metres is `focus_distance_numerator /
     /// focus_distance_denominator`.
     pub focus_distance_denominator: u16,
+}
+
+impl Fobr {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(focus_distance_numerator: u16, focus_distance_denominator: u16) -> Self {
+        Self {
+            focus_distance_numerator,
+            focus_distance_denominator,
+        }
+    }
 }
 
 impl Fobr {
@@ -1397,6 +1856,7 @@ impl Fobr {
 ///
 /// Spec: ISO/IEC 23008-12 §6.5.25.2 — FullBox(`afbr`, version=0,
 /// flags=0).
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Afbr {
     /// Numerator of the flash-exposure ratio (§6.5.25.3). Signed
@@ -1410,6 +1870,20 @@ pub struct Afbr {
     /// a zero denominator — a zero is mathematically undefined and
     /// is surfaced as `None` by [`Self::flash_exposure_stops`].
     pub flash_exposure_denominator: i8,
+}
+
+impl Afbr {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(flash_exposure_numerator: i8, flash_exposure_denominator: i8) -> Self {
+        Self {
+            flash_exposure_numerator,
+            flash_exposure_denominator,
+        }
+    }
 }
 
 impl Afbr {
@@ -1475,6 +1949,7 @@ impl Afbr {
 ///
 /// Spec: ISO/IEC 23008-12 §6.5.26.2 — FullBox(`dobr`, version=0,
 /// flags=0).
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Dobr {
     /// Numerator of the aperture-change ratio (§6.5.26.3). Signed
@@ -1488,6 +1963,20 @@ pub struct Dobr {
     /// zero denominator — a zero is mathematically undefined and is
     /// surfaced as `None` by [`Self::aperture_stops`].
     pub f_stop_denominator: i8,
+}
+
+impl Dobr {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(f_stop_numerator: i8, f_stop_denominator: i8) -> Self {
+        Self {
+            f_stop_numerator,
+            f_stop_denominator,
+        }
+    }
 }
 
 impl Dobr {
@@ -1521,12 +2010,27 @@ impl Dobr {
 /// `0` means one row / one column. The [`Self::rows`] / [`Self::columns`]
 /// projections add the one back, widening to `u16` so the `255 + 1`
 /// endpoint doesn't wrap.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PanoGrid {
     /// Number of rows in the grid **minus one** (§6.5.27.3).
     pub rows_minus_one: u8,
     /// Number of columns in the grid **minus one** (§6.5.27.3).
     pub columns_minus_one: u8,
+}
+
+impl PanoGrid {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(rows_minus_one: u8, columns_minus_one: u8) -> Self {
+        Self {
+            rows_minus_one,
+            columns_minus_one,
+        }
+    }
 }
 
 impl PanoGrid {
@@ -1590,6 +2094,7 @@ impl PanoGrid {
 ///
 /// Spec: ISO/IEC 23008-12 §6.5.27.2 — FullBox(`pano`, version=0,
 /// flags=0).
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Pano {
     /// Type of panorama + scanning order of the input images
@@ -1602,6 +2107,20 @@ pub struct Pano {
     /// [`Self::DIRECTION_GRID_CONTINUOUS`]); `None` for the four
     /// linear directions and for undefined direction values.
     pub grid: Option<PanoGrid>,
+}
+
+impl Pano {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(panorama_direction: u8, grid: Option<PanoGrid>) -> Self {
+        Self {
+            panorama_direction,
+            grid,
+        }
+    }
 }
 
 impl Pano {
@@ -1643,6 +2162,7 @@ impl Pano {
 /// One sub-sample of a `subs` Sub-Sample Information descriptive property
 /// (HEIF §6.5.28). Each entry mirrors the inner loop body of the
 /// `SubSampleInformationBox` (ISO/IEC 14496-12 §8.7.7.2).
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SubsEntry {
     /// Size, in bytes, of this sub-sample (ISO/IEC 14496-12 §8.7.7.3).
@@ -1659,6 +2179,27 @@ pub struct SubsEntry {
     /// Codec-defined parameter block; `0` when the coding format gives no
     /// definition (§8.7.7.3).
     pub codec_specific_parameters: u32,
+}
+
+impl SubsEntry {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        subsample_size: u32,
+        subsample_priority: u8,
+        discardable: u8,
+        codec_specific_parameters: u32,
+    ) -> Self {
+        Self {
+            subsample_size,
+            subsample_priority,
+            discardable,
+            codec_specific_parameters,
+        }
+    }
 }
 
 /// Sub-Sample Information descriptive property (`subs`) — HEIF §6.5.28.
@@ -1691,6 +2232,7 @@ pub struct SubsEntry {
 /// keeps it off [`Meta::unsupported_essential_properties`].
 ///
 /// Spec: ISO/IEC 23008-12 §6.5.28; ISO/IEC 14496-12 §8.7.7.
+#[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Subs {
     /// `flags` from the `FullBox` header. The semantics, if any, are
@@ -1700,6 +2242,17 @@ pub struct Subs {
     /// The single entry's sub-samples, in wire order (§8.7.7.2 inner
     /// loop). Empty when the entry's `subsample_count` is `0`.
     pub entries: Vec<SubsEntry>,
+}
+
+impl Subs {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(flags: u32, entries: Vec<SubsEntry>) -> Self {
+        Self { flags, entries }
+    }
 }
 
 /// Target Output Layer Set descriptive property (`tols`) — HEIF
@@ -1736,11 +2289,23 @@ pub struct Subs {
 ///
 /// Spec: ISO/IEC 23008-12 §6.5.29.2 — ItemFullProperty(`tols`,
 /// version=0, flags=0).
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Tols {
     /// Output layer set index to be provided to the decoding process
     /// (§6.5.29.3). Interpretation is coding-format specific.
     pub target_ols_idx: u16,
+}
+
+impl Tols {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(target_ols_idx: u16) -> Self {
+        Self { target_ols_idx }
+    }
 }
 
 /// Progressive Derived Image Item Information descriptive property
@@ -1801,6 +2366,7 @@ pub struct Tols {
 ///
 /// Spec: ISO/IEC 23008-12 §6.5.37.2 — ItemFullProperty(`prdi`,
 /// version=0, flags).
+#[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Prdi {
     /// The full 24-bit `flags` field of the `ItemFullProperty` header.
@@ -1820,6 +2386,21 @@ pub struct Prdi {
     /// exactly `step_count` entries. `None` means each step consumes one
     /// candidate input image item (the inferred `item_count == 1`).
     pub item_counts: Option<Vec<u16>>,
+}
+
+impl Prdi {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(flags: u32, step_count: Option<u16>, item_counts: Option<Vec<u16>>) -> Self {
+        Self {
+            flags,
+            step_count,
+            item_counts,
+        }
+    }
 }
 
 impl Prdi {
@@ -1925,6 +2506,7 @@ pub struct Sstr;
 ///
 /// Spec: ISO/IEC 23008-12 §6.10.2.1.2 — ItemFullProperty(`txlo`,
 /// version=0, flags).
+#[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Txlo {
     /// The full 24-bit `flags` field. Only bit 0 (the field-size
@@ -1955,6 +2537,39 @@ pub struct Txlo {
 }
 
 impl Txlo {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        flags: u32,
+        reference_width: u32,
+        reference_height: u32,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        font_size: u16,
+        direction: String,
+        writing_mode: String,
+    ) -> Self {
+        Self {
+            flags,
+            reference_width,
+            reference_height,
+            x,
+            y,
+            width,
+            height,
+            font_size,
+            direction,
+            writing_mode,
+        }
+    }
+}
+
+impl Txlo {
     /// §6.10.2.1.2 `flags` bit 0 — when set the `reference_*` / `x` / `y` /
     /// `width` / `height` fields are 32-bit (else 16-bit).
     pub const FLAG_LARGE_FIELD_SIZE: u32 = 0x0000_0001;
@@ -1981,11 +2596,23 @@ impl Txlo {
 ///
 /// Spec: ISO/IEC 23008-12 §6.10.2.2 (carrying ISO/IEC 14496-12 §8.4.6
 /// ExtendedLanguageBox semantics).
+#[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Elng {
     /// RFC 5646 / BCP 47 language tag for the associated item. An empty
     /// string is the documented "unspecified" shape.
     pub extended_language: String,
+}
+
+impl Elng {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(extended_language: String) -> Self {
+        Self { extended_language }
+    }
 }
 
 /// Font Characteristics descriptive property (`fnch`) — HEIF §6.10.4.1.
@@ -2008,6 +2635,7 @@ pub struct Elng {
 ///
 /// Spec: ISO/IEC 23008-12 §6.10.4.1.2 — ItemFullProperty(`fnch`,
 /// version=0, flags=0).
+#[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Fnch {
     /// Single font-family name (e.g. `"Arial"`, `"Helvetica"`).
@@ -2016,6 +2644,21 @@ pub struct Fnch {
     pub font_style: String,
     /// W3C TTML2 `tts:fontWeight` value (e.g. `"normal"`, `"bold"`).
     pub font_weight: String,
+}
+
+impl Fnch {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(font_family: String, font_style: String, font_weight: String) -> Self {
+        Self {
+            font_family,
+            font_style,
+            font_weight,
+        }
+    }
 }
 
 /// Mask Configuration descriptive property (`mskC`) — HEIF §11.2.2.2.
@@ -2035,11 +2678,23 @@ pub struct Fnch {
 ///
 /// Spec: ISO/IEC 23008-12 §11.2.2.2.2 — ItemFullProperty(`mskC`,
 /// version=0, flags=0).
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MaskC {
     /// Number of bits per mask pixel (§11.2.2.2.3). Defined values are
     /// `1`, `2`, `4`, `8`, `16`, `24`; others are reserved.
     pub bits_per_pixel: u8,
+}
+
+impl MaskC {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(bits_per_pixel: u8) -> Self {
+        Self { bits_per_pixel }
+    }
 }
 
 impl MaskC {
@@ -2129,6 +2784,7 @@ impl MaskC {
 ///
 /// Spec: ISO/IEC 23008-12 §6.5.39 — ItemFullProperty(`cmex`, version,
 /// flags).
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Cmex {
     /// The full 24-bit `flags` field of the FullBox header, preserved
@@ -2162,6 +2818,37 @@ pub struct Cmex {
     /// `id` — the world coordinate-system identifier (§6.5.39.3). `Some`
     /// exactly when `id_present`; absent values are inferred to be `0`.
     pub id: Option<u32>,
+}
+
+impl Cmex {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        flags: u32,
+        version: u8,
+        pos_x: Option<i32>,
+        pos_y: Option<i32>,
+        pos_z: Option<i32>,
+        quat_x: Option<i32>,
+        quat_y: Option<i32>,
+        quat_z: Option<i32>,
+        id: Option<u32>,
+    ) -> Self {
+        Self {
+            flags,
+            version,
+            pos_x,
+            pos_y,
+            pos_z,
+            quat_x,
+            quat_y,
+            quat_z,
+            id,
+        }
+    }
 }
 
 impl Cmex {
@@ -2344,6 +3031,7 @@ impl Cmex {
 ///
 /// Spec: ISO/IEC 23008-12 §6.5.40.2 — ItemFullProperty(`cmin`,
 /// version=0, flags).
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Cmin {
     /// The full 24-bit `flags` field of the FullBox header. The
@@ -2376,6 +3064,31 @@ pub struct Cmin {
     /// `None` for the simplified form, in which case `s` is inferred to
     /// be `0` (§6.5.40.3).
     pub skew_factor: Option<i32>,
+}
+
+impl Cmin {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        flags: u32,
+        focal_length_x: i32,
+        principal_point_x: i32,
+        principal_point_y: i32,
+        focal_length_y: Option<i32>,
+        skew_factor: Option<i32>,
+    ) -> Self {
+        Self {
+            flags,
+            focal_length_x,
+            principal_point_x,
+            principal_point_y,
+            focal_length_y,
+            skew_factor,
+        }
+    }
 }
 
 impl Cmin {
@@ -2480,11 +3193,25 @@ impl Cmin {
 ///
 /// Spec: ISO/IEC 23008-12 §6.5.30.2 — ItemFullProperty(`wipe`,
 /// version=0, flags=0).
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Wipe {
     /// `transition_direction` (§6.5.30.3) — see the direction constants
     /// on [`Wipe`]. Values `>= 8` are reserved; surfaced verbatim.
     pub transition_direction: u8,
+}
+
+impl Wipe {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(transition_direction: u8) -> Self {
+        Self {
+            transition_direction,
+        }
+    }
 }
 
 impl Wipe {
@@ -2532,6 +3259,7 @@ impl Wipe {
 ///
 /// Spec: ISO/IEC 23008-12 §6.5.31.2 — ItemFullProperty(`zoom`,
 /// version=0, flags=0).
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Zoom {
     /// `transition_direction` (§6.5.31.3) — `0` = zoom-in, `1` =
@@ -2541,6 +3269,20 @@ pub struct Zoom {
     /// [`Zoom`]. Decoded from the low 7 bits; values not enumerated are
     /// reserved and surfaced verbatim.
     pub transition_shape: u8,
+}
+
+impl Zoom {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(transition_direction: u8, transition_shape: u8) -> Self {
+        Self {
+            transition_direction,
+            transition_shape,
+        }
+    }
 }
 
 impl Zoom {
@@ -2577,11 +3319,25 @@ impl Zoom {
 ///
 /// Spec: ISO/IEC 23008-12 §6.5.32.2 — ItemFullProperty(`fade`,
 /// version=0, flags=0).
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Fade {
     /// `transition_direction` (§6.5.32.3) — see the constants on
     /// [`Fade`]. Values `>= 3` are reserved; surfaced verbatim.
     pub transition_direction: u8,
+}
+
+impl Fade {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(transition_direction: u8) -> Self {
+        Self {
+            transition_direction,
+        }
+    }
 }
 
 impl Fade {
@@ -2615,11 +3371,25 @@ impl Fade {
 ///
 /// Spec: ISO/IEC 23008-12 §6.5.33.2 — ItemFullProperty(`splt`,
 /// version=0, flags=0).
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Splt {
     /// `transition_direction` (§6.5.33.3) — see the constants on
     /// [`Splt`]. Values `>= 4` are reserved; surfaced verbatim.
     pub transition_direction: u8,
+}
+
+impl Splt {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(transition_direction: u8) -> Self {
+        Self {
+            transition_direction,
+        }
+    }
 }
 
 impl Splt {
@@ -2656,12 +3426,24 @@ impl Splt {
 ///
 /// Spec: ISO/IEC 23008-12 §6.5.34.2 — ItemFullProperty(`stpe`,
 /// version=0, flags=0).
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Stpe {
     /// `transition_period` (§6.5.34.3) — the recommended transition
     /// period in units of 1/16 second. Surfaced verbatim; see
     /// [`Self::seconds`] for the converted value.
     pub transition_period: u8,
+}
+
+impl Stpe {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(transition_period: u8) -> Self {
+        Self { transition_period }
+    }
 }
 
 impl Stpe {
@@ -2688,6 +3470,7 @@ impl Stpe {
 ///
 /// Spec: ISO/IEC 23008-12 §6.5.35.2 — ItemFullProperty(`ssld`,
 /// version=0, flags=0).
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Ssld {
     /// `duration` (§6.5.35.3) — the recommended display duration in
@@ -2695,6 +3478,17 @@ pub struct Ssld {
     /// verbatim. See [`Self::seconds`] for the converted value and
     /// [`Self::is_reserved`] for the reserved-sentinel check.
     pub duration: u16,
+}
+
+impl Ssld {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(duration: u16) -> Self {
+        Self { duration }
+    }
 }
 
 impl Ssld {
@@ -2712,6 +3506,7 @@ impl Ssld {
 
 /// One property box, kept typed for the boxes AVIF cares about + a raw
 /// fallback so an unknown property still gets an index for association.
+#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub enum Property {
     Av1C(Vec<u8>),
@@ -2864,6 +3659,7 @@ impl Property {
 /// One entry in `iref` — a typed reference whose `from_id` is the source
 /// item and `to_ids` is the list of target items (e.g. `dimg` -> tile
 /// items for a grid, `auxl` -> alpha item).
+#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct IrefEntry {
     pub reference_type: BoxType,
@@ -2871,7 +3667,23 @@ pub struct IrefEntry {
     pub to_ids: Vec<u32>,
 }
 
+impl IrefEntry {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(reference_type: BoxType, from_id: u32, to_ids: Vec<u32>) -> Self {
+        Self {
+            reference_type,
+            from_id,
+            to_ids,
+        }
+    }
+}
+
 /// Everything we pulled out of `meta`.
+#[non_exhaustive]
 #[derive(Clone, Debug, Default)]
 pub struct Meta {
     pub handler: Option<BoxType>,
@@ -2891,6 +3703,37 @@ pub struct Meta {
     /// derived items (overlay, grid) whose descriptor lives in `idat`
     /// rather than `mdat`. Spec: ISO/IEC 14496-12 §8.11.11.
     pub idat: Option<Vec<u8>>,
+}
+
+impl Meta {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        handler: Option<BoxType>,
+        primary_item_id: Option<u32>,
+        items: Vec<ItemInfo>,
+        locations: Vec<ItemLocation>,
+        properties: Vec<Property>,
+        associations: Vec<ItemPropertyAssociation>,
+        irefs: Vec<IrefEntry>,
+        grpl: Option<Vec<u8>>,
+        idat: Option<Vec<u8>>,
+    ) -> Self {
+        Self {
+            handler,
+            primary_item_id,
+            items,
+            locations,
+            properties,
+            associations,
+            irefs,
+            grpl,
+            idat,
+        }
+    }
 }
 
 impl Meta {
@@ -3332,12 +4175,7 @@ fn container_property(p: &hprops::Property) -> Property {
 /// (test scaffolding for the historical per-property unit tests).
 #[cfg(test)]
 fn container_parse(box_type: &FourCc, body: &[u8]) -> Result<hprops::Property> {
-    let raw = hmeta::RawProperty {
-        box_type: *box_type,
-        user_type: None,
-        body: body.to_vec(),
-        box_size: body.len() + 8,
-    };
+    let raw = hmeta::RawProperty::new(*box_type, None, body.to_vec(), body.len() + 8);
     container_typed(&raw)
 }
 
@@ -3388,12 +4226,12 @@ fn parse_ipco(payload: &[u8]) -> Result<Vec<Property>> {
     let mut out = Vec::new();
     for hdr in iter_boxes(payload) {
         let hdr = hdr?;
-        let raw = hmeta::RawProperty {
-            box_type: hdr.box_type,
-            user_type: hdr.user_type,
-            body: payload[hdr.payload_start..hdr.end()].to_vec(),
-            box_size: hdr.total_len(),
-        };
+        let raw = hmeta::RawProperty::new(
+            hdr.box_type,
+            hdr.user_type,
+            payload[hdr.payload_start..hdr.end()].to_vec(),
+            hdr.total_len(),
+        );
         out.push(property_from_raw(&raw)?);
     }
     Ok(out)
@@ -3485,6 +4323,10 @@ impl From<hprops::Colr> for Colr {
             },
             hprops::Colr::Icc { profile, .. } => Colr::Icc(profile),
             hprops::Colr::Other { colour_type, .. } => Colr::Unknown(colour_type),
+            // A `colr` colour type the container learns later: unknown
+            // to this crate's model (which keeps a type tag only; the
+            // container's variant name is not a four-CC).
+            _ => Colr::Unknown(*b"????"),
         }
     }
 }
@@ -3548,16 +4390,16 @@ impl From<hprops::Clap> for Clap {
 
 impl From<&Clap> for hprops::Clap {
     fn from(v: &Clap) -> Self {
-        hprops::Clap {
-            width_n: v.clean_aperture_width_n as u32,
-            width_d: v.clean_aperture_width_d as u32,
-            height_n: v.clean_aperture_height_n as u32,
-            height_d: v.clean_aperture_height_d as u32,
-            horiz_off_n: v.horiz_off_n,
-            horiz_off_d: v.horiz_off_d as u32,
-            vert_off_n: v.vert_off_n,
-            vert_off_d: v.vert_off_d as u32,
-        }
+        hprops::Clap::new(
+            v.clean_aperture_width_n as u32,
+            v.clean_aperture_width_d as u32,
+            v.clean_aperture_height_n as u32,
+            v.clean_aperture_height_d as u32,
+            v.horiz_off_n,
+            v.horiz_off_d as u32,
+            v.vert_off_n,
+            v.vert_off_d as u32,
+        )
     }
 }
 
@@ -3581,10 +4423,7 @@ impl From<hprops::Clli> for Clli {
 
 impl From<&Clli> for hprops::Clli {
     fn from(v: &Clli) -> Self {
-        hprops::Clli {
-            max_content_light_level: v.max_content_light_level,
-            max_pic_average_light_level: v.max_pic_average_light_level,
-        }
+        hprops::Clli::new(v.max_content_light_level, v.max_pic_average_light_level)
     }
 }
 
@@ -3600,11 +4439,7 @@ impl From<hprops::Amve> for Amve {
 
 impl From<&Amve> for hprops::Amve {
     fn from(v: &Amve) -> Self {
-        hprops::Amve {
-            ambient_illuminance: v.ambient_illuminance,
-            ambient_light_x: v.ambient_light_x,
-            ambient_light_y: v.ambient_light_y,
-        }
+        hprops::Amve::new(v.ambient_illuminance, v.ambient_light_x, v.ambient_light_y)
     }
 }
 

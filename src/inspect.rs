@@ -30,6 +30,7 @@ const AMVE: BoxType = b(b"amve");
 /// High-level view of an AVIF file after the HEIF pass — useful for
 /// callers that want to inspect dimensions + colour info without
 /// constructing a full `Decoder`.
+#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct AvifInfo {
     pub width: u32,
@@ -289,6 +290,103 @@ pub struct AvifInfo {
     /// decode). Empty for files without a grid derivation. See
     /// [`crate::derived::GridResolution`].
     pub grid_resolutions: Vec<crate::derived::GridResolution>,
+}
+
+impl AvifInfo {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        width: u32,
+        height: u32,
+        bits_per_channel: Vec<u8>,
+        pasp: Option<Pasp>,
+        av1c: Vec<u8>,
+        obu_bytes: Vec<u8>,
+        is_grid: bool,
+        has_alpha: bool,
+        brands: BrandClass,
+        colour: Option<Colr>,
+        mdcv: Option<Mdcv>,
+        clli: Option<Clli>,
+        cclv: Option<Cclv>,
+        amve: Option<Amve>,
+        bit_depth: Option<u8>,
+        monochrome: bool,
+        chroma_subsampling: Option<(bool, bool)>,
+        thumbnail_item_ids: Vec<u32>,
+        exif_item_id: Option<u32>,
+        xmp_item_id: Option<u32>,
+        premultiplied_alpha: bool,
+        aux_items: Vec<(u32, crate::meta::AuxKind)>,
+        alpha_aux_kind: Option<crate::meta::AuxKind>,
+        depth_map_item_id: Option<u32>,
+        hdr_gain_map_item_id: Option<u32>,
+        entity_group_count: usize,
+        mif1_compliance: crate::derived::Mif1Compliance,
+        operating_point: Option<crate::meta::A1op>,
+        layered_index: Option<crate::meta::A1lx>,
+        sato_item_ids: Vec<u32>,
+        tmap_item_ids: Vec<u32>,
+        tone_map_compliance: Vec<crate::derived::ToneMapCompliance>,
+        grid_derivation_compliance: Vec<crate::derived::GridDerivationAudit>,
+        iden_item_ids: Vec<u32>,
+        iden_compliance: Vec<crate::derived::IdenCompliance>,
+        alpha_bit_depth_compliance: Vec<crate::derived::AlphaBitDepthAudit>,
+        sequence_header_obu_compliance: Vec<crate::derived::SequenceHeaderObuAudit>,
+        avif_profile_compliance: Vec<crate::derived::AvifProfileCompliance>,
+        overlay_resolutions: Vec<crate::derived::OverlayResolution>,
+        iden_resolutions: Vec<crate::derived::IdenResolution>,
+        tone_map_resolutions: Vec<crate::derived::ToneMapResolution>,
+        grid_resolutions: Vec<crate::derived::GridResolution>,
+    ) -> Self {
+        Self {
+            width,
+            height,
+            bits_per_channel,
+            pasp,
+            av1c,
+            obu_bytes,
+            is_grid,
+            has_alpha,
+            brands,
+            colour,
+            mdcv,
+            clli,
+            cclv,
+            amve,
+            bit_depth,
+            monochrome,
+            chroma_subsampling,
+            thumbnail_item_ids,
+            exif_item_id,
+            xmp_item_id,
+            premultiplied_alpha,
+            aux_items,
+            alpha_aux_kind,
+            depth_map_item_id,
+            hdr_gain_map_item_id,
+            entity_group_count,
+            mif1_compliance,
+            operating_point,
+            layered_index,
+            sato_item_ids,
+            tmap_item_ids,
+            tone_map_compliance,
+            grid_derivation_compliance,
+            iden_item_ids,
+            iden_compliance,
+            alpha_bit_depth_compliance,
+            sequence_header_obu_compliance,
+            avif_profile_compliance,
+            overlay_resolutions,
+            iden_resolutions,
+            tone_map_resolutions,
+            grid_resolutions,
+        }
+    }
 }
 
 impl AvifInfo {
@@ -700,6 +798,7 @@ pub fn item_payload_bytes(file: &[u8], item_id: u32) -> Result<Vec<u8>> {
 
 /// A region item (`'rgan'`) resolved against an AVIF file, paired with the
 /// image item it annotates (HEIF §11.3).
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedRegionItem {
     /// Item id of the `'rgan'` region item itself.
@@ -709,6 +808,21 @@ pub struct ResolvedRegionItem {
     pub image_item_id: u32,
     /// The parsed region-item data.
     pub region: crate::region::RegionItem,
+}
+
+impl ResolvedRegionItem {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(region_item_id: u32, image_item_id: u32, region: crate::region::RegionItem) -> Self {
+        Self {
+            region_item_id,
+            image_item_id,
+            region,
+        }
+    }
 }
 
 /// Enumerate the region items (`item_type == 'rgan'`, HEIF §11.3.2) that
@@ -761,6 +875,7 @@ pub fn region_items(file: &[u8]) -> Result<Vec<ResolvedRegionItem>> {
 
 /// A text item (HEIF §6.10.1) resolved against an AVIF file, paired with
 /// the image item it annotates and the font items it references.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedTextItem {
     /// Item id of the text item (a `'mime'` item).
@@ -775,6 +890,27 @@ pub struct ResolvedTextItem {
     /// (HEIF §6.10.1.1), in declaration order. Empty when the text item
     /// references no font item.
     pub font_item_ids: Vec<u32>,
+}
+
+impl ResolvedTextItem {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        text_item_id: u32,
+        image_item_id: u32,
+        content_type: String,
+        font_item_ids: Vec<u32>,
+    ) -> Self {
+        Self {
+            text_item_id,
+            image_item_id,
+            content_type,
+            font_item_ids,
+        }
+    }
 }
 
 /// Enumerate the text items (HEIF §6.10.1) that annotate `image_item_id`.
@@ -855,6 +991,7 @@ pub fn is_font_item(item: &crate::meta::ItemInfo) -> bool {
 /// depends on, or is pre-derived from, other coded items) — distinct from
 /// the `'dimg'` *derived* image graph (grid / overlay / iden / tmap), which
 /// is modelled by [`crate::derived::DerivationGraph`].
+#[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CodedItemDependencies {
     /// `'pred'` targets (§6.4.9) — the coded image items this predictively
@@ -876,6 +1013,22 @@ pub struct CodedItemDependencies {
     /// `'tbas'` target (§6.5) — the related (tile-base) image item this
     /// item is a tile of, identified by a `'tbas'` item reference.
     pub tbas: Option<u32>,
+}
+
+impl CodedItemDependencies {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(pred: Vec<u32>, base: Vec<u32>, exbl: Vec<u32>, tbas: Option<u32>) -> Self {
+        Self {
+            pred,
+            base,
+            exbl,
+            tbas,
+        }
+    }
 }
 
 impl CodedItemDependencies {

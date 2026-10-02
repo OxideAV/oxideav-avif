@@ -38,56 +38,30 @@ fn red_primary() -> (Vec<u8>, Av1Config, u32, u32) {
 fn amendment_properties() -> Vec<(HProp, bool)> {
     vec![
         (
-            HProp::Reve(hprops::Reve {
-                surround_luminance: 2_000_000,
-                surround_light_x: 3127,
-                surround_light_y: 3290,
-                periphery_luminance: 500_000,
-                periphery_light_x: 3127,
-                periphery_light_y: 3290,
-            }),
+            HProp::Reve(hprops::Reve::new(
+                2_000_000, 3127, 3290, 500_000, 3127, 3290,
+            )),
+            false,
+        ),
+        (HProp::Ndwt(hprops::Ndwt::new(2_030_000)), false),
+        (
+            HProp::Cexg(hprops::Cexg::new(1, 1, 16, 16, false, None)),
+            false,
+        ),
+        (HProp::Dadj(hprops::Dadj::new(-250)), false),
+        (
+            HProp::Stag(hprops::Stag::new(vec![hprops::StereoAggressor::new(
+                3, 50, None,
+            )])),
             false,
         ),
         (
-            HProp::Ndwt(hprops::Ndwt {
-                diffuse_white_luminance: 2_030_000,
-            }),
-            false,
-        ),
-        (
-            HProp::Cexg(hprops::Cexg {
-                rows: 1,
-                columns: 1,
-                tile_width: 16,
-                tile_height: 16,
-                large_fields: false,
-                extent_config: None,
-            }),
-            false,
-        ),
-        (
-            HProp::Dadj(hprops::Dadj {
-                disparity_adjustment: -250,
-            }),
-            false,
-        ),
-        (
-            HProp::Stag(hprops::Stag {
-                aggressors: vec![hprops::StereoAggressor {
-                    aggressor_type: 3,
-                    severity: 50,
-                    sub_type_uri: None,
-                }],
-            }),
-            false,
-        ),
-        (
-            HProp::TilC(hprops::TilC {
-                tile_width: 16,
-                tile_height: 16,
-                extra_dimensions: Vec::new(),
-                in_file_tiles: Some((fourcc(b"av01"), Vec::new())),
-            }),
+            HProp::TilC(hprops::TilC::new(
+                16,
+                16,
+                Vec::new(),
+                Some((fourcc(b"av01"), Vec::new())),
+            )),
             false,
         ),
     ]
@@ -99,39 +73,16 @@ fn amendment_file() -> Vec<u8> {
     let (payload, av1c, w, h) = red_primary();
     let mut props = vec![
         (HProp::Av1C(av1c), true),
+        (HProp::Ispe(hprops::Ispe::new(w, h)), false),
         (
-            HProp::Ispe(hprops::Ispe {
-                width: w,
-                height: h,
-            }),
-            false,
-        ),
-        (
-            HProp::PixiExtended(hprops::PixiExtended {
-                pixi: hprops::Pixi {
-                    bits_per_channel: vec![8, 8, 8],
-                },
-                channels: vec![
-                    hprops::PixiChannel {
-                        channel_idc: 2,
-                        component_format: 0,
-                        subsampling: None,
-                        label: Some("Y".to_owned()),
-                    },
-                    hprops::PixiChannel {
-                        channel_idc: 3,
-                        component_format: 0,
-                        subsampling: Some((1, 0)),
-                        label: None,
-                    },
-                    hprops::PixiChannel {
-                        channel_idc: 4,
-                        component_format: 0,
-                        subsampling: Some((1, 0)),
-                        label: None,
-                    },
+            HProp::PixiExtended(hprops::PixiExtended::new(
+                hprops::Pixi::new(vec![8, 8, 8]),
+                vec![
+                    hprops::PixiChannel::new(2, 0, None, Some("Y".to_owned())),
+                    hprops::PixiChannel::new(3, 0, Some((1, 0)), None),
+                    hprops::PixiChannel::new(4, 0, Some((1, 0)), None),
                 ],
-            }),
+            )),
             false,
         ),
     ];
@@ -262,24 +213,8 @@ fn essential_container_property_is_reported_not_refused() {
     let (payload, av1c, w, h) = red_primary();
     let props = vec![
         (HProp::Av1C(av1c), true),
-        (
-            HProp::Ispe(hprops::Ispe {
-                width: w,
-                height: h,
-            }),
-            false,
-        ),
-        (
-            HProp::Reve(hprops::Reve {
-                surround_luminance: 1,
-                surround_light_x: 2,
-                surround_light_y: 3,
-                periphery_luminance: 4,
-                periphery_light_x: 5,
-                periphery_light_y: 6,
-            }),
-            true,
-        ),
+        (HProp::Ispe(hprops::Ispe::new(w, h)), false),
+        (HProp::Reve(hprops::Reve::new(1, 2, 3, 4, 5, 6)), true),
     ];
     let mut wr = HeifWriter::new().with_brands(
         fourcc(b"avif"),

@@ -352,10 +352,7 @@ fn yuv420_alpha_premultiplied_round_trips() {
     let img = build_image(w, h, 8, StillChroma::Yuv420);
     let alpha = plane(w, h, 8, 9);
     let img = img.with_alpha(alpha.clone()).expect("alpha");
-    let opts = StillEncodeOptions {
-        premultiplied_alpha: true,
-        ..Default::default()
-    };
+    let opts = StillEncodeOptions::default().with_premultiplied_alpha(true);
     let avif = encode_still(&img, &opts).expect("encode");
 
     let hdr = oxideav_avif::parse_header(&avif).expect("parse_header");
@@ -475,10 +472,7 @@ fn twelve_bit_alpha_premultiplied_round_trips() {
     let img = build_image(w, h, 12, StillChroma::Yuv444);
     let alpha = plane(w, h, 12, 21);
     let img = img.with_alpha(alpha.clone()).expect("alpha");
-    let opts = StillEncodeOptions {
-        premultiplied_alpha: true,
-        ..Default::default()
-    };
+    let opts = StillEncodeOptions::default().with_premultiplied_alpha(true);
     let avif = encode_still(&img, &opts).expect("encode");
 
     let hdr = parse_header(&avif).expect("parse_header");
@@ -575,10 +569,8 @@ fn hbd_odd_dimensions_pad_and_clap_back_exact() {
 #[test]
 fn hbd_orientation_irot_rotates_samples_exact() {
     let (w, h) = (24u32, 16u32);
-    let img = build_image(w, h, 10, StillChroma::Yuv444).with_props(StillProperties {
-        irot: Some(1),
-        ..Default::default()
-    });
+    let img = build_image(w, h, 10, StillChroma::Yuv444)
+        .with_props(StillProperties::default().with_irot(Some(1)));
     let avif = encode_still(&img, &StillEncodeOptions::default()).expect("encode");
 
     let vf = decode_own("10-bit irot", &avif);
@@ -604,16 +596,13 @@ fn pass_through_properties_round_trip() {
     let (w, h) = (24u32, 16u32);
     let exif = b"\x00\x00\x00\x00II*\x00still-exif".to_vec();
     let xmp = br#"<?xpacket?><x:xmpmeta/>"#.to_vec();
-    let img = build_image(w, h, 8, StillChroma::Yuv444).with_props(StillProperties {
-        exif: Some(exif.clone()),
-        xmp: Some(xmp.clone()),
-        clli: Some(oxideav_avif::Clli {
-            max_content_light_level: 1000,
-            max_pic_average_light_level: 400,
-        }),
-        irot: Some(1),
-        ..Default::default()
-    });
+    let img = build_image(w, h, 8, StillChroma::Yuv444).with_props(
+        StillProperties::default()
+            .with_exif(Some(exif.clone()))
+            .with_xmp(Some(xmp.clone()))
+            .with_clli(Some(oxideav_avif::Clli::new(1000, 400)))
+            .with_irot(Some(1)),
+    );
     let avif = encode_still(&img, &StillEncodeOptions::default()).expect("encode");
 
     let info = inspect(&avif).expect("inspect");
@@ -865,12 +854,10 @@ fn avis_sequence_all_intra_round_trips_exact() {
             StillImage::yuv(w, h, 8, StillChroma::Yuv420, y, u, v).unwrap()
         })
         .collect();
-    let opts = SequenceEncodeOptions {
-        all_intra: true,
-        timescale: 10,
-        frame_duration: 2,
-        ..Default::default()
-    };
+    let opts = SequenceEncodeOptions::default()
+        .with_timescale(10)
+        .with_frame_duration(2)
+        .with_all_intra(true);
     let avif = encode_sequence(&frames, &opts).expect("sequence encode");
 
     let hdr = parse_header(&avif).expect("parse");
@@ -976,10 +963,7 @@ fn avis_sequence_gop_10bit_round_trips_exact() {
             StillImage::yuv(w, h, 10, StillChroma::Yuv420, y, u, v).unwrap()
         })
         .collect();
-    let opts = SequenceEncodeOptions {
-        gop_length: 4,
-        ..Default::default()
-    };
+    let opts = SequenceEncodeOptions::default().with_gop_length(4);
     let avif = encode_sequence(&frames, &opts).expect("sequence encode");
     let meta = oxideav_avif::parse_avis(&avif).expect("parse_avis");
     assert_eq!(meta.samples.len(), 6);
@@ -1090,14 +1074,8 @@ fn lossy_encode_is_smaller_and_psnr_gated() {
     let img = StillImage::yuv(w, h, 8, StillChroma::Yuv420, y.clone(), u, v).expect("image");
 
     let lossless = encode_still(&img, &StillEncodeOptions::default()).expect("lossless");
-    let lossy = encode_still(
-        &img,
-        &StillEncodeOptions {
-            base_q_idx: 100,
-            ..Default::default()
-        },
-    )
-    .expect("lossy");
+    let lossy =
+        encode_still(&img, &StillEncodeOptions::default().with_base_q_idx(100)).expect("lossy");
     assert!(
         lossy.len() < lossless.len(),
         "lossy {} must be smaller than lossless {}",
@@ -1159,10 +1137,10 @@ fn grid_encode_guards() {
         .with_depth_map(plane(128, 128, 8, 5))
         .unwrap();
     assert!(encode_still_grid(&with_depth, &StillEncodeOptions::default(), 2, 1).is_err());
-    let with_iden = img.with_props(StillProperties {
-        identity_derivation: Some(oxideav_avif::IdentityDerivation::default()),
-        ..Default::default()
-    });
+    let with_iden = img.with_props(
+        StillProperties::default()
+            .with_identity_derivation(Some(oxideav_avif::IdentityDerivation::default())),
+    );
     assert!(encode_still_grid(&with_iden, &StillEncodeOptions::default(), 2, 1).is_err());
 }
 
@@ -1179,10 +1157,7 @@ fn grid_encode_with_alpha_round_trips_exact() {
         let img = build_image(w, h, depth, StillChroma::Yuv420)
             .with_alpha(plane(w, h, depth, 9))
             .unwrap();
-        let opts = StillEncodeOptions {
-            premultiplied_alpha: premultiplied,
-            ..Default::default()
-        };
+        let opts = StillEncodeOptions::default().with_premultiplied_alpha(premultiplied);
         let avif = encode_still_grid(&img, &opts, 2, 2).expect("grid+alpha encode");
         let label = format!("grid alpha {depth}-bit");
 
@@ -1315,32 +1290,22 @@ fn depth_map_auxiliary_round_trips_exact() {
 fn grid_pass_through_properties_round_trip() {
     let (w, h) = (200u32, 80u32);
     let exif = b"\x00\x00\x00\x00II*\x00grid-exif".to_vec();
-    let mdcv = oxideav_avif::Mdcv {
-        display_primaries_xy: [(34000, 16000), (13250, 34500), (7500, 3000)],
-        white_point_xy: (15635, 16450),
-        max_display_mastering_luminance: 10_000_000,
-        min_display_mastering_luminance: 50,
-    };
-    let amve = oxideav_avif::meta::Amve {
-        ambient_illuminance: 314_000,
-        ambient_light_x: 15635,
-        ambient_light_y: 16450,
-    };
-    let img = build_image(w, h, 8, StillChroma::Yuv420).with_props(StillProperties {
-        exif: Some(exif.clone()),
-        mdcv: Some(mdcv),
-        amve: Some(amve),
-        clli: Some(oxideav_avif::Clli {
-            max_content_light_level: 4000,
-            max_pic_average_light_level: 400,
-        }),
-        irot: Some(1),
-        pasp: Some(oxideav_avif::Pasp {
-            h_spacing: 4,
-            v_spacing: 3,
-        }),
-        ..Default::default()
-    });
+    let mdcv = oxideav_avif::Mdcv::new(
+        [(34000, 16000), (13250, 34500), (7500, 3000)],
+        (15635, 16450),
+        10_000_000,
+        50,
+    );
+    let amve = oxideav_avif::meta::Amve::new(314_000, 15635, 16450);
+    let img = build_image(w, h, 8, StillChroma::Yuv420).with_props(
+        StillProperties::default()
+            .with_exif(Some(exif.clone()))
+            .with_mdcv(Some(mdcv))
+            .with_clli(Some(oxideav_avif::Clli::new(4000, 400)))
+            .with_amve(Some(amve))
+            .with_irot(Some(1))
+            .with_pasp(Some(oxideav_avif::Pasp::new(4, 3))),
+    );
     let avif = encode_still_grid(&img, &StillEncodeOptions::default(), 2, 1).expect("grid encode");
     let info = inspect(&avif).expect("inspect");
     assert!(info.is_grid);

@@ -41,10 +41,35 @@ use crate::error::{AvifError as Error, Result};
 /// The actual source image item id isn't stored here — `iovl` payload
 /// only carries the offsets; the source ids come from the parallel
 /// `dimg` iref's `to_ids` list (in the same order).
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OverlayEntry {
     pub horizontal_offset: i32,
     pub vertical_offset: i32,
+}
+
+impl OverlayEntry {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(horizontal_offset: i32, vertical_offset: i32) -> Self {
+        Self {
+            horizontal_offset,
+            vertical_offset,
+        }
+    }
+    /// Setter: replace `horizontal_offset`.
+    pub fn with_horizontal_offset(mut self, horizontal_offset: i32) -> Self {
+        self.horizontal_offset = horizontal_offset;
+        self
+    }
+    /// Setter: replace `vertical_offset`.
+    pub fn with_vertical_offset(mut self, vertical_offset: i32) -> Self {
+        self.vertical_offset = vertical_offset;
+        self
+    }
 }
 
 /// Parsed `iovl` ImageOverlay descriptor (HEIF §6.6.2.2). Bottom-most
@@ -53,12 +78,54 @@ pub struct OverlayEntry {
 /// `canvas_fill_value` is RGBA in sRGB (R, G, B, A) per spec; the A
 /// channel runs 0 (transparent) to 65535 (opaque) linearly. RGB values
 /// are also 16-bit, padded with zeros if the writer thought in 8-bit.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImageOverlay {
     pub canvas_fill_value: [u16; 4],
     pub output_width: u32,
     pub output_height: u32,
     pub entries: Vec<OverlayEntry>,
+}
+
+impl ImageOverlay {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        canvas_fill_value: [u16; 4],
+        output_width: u32,
+        output_height: u32,
+        entries: Vec<OverlayEntry>,
+    ) -> Self {
+        Self {
+            canvas_fill_value,
+            output_width,
+            output_height,
+            entries,
+        }
+    }
+    /// Setter: replace `canvas_fill_value`.
+    pub fn with_canvas_fill_value(mut self, canvas_fill_value: [u16; 4]) -> Self {
+        self.canvas_fill_value = canvas_fill_value;
+        self
+    }
+    /// Setter: replace `output_width`.
+    pub fn with_output_width(mut self, output_width: u32) -> Self {
+        self.output_width = output_width;
+        self
+    }
+    /// Setter: replace `output_height`.
+    pub fn with_output_height(mut self, output_height: u32) -> Self {
+        self.output_height = output_height;
+        self
+    }
+    /// Setter: replace `entries`.
+    pub fn with_entries(mut self, entries: Vec<OverlayEntry>) -> Self {
+        self.entries = entries;
+        self
+    }
 }
 
 impl ImageOverlay {
@@ -88,16 +155,15 @@ impl ImageOverlay {
 
     /// The container crate's view of the same descriptor.
     pub(crate) fn descriptor(&self) -> oxideav_heif::derived::OverlayDescriptor {
-        oxideav_heif::derived::OverlayDescriptor {
-            canvas_fill: self.canvas_fill_value,
-            output_width: self.output_width,
-            output_height: self.output_height,
-            offsets: self
-                .entries
+        oxideav_heif::derived::OverlayDescriptor::new(
+            self.canvas_fill_value,
+            self.output_width,
+            self.output_height,
+            self.entries
                 .iter()
                 .map(|e| (e.horizontal_offset, e.vertical_offset))
                 .collect(),
-        }
+        )
     }
 }
 
@@ -110,6 +176,7 @@ impl ImageOverlay {
 /// (file-level `grpl` references file-level items; per §9.4.1). When a
 /// grouping mixes items and tracks, the resolver chooses based on which
 /// id matches — that's a caller-side concern.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EntityGroup {
     pub grouping_type: BoxType,
@@ -122,6 +189,22 @@ pub struct EntityGroup {
     /// that the audio track should repeat for the whole viewing
     /// duration.
     pub flags: u32,
+}
+
+impl EntityGroup {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(grouping_type: BoxType, group_id: u32, entity_ids: Vec<u32>, flags: u32) -> Self {
+        Self {
+            grouping_type,
+            group_id,
+            entity_ids,
+            flags,
+        }
+    }
 }
 
 impl EntityGroup {
@@ -281,6 +364,7 @@ impl EntityGroup {
 /// — for image sequences — as a sample-group `grouping_type` whose
 /// `VisualSampleGroupEntry` subclass carries the per-sample parameter
 /// (see [`BracketingEntry`]).
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BracketingKind {
     /// `'aebr'` — auto-exposure bracketing (§6.8.6.2).
@@ -371,6 +455,7 @@ pub fn parse_grpl(payload: &[u8]) -> Result<Vec<EntityGroup>> {
 /// emitted by ImageMagick), and our reader still accepts them. The
 /// validator exists so callers that want to enforce strict-mif1 mode
 /// can.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct Mif1Compliance {
     pub has_hdlr: bool,
@@ -383,6 +468,33 @@ pub struct Mif1Compliance {
     pub infe_count: usize,
     /// Brand carries `mif1` in major_brand or compatible_brands.
     pub claims_mif1: bool,
+}
+
+impl Mif1Compliance {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        has_hdlr: bool,
+        has_pitm: bool,
+        has_iinf: bool,
+        has_iloc: bool,
+        has_iprp: bool,
+        infe_count: usize,
+        claims_mif1: bool,
+    ) -> Self {
+        Self {
+            has_hdlr,
+            has_pitm,
+            has_iinf,
+            has_iloc,
+            has_iprp,
+            infe_count,
+            claims_mif1,
+        }
+    }
 }
 
 impl Mif1Compliance {
@@ -473,6 +585,7 @@ impl Mif1Compliance {
 ///   * `136` — min
 ///   * `137` — max
 /// * `138..=255` — reserved.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Token {
     /// A literal signed constant pushed to the stack.
@@ -536,6 +649,7 @@ impl Token {
 /// `oxideav-av1` decoder is the bottleneck (see crate README). This
 /// parser unblocks structural inspection, validation, and any future
 /// composition work that lands on top.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SampleTransform {
     /// `version` field. Spec mandates `0`; readers shall ignore items
@@ -552,6 +666,21 @@ pub struct SampleTransform {
     pub bit_depth: u8,
     /// Decoded token list. The first token's evaluation happens first.
     pub tokens: Vec<Token>,
+}
+
+impl SampleTransform {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(version: u8, bit_depth: u8, tokens: Vec<Token>) -> Self {
+        Self {
+            version,
+            bit_depth,
+            tokens,
+        }
+    }
 }
 
 impl SampleTransform {
@@ -974,6 +1103,7 @@ fn pow_truncated(base: i64, exp: i64) -> i64 {
 /// uses). Convention in HEIF gain-map layouts is `to_ids[0]` =
 /// base image item, `to_ids[1..]` = gain map(s); we treat
 /// `to_ids[0]` as the base and every subsequent entry as a gain map.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct ToneMapCompliance {
     /// The `'tmap'` item id this audit describes.
@@ -994,6 +1124,29 @@ pub struct ToneMapCompliance {
     /// (`infe` flags low bit set; HEIF §6.4.2). Trivially true when
     /// `gain_map_item_ids` is empty.
     pub gain_maps_hidden: bool,
+}
+
+impl ToneMapCompliance {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        tmap_item_id: u32,
+        base_item_id: Option<u32>,
+        gain_map_item_ids: Vec<u32>,
+        paired_in_altr: bool,
+        gain_maps_hidden: bool,
+    ) -> Self {
+        Self {
+            tmap_item_id,
+            base_item_id,
+            gain_map_item_ids,
+            paired_in_altr,
+            gain_maps_hidden,
+        }
+    }
 }
 
 impl ToneMapCompliance {
@@ -1084,6 +1237,7 @@ fn audit_one_tone_map(
 /// Stored as raw integer components rather than a pre-divided float so
 /// the parse stays lossless — callers that want the value compute
 /// `numerator as f64 / denominator as f64` themselves.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct GainMapRational {
     /// Signed numerator (the `int(32)` component).
@@ -1092,6 +1246,20 @@ pub struct GainMapRational {
     /// forbids `0`; [`GainMapMetadata::parse`] rejects any payload that
     /// carries a zero denominator.
     pub denominator: u32,
+}
+
+impl GainMapRational {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(numerator: i32, denominator: u32) -> Self {
+        Self {
+            numerator,
+            denominator,
+        }
+    }
 }
 
 impl GainMapRational {
@@ -1109,6 +1277,7 @@ impl GainMapRational {
 ///
 /// `gamma_numerator` and every `*_denominator` "shall not be 0" per Annex
 /// C.2.3; [`GainMapMetadata::parse`] enforces those constraints.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct GainMapChannel {
     /// Per-component gain map min value (signed rational; 5.2.5.2).
@@ -1122,6 +1291,29 @@ pub struct GainMapChannel {
     pub base_offset: GainMapRational,
     /// Per-component alternate offset constant (signed rational; 5.2.5.5).
     pub alternate_offset: GainMapRational,
+}
+
+impl GainMapChannel {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        gain_map_min: GainMapRational,
+        gain_map_max: GainMapRational,
+        gamma: GainMapRational,
+        base_offset: GainMapRational,
+        alternate_offset: GainMapRational,
+    ) -> Self {
+        Self {
+            gain_map_min,
+            gain_map_max,
+            gamma,
+            base_offset,
+            alternate_offset,
+        }
+    }
 }
 
 impl GainMapChannel {
@@ -1179,6 +1371,7 @@ impl GainMapChannel {
 /// metadata after the recognised fields; the parser stops after the last
 /// recognised field and ignores the remainder, so a longer payload is
 /// not an error.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct GainMapMetadata {
     /// `minimum_version` — the minimum version a parser must understand to
@@ -1205,6 +1398,33 @@ pub struct GainMapMetadata {
     /// Per-channel metadata. Length is 3 when [`Self::is_multichannel`],
     /// else 1.
     pub channels: Vec<GainMapChannel>,
+}
+
+impl GainMapMetadata {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        minimum_version: u16,
+        writer_version: u16,
+        is_multichannel: bool,
+        use_base_colour_space: bool,
+        base_hdr_headroom: GainMapRational,
+        alternate_hdr_headroom: GainMapRational,
+        channels: Vec<GainMapChannel>,
+    ) -> Self {
+        Self {
+            minimum_version,
+            writer_version,
+            is_multichannel,
+            use_base_colour_space,
+            base_hdr_headroom,
+            alternate_hdr_headroom,
+            channels,
+        }
+    }
 }
 
 impl GainMapMetadata {
@@ -1679,6 +1899,7 @@ fn rationals_differ(a: &GainMapRational, b: &GainMapRational) -> bool {
 /// lists the offending `(tile_item_id, transformative_kind)` pairs found
 /// on any `dimg` input. An empty `offenders` vector is the compliant
 /// case; [`Self::is_compliant`] is a one-call gate.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct GridDerivationAudit {
     /// The `'grid'` item id this audit describes.
@@ -1693,6 +1914,21 @@ pub struct GridDerivationAudit {
     /// all four lands as four entries. Empty when the grid is
     /// compliant.
     pub offenders: Vec<(u32, BoxType)>,
+}
+
+impl GridDerivationAudit {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(grid_item_id: u32, tile_item_ids: Vec<u32>, offenders: Vec<(u32, BoxType)>) -> Self {
+        Self {
+            grid_item_id,
+            tile_item_ids,
+            offenders,
+        }
+    }
 }
 
 impl GridDerivationAudit {
@@ -1805,6 +2041,7 @@ pub fn audit_grid_derivations(meta: &crate::meta::Meta) -> Vec<GridDerivationAud
 /// non-conformant per HEIF §6.6.2.1 / §6.6.1. [`Self::is_compliant`]
 /// reports the AND of every signal; [`Self::missing`] enumerates the
 /// failing checks for diagnostics.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct IdenCompliance {
     /// The `'iden'` item id this audit describes.
@@ -1830,6 +2067,29 @@ pub struct IdenCompliance {
     /// the audit doesn't pick "the" source — the file is malformed and
     /// the caller should inspect `dimg_reference_count` to disambiguate).
     pub source_item_id: Option<u32>,
+}
+
+impl IdenCompliance {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        iden_item_id: u32,
+        dimg_reference_count: usize,
+        dimg_iref_count: usize,
+        has_item_body: bool,
+        source_item_id: Option<u32>,
+    ) -> Self {
+        Self {
+            iden_item_id,
+            dimg_reference_count,
+            dimg_iref_count,
+            has_item_body,
+            source_item_id,
+        }
+    }
 }
 
 impl IdenCompliance {
@@ -1944,6 +2204,7 @@ fn audit_one_iden(meta: &crate::meta::Meta, dimg: &BoxType, iden_id: u32) -> Ide
 ///
 /// All flags are reported even when the file makes no `'pred'` claim, so a
 /// caller can distinguish "claims pred and fails" from "no pred claim".
+#[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PredBrandCompliance {
     /// `'pred'` is among the file's major/compatible brands.
@@ -1961,6 +2222,29 @@ pub struct PredBrandCompliance {
     /// `'pred'` reference (i.e. it is not independently coded) — a
     /// §10.2.4.2 violation. `false` when not applicable or satisfied.
     pub primary_not_independent: bool,
+}
+
+impl PredBrandCompliance {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        claims_pred: bool,
+        claims_mif1: bool,
+        predictive_item_count: usize,
+        missing_dependency_ids: Vec<u32>,
+        primary_not_independent: bool,
+    ) -> Self {
+        Self {
+            claims_pred,
+            claims_mif1,
+            predictive_item_count,
+            missing_dependency_ids,
+            primary_not_independent,
+        }
+    }
 }
 
 impl PredBrandCompliance {
@@ -2097,6 +2381,7 @@ fn decode_av1c_bit_depth(av1c: &[u8]) -> Option<u8> {
 /// The check passes ([`AlphaBitDepthAudit::is_compliant`]) when both
 /// items carry an `av1C` and both decoded bit depths agree. Either
 /// item missing `av1C`, or any mismatch, fails the audit.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct AlphaBitDepthAudit {
     /// The AV1 Alpha Image Item id (the `auxl` iref's `from_id`).
@@ -2117,6 +2402,31 @@ pub struct AlphaBitDepthAudit {
     /// `true` when the master item carries no `av1C` association at
     /// all.
     pub master_missing_av1c: bool,
+}
+
+impl AlphaBitDepthAudit {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        alpha_item_id: u32,
+        master_item_id: u32,
+        alpha_bit_depth: Option<u8>,
+        master_bit_depth: Option<u8>,
+        alpha_missing_av1c: bool,
+        master_missing_av1c: bool,
+    ) -> Self {
+        Self {
+            alpha_item_id,
+            master_item_id,
+            alpha_bit_depth,
+            master_bit_depth,
+            alpha_missing_av1c,
+            master_missing_av1c,
+        }
+    }
 }
 
 impl AlphaBitDepthAudit {
@@ -2279,6 +2589,7 @@ fn effective_av1c(meta: &crate::meta::Meta, item_id: u32, depth: u32) -> Option<
 ///   the walker cannot frame an OBU without an explicit size when
 ///   chained — it stops at the first such OBU and the count from
 ///   that point on is undefined.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct SequenceHeaderObuAudit {
     /// AV1 Image Item id whose payload was walked.
@@ -2303,6 +2614,31 @@ pub struct SequenceHeaderObuAudit {
     /// av1-avif §2.1, AV1 Image Item Data chains OBUs into one item
     /// payload and the `has_size` bit is required.
     pub has_size_field_zero: bool,
+}
+
+impl SequenceHeaderObuAudit {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        item_id: u32,
+        sequence_header_count: u32,
+        total_obu_count: u32,
+        missing_iloc: bool,
+        truncated_obu: bool,
+        has_size_field_zero: bool,
+    ) -> Self {
+        Self {
+            item_id,
+            sequence_header_count,
+            total_obu_count,
+            missing_iloc,
+            truncated_obu,
+            has_size_field_zero,
+        }
+    }
 }
 
 impl SequenceHeaderObuAudit {
@@ -2538,6 +2874,7 @@ pub(crate) fn decode_av1c_seq_profile(av1c: &[u8]) -> Option<u8> {
 
 /// Which AVIF profile brand a record was audited against — see
 /// [`AvifProfileCompliance::profile`].
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AvifProfile {
     /// `MA1B` — AVIF Baseline Profile (av1-avif v1.2.0 §8.2). Requires
@@ -2582,6 +2919,7 @@ pub enum AvifProfile {
 /// the spec's profile clauses both bound the level (5.1 / 6.0), and
 /// the level-31 carve-out signals unconstrained sizing, which is
 /// outside either profile's reach.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AvifProfileCompliance {
     /// The AVIF profile this record is checking the item against.
@@ -2598,6 +2936,29 @@ pub struct AvifProfileCompliance {
     /// (distinct from a present-but-truncated `av1C`, which surfaces
     /// as both fields `None` without setting this flag).
     pub missing_av1c: bool,
+}
+
+impl AvifProfileCompliance {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        profile: AvifProfile,
+        item_id: u32,
+        seq_profile: Option<u8>,
+        seq_level_idx_0: Option<u8>,
+        missing_av1c: bool,
+    ) -> Self {
+        Self {
+            profile,
+            item_id,
+            seq_profile,
+            seq_level_idx_0,
+            missing_av1c,
+        }
+    }
 }
 
 impl AvifProfileCompliance {
@@ -2751,6 +3112,7 @@ pub fn audit_avif_profile_compliance(
 ///
 /// Spec: ISO/IEC 23008-12 §6.5.10 (`irot`), §6.5.12 (`imir`), §6.5.8 /
 /// §6.5.9 (`clap`), §6.5.13 (`iscl`).
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DimTransform {
     /// Counter-clockwise rotation, `angle` × 90°. 90°/270° swap width and
@@ -3043,6 +3405,7 @@ fn reconstructed_dims_inner(
 /// in the reconstructed image only when its canvas coordinate is in
 /// `[0, output_width)` × `[0, output_height)`; the [`visible`](Self::visible)
 /// rectangle is that intersection, expressed back in canvas coordinates.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OverlayPlacement {
     /// The source image item id (from the parallel `dimg` iref `to_ids`).
@@ -3055,6 +3418,29 @@ pub struct OverlayPlacement {
     pub input_width: u32,
     /// Input image output-image height.
     pub input_height: u32,
+}
+
+impl OverlayPlacement {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        source_item_id: u32,
+        offset_x: i64,
+        offset_y: i64,
+        input_width: u32,
+        input_height: u32,
+    ) -> Self {
+        Self {
+            source_item_id,
+            offset_x,
+            offset_y,
+            input_width,
+            input_height,
+        }
+    }
 }
 
 impl OverlayPlacement {
@@ -3094,6 +3480,7 @@ impl OverlayPlacement {
 
 /// A fully resolved `iovl` overlay derivation: the parsed descriptor plus
 /// each input's resolved placement against the canvas (§6.6.2.2).
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OverlayResolution {
     /// The `iovl` derived item id.
@@ -3103,6 +3490,25 @@ pub struct OverlayResolution {
     /// One placement per input, bottom-most first (layering order matches
     /// the `dimg` iref `to_ids` order, §6.6.2.2.1).
     pub placements: Vec<OverlayPlacement>,
+}
+
+impl OverlayResolution {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        iovl_item_id: u32,
+        descriptor: ImageOverlay,
+        placements: Vec<OverlayPlacement>,
+    ) -> Self {
+        Self {
+            iovl_item_id,
+            descriptor,
+            placements,
+        }
+    }
 }
 
 impl OverlayResolution {
@@ -3192,6 +3598,7 @@ pub fn resolve_overlays(
 /// A fully resolved `iden` identity derivation: the single source item, its
 /// reconstructed dimensions, the transform chain applied by the iden item
 /// itself, and the resulting output dimensions (§6.6.2.1 + §6.3).
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IdenResolution {
     /// The `iden` derived item id.
@@ -3208,6 +3615,29 @@ pub struct IdenResolution {
     /// The iden item's output dimensions after applying `transforms` to
     /// `source_dims`, or `None` when `source_dims` is `None`.
     pub output_dims: Option<(u32, u32)>,
+}
+
+impl IdenResolution {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        iden_item_id: u32,
+        source_item_id: Option<u32>,
+        source_dims: Option<(u32, u32)>,
+        transforms: Vec<DimTransform>,
+        output_dims: Option<(u32, u32)>,
+    ) -> Self {
+        Self {
+            iden_item_id,
+            source_item_id,
+            source_dims,
+            transforms,
+            output_dims,
+        }
+    }
 }
 
 /// Resolve every `iden` identity-derivation item in `meta` end-to-end:
@@ -3271,6 +3701,7 @@ pub fn resolve_iden_derivations(
 /// this record describes the derivation *geometry* — which item is the base,
 /// which are gain maps, and the resulting output dimensions — without an AV1
 /// decode, mirroring [`OverlayResolution`] / [`IdenResolution`].
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToneMapResolution {
     /// The `tmap` derived item id.
@@ -3292,6 +3723,29 @@ pub struct ToneMapResolution {
     /// up-sampling ratio. `dims` is `None` when the gain map's dimensions
     /// are unresolvable (missing `ispe`, malformed derivation, …).
     pub gain_map_dims: Vec<(u32, Option<(u32, u32)>)>,
+}
+
+impl ToneMapResolution {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        tmap_item_id: u32,
+        base_item_id: Option<u32>,
+        gain_map_item_ids: Vec<u32>,
+        rendered_dims: Option<(u32, u32)>,
+        gain_map_dims: Vec<(u32, Option<(u32, u32)>)>,
+    ) -> Self {
+        Self {
+            tmap_item_id,
+            base_item_id,
+            gain_map_item_ids,
+            rendered_dims,
+            gain_map_dims,
+        }
+    }
 }
 
 impl ToneMapResolution {
@@ -3362,6 +3816,7 @@ pub fn resolve_tone_maps(
 /// left to right, at `(col · tile_width, row · tile_height)` without gap or
 /// overlap; pixels at or beyond `output_width` / `output_height` are
 /// trimmed.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GridTilePlacement {
     /// The tile's source image item id (the `dimg` `to_id` at this index).
@@ -3374,6 +3829,23 @@ pub struct GridTilePlacement {
     pub origin_x: u32,
     /// Canvas y of the tile's top row (`row · tile_height`).
     pub origin_y: u32,
+}
+
+impl GridTilePlacement {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(source_item_id: u32, row: u16, col: u16, origin_x: u32, origin_y: u32) -> Self {
+        Self {
+            source_item_id,
+            row,
+            col,
+            origin_x,
+            origin_y,
+        }
+    }
 }
 
 impl GridTilePlacement {
@@ -3421,6 +3893,7 @@ impl GridTilePlacement {
 
 /// A fully resolved `'grid'` derivation: the parsed descriptor, the common
 /// tile dimensions, and each tile's canvas placement (§6.6.2.3).
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GridResolution {
     /// The `'grid'` derived item id.
@@ -3435,6 +3908,27 @@ pub struct GridResolution {
     /// One placement per tile, row-major (top row first, left to right),
     /// in `dimg` `to_ids` order (§6.6.2.3.1).
     pub placements: Vec<GridTilePlacement>,
+}
+
+impl GridResolution {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        grid_item_id: u32,
+        descriptor: crate::grid::ImageGrid,
+        tile_dims: Option<(u32, u32)>,
+        placements: Vec<GridTilePlacement>,
+    ) -> Self {
+        Self {
+            grid_item_id,
+            descriptor,
+            tile_dims,
+            placements,
+        }
+    }
 }
 
 impl GridResolution {
@@ -3532,6 +4026,7 @@ pub fn resolve_grids(
 /// image is obtained (HEIF §6.6.1). A coded leaf is decoded directly from an
 /// AV1 bitstream; every other variant is a derived image item whose
 /// reconstructed image is computed from its `'dimg'` inputs.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DerivationKind {
     /// A coded image item (`'av01'`): the leaf a renderer actually decodes.
@@ -3597,6 +4092,7 @@ impl DerivationKind {
 /// `output_dims` folds the node's own transformative item properties on top
 /// (§6.6.1). For a coded leaf the two differ only when the leaf carries a
 /// `'clap'`/`'irot'`/`'imir'`/`'iscl'` of its own.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DerivationNode {
     /// The image item id.
@@ -3617,6 +4113,31 @@ pub struct DerivationNode {
     pub output_dims: Option<(u32, u32)>,
     /// Recursion depth from the root primary (the root is depth 0).
     pub depth: u32,
+}
+
+impl DerivationNode {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        item_id: u32,
+        kind: DerivationKind,
+        inputs: Vec<u32>,
+        reconstructed_dims: Option<(u32, u32)>,
+        output_dims: Option<(u32, u32)>,
+        depth: u32,
+    ) -> Self {
+        Self {
+            item_id,
+            kind,
+            inputs,
+            reconstructed_dims,
+            output_dims,
+            depth,
+        }
+    }
 }
 
 impl DerivationNode {
@@ -3646,6 +4167,7 @@ impl DerivationNode {
 /// cycle terminates; a node already visited is recorded once (its first
 /// visit) and not re-expanded, so a diamond-shaped graph (two derivations
 /// sharing an input) lists the shared leaf once.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DerivationGraph {
     /// The root item id the graph was built from.
@@ -3662,6 +4184,27 @@ pub struct DerivationGraph {
     /// nesting). The partial graph collected up to the bound is still
     /// returned.
     pub truncated: bool,
+}
+
+impl DerivationGraph {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        root_item_id: u32,
+        nodes: Vec<DerivationNode>,
+        coded_leaf_ids: Vec<u32>,
+        truncated: bool,
+    ) -> Self {
+        Self {
+            root_item_id,
+            nodes,
+            coded_leaf_ids,
+            truncated,
+        }
+    }
 }
 
 impl DerivationGraph {

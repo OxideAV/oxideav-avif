@@ -53,6 +53,7 @@ use crate::meta::Colr;
 /// AVIF image has an effective triple, even if it's the canonical
 /// "Unspecified" `(2, 2, 2, false)`. Use [`effective_cicp`] to fold
 /// `Option<&Colr>` into a `CicpTriple`.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CicpTriple {
     /// `colour_primaries` per ITU-T H.273 §8.1. 1 = BT.709,
@@ -69,6 +70,27 @@ pub struct CicpTriple {
     /// `video_full_range_flag`. `false` → studio range (limited),
     /// `true` → full range (0..=255 / 0..=1023).
     pub full_range: bool,
+}
+
+impl CicpTriple {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        colour_primaries: u16,
+        transfer_characteristics: u16,
+        matrix_coefficients: u16,
+        full_range: bool,
+    ) -> Self {
+        Self {
+            colour_primaries,
+            transfer_characteristics,
+            matrix_coefficients,
+            full_range,
+        }
+    }
 }
 
 impl CicpTriple {

@@ -45,6 +45,7 @@ pub const ITEM_TYPE_AV01: BoxType = b(b"av01");
 pub const ITEM_TYPE_GRID: BoxType = b(b"grid");
 
 /// Decoded AVIF file, ready for hand-off to an AV1 OBU decoder.
+#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct AvifImage<'a> {
     pub major_brand: BoxType,
@@ -81,10 +82,56 @@ pub struct AvifImage<'a> {
     pub amve: Option<Amve>,
 }
 
+impl<'a> AvifImage<'a> {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        major_brand: BoxType,
+        minor_version: u32,
+        compatible_brands: Vec<BoxType>,
+        meta: Meta,
+        primary_item_id: u32,
+        primary_item: ItemInfo,
+        primary_item_data: Cow<'a, [u8]>,
+        av1c: Option<Vec<u8>>,
+        ispe: Option<Ispe>,
+        colr: Option<Colr>,
+        pixi: Option<Pixi>,
+        pasp: Option<Pasp>,
+        mdcv: Option<Mdcv>,
+        clli: Option<Clli>,
+        cclv: Option<Cclv>,
+        amve: Option<Amve>,
+    ) -> Self {
+        Self {
+            major_brand,
+            minor_version,
+            compatible_brands,
+            meta,
+            primary_item_id,
+            primary_item,
+            primary_item_data,
+            av1c,
+            ispe,
+            colr,
+            pixi,
+            pasp,
+            mdcv,
+            clli,
+            cclv,
+            amve,
+        }
+    }
+}
+
 /// Header-only parse that stops after `ftyp` + `meta` have been walked.
 /// Used by callers (grid composition, AVIS) that need access to the
 /// full `Meta` without committing to the single-av01-item contract
 /// [`parse`] enforces.
+#[non_exhaustive]
 pub struct AvifHeader<'a> {
     pub file: &'a [u8],
     pub major_brand: BoxType,
@@ -98,6 +145,31 @@ pub struct AvifHeader<'a> {
     /// `file` (`HeifFile::parse_borrowed`): the header never copies
     /// the input.
     pub heif: HeifFileRef<'a>,
+}
+
+impl<'a> AvifHeader<'a> {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        file: &'a [u8],
+        major_brand: BoxType,
+        minor_version: u32,
+        compatible_brands: Vec<BoxType>,
+        meta: Meta,
+        heif: HeifFileRef<'a>,
+    ) -> Self {
+        Self {
+            file,
+            major_brand,
+            minor_version,
+            compatible_brands,
+            meta,
+            heif,
+        }
+    }
 }
 
 impl AvifHeader<'_> {
@@ -403,6 +475,7 @@ fn primary_payload<'a>(
 /// Classification of an AVIF / HEIF `ftyp` box per av1-avif §6 + §7 +
 /// §8 and ISO/IEC 23000-22 (MIAF) §7. Surfaces both the structural
 /// brand the file claims and the optional AVIF profile.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BrandClass {
     /// File declares an AV1 image / image-collection (`avif`) brand.
@@ -422,6 +495,35 @@ pub struct BrandClass {
     pub is_baseline_profile: bool,
     /// AVIF Advanced Profile brand (`MA1A`).
     pub is_advanced_profile: bool,
+}
+
+impl BrandClass {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        is_image: bool,
+        is_sequence: bool,
+        is_intra_only: bool,
+        is_miaf: bool,
+        has_mif1: bool,
+        has_msf1: bool,
+        is_baseline_profile: bool,
+        is_advanced_profile: bool,
+    ) -> Self {
+        Self {
+            is_image,
+            is_sequence,
+            is_intra_only,
+            is_miaf,
+            has_mif1,
+            has_msf1,
+            is_baseline_profile,
+            is_advanced_profile,
+        }
+    }
 }
 
 /// Classify the brand set of a parsed `ftyp` box. Errors when the file

@@ -218,16 +218,8 @@ fn overlay_8bit_420_two_opaque_layers_round_trips_exact() {
     let stamp = build_image(16, 8, 8, StillChroma::Yuv420, 7);
     let canvas = OverlayCanvas::new(32, 24);
     let layers = [
-        OverlayLayerImage {
-            image: &base,
-            x: 0,
-            y: 0,
-        },
-        OverlayLayerImage {
-            image: &stamp,
-            x: 8,
-            y: 8,
-        },
+        OverlayLayerImage::new(&base, 0, 0),
+        OverlayLayerImage::new(&stamp, 8, 8),
     ];
     let avif = encode_still_overlay(&canvas, &layers, &StillEncodeOptions::default())
         .expect("overlay encode");
@@ -308,16 +300,8 @@ fn overlay_10bit_422_clipped_stamp_round_trips_exact() {
     let stamp = build_image(8, 8, 10, StillChroma::Yuv422, 11);
     let canvas = OverlayCanvas::new(24, 16);
     let layers = [
-        OverlayLayerImage {
-            image: &base,
-            x: 0,
-            y: 0,
-        },
-        OverlayLayerImage {
-            image: &stamp,
-            x: -2,
-            y: 12,
-        },
+        OverlayLayerImage::new(&base, 0, 0),
+        OverlayLayerImage::new(&stamp, -2, 12),
     ];
     let avif = encode_still_overlay(&canvas, &layers, &StillEncodeOptions::default())
         .expect("overlay encode");
@@ -375,16 +359,8 @@ fn overlay_rgba_identity_alpha_over_and_transparent_fill() {
     let mut canvas = OverlayCanvas::new(20, 12);
     canvas.fill_rgba = [0x4000, 0x8000, 0xC000, 0x0000];
     let layers = [
-        OverlayLayerImage {
-            image: &base,
-            x: 0,
-            y: 0,
-        },
-        OverlayLayerImage {
-            image: &stamp,
-            x: 4,
-            y: 2,
-        },
+        OverlayLayerImage::new(&base, 0, 0),
+        OverlayLayerImage::new(&stamp, 4, 2),
     ];
     let avif = encode_still_overlay(&canvas, &layers, &StillEncodeOptions::default())
         .expect("overlay encode");
@@ -465,16 +441,8 @@ fn overlay_12bit_mono_odd_offset_with_irot() {
     let mut canvas = OverlayCanvas::new(12, 10);
     canvas.irot = Some(1);
     let layers = [
-        OverlayLayerImage {
-            image: &base,
-            x: 0,
-            y: 0,
-        },
-        OverlayLayerImage {
-            image: &stamp,
-            x: 3,
-            y: 5,
-        },
+        OverlayLayerImage::new(&base, 0, 0),
+        OverlayLayerImage::new(&stamp, 3, 5),
     ];
     let avif = encode_still_overlay(&canvas, &layers, &StillEncodeOptions::default())
         .expect("overlay encode");
@@ -502,16 +470,8 @@ fn overlay_12bit_mono_odd_offset_with_irot() {
     let base8 = build_image(12, 10, 8, StillChroma::Monochrome, 5);
     let stamp8 = build_image(5, 3, 8, StillChroma::Monochrome, 9);
     let layers8 = [
-        OverlayLayerImage {
-            image: &base8,
-            x: 0,
-            y: 0,
-        },
-        OverlayLayerImage {
-            image: &stamp8,
-            x: 3,
-            y: 5,
-        },
+        OverlayLayerImage::new(&base8, 0, 0),
+        OverlayLayerImage::new(&stamp8, 3, 5),
     ];
     let avif8 = encode_still_overlay(&canvas, &layers8, &StillEncodeOptions::default())
         .expect("overlay encode 8-bit");
@@ -519,10 +479,7 @@ fn overlay_12bit_mono_odd_offset_with_irot() {
         .iter()
         .map(|v| v.unwrap())
         .collect();
-    let props = StillProperties {
-        irot: Some(1),
-        ..Default::default()
-    };
+    let props = StillProperties::default().with_irot(Some(1));
     let flat = StillImage::yuv(
         12,
         10,
@@ -547,16 +504,8 @@ fn overlay_encode_guards() {
     let err = encode_still_overlay(
         &canvas,
         &[
-            OverlayLayerImage {
-                image: &a,
-                x: 0,
-                y: 0,
-            },
-            OverlayLayerImage {
-                image: &b,
-                x: 0,
-                y: 0,
-            },
+            OverlayLayerImage::new(&a, 0, 0),
+            OverlayLayerImage::new(&b, 0, 0),
         ],
         &StillEncodeOptions::default(),
     )
@@ -565,11 +514,7 @@ fn overlay_encode_guards() {
     assert!(encode_still_overlay(&canvas, &[], &StillEncodeOptions::default()).is_err());
     assert!(encode_still_overlay(
         &OverlayCanvas::new(0, 8),
-        &[OverlayLayerImage {
-            image: &a,
-            x: 0,
-            y: 0
-        }],
+        &[OverlayLayerImage::new(&a, 0, 0)],
         &StillEncodeOptions::default()
     )
     .is_err());
@@ -584,14 +529,11 @@ fn overlay_encode_guards() {
 #[test]
 fn identity_derivation_rotates_and_round_trips() {
     let img = build_image(12, 8, 8, StillChroma::Yuv420, 21);
-    let props = StillProperties {
-        identity_derivation: Some(IdentityDerivation {
-            clap: None,
-            irot: Some(3),
-            imir: None,
-        }),
-        ..Default::default()
-    };
+    let props = StillProperties::default().with_identity_derivation(Some(IdentityDerivation::new(
+        None,
+        Some(3),
+        None,
+    )));
     let img = img.with_props(props);
     let avif = encode_still(&img, &StillEncodeOptions::default()).expect("encode");
 
@@ -623,10 +565,7 @@ fn identity_derivation_rotates_and_round_trips() {
     }
     // Black box: the external decoder renders the iden primary exactly
     // like a plain encode carrying the same irot on the coded item.
-    let flat_props = StillProperties {
-        irot: Some(3),
-        ..Default::default()
-    };
+    let flat_props = StillProperties::default().with_irot(Some(3));
     let flat = build_image(12, 8, 8, StillChroma::Yuv420, 21).with_props(flat_props);
     let flat = encode_still(&flat, &StillEncodeOptions::default()).expect("flat encode");
     assert_external_equivalent("iden irot", &avif, &flat, 8);
@@ -649,24 +588,12 @@ fn identity_derivation_clap_imir_with_alpha() {
         })
         .collect();
     let img = StillImage::rgba8(w, h, &rgba).expect("rgba");
-    let props = StillProperties {
-        identity_derivation: Some(IdentityDerivation {
-            // Centre 8×4 crop.
-            clap: Some(oxideav_avif::Clap {
-                clean_aperture_width_n: 8,
-                clean_aperture_width_d: 1,
-                clean_aperture_height_n: 4,
-                clean_aperture_height_d: 1,
-                horiz_off_n: 0,
-                horiz_off_d: 1,
-                vert_off_n: 0,
-                vert_off_d: 1,
-            }),
-            irot: None,
-            imir: Some(1),
-        }),
-        ..Default::default()
-    };
+    // Centre 8×4 crop, then a horizontal mirror.
+    let props = StillProperties::default().with_identity_derivation(Some(IdentityDerivation::new(
+        Some(oxideav_avif::Clap::new(8, 1, 4, 1, 0, 1, 0, 1)),
+        None,
+        Some(1),
+    )));
     let img = img.with_props(props);
     let avif = encode_still(&img, &StillEncodeOptions::default()).expect("encode");
     let info = inspect(&avif).expect("inspect");

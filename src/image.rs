@@ -28,6 +28,17 @@ pub struct AvifPlane {
     pub data: Vec<u8>,
 }
 
+impl AvifPlane {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(stride: usize, data: Vec<u8>) -> Self {
+        Self { stride, data }
+    }
+}
+
 /// One decoded video frame, planar.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AvifFrame {
@@ -36,6 +47,17 @@ pub struct AvifFrame {
     /// One [`AvifPlane`] per channel — single plane for monochrome,
     /// three for planar YUV, four for YUV+alpha.
     pub planes: Vec<AvifPlane>,
+}
+
+impl AvifFrame {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(pts: Option<i64>, planes: Vec<AvifPlane>) -> Self {
+        Self { pts, planes }
+    }
 }
 
 /// Pixel layout — only the variants the AV1-decoded primary item +

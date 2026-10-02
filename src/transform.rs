@@ -233,7 +233,7 @@ pub fn apply_irot(
         return Ok((frame.clone(), width, height));
     }
     rotation_keeps_layout(format.chroma_subsampling(), turns)?;
-    let hirot = hprops::Irot { angle: turns };
+    let hirot = hprops::Irot::new(turns);
     same_layout_transform(frame, format, width, height, "irot", |f| {
         compose::apply_irot(f, &hirot)
     })
@@ -248,9 +248,7 @@ pub fn apply_imir(
     height: u32,
     imir: &Imir,
 ) -> Result<(VideoFrame, u32, u32)> {
-    let himir = hprops::Imir {
-        axis: imir.axis & 0x01,
-    };
+    let himir = hprops::Imir::new(imir.axis & 0x01);
     same_layout_transform(frame, format, width, height, "imir", |f| {
         compose::apply_imir(f, &himir)
     })

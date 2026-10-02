@@ -39,6 +39,7 @@ pub const ITEM_TYPE_IDEN: [u8; 4] = *b"iden";
 /// fields use the region item's `(flags & 1)`-selected 16- or 32-bit width
 /// (§11.2.1.3), sign-extended to `i32` for signed fields. `x` / `y` may be
 /// negative to place a corner / centre / point outside the image.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RegionGeometry {
     /// `geometry_type == 0` — a single point at `(x, y)`.
@@ -123,6 +124,7 @@ impl RegionGeometry {
 /// the top-left and a maximum size of `reference_width` × `reference_height`
 /// (§11.3.2.1). Each [`RegionGeometry`] is expressed against that space; a
 /// renderer scales it to the image item's pixel extents.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RegionItem {
     /// The full 8-bit `flags` field. Only bit 0 (the field-size selector)
@@ -135,6 +137,27 @@ pub struct RegionItem {
     pub reference_height: u32,
     /// The regions described by the item, in declaration order.
     pub regions: Vec<RegionGeometry>,
+}
+
+impl RegionItem {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        flags: u8,
+        reference_width: u32,
+        reference_height: u32,
+        regions: Vec<RegionGeometry>,
+    ) -> Self {
+        Self {
+            flags,
+            reference_width,
+            reference_height,
+            regions,
+        }
+    }
 }
 
 impl RegionItem {
@@ -204,6 +227,7 @@ impl RegionItem {
 /// which `shall` have no item body and a `'drgn'` `reference_count` of
 /// exactly 1; the resulting regions are the input region item's regions
 /// with the derived item's transformative item properties applied.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DerivedRegionItem {
     /// Item id of the derived region item (an `'iden'` item).
@@ -221,6 +245,29 @@ pub struct DerivedRegionItem {
     /// (§11.3.3.2.1 requires no item body — an `'iden'` derived region
     /// item shall have no extents).
     pub has_item_body: bool,
+}
+
+impl DerivedRegionItem {
+    /// Every field as a positional argument, in declaration order
+    /// (the record is `#[non_exhaustive]`: build it here, or from
+    /// `Default` where one exists, then read / assign the public
+    /// fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        derived_item_id: u32,
+        source_region_item_id: Option<u32>,
+        drgn_reference_count: usize,
+        drgn_iref_count: usize,
+        has_item_body: bool,
+    ) -> Self {
+        Self {
+            derived_item_id,
+            source_region_item_id,
+            drgn_reference_count,
+            drgn_iref_count,
+            has_item_body,
+        }
+    }
 }
 
 impl DerivedRegionItem {
