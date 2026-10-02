@@ -475,7 +475,7 @@ fn primary_payload<'a>(
 /// Classification of an AVIF / HEIF `ftyp` box per av1-avif §6 + §7 +
 /// §8 and ISO/IEC 23000-22 (MIAF) §7. Surfaces both the structural
 /// brand the file claims and the optional AVIF profile.
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BrandClass {
     /// File declares an AV1 image / image-collection (`avif`) brand.

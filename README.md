@@ -142,19 +142,21 @@ passes `audit_mif1`. At this layer the AV1 bitstream is taken
 
 ## Constructing the crate's types
 
-Every public record (typed properties, `Meta` / item records, the
-`inspect` results, descriptors, `StillImage` / `StillProperties` /
-the encode options, muxer specs) is `#[non_exhaustive]`: build it
-with `Type::new(<every field, in declaration order>)` — or `Default`
-where one exists — then read / assign its `pub` fields; the option
-records (`StillProperties`, `StillEncodeOptions`,
-`SequenceEncodeOptions`, `GainMapSpec`, `IdentityDerivation`, the
-muxer specs) also take `with_<field>` setters
-(`StillProperties::default().with_irot(Some(1))`). The enums that
-grow with the standard (`Property`, `Colr`, `AvifError`, `AuxKind`,
-`DerivationKind`, …) are `#[non_exhaustive]` too: match them with a
-`_` arm. `AvifFrame` / `AvifPlane` / `AvifPixelFormat` and
-`StillChroma` stay plain (the sample model AV1 closes).
+The records a user builds or reads through the documented API — the
+decode results (`AvifImage`, `AvifInfo`, `AvisMeta`, …), the typed
+metadata (`Ispe`, `Clap`, `Colr`, `Mdcv`, `Clli`, …), `StillImage` /
+`StillProperties` / the encode options and the muxer specs — are
+`#[non_exhaustive]`: build them with `Type::new(<every field, in
+declaration order>)` (or `Default` where one exists) and read /
+assign their `pub` fields; the option records take `with_<field>`
+setters (`StillProperties::default().with_irot(Some(1))`). The enums
+that grow with the standard (`Property`, `Colr`, `AvifError`,
+`AuxKind`, `DerivationKind`, …) are `#[non_exhaustive]` too: match
+them with a `_` arm. The parser's and composer's own records (table
+entries, descriptors, placements, the HEIF-extension property family)
+are `#[doc(hidden)]` — reachable, outside the semver contract.
+`AvifFrame` / `AvifPlane` / `AvifPixelFormat` and `StillChroma` stay
+plain (the sample model AV1 closes).
 
 ## Low-overhead files
 

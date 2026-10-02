@@ -9,49 +9,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **API hygiene (a minor bump): `#[non_exhaustive]` on every public
-  record and growing enum, `Type::new(<every field, in declaration
-  order>)` constructors, `with_<field>` setters on the option records.**
-  Records callers used to build by struct literal now take `new(..)`
-  (or `Default` where one exists) and keep their `pub` fields for
-  reading / assignment; `..Default::default()` struct update is no
-  longer available from outside the crate — use the setters or
-  assign. By module: `meta` (`Ispe` `Pixi` `Pasp` `Clap` `Irot` `Imir`
-  `AuxC` `Rloc` `Lsel` `A1op` `A1lx` `Mdcv` `Clli` `Cclv` `Amve` `Iscl`
-  `Rref` `Crtt` `Mdft` `Udes` `Altt` `Aebr` `Wbbr` `Fobr` `Afbr` `Dobr`
-  `Pano` `PanoGrid` `Subs` `SubsEntry` `Tols` `Prdi` `Txlo` `Elng`
-  `Fnch` `MaskC` `Cmex` `Cmin` `Wipe` `Zoom` `Fade` `Splt` `Stpe` `Ssld`
-  `ItemInfo` `IlocExtent` `ItemLocation` `ItemPropertyAssociation`
-  `PropertyAssociation` `IrefEntry` `Meta`), `derived` (`OverlayEntry`
-  `ImageOverlay` `EntityGroup` `SampleTransform` `GainMapRational`
-  `GainMapChannel` `GainMapMetadata`, every `*Compliance` / `*Audit` /
-  `*Resolution` / `*Placement` record, `DerivationNode`
-  `DerivationGraph`), `grid::ImageGrid`, `inspect` (`AvifInfo`
-  `ResolvedRegionItem` `ResolvedTextItem` `CodedItemDependencies`),
-  `parser` (`AvifImage` `AvifHeader` `BrandClass`), `avis` (`Sample`
-  `EditListEntry` `ProducerReferenceTime` `SubsegmentRange`
-  `SubsegmentIndex` `AvisMeta` `AvisInfo`, the compliance records),
-  `region` (`RegionItem` `DerivedRegionItem`), `sample_group`
-  (`SampleToGroupRun` `SampleToGroup` `SampleGroupDescription`
-  `VisualEquivalenceEntry`), `cicp::CicpTriple`, `overlay`
-  (`OverlayInput` `SamplePlanes`), `mux` (`ToneMapItem` `EntityGroupSpec`
-  `IdentityDerivation` `GridTile` `OverlayLayer`), `still` (`StillImage`
-  `StillProperties` `GainMapSpec` `StillEncodeOptions` `OverlayCanvas`
-  `OverlayLayerImage`), `sequence::SequenceEncodeOptions`. Setters
-  (`with_<field>`, one per field) on `StillProperties`
-  `StillEncodeOptions` `SequenceEncodeOptions` `GainMapSpec`
-  `IdentityDerivation` `EntityGroupSpec` `ToneMapItem` `GridTile`
-  `OverlayLayer` `OverlayCanvas` `OverlayLayerImage` `ImageGrid`
-  `ImageOverlay` `OverlayEntry` — e.g.
-  `StillProperties::default().with_irot(Some(1))`. Enums that grow with
-  the standard are `#[non_exhaustive]` (match them with a `_` arm):
-  `Property` `Colr` `AvifError` `AuxKind` `DerivationKind`
-  `RegionGeometry` `BracketingKind` `BracketingEntry`
-  `SampleToGroupKind` `Token` `AvifProfile` `DimTransform`. Kept plain
-  on purpose: `AvifFrame` / `AvifPlane` / `AvifPixelFormat` (the
-  sample model, closed by AV1), `StillChroma` (AV1's four layouts),
-  the builders with private fields (`AvifMuxer` family, `AvifDecoder`,
-  `AvifEncoder`).
+- **API hygiene (a minor bump): a small, deliberate public surface.**
+  The records an external user deliberately constructs or reads
+  through the documented API are `#[non_exhaustive]` with
+  `Type::new(<every field, in declaration order>)` constructors (keep
+  reading / assigning their `pub` fields; `..Default::default()` struct
+  update is no longer available from outside the crate) and, on the
+  option records, `with_<field>` setters — **64 types**: the decode
+  results (`AvifImage` `AvifHeader` `AvifInfo` `Meta` `ItemInfo`
+  `AvisMeta` `AvisInfo` `ResolvedRegionItem` `ResolvedTextItem`
+  `CodedItemDependencies` `EntityGroup` `RegionItem`
+  `DerivedRegionItem` `DerivationNode` `DerivationGraph`
+  `SampleTransform`), the audit records surfaced on them
+  (`Mif1Compliance` `ToneMapCompliance` `GridDerivationAudit`
+  `IdenCompliance` `PredBrandCompliance` `AlphaBitDepthAudit`
+  `SequenceHeaderObuAudit` `AvifProfileCompliance`
+  `AvisSequenceCompliance` `AvisProfileCompliance`
+  `EditListCompliance`), the typed metadata a user reads or sets when
+  authoring (`Ispe` `Pixi` `Pasp` `Clap` `Irot` `Imir` `AuxC` `Lsel`
+  `A1op` `A1lx` `Mdcv` `Clli` `Cclv` `Amve` `CicpTriple`), the
+  encoder / decoder options and muxer specs (`StillImage`
+  `StillProperties` `StillEncodeOptions` `GainMapSpec`
+  `SequenceEncodeOptions` `OverlayCanvas` `OverlayLayerImage`
+  `OverlayInput` `ToneMapItem` `EntityGroupSpec` `IdentityDerivation`
+  `GridTile` `OverlayLayer`), and the enums that grow with the
+  standard (`AvifError` `Property` `Colr` `AuxKind` `DerivationKind`
+  `RegionGeometry` `BracketingKind` `Token` `AvifProfile` — match them
+  with a `_` arm). Setters on `StillProperties` `StillEncodeOptions`
+  `SequenceEncodeOptions` `GainMapSpec` `IdentityDerivation`
+  `EntityGroupSpec` `ToneMapItem` `GridTile` `OverlayLayer`
+  `OverlayCanvas` `OverlayLayerImage`.
+  Everything that exists because the parser / composer / writer
+  needed a module-crossing record is `#[doc(hidden)]` (outside the
+  semver contract, no `#[non_exhaustive]`) — **61 types**: the
+  `iloc` / `ipma` / `iref` table records (`IlocExtent` `ItemLocation`
+  `ItemPropertyAssociation` `PropertyAssociation` `IrefEntry`), the
+  brand classification helper (`BrandClass`), the descriptors and
+  geometry records (`ImageGrid` `ImageOverlay` `OverlayEntry`
+  `DimTransform` `OverlayPlacement` `OverlayResolution`
+  `IdenResolution` `ToneMapResolution` `GridTilePlacement`
+  `GridResolution`), the standalone gain-map descriptor copy
+  (`GainMapMetadata` `GainMapChannel` `GainMapRational` — authoring
+  takes `oxideav_heif::gainmap::GainMapMetadata`), the sample-table
+  records (`Sample` `EditListEntry` `ProducerReferenceTime`
+  `SubsegmentRange` `SubsegmentIndex` `SampleToGroupRun`
+  `SampleToGroup` `SampleToGroupKind` `SampleGroupDescription`
+  `BracketingEntry` `VisualEquivalenceEntry`) and the HEIF-extension
+  property family carried by `Property` (`Rloc` `Iscl` `Rref` `Crtt`
+  `Mdft` `Udes` `Altt` `Aebr` `Wbbr` `Fobr` `Afbr` `Dobr` `Pano`
+  `PanoGrid` `Subs` `SubsEntry` `Tols` `Prdi` `Sstr` `Txlo` `Elng`
+  `Fnch` `MaskC` `Cmex` `Cmin` `Wipe` `Zoom` `Fade` `Splt` `Stpe`
+  `Ssld`). The overlay compositor's `SamplePlanes` scaffolding
+  (`unpack_planes` / `pack_planes`) is test-only. Kept plain on
+  purpose: `AvifFrame` / `AvifPlane` / `AvifPixelFormat` (the sample
+  model, closed by AV1), `StillChroma`, the builders with private
+  fields (`AvifMuxer` family, `AvifDecoder`, `AvifEncoder`).
 - **`oxideav-heif = "0.0.7"` minimum** (was 0.0.5 earlier in this
   cycle): the container's records are `#[non_exhaustive]` with `new`
   constructors, so every property / descriptor / `RawProperty` /

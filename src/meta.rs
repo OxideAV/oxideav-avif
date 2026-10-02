@@ -262,7 +262,7 @@ impl ItemInfo {
 /// the field is unused and left at its default of `0`; the parser also
 /// records `0` when the box's `index_size` is `0`, in which case the spec
 /// implies the value `1` for cm=2 resolution.
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Debug, Default)]
 pub struct IlocExtent {
     pub offset: u64,
@@ -288,7 +288,7 @@ impl IlocExtent {
 }
 
 /// One `iloc` entry.
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Debug)]
 pub struct ItemLocation {
     pub id: u32,
@@ -323,7 +323,7 @@ impl ItemLocation {
 }
 
 /// One property association list (for a single item).
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Debug)]
 pub struct ItemPropertyAssociation {
     pub item_id: u32,
@@ -343,7 +343,7 @@ impl ItemPropertyAssociation {
     }
 }
 
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug)]
 pub struct PropertyAssociation {
     pub index: u16,
@@ -644,7 +644,7 @@ impl AuxC {
 ///
 /// Spec: ISO/IEC 23008-12 §6.5.7.2 — `unsigned int(32) horizontal_offset;`
 /// + `unsigned int(32) vertical_offset;` inside a FullBox header.
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rloc {
     pub horizontal_offset: u32,
@@ -973,7 +973,7 @@ impl Amve {
 /// [`Iscl::is_well_formed`] helper exposes the §6.5.13.3 check
 /// without conflating "syntactically parseable" with "semantically
 /// valid" — both are useful signals at distinct layers.
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Iscl {
     /// Numerator of the horizontal scaling ratio.
@@ -1084,7 +1084,7 @@ fn div_ceil_u64(n: u64, d: u64) -> u64 {
 /// Each `reference_type[i]` is a four-CC carried as a big-endian
 /// `u32`; the four ASCII bytes (high → low byte order) form the
 /// `BoxType` of the required iref category.
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rref {
     /// The list of required `iref` four-CCs in declaration order.
@@ -1139,7 +1139,7 @@ impl Rref {
 /// ```text
 /// unsigned int(64) creation_time;
 /// ```
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Crtt {
     /// Creation time in microseconds since midnight, Jan. 1, 1904 UTC.
@@ -1215,7 +1215,7 @@ impl Crtt {
 /// ```text
 /// unsigned int(64) modification_time;
 /// ```
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Mdft {
     /// Modification time in microseconds since midnight, Jan. 1, 1904 UTC.
@@ -1299,7 +1299,7 @@ impl Mdft {
 ///
 /// Spec: ISO/IEC 23008-12 §6.5.20.2 — FullBox(`udes`, version=0,
 /// flags=0).
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Udes {
     /// RFC 5646 language tag (e.g. `"en-US"`); empty = unknown.
@@ -1436,7 +1436,7 @@ impl Udes {
 ///
 /// Spec: ISO/IEC 23008-12 §6.5.21.2 — FullBox(`altt`, version=0,
 /// flags=0).
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Altt {
     /// Alternate text for the associated image (HTML-`alt`-style).
@@ -1529,7 +1529,7 @@ impl Altt {
 ///
 /// Spec: ISO/IEC 23008-12 §6.5.22.2 — FullBox(`aebr`, version=0,
 /// flags=0).
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Aebr {
     /// Bracketing increment selector. Defined values per §6.5.22.3
@@ -1638,7 +1638,7 @@ impl Aebr {
 ///
 /// Spec: ISO/IEC 23008-12 §6.5.23.2 — FullBox(`wbbr`, version=0,
 /// flags=0).
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Wbbr {
     /// Colour-temperature component of the white balance in Kelvin
@@ -1732,7 +1732,7 @@ impl Wbbr {
 ///
 /// Spec: ISO/IEC 23008-12 §6.5.24.2 — FullBox(`fobr`, version=0,
 /// flags=0).
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Fobr {
     /// Numerator of the focus-distance ratio (§6.5.24.3). Unsigned
@@ -1856,7 +1856,7 @@ impl Fobr {
 ///
 /// Spec: ISO/IEC 23008-12 §6.5.25.2 — FullBox(`afbr`, version=0,
 /// flags=0).
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Afbr {
     /// Numerator of the flash-exposure ratio (§6.5.25.3). Signed
@@ -1949,7 +1949,7 @@ impl Afbr {
 ///
 /// Spec: ISO/IEC 23008-12 §6.5.26.2 — FullBox(`dobr`, version=0,
 /// flags=0).
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Dobr {
     /// Numerator of the aperture-change ratio (§6.5.26.3). Signed
@@ -2010,7 +2010,7 @@ impl Dobr {
 /// `0` means one row / one column. The [`Self::rows`] / [`Self::columns`]
 /// projections add the one back, widening to `u16` so the `255 + 1`
 /// endpoint doesn't wrap.
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PanoGrid {
     /// Number of rows in the grid **minus one** (§6.5.27.3).
@@ -2094,7 +2094,7 @@ impl PanoGrid {
 ///
 /// Spec: ISO/IEC 23008-12 §6.5.27.2 — FullBox(`pano`, version=0,
 /// flags=0).
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Pano {
     /// Type of panorama + scanning order of the input images
@@ -2162,7 +2162,7 @@ impl Pano {
 /// One sub-sample of a `subs` Sub-Sample Information descriptive property
 /// (HEIF §6.5.28). Each entry mirrors the inner loop body of the
 /// `SubSampleInformationBox` (ISO/IEC 14496-12 §8.7.7.2).
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SubsEntry {
     /// Size, in bytes, of this sub-sample (ISO/IEC 14496-12 §8.7.7.3).
@@ -2232,7 +2232,7 @@ impl SubsEntry {
 /// keeps it off [`Meta::unsupported_essential_properties`].
 ///
 /// Spec: ISO/IEC 23008-12 §6.5.28; ISO/IEC 14496-12 §8.7.7.
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Subs {
     /// `flags` from the `FullBox` header. The semantics, if any, are
@@ -2289,7 +2289,7 @@ impl Subs {
 ///
 /// Spec: ISO/IEC 23008-12 §6.5.29.2 — ItemFullProperty(`tols`,
 /// version=0, flags=0).
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Tols {
     /// Output layer set index to be provided to the decoding process
@@ -2366,7 +2366,7 @@ impl Tols {
 ///
 /// Spec: ISO/IEC 23008-12 §6.5.37.2 — ItemFullProperty(`prdi`,
 /// version=0, flags).
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Prdi {
     /// The full 24-bit `flags` field of the `ItemFullProperty` header.
@@ -2467,6 +2467,7 @@ impl Prdi {
 /// per item is zero-or-one for a derived image item. This is a
 /// *descriptive* property (it does not transform the reconstructed
 /// representation).
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Sstr;
 
@@ -2506,7 +2507,7 @@ pub struct Sstr;
 ///
 /// Spec: ISO/IEC 23008-12 §6.10.2.1.2 — ItemFullProperty(`txlo`,
 /// version=0, flags).
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Txlo {
     /// The full 24-bit `flags` field. Only bit 0 (the field-size
@@ -2596,7 +2597,7 @@ impl Txlo {
 ///
 /// Spec: ISO/IEC 23008-12 §6.10.2.2 (carrying ISO/IEC 14496-12 §8.4.6
 /// ExtendedLanguageBox semantics).
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Elng {
     /// RFC 5646 / BCP 47 language tag for the associated item. An empty
@@ -2635,7 +2636,7 @@ impl Elng {
 ///
 /// Spec: ISO/IEC 23008-12 §6.10.4.1.2 — ItemFullProperty(`fnch`,
 /// version=0, flags=0).
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Fnch {
     /// Single font-family name (e.g. `"Arial"`, `"Helvetica"`).
@@ -2678,7 +2679,7 @@ impl Fnch {
 ///
 /// Spec: ISO/IEC 23008-12 §11.2.2.2.2 — ItemFullProperty(`mskC`,
 /// version=0, flags=0).
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MaskC {
     /// Number of bits per mask pixel (§11.2.2.2.3). Defined values are
@@ -2784,7 +2785,7 @@ impl MaskC {
 ///
 /// Spec: ISO/IEC 23008-12 §6.5.39 — ItemFullProperty(`cmex`, version,
 /// flags).
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Cmex {
     /// The full 24-bit `flags` field of the FullBox header, preserved
@@ -3031,7 +3032,7 @@ impl Cmex {
 ///
 /// Spec: ISO/IEC 23008-12 §6.5.40.2 — ItemFullProperty(`cmin`,
 /// version=0, flags).
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Cmin {
     /// The full 24-bit `flags` field of the FullBox header. The
@@ -3193,7 +3194,7 @@ impl Cmin {
 ///
 /// Spec: ISO/IEC 23008-12 §6.5.30.2 — ItemFullProperty(`wipe`,
 /// version=0, flags=0).
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Wipe {
     /// `transition_direction` (§6.5.30.3) — see the direction constants
@@ -3259,7 +3260,7 @@ impl Wipe {
 ///
 /// Spec: ISO/IEC 23008-12 §6.5.31.2 — ItemFullProperty(`zoom`,
 /// version=0, flags=0).
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Zoom {
     /// `transition_direction` (§6.5.31.3) — `0` = zoom-in, `1` =
@@ -3319,7 +3320,7 @@ impl Zoom {
 ///
 /// Spec: ISO/IEC 23008-12 §6.5.32.2 — ItemFullProperty(`fade`,
 /// version=0, flags=0).
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Fade {
     /// `transition_direction` (§6.5.32.3) — see the constants on
@@ -3371,7 +3372,7 @@ impl Fade {
 ///
 /// Spec: ISO/IEC 23008-12 §6.5.33.2 — ItemFullProperty(`splt`,
 /// version=0, flags=0).
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Splt {
     /// `transition_direction` (§6.5.33.3) — see the constants on
@@ -3426,7 +3427,7 @@ impl Splt {
 ///
 /// Spec: ISO/IEC 23008-12 §6.5.34.2 — ItemFullProperty(`stpe`,
 /// version=0, flags=0).
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Stpe {
     /// `transition_period` (§6.5.34.3) — the recommended transition
@@ -3470,7 +3471,7 @@ impl Stpe {
 ///
 /// Spec: ISO/IEC 23008-12 §6.5.35.2 — ItemFullProperty(`ssld`,
 /// version=0, flags=0).
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Ssld {
     /// `duration` (§6.5.35.3) — the recommended display duration in
@@ -3659,7 +3660,7 @@ impl Property {
 /// One entry in `iref` — a typed reference whose `from_id` is the source
 /// item and `to_ids` is the list of target items (e.g. `dimg` -> tile
 /// items for a grid, `auxl` -> alpha item).
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Debug)]
 pub struct IrefEntry {
     pub reference_type: BoxType,

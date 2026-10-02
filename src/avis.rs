@@ -45,7 +45,7 @@ pub const HANDLER_PICT: BoxType = *b"pict";
 /// the movie's timescale (see [`AvisMeta::timescale`]). `is_sync` flags
 /// sync samples — keyframes that can be decoded standalone. When `stss`
 /// is absent every sample is a sync sample.
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Sample {
     pub offset: u64,
@@ -93,7 +93,7 @@ impl Sample {
 /// v1 64-bit shape so the entry shape stays version-agnostic for
 /// callers. `media_rate_fraction` is preserved as a diagnostic — the
 /// spec sets it to `0` and gives no use for non-zero values.
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EditListEntry {
     /// `segment_duration` in movie-timescale (`mvhd::timescale`) units.
@@ -193,7 +193,7 @@ impl EditListEntry {
 ///
 /// All fields are widened to their largest version shape (`u64`
 /// `media_time`) so callers stay version-agnostic.
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProducerReferenceTime {
     /// FullBox `version` (`0` or `1`). v0 carries a 32-bit `media_time`;
@@ -344,7 +344,7 @@ pub fn parse_producer_reference_times(file: &[u8]) -> Vec<ProducerReferenceTime>
 /// slice of the subsegment. Ranges within a subsegment are contiguous
 /// and together cover every byte of it, so a client can fetch a partial
 /// subsegment (e.g. just the base layer) by summing leading ranges.
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SubsegmentRange {
     /// Level (per the `leva` Level Assignment Box) to which this partial
@@ -380,7 +380,7 @@ impl SubsegmentRange {
 ///
 /// `subsegment_count` shall equal the `reference_count` of the preceding
 /// `sidx`; each subsegment's `range_count` shall be ≥ 2.
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubsegmentIndex {
     /// One entry per indexed subsegment, in bitstream order. Each is the

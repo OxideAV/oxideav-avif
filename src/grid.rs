@@ -25,7 +25,7 @@ use crate::image::AvifPlane as VideoPlane;
 use crate::image::{AvifFrame as VideoFrame, AvifPixelFormat as PixelFormat};
 
 /// The `ImageGrid` descriptor (HEIF §6.6.2.3.2).
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ImageGrid {
     pub version: u8,

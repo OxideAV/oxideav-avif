@@ -60,7 +60,9 @@ use crate::cicp::CicpTriple;
 use crate::derived::ImageOverlay;
 use crate::error::{AvifError as Error, Result};
 use crate::frame_bridge::{demote_to_mono, from_heif, to_heif};
-use crate::image::{AvifFrame, AvifPixelFormat, AvifPlane};
+#[cfg(test)]
+use crate::image::AvifPlane;
+use crate::image::{AvifFrame, AvifPixelFormat};
 
 /// Upper bound on an overlay canvas (`output_width × output_height`),
 /// in pixels — 8192 × 8192. The compositor keeps a pre-multiplied
@@ -125,12 +127,12 @@ impl<'a> OverlayInput<'a> {
 }
 
 /// A frame unpacked into `u16` sample planes at the coded depth —
-/// the working representation of the compositor. Public for the
-/// decoder's other composition steps; not a stable surface.
-#[non_exhaustive]
-#[doc(hidden)]
+/// the test scaffolding that builds and reads the frames the overlay
+/// tests feed to the container's compositor (the production path
+/// works on `HeifFrame` directly).
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SamplePlanes {
+pub(crate) struct SamplePlanes {
     pub width: u32,
     pub height: u32,
     pub bit_depth: u8,
@@ -144,58 +146,22 @@ pub struct SamplePlanes {
     pub alpha: Option<Vec<u16>>,
 }
 
-impl SamplePlanes {
-    /// Every field as a positional argument, in declaration order
-    /// (the record is `#[non_exhaustive]`: build it here, or from
-    /// `Default` where one exists, then read / assign the public
-    /// fields).
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        width: u32,
-        height: u32,
-        bit_depth: u8,
-        sx: u8,
-        sy: u8,
-        gray: bool,
-        y: Vec<u16>,
-        u: Vec<u16>,
-        v: Vec<u16>,
-        alpha: Option<Vec<u16>>,
-    ) -> Self {
-        Self {
-            width,
-            height,
-            bit_depth,
-            sx,
-            sy,
-            gray,
-            y,
-            u,
-            v,
-            alpha,
-        }
-    }
-}
-
+#[cfg(test)]
 impl SamplePlanes {
     /// Chroma plane dimensions (ceil-divided by the subsampling).
     pub fn chroma_dims(&self) -> (u32, u32) {
         chroma_dims(self.width, self.height, self.sx, self.sy)
     }
-
-    /// The alpha-less layout these planes describe.
-    pub fn base_format(&self) -> Result<AvifPixelFormat> {
-        AvifPixelFormat::from_layout(self.bit_depth, self.sx, self.sy, self.gray, false)
-            .ok_or_else(|| Error::unsupported("avif overlay: no pixel layout for these planes"))
-    }
 }
 
+#[cfg(test)]
 fn chroma_dims(width: u32, height: u32, sx: u8, sy: u8) -> (u32, u32) {
     let w = (width + (1 << sx) - 1) >> sx;
     let h = (height + (1 << sy) - 1) >> sy;
     (w.max(1), h.max(1))
 }
 
+#[cfg(test)]
 fn read_sample(data: &[u8], at: usize, bps: usize) -> u16 {
     if bps == 1 {
         data[at] as u16
@@ -204,6 +170,7 @@ fn read_sample(data: &[u8], at: usize, bps: usize) -> u16 {
     }
 }
 
+#[cfg(test)]
 fn read_plane(plane: &AvifPlane, w: u32, h: u32, bps: usize, label: &str) -> Result<Vec<u16>> {
     let (w, h) = (w as usize, h as usize);
     let row_bytes = w * bps;
@@ -225,8 +192,8 @@ fn read_plane(plane: &AvifPlane, w: u32, h: u32, bps: usize, label: &str) -> Res
 }
 
 /// Unpack `frame` (any layout this crate emits) into [`SamplePlanes`].
-#[doc(hidden)]
-pub fn unpack_planes(
+#[cfg(test)]
+pub(crate) fn unpack_planes(
     frame: &AvifFrame,
     format: AvifPixelFormat,
     bit_depth: u8,
@@ -315,6 +282,7 @@ pub fn unpack_planes(
     })
 }
 
+#[cfg(test)]
 fn write_plane(samples: &[u16], w: u32, bps: usize) -> AvifPlane {
     let stride = w as usize * bps;
     let mut data = Vec::with_capacity(samples.len() * bps);
@@ -331,7 +299,8 @@ fn write_plane(samples: &[u16], w: u32, bps: usize) -> AvifPlane {
 /// Pack [`SamplePlanes`] back into an [`AvifFrame`]; returns the frame
 /// and its layout (alpha appended when `planes.alpha` is present).
 #[doc(hidden)]
-pub fn pack_planes(planes: &SamplePlanes) -> Result<(AvifFrame, AvifPixelFormat)> {
+#[cfg(test)]
+pub(crate) fn pack_planes(planes: &SamplePlanes) -> Result<(AvifFrame, AvifPixelFormat)> {
     let has_alpha = planes.alpha.is_some();
     let format = AvifPixelFormat::from_layout(
         planes.bit_depth,

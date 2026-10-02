@@ -41,7 +41,7 @@ use crate::error::{AvifError as Error, Result};
 /// The actual source image item id isn't stored here — `iovl` payload
 /// only carries the offsets; the source ids come from the parallel
 /// `dimg` iref's `to_ids` list (in the same order).
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OverlayEntry {
     pub horizontal_offset: i32,
@@ -78,7 +78,7 @@ impl OverlayEntry {
 /// `canvas_fill_value` is RGBA in sRGB (R, G, B, A) per spec; the A
 /// channel runs 0 (transparent) to 65535 (opaque) linearly. RGB values
 /// are also 16-bit, padded with zeros if the writer thought in 8-bit.
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImageOverlay {
     pub canvas_fill_value: [u16; 4],
@@ -1237,7 +1237,7 @@ fn audit_one_tone_map(
 /// Stored as raw integer components rather than a pre-divided float so
 /// the parse stays lossless — callers that want the value compute
 /// `numerator as f64 / denominator as f64` themselves.
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct GainMapRational {
     /// Signed numerator (the `int(32)` component).
@@ -1277,7 +1277,7 @@ impl GainMapRational {
 ///
 /// `gamma_numerator` and every `*_denominator` "shall not be 0" per Annex
 /// C.2.3; [`GainMapMetadata::parse`] enforces those constraints.
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct GainMapChannel {
     /// Per-component gain map min value (signed rational; 5.2.5.2).
@@ -1371,7 +1371,7 @@ impl GainMapChannel {
 /// metadata after the recognised fields; the parser stops after the last
 /// recognised field and ignores the remainder, so a longer payload is
 /// not an error.
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct GainMapMetadata {
     /// `minimum_version` — the minimum version a parser must understand to
@@ -3112,7 +3112,7 @@ pub fn audit_avif_profile_compliance(
 ///
 /// Spec: ISO/IEC 23008-12 §6.5.10 (`irot`), §6.5.12 (`imir`), §6.5.8 /
 /// §6.5.9 (`clap`), §6.5.13 (`iscl`).
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DimTransform {
     /// Counter-clockwise rotation, `angle` × 90°. 90°/270° swap width and
@@ -3405,7 +3405,7 @@ fn reconstructed_dims_inner(
 /// in the reconstructed image only when its canvas coordinate is in
 /// `[0, output_width)` × `[0, output_height)`; the [`visible`](Self::visible)
 /// rectangle is that intersection, expressed back in canvas coordinates.
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OverlayPlacement {
     /// The source image item id (from the parallel `dimg` iref `to_ids`).
@@ -3480,7 +3480,7 @@ impl OverlayPlacement {
 
 /// A fully resolved `iovl` overlay derivation: the parsed descriptor plus
 /// each input's resolved placement against the canvas (§6.6.2.2).
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OverlayResolution {
     /// The `iovl` derived item id.
@@ -3598,7 +3598,7 @@ pub fn resolve_overlays(
 /// A fully resolved `iden` identity derivation: the single source item, its
 /// reconstructed dimensions, the transform chain applied by the iden item
 /// itself, and the resulting output dimensions (§6.6.2.1 + §6.3).
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IdenResolution {
     /// The `iden` derived item id.
@@ -3701,7 +3701,7 @@ pub fn resolve_iden_derivations(
 /// this record describes the derivation *geometry* — which item is the base,
 /// which are gain maps, and the resulting output dimensions — without an AV1
 /// decode, mirroring [`OverlayResolution`] / [`IdenResolution`].
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToneMapResolution {
     /// The `tmap` derived item id.
@@ -3816,7 +3816,7 @@ pub fn resolve_tone_maps(
 /// left to right, at `(col · tile_width, row · tile_height)` without gap or
 /// overlap; pixels at or beyond `output_width` / `output_height` are
 /// trimmed.
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GridTilePlacement {
     /// The tile's source image item id (the `dimg` `to_id` at this index).
@@ -3893,7 +3893,7 @@ impl GridTilePlacement {
 
 /// A fully resolved `'grid'` derivation: the parsed descriptor, the common
 /// tile dimensions, and each tile's canvas placement (§6.6.2.3).
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GridResolution {
     /// The `'grid'` derived item id.

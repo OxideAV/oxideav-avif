@@ -57,7 +57,7 @@ const MAX_RUNS: usize = 1 << 20;
 /// fragment-local bit is decoded on demand via
 /// [`SampleToGroupRun::is_fragment_local`] /
 /// [`SampleToGroupRun::description_index`].
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SampleToGroupRun {
     /// Number of consecutive samples covered by this run.
@@ -115,7 +115,7 @@ impl SampleToGroupRun {
 }
 
 /// Which on-wire box a [`SampleToGroup`] was decoded from.
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SampleToGroupKind {
     /// ISO/IEC 14496-12:2015 §8.9.2 `sbgp` (run-length table).
@@ -131,7 +131,7 @@ pub enum SampleToGroupKind {
 /// [`SampleToGroupRun`]s covering the samples in declaration order. The
 /// per-sample group index is recovered with
 /// [`Self::group_index_for_sample`].
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SampleToGroup {
     /// Which box produced this mapping.
@@ -220,7 +220,7 @@ impl SampleToGroup {
 /// `default_length` (v1), and its `default_group_description_index`
 /// (v2): the latter is the index assigned to any sample not explicitly
 /// covered by an `sbgp`/`csgp` run (§8.9.3.3).
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SampleGroupDescription {
     /// FullBox version (0, 1, or 2 in the staged editions).
@@ -638,7 +638,7 @@ impl<'a> BitReader<'a> {
 /// selected by the 1-based `group_description_index` from an
 /// `sbgp`/`csgp` run indexing into
 /// [`SampleGroupDescription::entries`].
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BracketingEntry {
     /// `'aebr'` AutoExposureBracketingEntry (§6.8.6.2.2). The exposure
@@ -776,7 +776,7 @@ impl SampleGroupDescription {
 /// entity group: the image time `T = C + O/(M/256)` where `C` is the
 /// sample composition time, `O` is [`time_offset`](Self::time_offset),
 /// and `M` is [`timescale_multiplier`](Self::timescale_multiplier).
-#[non_exhaustive]
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VisualEquivalenceEntry {
     /// `signed int(16) time_offset` — the difference, expressed in the
