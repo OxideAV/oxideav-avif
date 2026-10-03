@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.12](https://github.com/OxideAV/oxideav-avif/compare/v0.0.11...v0.0.12) - 2026-10-02
+
+### Other
+
+- hygiene narrowed to the deliberate public surface — 64 records/enums keep non_exhaustive + new, 61 module-crossing records go doc(hidden), SamplePlanes test-only
+- heif 0.0.7 minimum (new() constructors, _ arms on Colr / HeifError); #[non_exhaustive] + new / with_* across this crate's own public records and growing enums
+- fuzz harnesses on heif 0.0.5 (image_plane_count), low-overhead files documented as outside the AVIF profile
+- tmap gain maps decode (base by default, opt-in applied reconstruction) and encode, ToneMapImage wrapper parsed
+- avis sequences through the container's SequenceWriter (ccst, cover aliasing); raw Exif / XMP bodies, item names, flagged entity groups
+- zero-copy header, ColorSignal on every frame, identity-matrix items as planar RGB, encoder honours the stream signal
+- heif 0.0.5 minimum — Amd 1 / Amd 2 properties ride as Property::Container, per-channel pixi typed, no refusals
+- av1C record parse for the decoder is the container's Av1Config
+- avif README + lib docs: the layering — container by oxideav-heif, AV1 profile here
+- still-image muxer onto oxideav-heif HeifWriter; sequence cover still through the container
+- avis sequence walk onto oxideav-heif sequence::parse_movie
+- derived-image composition onto oxideav-heif compose — grid / iovl / alpha / clap / irot / imir on the container frame
+- parse path onto oxideav-heif — HeifFile + Meta::from_container replace the box walker and meta parser
+- avif CHANGELOG: state the published oxideav-av1 floor the layered path needs
+- derived-image graph fuzz target + decode memoisation/budget + canvas caps; two fuzz findings fixed
+- avif mux: keep the standalone (no-registry) build warning-free — W::u64 is sequence-only
+- avif sequence: avis image-sequence encode — moov/trak/stbl writer, all-intra or KEY+P groups, still primary aliasing sample 0
+- layered (progressive) image items — encode_still_layered with a1lx/lsel, decoder lsel/a1op layer selection
+- avif still/mux: grid alpha (hidden alpha grid of mono tiles) + grid pass-through props + depth-map aux + 64-px tile floor with tiling election
+- avif mux/still: overlay (iovl) + identity (iden) encode — AvifOverlayMuxer, encode_still_overlay, with_identity_derivation
+- avif decoder: iovl overlay + iden identity pixel composition, recursive derived-image output path
+- hide internal pub surface from rustdoc/semver (fleet rule 2026-09-01)
+
 ### Changed
 
 - **API hygiene (a minor bump): a small, deliberate public surface.**
