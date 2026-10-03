@@ -20,6 +20,146 @@ dependencies.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
+## Standalone use
+
+`oxideav-avif` follows the workspace image-crate API: the same small
+root vocabulary as `oxideav-png`, `oxideav-heif`, … returning raw
+`Vec<u8>` pixels.
+
+```rust
+# fn main() -> Result<(), oxideav_avif::Error> {
+let bytes = std::fs::read("in.avif").map_err(oxideav_avif::Error::from)?;
+if oxideav_avif::probe(&bytes) {
+    let info = oxideav_avif::info(&bytes)?;      // header only: width, height, format, frames, alpha, colour
+    let img  = oxideav_avif::decode(&bytes)?;    // AvifImage, native planar layout
+    let rgba: Vec<u8> = img.to_rgba8();          // tightly packed RGBA, 4 * width bytes per row
+    let (w, h) = (img.width(), img.height());
+
+    let opts = oxideav_avif::EncodeOptions::default().with_quality(90);
+    let out: Vec<u8> = oxideav_avif::encode_rgba8(w, h, &rgba, &opts)?;
+    std::fs::write("out.avif", out).map_err(oxideav_avif::Error::from)?;
+    assert_eq!((info.width, info.height), (w, h));
+}
+# Ok(())
+# }
+```
+
+**Pixels need the `registry` feature.** AVIF is a container whose
+pixels come from the AV1 codec crate, and codec crates in this
+workspace are framework-only. So:
+
+| Build | Available |
+|-------|-----------|
+| `default-features = false` (no `oxideav-core`, no `oxideav-av1`) | `probe`, `info`, every type (`AvifImage`, `ImageInfo`, `ColorInfo`, `Metadata`, `RgbImage` / `RgbaImage`, `Frame`, `DecodeOptions`, `EncodeOptions`, `PixelFormat`, `Plane`, `Error`), `AvifImage::to_rgb8` / `to_rgba8` / `from_rgb8` / `from_rgba8`, the container model (`parse` → `AvifFile`, `parse_header`, `inspect` → `AvifInfo`, `parse_avis`), composition over caller-supplied planes (`grid`, `alpha`, `transform`, `overlay`) and the container muxer (`AvifMuxer`, `encode_still_av1`) around an already-coded AV1 payload |
+| default (`registry` on) | everything above plus `decode`, `decode_with`, `decode_rgb8`, `decode_rgba8`, `decode_all` / `decode_all_with`, `decode_from`, `encode`, `encode_rgb8`, `encode_rgba8`, `encode_to`, the pixel encoder (`still`), `avis` sequence encode, and the framework `Decoder` / `Encoder` |
+
+A standalone caller that pairs the container model with its own AV1
+decoder builds an `AvifImage::new(width, height, format, planes)` from
+the composed planes and gets `to_rgba8()` like everyone else.
+
+```toml
+[dependencies]
+oxideav-avif = "0.0"                                   # with pixels (registry on)
+# oxideav-avif = { version = "0.0", default-features = false }   # container + conversions only
+```
+
+## Framework use
+
+With `registry` the crate also plugs into `oxideav-core`:
+
+```rust
+# #[cfg(feature = "registry")] {
+let mut ctx = oxideav_core::RuntimeContext::new();
+oxideav_avif::register(&mut ctx);                 // codec "avif" + .avif / .avifs extension hints
+// or: oxideav_avif::register_with_av1(&mut ctx.codecs) to install the AV1 codec too
+let params = oxideav_core::CodecParameters::video(oxideav_core::CodecId::new("avif"));
+let _dec = oxideav_avif::make_decoder(&params).unwrap();   // direct factory, same as the registry's
+let _enc = oxideav_avif::make_encoder(&params).unwrap();
+# }
+```
+
+The framework `AvifDecoder` / `AvifEncoder` are thin adapters over the
+functions above: `send_packet` (one complete AVIF file per packet)
+runs `decode_with` / `decode_all_with` with the decoder's
+`DecodeOptions` (`gain_map=apply` / `reference_white` codec options,
+`set_options`), and emits every frame with its `ColorSignal`; the
+encoder maps a `VideoFrame` onto the still encoder (`q` / `alpha_q` /
+`premultiplied` options). `From<AvifImage> for VideoFrame` and
+`AvifImage::from_video_frame` move pictures between the two worlds.
+Codec id `"avif"`, capability `avif_heif_av1_decode`;
+`CodecParameters::extradata` is the `av1C` record.
+
+## Supported layouts
+
+`PixelFormat` (= `AvifPixelFormat`) mirrors `oxideav_core::PixelFormat`
+by name. Decode yields the storage layout; `color.matrix == 0`
+(identity) means the 4:4:4 planes are **G, B, R**.
+
+| Decode (`AvifImage::format`) | 8-bit | 10 / 12-bit (LE words) |
+|---|---|---|
+| 4:2:0 / 4:2:2 / 4:4:4 | `Yuv420P` `Yuv422P` `Yuv444P` | `Yuv420P10Le` … `Yuv444P12Le` |
+| … with alpha auxiliary | `Yuva420P` `Yuva422P` `Yuva444P` | `Yuva420P10Le` … `Yuva444P12Le` |
+| monochrome | `Gray8` | `Gray10Le` `Gray12Le` |
+| monochrome + alpha (packed) | `Ya8` | `Ya16Le` (depth on `bit_depth`) |
+
+| Encode | Layout written |
+|---|---|
+| `encode(&AvifImage)` | the image's own layout and depth; alpha as the AV1-coded alpha auxiliary item; `Error::Unsupported` for sub-sampled chroma at odd extents (never a silent conversion) |
+| `encode_rgb8` / `encode_rgba8` | 8-bit 4:2:0 (`EncodeOptions::chroma`; 4:4:4 at odd extents), MIAF default colour (BT.709 / sRGB / BT.601, full range), alpha as the auxiliary |
+| `encode(&AvifImage::from_rgb8(..))` | identity-matrix 4:4:4 — byte-exact RGB at the default lossless quality |
+| canvases past 4096 coded pixels per axis | `grid` tiling (`encode_still_auto`) |
+
+`decode_all` returns every sample of an `avis` image sequence (with
+its `delay`), the entities of the primary's `brst` burst group, else
+the primary alone.
+
+## Options
+
+`EncodeOptions` (`Default` = lossless): `base_q_idx` (AV1 quantizer,
+0 = lossless) or `with_quality(0..=100)` (`base_q_idx = ((100 − q) ×
+255 + 50) / 100`), `alpha_q_idx`, `premultiplied_alpha` (`prem`
+signalling), `chroma` for the RGB one-call paths, `embed_exif` /
+`embed_xmp` / `embed_icc`. `StillEncodeOptions` is the deprecated
+alias.
+
+`DecodeOptions` (`Default` = lenient, 16384 × 16384, `1 << 28`
+pixels): `max_width`, `max_height`, `max_pixels` (also caps every
+grid / overlay canvas on the way), `max_bytes`, `strict` (an AVIF
+brand is required, a claimed `mif1` must carry its mandatory boxes),
+`tone_mapped` (apply a `tmap` gain map — default off: the base
+image), `reference_white_nits` (203), `layer` (render this spatial
+layer of a layered primary instead of its `lsel`).
+
+## Metadata and colour
+
+`AvifImage::color` is the item's `colr` `nclx` as `ColorInfo
+{ full_range, primaries, transfer, matrix }` (H.273 code points); with
+no CICP the MIAF §7.3.6.4 default applies — BT.709 / sRGB / BT.601,
+**full range**. `to_rgb8` / `to_rgba8` invert the signalled matrix at
+the signalled range exactly (round-to-nearest, chroma replicated to
+its co-sited luma samples), bring 10 / 12-bit samples to 8 bits as
+`round(v × 255 / (2^d − 1))`, and read a matrix without a kernel
+(reserved / unspecified / constant-luminance / ICtCp / YCgCo) as
+BT.601 — `try_to_rgb8` reports `Unsupported` instead.
+
+`AvifImage::metadata`: `icc` (an ICC `colr`), `exif` (from the TIFF
+header on — the HEIF A.2.1 offset word is stripped on decode and
+re-written on encode), `xmp`; `gamma` is always `None`. `encode`
+writes them back as an ICC `colr` next to the `nclx`, an `Exif` item
+and an XMP `mime` item. HDR descriptive properties (`mdcv` / `clli` /
+`cclv` / `amve`) stay on `inspect`'s `AvifInfo` and the still
+encoder's `StillProperties`.
+
+## Limits
+
+Enforced before any pixel allocation, as `Error::LimitExceeded`: the
+`DecodeOptions` bounds above, plus the crate's own caps — a 32 MiB
+per-item AV1 payload, `MAX_GRID_CANVAS_PIXELS` / `MAX_OVERLAY_CANVAS_PIXELS`
+(`1 << 28`), `MAX_ITEM_DECODES` (4096 item decodes per file),
+`MAX_DERIVATION_DEPTH`. Hostile input returns `Error`, never panics
+(fuzzed: `contract_api`, `derived_graph_decode`, and the
+cross-decoder harnesses under `fuzz/`).
+
 ## Layering
 
 | Layer | Crate | What lives there |
@@ -143,9 +283,11 @@ passes `audit_mif1`. At this layer the AV1 bitstream is taken
 ## Constructing the crate's types
 
 The records a user builds or reads through the documented API — the
-decode results (`AvifImage`, `AvifInfo`, `AvisMeta`, …), the typed
+picture (`AvifImage`) and the contract records around it, the
+container results (`AvifFile`, `AvifInfo`, `AvisMeta`, …), the typed
 metadata (`Ispe`, `Clap`, `Colr`, `Mdcv`, `Clli`, …), `StillImage` /
-`StillProperties` / the encode options and the muxer specs — are
+`StillProperties` / `EncodeOptions` / `DecodeOptions` and the muxer
+specs — are
 `#[non_exhaustive]`: build them with `Type::new(<every field, in
 declaration order>)` (or `Default` where one exists) and read /
 assign their `pub` fields; the option records take `with_<field>`
@@ -166,59 +308,25 @@ crate's brand rule refuses them. `oxideav-heif` reads and writes
 `mini` files (an AV1-coded one expands to an `avif`-equivalent
 `meta`), which is where a `.hmg` / `image/hif2` file opens.
 
-## Installation
-
-```toml
-[dependencies]
-oxideav-core = "0.1"
-oxideav-codec = "0.1"
-oxideav-avif = "0.0"
-```
-
-The default-on `registry` feature pulls in `oxideav-core` and exposes
-the `oxideav_core::Decoder` trait surface (`AvifDecoder`,
-`make_decoder`, `register`, `make_encoder`). Build with
-`default-features = false` for an `oxideav-core`-free container parser
-(it still depends on `oxideav-heif` with its default features off).
-
-## Use
-
-### Inspect an AVIF file without decoding
+## Container-level use
 
 ```rust
-use oxideav_avif::inspect;
+use oxideav_avif::{inspect, parse};
 
 let bytes = std::fs::read("image.avif")?;
-let info = inspect(&bytes)?;
+let info = inspect(&bytes)?;                 // AvifInfo: everything the container says
 println!("{}x{} bits_per_channel={:?} av1c_len={}",
     info.width, info.height, info.bits_per_channel, info.av1c.len());
-println!("primary OBU stream is {} bytes", info.obu_bytes.len());
-# Ok::<(), Box<dyn std::error::Error>>(())
-```
-
-### Low-level: parse the container yourself
-
-```rust
-use oxideav_avif::parse;
-
-let bytes = std::fs::read("image.avif")?;
-let img = parse(&bytes)?;
-for item in &img.meta.items {
+let file = parse(&bytes)?;                   // AvifFile: brands, meta, the primary av01 item
+for item in &file.meta.items {
     println!("item {} type={:?} name={:?}", item.id,
         std::str::from_utf8(&item.item_type), item.name);
 }
-// `img.primary_item_data` is the slice inside `mdat` holding the
-// primary image's AV1 OBU stream. Pair it with `img.av1c` and your
-// own AV1 decoder to recover pixels.
+// `file.primary_item_data` is the primary image's AV1 OBU stream and
+// `file.av1c` its record — pair them with your own AV1 decoder, then
+// `AvifImage::new(w, h, format, planes).to_rgba8()`.
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
-
-## Codec id
-
-- Codec: `"avif"`; capability name declared to the registry is
-  `avif_heif_av1_decode`.
-- `CodecParameters::extradata` is the `av1C` byte record; width /
-  height reflect `ispe` from the primary item.
 
 ## Test fixtures
 

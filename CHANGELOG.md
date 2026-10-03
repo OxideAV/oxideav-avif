@@ -7,6 +7,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The workspace image-crate API** (`IMAGE_CRATE_API.md`) at the
+  crate root. Standalone (no `oxideav-core`): `probe(&[u8]) -> bool`
+  (`ftyp` with an `avif` / `avis` / `avio` brand), `info(&[u8]) ->
+  ImageInfo` (width, height, native `PixelFormat` from `av1C` + alpha,
+  `frames`, `has_alpha`, `color`, `has_icc` / `has_exif` / `has_xmp`,
+  `bit_depth`, `is_sequence`), the records `AvifImage` (the decoded
+  picture: `width`, `height`, `format`, `planes`, `color: ColorInfo`,
+  `metadata: Metadata`, `bit_depth`) with `new` / `from_rgb8` /
+  `from_rgba8` (identity-matrix 4:4:4, exact) / `as_bytes` / `into_raw`
+  / `to_rgb8` / `to_rgba8` (+ `try_` variants), `RgbImage` /
+  `RgbaImage`, `Frame { image, delay }`, `ColorInfo`, `Metadata`,
+  `DecodeOptions` (`max_width` / `max_height` / `max_pixels` /
+  `max_bytes` / `strict` / `tone_mapped` / `reference_white_nits` /
+  `layer`), `EncodeOptions`, the aliases `PixelFormat` (=
+  `AvifPixelFormat`), `Plane` (= `AvifPlane`) and `Error` (=
+  `AvifError`). With `registry`: `decode`, `decode_with`,
+  `decode_rgb8`, `decode_rgba8`, `decode_all` / `decode_all_with`
+  (`avis` samples with their display delay, `brst` burst entities, else
+  the primary), `decode_from`, `encode` (the image's own layout, alpha
+  as the auxiliary item, `Unsupported` for sub-sampled chroma at odd
+  extents), `encode_rgb8` / `encode_rgba8` (8-bit 4:2:0 at the MIAF
+  default colour by default, 4:4:4 at odd extents, alpha as the
+  auxiliary), `encode_to`; `From<AvifImage> for VideoFrame`,
+  `AvifImage::from_video_frame`, `From<ColorSignal> for ColorInfo`.
+- `AvifError::LimitExceeded` (a `DecodeOptions` bound, mapped to the
+  framework's `ResourceExhausted`) and `AvifError::Io`
+  (`From<std::io::Error>`).
+- `AvifDecoder::{options, set_options, with_options}` — the decoder
+  runs the contract functions with a full `DecodeOptions`.
+- `AvifMuxer::with_icc` / `AvifGridMuxer::with_icc` and
+  `StillProperties::icc` — an ICC `colr` written next to the `nclx`
+  one (MIAF §7.3.6.4 allows one of each), so decoded metadata
+  round-trips.
+- `EncodeOptions::{chroma, embed_exif, embed_xmp, embed_icc}` and
+  `with_quality(0..=100)` (`base_q_idx = ((100 − q) × 255 + 50) / 100`).
+- Fuzz harness `contract_api` (probe / info / decode_with / to_rgba8 /
+  decode_all_with under tight limits, lossless re-encode of small
+  pictures); regression fixture
+  `tests/fixtures/fuzz/av1c_depth_disagrees_with_stream.avif`.
+- README in the contract's section order: Standalone use (pixels need
+  `registry`), Framework use, Supported layouts, Options, Metadata and
+  colour, Limits, then the AVIF-specific material.
+
+### Changed
+
+- **`AvifImage` now names the decoded picture.** The parsed container
+  that `parse` returns — brands, `meta`, the primary `av01` item and
+  its properties — is renamed **`AvifFile<'_>`**; its fields and
+  `new` are unchanged. There is no alias: the old name is taken by the
+  pixel type the contract requires. `inspect` / `parse_header` /
+  `AvifInfo` / `AvifHeader` keep their names.
+- The framework `AvifDecoder` is a thin adapter over the contract
+  implementation (`decode_file` → `decode_primary`, `decode_avis_file`
+  → `decode_sequence_with`); the frames it emits are byte-identical
+  to 0.0.12. Its `ColorSignal` now comes from the item's `nclx`
+  wherever it sits in the association list (an ICC `colr` listed first
+  no longer hides it).
+- `StillChroma` lives in the `api` module (re-exported at the root and
+  from `still`); it implements `Default` (`Yuv420`).
+- A coded item whose `av1C` disagrees with its Sequence Header OBU on
+  bit depth, monochrome or sub-sampling is refused as `InvalidData`
+  (av1-avif §2.2.1 "shall match") instead of decoding under the wrong
+  label.
+
+### Deprecated
+
+- `StillEncodeOptions` → `EncodeOptions` (type alias kept for one
+  release; same fields `base_q_idx` / `alpha_q_idx` /
+  `premultiplied_alpha`, same `new` / `with_*`).
+
+### Removed
+
+- The container meaning of `AvifImage<'_>` (see Changed:
+  `parse -> AvifFile<'_>`).
+
 ## [0.0.12](https://github.com/OxideAV/oxideav-avif/compare/v0.0.11...v0.0.12) - 2026-10-02
 
 ### Other
