@@ -1,6 +1,6 @@
 name: Fuzz
 
-# Daily fuzz run for the cargo-fuzz harnesses under fuzz/. Four
+# Daily fuzz run for the cargo-fuzz harnesses under fuzz/. Seven
 # harnesses ship today:
 #
 #   * oxideav_encode_oxideav_decode_roundtrip (#304 literal) —
@@ -21,6 +21,9 @@ name: Fuzz
 #   * derived_graph_decode — structure-aware derived-image graphs
 #     (grid / iovl / iden / alpha aux with hostile dimg / auxl edges)
 #     decoded end to end; never panics, memory-bounded.
+#   * contract_api — the image-crate API on raw bytes: probe / info /
+#     decode_with / to_rgba8 / decode_all_with under tight
+#     DecodeOptions limits, lossless re-encode of small pictures.
 #
 # The libavif harnesses dlopen libavif at runtime via libloading; the
 # CI runner needs `libavif-dev` so they actually validate instead of

@@ -483,6 +483,7 @@ fn decode_av01_item(
     }
     let cfg = parse_av1c(av1c)?; // eagerly validate
     validate_av1_config(&cfg)?;
+    check_av1c_matches_stream(obu_bytes, &cfg)?;
     // Every shown frame of the temporal unit, in decode order — a
     // layered item (av1-avif §2.3.1) shows one frame per spatial
     // layer, increasing `spatial_id`.
@@ -538,6 +539,63 @@ fn decode_av01_item(
     };
     let (format, width, height) = infer_av1_pixmap(&frame, &cfg)?;
     Ok((frame, format, width, height))
+}
+
+/// av1-avif §2.2.1: "The values of the fields in the
+/// AV1CodecConfigurationBox shall match those of the Sequence Header
+/// OBU in the AV1 Image Item Data." The layout fields decide how the
+/// decoded planes are read (storage width, plane count, chroma
+/// extents), so a record that disagrees with the stream on bit depth,
+/// monochrome or sub-sampling would label the picture wrongly — the
+/// item is refused instead. Walks the item's OBUs up to the first
+/// Sequence Header; an item without one is left to the AV1 decoder.
+fn check_av1c_matches_stream(obu_bytes: &[u8], cfg: &Av1CodecConfig) -> Result<()> {
+    use oxideav_av1::{parse_obu, ObuType};
+    let mut off = 0usize;
+    while off < obu_bytes.len() {
+        let Ok((desc, consumed)) = parse_obu(&obu_bytes[off..]) else {
+            return Ok(());
+        };
+        if desc.obu_type == ObuType::SequenceHeader {
+            let Ok(seq) = oxideav_av1::sequence_header::parse_sequence_header(desc.payload) else {
+                return Ok(());
+            };
+            let cc = &seq.color_config;
+            let stream = (
+                cc.bit_depth,
+                cc.mono_chrome,
+                cc.subsampling_x,
+                cc.subsampling_y,
+            );
+            let record = (
+                cfg.bit_depth(),
+                cfg.monochrome,
+                cfg.chroma_subsampling_x,
+                cfg.chroma_subsampling_y,
+            );
+            if stream != record {
+                return Err(Error::invalid(format!(
+                    "avif: av1C (bit depth {}, monochrome {}, subsampling {}/{}) disagrees with \
+                     the Sequence Header OBU (bit depth {}, monochrome {}, subsampling {}/{}) — \
+                     av1-avif §2.2.1",
+                    record.0,
+                    record.1,
+                    u8::from(record.2),
+                    u8::from(record.3),
+                    stream.0,
+                    stream.1,
+                    u8::from(stream.2),
+                    u8::from(stream.3)
+                )));
+            }
+            return Ok(());
+        }
+        if consumed == 0 {
+            return Ok(());
+        }
+        off += consumed;
+    }
+    Ok(())
 }
 
 /// Decode an item's temporal unit at a non-default operating point

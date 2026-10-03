@@ -95,3 +95,13 @@ name = "derived_graph_decode"
 path = "fuzz_targets/derived_graph_decode.rs"
 test = false
 doc = false
+
+# Image-crate API on raw bytes — probe / info / decode_with / to_rgba8 /
+# decode_all_with under tight DecodeOptions limits, plus a lossless
+# re-encode of small pictures. Fully in-tree; never skips. Must never
+# panic or blow the memory bound.
+[[bin]]
+name = "contract_api"
+path = "fuzz_targets/contract_api.rs"
+test = false
+doc = false

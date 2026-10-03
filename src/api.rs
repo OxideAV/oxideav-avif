@@ -521,35 +521,53 @@ impl AvifImage {
     /// The picture as tightly packed 8-bit RGB (see the module docs for
     /// the exact conversion). Alpha, if any, is dropped.
     ///
+    /// A `MatrixCoefficients` the converter has no kernel for — the
+    /// reserved code points, unspecified (2), the constant-luminance
+    /// BT.2020 (10), chromaticity-derived (12 / 13) and ICtCp (14)
+    /// matrices, YCgCo (8) — is converted as the MIAF default BT.601 (6)
+    /// at the signalled range; [`Self::try_to_rgb8`] reports it as
+    /// [`Error::Unsupported`] instead for callers that must know.
+    ///
     /// # Panics
     ///
     /// Only when the planes assigned to this image do not cover
     /// `width × height` at `format` (an image produced by this crate
     /// always does); [`Self::try_to_rgb8`] reports that as an error.
     pub fn to_rgb8(&self) -> Vec<u8> {
-        self.try_to_rgb8()
+        self.rgb_bytes_or_bt601(3)
             .expect("AvifImage::to_rgb8: planes inconsistent with width/height/format")
     }
 
     /// The picture as tightly packed 8-bit RGBA, alpha opaque (`255`)
-    /// when the layout has none.
+    /// when the layout has none. Matrix fallback as [`Self::to_rgb8`].
     ///
     /// # Panics
     ///
     /// As [`Self::to_rgb8`].
     pub fn to_rgba8(&self) -> Vec<u8> {
-        self.try_to_rgba8()
+        self.rgb_bytes_or_bt601(4)
             .expect("AvifImage::to_rgba8: planes inconsistent with width/height/format")
     }
 
-    /// Fallible [`Self::to_rgb8`].
+    /// Fallible, exact [`Self::to_rgb8`]: [`Error::Unsupported`] for a
+    /// matrix without a kernel (no BT.601 fallback),
+    /// [`Error::InvalidData`] for planes inconsistent with the layout.
     pub fn try_to_rgb8(&self) -> Result<Vec<u8>> {
-        self.rgb_bytes(3)
+        self.rgb_bytes(3, self.color)
     }
 
-    /// Fallible [`Self::to_rgba8`].
+    /// Fallible, exact [`Self::to_rgba8`] (see [`Self::try_to_rgb8`]).
     pub fn try_to_rgba8(&self) -> Result<Vec<u8>> {
-        self.rgb_bytes(4)
+        self.rgb_bytes(4, self.color)
+    }
+
+    /// The exact conversion, else the BT.601 reading of a matrix the
+    /// converter does not know.
+    fn rgb_bytes_or_bt601(&self, channels: usize) -> Result<Vec<u8>> {
+        match self.rgb_bytes(channels, self.color) {
+            Err(Error::Unsupported(_)) => self.rgb_bytes(channels, self.color.with_matrix(6)),
+            other => other,
+        }
     }
 
     /// The container crate's planar frame for this picture (the shape
@@ -559,8 +577,9 @@ impl AvifImage {
         crate::frame_bridge::to_heif(&frame, self.format, self.bit_depth, self.width, self.height)
     }
 
-    /// `channels` = 3 (RGB) or 4 (RGBA), 8 bits per channel.
-    fn rgb_bytes(&self, channels: usize) -> Result<Vec<u8>> {
+    /// `channels` = 3 (RGB) or 4 (RGBA), 8 bits per channel, converted
+    /// with `color`.
+    fn rgb_bytes(&self, channels: usize, color: ColorInfo) -> Result<Vec<u8>> {
         if !matches!(self.bit_depth, 8 | 10 | 12) {
             return Err(Error::invalid(format!(
                 "avif: bit_depth {} is not 8, 10 or 12",
@@ -568,7 +587,7 @@ impl AvifImage {
             )));
         }
         let frame = self.to_heif_frame()?;
-        let colr = self.color.to_heif_colr();
+        let colr = color.to_heif_colr();
         let rgb = oxideav_heif::rgb::to_rgb(&frame, Some(&colr))?;
         let n = self.width as usize * self.height as usize;
         if rgb.channels < 3 || rgb.data.len() < n * rgb.channels {
@@ -1257,6 +1276,21 @@ mod tests {
         assert_eq!(rgb[6], 128);
         assert_eq!(rgb[9], 0); // 2 * 255 / 1023 = 0.498 → 0
         assert_eq!(img.as_bytes().map(|b| b.len()), Some(8));
+    }
+
+    #[test]
+    fn unknown_matrix_falls_back_to_bt601_in_the_infallible_view() {
+        let planes = vec![
+            Plane::new(2, vec![16, 235, 128, 128]),
+            Plane::new(1, vec![128]),
+            Plane::new(1, vec![128]),
+        ];
+        let img = AvifImage::new(2, 2, PixelFormat::Yuv420P, planes)
+            .with_color(ColorInfo::new(false, 1, 1, 131));
+        assert!(matches!(img.try_to_rgb8(), Err(Error::Unsupported(_))));
+        let bt601 = img.clone().with_color(ColorInfo::new(false, 1, 1, 6));
+        assert_eq!(img.to_rgb8(), bt601.to_rgb8());
+        assert_eq!(img.to_rgba8(), bt601.to_rgba8());
     }
 
     #[test]

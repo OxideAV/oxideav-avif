@@ -15,7 +15,7 @@
 //! word mismatch.
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_avif::{encode_still, AvifDecoder, StillChroma, EncodeOptions, StillImage};
+use oxideav_avif::{encode_still, AvifDecoder, EncodeOptions, StillChroma, StillImage};
 use oxideav_core::{CodecId, Decoder, Frame, Packet, TimeBase};
 
 const MAX_WIDTH: usize = 40;

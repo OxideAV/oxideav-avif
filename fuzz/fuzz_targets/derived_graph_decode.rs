@@ -11,7 +11,7 @@
 //! memory": every hostile shape must surface as an `Err`.
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_avif::{encode_still, parse, AvifDecoder, StillChroma, EncodeOptions, StillImage};
+use oxideav_avif::{encode_still, parse, AvifDecoder, EncodeOptions, StillChroma, StillImage};
 use oxideav_core::{CodecId, Decoder, Packet, TimeBase};
 use std::sync::OnceLock;
 
@@ -22,7 +22,8 @@ fn tiles() -> &'static (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
     TILES.get_or_init(|| {
         let y: Vec<u16> = (0..64).map(|i| (i * 3) as u16).collect();
         let c: Vec<u16> = (0..16).map(|i| 100 + i as u16).collect();
-        let colour = StillImage::yuv(8, 8, 8, StillChroma::Yuv420, y.clone(), c.clone(), c).unwrap();
+        let colour =
+            StillImage::yuv(8, 8, 8, StillChroma::Yuv420, y.clone(), c.clone(), c).unwrap();
         let mono = StillImage::yuv(8, 8, 8, StillChroma::Monochrome, y, vec![], vec![]).unwrap();
         let cf = encode_still(&colour, &EncodeOptions::default()).unwrap();
         let mf = encode_still(&mono, &EncodeOptions::default()).unwrap();
@@ -61,7 +62,12 @@ fn boxed(t: &[u8; 4], body: &[u8]) -> Vec<u8> {
 }
 
 fn full(t: &[u8; 4], version: u8, flags: u32, body: &[u8]) -> Vec<u8> {
-    let mut inner = vec![version, (flags >> 16) as u8, (flags >> 8) as u8, flags as u8];
+    let mut inner = vec![
+        version,
+        (flags >> 16) as u8,
+        (flags >> 8) as u8,
+        flags as u8,
+    ];
     inner.extend_from_slice(body);
     boxed(t, &inner)
 }
@@ -113,7 +119,12 @@ fuzz_target!(|data: &[u8]| {
                 props.push((boxed(b"av1C", mav1c), true));
                 if flags & 2 != 0 {
                     props.push((
-                        full(b"auxC", 0, 0, b"urn:mpeg:mpegB:cicp:systems:auxiliary:alpha\0"),
+                        full(
+                            b"auxC",
+                            0,
+                            0,
+                            b"urn:mpeg:mpegB:cicp:systems:auxiliary:alpha\0",
+                        ),
                         false,
                     ));
                     let to = b.u8() as u16 % n as u16 + 1;

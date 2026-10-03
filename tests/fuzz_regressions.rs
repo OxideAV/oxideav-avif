@@ -83,3 +83,26 @@ fn fuzz_y_plane_roundtrip_avif2_does_not_panic() {
 // unit tests in that module (`av1c_parses_minimal_record` /
 // `av1c_rejects_wrong_marker` / `av1c_rejects_wrong_version` /
 // `av1c_carries_config_obus`).
+
+/// Captured by the `contract_api` fuzz harness on 2026-10-03 (824
+/// bytes): the primary item's `av1C` declares a 10-bit stream while
+/// its Sequence Header OBU codes 12 bits. Before the av1-avif §2.2.1
+/// check the picture decoded "successfully" labelled 10-bit with
+/// 12-bit sample values, and re-encoding it tripped the still
+/// encoder's depth-range validation. Now the item is refused as
+/// `InvalidData`, and the contract functions agree with the framework
+/// decoder.
+const AV1C_DEPTH_DISAGREES_WITH_STREAM: &[u8] =
+    include_bytes!("fixtures/fuzz/av1c_depth_disagrees_with_stream.avif");
+
+#[test]
+fn fuzz_av1c_depth_disagreeing_with_the_stream_is_refused() {
+    drive(AV1C_DEPTH_DISAGREES_WITH_STREAM);
+    let err = oxideav_avif::decode(AV1C_DEPTH_DISAGREES_WITH_STREAM).unwrap_err();
+    assert!(
+        matches!(err, oxideav_avif::Error::InvalidData(ref m) if m.contains("2.2.1")),
+        "{err}"
+    );
+    // The header-only path still describes the file.
+    assert!(oxideav_avif::info(AV1C_DEPTH_DISAGREES_WITH_STREAM).is_ok());
+}
