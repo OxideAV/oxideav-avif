@@ -44,10 +44,16 @@ pub const BRAND_MA1A: BoxType = b(b"MA1A");
 pub const ITEM_TYPE_AV01: BoxType = b(b"av01");
 pub const ITEM_TYPE_GRID: BoxType = b(b"grid");
 
-/// Decoded AVIF file, ready for hand-off to an AV1 OBU decoder.
+/// The parsed AVIF **container** (the file, not its pixels): brands,
+/// the `meta` model, the primary `av01` item with its coded payload
+/// and properties — ready for hand-off to an AV1 OBU decoder.
+///
+/// Was `AvifImage` before 0.0.13; that name is now the decoded
+/// picture ([`crate::AvifImage`]), as the image-crate API contract
+/// requires.
 #[non_exhaustive]
 #[derive(Clone, Debug)]
-pub struct AvifImage<'a> {
+pub struct AvifFile<'a> {
     pub major_brand: BoxType,
     pub minor_version: u32,
     pub compatible_brands: Vec<BoxType>,
@@ -82,7 +88,7 @@ pub struct AvifImage<'a> {
     pub amve: Option<Amve>,
 }
 
-impl<'a> AvifImage<'a> {
+impl<'a> AvifFile<'a> {
     /// Every field as a positional argument, in declaration order
     /// (the record is `#[non_exhaustive]`: build it here, or from
     /// `Default` where one exists, then read / assign the public
@@ -362,7 +368,7 @@ fn count_infe(payload: &[u8]) -> Result<usize> {
 ///
 /// This path errors out when the primary item type is not `av01` — use
 /// [`parse_header`] + the `grid` module to handle grid primaries.
-pub fn parse(file: &[u8]) -> Result<AvifImage<'_>> {
+pub fn parse(file: &[u8]) -> Result<AvifFile<'_>> {
     let hdr = parse_header(file)?;
     let AvifHeader {
         file: _,
@@ -429,7 +435,7 @@ pub fn parse(file: &[u8]) -> Result<AvifImage<'_>> {
         _ => None,
     };
 
-    Ok(AvifImage {
+    Ok(AvifFile {
         major_brand,
         minor_version,
         compatible_brands,

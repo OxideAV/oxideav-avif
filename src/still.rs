@@ -59,23 +59,14 @@ use oxideav_av1::encoder::temporal_unit::encode_sequence_header_obu;
 use oxideav_av1::encoder::yuv_frame::{ChromaFormat, YuvFrame};
 use oxideav_av1::{parse_obu, ObuType, SequenceHeader};
 
-/// Chroma layout of a [`StillImage`]. Mirrors the AV1 §6.4.2
-/// subsampling pairings; conversion to the AV1 encoder's own layout
-/// enum is internal.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StillChroma {
-    /// Chroma at half extent on both axes (`subsampling_x =
-    /// subsampling_y = 1`). Requires even luma extents.
-    Yuv420,
-    /// Chroma at half horizontal extent (`subsampling_x = 1`,
-    /// `subsampling_y = 0`). Requires an even luma width. Codes as AV1
-    /// Professional profile.
-    Yuv422,
-    /// Chroma at full extent.
-    Yuv444,
-    /// Luma only (4:0:0).
-    Monochrome,
-}
+pub use crate::api::{EncodeOptions, StillChroma};
+
+/// The encode options under their pre-contract name.
+#[deprecated(
+    since = "0.0.13",
+    note = "renamed to `oxideav_avif::EncodeOptions` (image-crate API contract)"
+)]
+pub type StillEncodeOptions = EncodeOptions;
 
 impl StillChroma {
     pub(crate) fn to_av1(self) -> ChromaFormat {
@@ -85,20 +76,6 @@ impl StillChroma {
             StillChroma::Yuv444 => ChromaFormat::Yuv444,
             StillChroma::Monochrome => ChromaFormat::Monochrome,
         }
-    }
-
-    /// `(subsampling_x, subsampling_y)` as shift amounts.
-    pub(crate) fn subsampling(self) -> (u32, u32) {
-        match self {
-            StillChroma::Yuv420 => (1, 1),
-            StillChroma::Yuv422 => (1, 0),
-            StillChroma::Yuv444 => (0, 0),
-            StillChroma::Monochrome => (0, 0), // no chroma planes
-        }
-    }
-
-    pub(crate) fn has_chroma(self) -> bool {
-        self != StillChroma::Monochrome
     }
 }
 
@@ -215,6 +192,11 @@ pub struct StillProperties {
     /// derived image (HEIF Amd 1:2025 §6.6.2.4, av1-avif §4.2.2) with
     /// this picture as the base. See [`GainMapSpec`].
     pub gain_map: Option<Box<GainMapSpec>>,
+    /// An ICC profile, written as a second (`prof`) `colr` property
+    /// next to the `nclx` one ([`AvifMuxer::with_icc`]). Not a
+    /// positional argument of [`Self::new`]; set it with
+    /// [`Self::with_icc`].
+    pub icc: Option<Vec<u8>>,
 }
 
 impl StillProperties {
@@ -246,7 +228,13 @@ impl StillProperties {
             pasp,
             identity_derivation,
             gain_map,
+            icc: None,
         }
+    }
+    /// Setter: replace `icc`.
+    pub fn with_icc(mut self, icc: Option<Vec<u8>>) -> Self {
+        self.icc = icc;
+        self
     }
     /// Setter: replace `exif`.
     pub fn with_exif(mut self, exif: Option<Vec<u8>>) -> Self {
@@ -636,55 +624,6 @@ impl StillImage {
     }
 }
 
-/// Tuning for [`encode_still`] / [`encode_still_grid`]. The default
-/// is a lossless colour encode (`base_q_idx = 0`), lossless alpha,
-/// straight (non-premultiplied) alpha signalling.
-#[non_exhaustive]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct StillEncodeOptions {
-    /// AV1 `base_q_idx` for the colour planes. `0` = lossless
-    /// (default); higher = lossier / smaller.
-    pub base_q_idx: u8,
-    /// AV1 `base_q_idx` for the alpha auxiliary. Defaults to `0`
-    /// (lossless) — alpha artefacts are far more visible than colour
-    /// ones, and flat alpha planes are cheap.
-    pub alpha_q_idx: u8,
-    /// Emit the `prem` iref declaring the colour planes premultiplied
-    /// by alpha (HEIF §6.10.1.1). Signalling only — the samples are
-    /// stored as given.
-    pub premultiplied_alpha: bool,
-}
-
-impl StillEncodeOptions {
-    /// Every field as a positional argument, in declaration order
-    /// (the record is `#[non_exhaustive]`: build it here, or from
-    /// `Default` where one exists, then read / assign the public
-    /// fields).
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(base_q_idx: u8, alpha_q_idx: u8, premultiplied_alpha: bool) -> Self {
-        Self {
-            base_q_idx,
-            alpha_q_idx,
-            premultiplied_alpha,
-        }
-    }
-    /// Setter: replace `base_q_idx`.
-    pub fn with_base_q_idx(mut self, base_q_idx: u8) -> Self {
-        self.base_q_idx = base_q_idx;
-        self
-    }
-    /// Setter: replace `alpha_q_idx`.
-    pub fn with_alpha_q_idx(mut self, alpha_q_idx: u8) -> Self {
-        self.alpha_q_idx = alpha_q_idx;
-        self
-    }
-    /// Setter: replace `premultiplied_alpha`.
-    pub fn with_premultiplied_alpha(mut self, premultiplied_alpha: bool) -> Self {
-        self.premultiplied_alpha = premultiplied_alpha;
-        self
-    }
-}
-
 /// Per-axis coded-extent bound of the single-item encode (mirrors the
 /// AV1 KEY-frame encoder's bound). Larger canvases go through
 /// [`encode_still_grid`].
@@ -732,7 +671,7 @@ pub fn elect_grid_tiling(width: u32, height: u32, max_tile: u32) -> Option<(u16,
 /// [`STILL_MAX_CODED_DIM`], otherwise as a grid with the tiling from
 /// [`elect_grid_tiling`]. The one-call entry point for arbitrary
 /// canvases.
-pub fn encode_still_auto(img: &StillImage, opts: &StillEncodeOptions) -> Result<Vec<u8>> {
+pub fn encode_still_auto(img: &StillImage, opts: &EncodeOptions) -> Result<Vec<u8>> {
     let (pw, ph) = (coded_extent(img.width), coded_extent(img.height));
     if pw <= STILL_MAX_CODED_DIM && ph <= STILL_MAX_CODED_DIM {
         return encode_still(img, opts);
@@ -1031,7 +970,7 @@ pub(crate) fn pixi_bits(img: &StillImage) -> Vec<u8> {
 /// for the property/brand mapping. Coded extents are bounded by
 /// [`STILL_MAX_CODED_DIM`] per axis — larger canvases go through
 /// [`encode_still_grid`].
-pub fn encode_still(img: &StillImage, opts: &StillEncodeOptions) -> Result<Vec<u8>> {
+pub fn encode_still(img: &StillImage, opts: &EncodeOptions) -> Result<Vec<u8>> {
     img.validate()?;
     let (pw, ph) = (coded_extent(img.width), coded_extent(img.height));
     if pw > STILL_MAX_CODED_DIM || ph > STILL_MAX_CODED_DIM {
@@ -1058,6 +997,9 @@ pub fn encode_still(img: &StillImage, opts: &StillEncodeOptions) -> Result<Vec<u
     }
     if let Some(xmp) = &props.xmp {
         mux = mux.with_xmp(xmp.clone());
+    }
+    if let Some(icc) = &props.icc {
+        mux = mux.with_icc(icc.clone());
     }
     if let Some(mdcv) = props.mdcv {
         mux = mux.with_mdcv(mdcv);
@@ -1156,7 +1098,7 @@ pub(crate) fn apply_profile_brand_mux(mux: AvifMuxer, seq_profile: u8) -> AvifMu
 /// the colour grid); pass-through properties land on the grid item.
 pub fn encode_still_grid(
     img: &StillImage,
-    opts: &StillEncodeOptions,
+    opts: &EncodeOptions,
     columns: u16,
     rows: u16,
 ) -> Result<Vec<u8>> {
@@ -1215,6 +1157,9 @@ pub fn encode_still_grid(
     }
     if let Some(xmp) = &props.xmp {
         muxer = muxer.with_xmp(xmp.clone());
+    }
+    if let Some(icc) = &props.icc {
+        muxer = muxer.with_icc(icc.clone());
     }
     if let Some(mdcv) = props.mdcv {
         muxer = muxer.with_mdcv(mdcv);
@@ -1425,7 +1370,7 @@ impl<'a> OverlayLayerImage<'a> {
 pub fn encode_still_overlay(
     canvas: &OverlayCanvas,
     layers: &[OverlayLayerImage<'_>],
-    opts: &StillEncodeOptions,
+    opts: &EncodeOptions,
 ) -> Result<Vec<u8>> {
     if layers.is_empty() {
         return Err(Error::invalid(
@@ -1538,7 +1483,7 @@ pub fn layer_byte_sizes(payload: &[u8]) -> Result<Vec<u32>> {
 pub fn encode_still_layered(
     layers: &[&StillImage],
     render_layer: Option<u8>,
-    opts: &StillEncodeOptions,
+    opts: &EncodeOptions,
 ) -> Result<Vec<u8>> {
     if !(2..=4).contains(&layers.len()) {
         return Err(Error::invalid(format!(
@@ -1648,6 +1593,9 @@ pub fn encode_still_layered(
     }
     if let Some(xmp) = &props.xmp {
         mux = mux.with_xmp(xmp.clone());
+    }
+    if let Some(icc) = &props.icc {
+        mux = mux.with_icc(icc.clone());
     }
     if let Some(mdcv) = props.mdcv {
         mux = mux.with_mdcv(mdcv);

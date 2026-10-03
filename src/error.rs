@@ -21,6 +21,14 @@ pub enum AvifError {
     /// Bitstream was syntactically valid but uses a feature this crate
     /// does not implement yet.
     Unsupported(String),
+    /// The input exceeds a caller-supplied bound
+    /// ([`crate::DecodeOptions`]: dimensions, pixel count, byte
+    /// length) — refused before any allocation.
+    LimitExceeded(String),
+    /// A read / write on a caller-supplied stream failed
+    /// ([`crate::decode_from`] / [`crate::encode_to`]); carries the
+    /// `std::io::Error`'s message.
+    Io(String),
 }
 
 impl AvifError {
@@ -33,6 +41,11 @@ impl AvifError {
     pub fn unsupported(msg: impl Into<String>) -> Self {
         Self::Unsupported(msg.into())
     }
+
+    /// Construct an [`AvifError::LimitExceeded`].
+    pub fn limit(msg: impl Into<String>) -> Self {
+        Self::LimitExceeded(msg.into())
+    }
 }
 
 impl fmt::Display for AvifError {
@@ -40,11 +53,19 @@ impl fmt::Display for AvifError {
         match self {
             Self::InvalidData(s) => write!(f, "invalid data: {s}"),
             Self::Unsupported(s) => write!(f, "unsupported: {s}"),
+            Self::LimitExceeded(s) => write!(f, "limit exceeded: {s}"),
+            Self::Io(s) => write!(f, "I/O error: {s}"),
         }
     }
 }
 
 impl std::error::Error for AvifError {}
+
+impl From<std::io::Error> for AvifError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e.to_string())
+    }
+}
 
 /// Bridge the container crate's errors. `InvalidData` / `Unsupported`
 /// map one-to-one; a structural-limit refusal (`ResourceExhausted`) is

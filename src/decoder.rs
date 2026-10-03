@@ -24,22 +24,20 @@ use oxideav_core::{
     CodecId, CodecParameters, ColorSignal, Error, Frame, Packet, PixelFormat, Result, TimeBase,
 };
 
+use crate::api::DecodeOptions;
 use crate::av1_config::{parse_av1c, Av1CodecConfig};
 
 use crate::alpha::find_alpha_item_id;
-use crate::avis::{parse_avis, sample_bytes};
 use crate::box_parser::{b, BoxType};
 use crate::cicp::effective_cicp;
 use crate::derived::{ImageOverlay, MAX_DERIVATION_DEPTH};
-use crate::frame_bridge::{from_heif, to_heif};
+use crate::frame_bridge::to_heif;
 use crate::grid::ImageGrid;
 use crate::image::{AvifFrame, AvifPixelFormat, AvifPlane};
-use crate::inspect::{build_info, build_info_derived, build_info_grid, AvifInfo};
+use crate::inspect::AvifInfo;
 use crate::meta::{Property, ITEM_TYPE_IDEN, ITEM_TYPE_IOVL, ITEM_TYPE_TMAP};
-use crate::parser::{
-    classify_brands, parse, parse_header, AvifHeader, ITEM_TYPE_AV01, ITEM_TYPE_GRID,
-};
-use crate::signal::{color_signal_for, labelled_pixel_format, layout_of_record};
+use crate::parser::{classify_brands, AvifHeader, ITEM_TYPE_AV01, ITEM_TYPE_GRID};
+use crate::signal::{color_signal_for, labelled_pixel_format};
 use crate::transform::{clap_extent, crop_top_left, rotation_keeps_layout};
 use oxideav_heif::compose;
 use oxideav_heif::gainmap::{
@@ -66,7 +64,7 @@ fn from_core_pix(fmt: PixelFormat) -> Result<AvifPixelFormat> {
 /// Convert a framework [`VideoFrame`] (returned by `oxideav_av1`) into
 /// the crate-local [`AvifFrame`] the composition layer consumes. Plane
 /// data is moved, not copied.
-fn core_to_avif_frame(vf: VideoFrame) -> AvifFrame {
+pub(crate) fn core_to_avif_frame(vf: VideoFrame) -> AvifFrame {
     // Only the image planes: a side-channel record the AV1 decoder
     // may attach (significant bits, colour signal) is not a plane the
     // composition layer can place.
@@ -85,22 +83,6 @@ fn core_to_avif_frame(vf: VideoFrame) -> AvifFrame {
     }
 }
 
-/// Inverse of [`core_to_avif_frame`] — used when handing the composited
-/// frame back to the framework via the `Decoder::receive_frame` trait.
-fn avif_to_core_frame(af: AvifFrame) -> VideoFrame {
-    VideoFrame {
-        pts: af.pts,
-        planes: af
-            .planes
-            .into_iter()
-            .map(|p| VideoPlane {
-                stride: p.stride,
-                data: p.data,
-            })
-            .collect(),
-    }
-}
-
 /// Infer `(format, width, height)` from a decoded AV1 [`VideoFrame`]
 /// plus the item's `av1C` record. `oxideav-av1` emits planar Y/U/V
 /// with a tight byte stride per plane — one byte per sample for an
@@ -108,7 +90,10 @@ fn avif_to_core_frame(af: AvifFrame) -> VideoFrame {
 /// record declares `high_bitdepth` (§5.5.2 flag pair) — so plane
 /// geometry (scaled by the record's storage width) reverses back to a
 /// `PixelFormat` at the record's bit depth.
-fn infer_av1_pixmap(frame: &VideoFrame, cfg: &Av1CodecConfig) -> Result<(PixelFormat, u32, u32)> {
+pub(crate) fn infer_av1_pixmap(
+    frame: &VideoFrame,
+    cfg: &Av1CodecConfig,
+) -> Result<(PixelFormat, u32, u32)> {
     if frame.planes.is_empty() {
         return Err(Error::invalid("avif: AV1 frame has no planes"));
     }
@@ -196,12 +181,9 @@ pub struct AvifDecoder {
     color_signal: Option<ColorSignal>,
     /// The framework label of the last decoded file's frames.
     output_format: Option<PixelFormat>,
-    /// Opt-in gain-map application (av1-avif §4.2.2 / HEIF Amd 1
-    /// §6.6.2.4): decode the `tmap` alternative of the primary instead
-    /// of the base.
-    tone_mapped: bool,
-    /// HDR reference white for a PQ-coded reconstruction (cd/m²).
-    reference_white_nits: f64,
+    /// The contract options the decode runs with (gain-map
+    /// application, reference white, limits, strictness, layer).
+    options: DecodeOptions,
 }
 
 impl AvifDecoder {
@@ -212,8 +194,7 @@ impl AvifDecoder {
             info: None,
             color_signal: None,
             output_format: None,
-            tone_mapped: false,
-            reference_white_nits: DEFAULT_HDR_REFERENCE_WHITE_NITS,
+            options: DecodeOptions::default(),
         }
     }
 
@@ -227,7 +208,7 @@ impl AvifDecoder {
         let mut d = Self::new(params.codec_id.clone());
         match params.options.get("gain_map") {
             None | Some("base") => {}
-            Some("apply") => d.tone_mapped = true,
+            Some("apply") => d.options.tone_mapped = true,
             Some(other) => {
                 return Err(Error::invalid(format!(
                     "avif: gain_map option '{other}' — expected 'base' or 'apply'"
@@ -256,19 +237,37 @@ impl AvifDecoder {
     /// applied (§6.6.2.4.1). Files without a `tmap` decode the same
     /// either way.
     pub fn set_tone_mapped(&mut self, tone_mapped: bool) {
-        self.tone_mapped = tone_mapped;
+        self.options.tone_mapped = tone_mapped;
     }
 
     /// Builder form of [`set_tone_mapped`](Self::set_tone_mapped).
     pub fn with_tone_mapped(mut self, tone_mapped: bool) -> Self {
-        self.tone_mapped = tone_mapped;
+        self.options.tone_mapped = tone_mapped;
         self
     }
 
     /// Whether gain maps are applied (see
     /// [`set_tone_mapped`](Self::set_tone_mapped)).
     pub fn tone_mapped(&self) -> bool {
-        self.tone_mapped
+        self.options.tone_mapped
+    }
+
+    /// The full [`DecodeOptions`] this decoder runs the contract
+    /// functions with ([`crate::decode_with`] / [`crate::decode_all`]).
+    pub fn options(&self) -> &DecodeOptions {
+        &self.options
+    }
+
+    /// Replace the [`DecodeOptions`] (limits, strictness, gain-map
+    /// application, reference white, layer selection).
+    pub fn set_options(&mut self, options: DecodeOptions) {
+        self.options = options;
+    }
+
+    /// Builder form of [`set_options`](Self::set_options).
+    pub fn with_options(mut self, options: DecodeOptions) -> Self {
+        self.options = options;
+        self
     }
 
     /// The HDR reference white, in cd/m², a PQ-coded reconstruction is
@@ -281,7 +280,7 @@ impl AvifDecoder {
                 "avif: reference white {nits} cd/m² is not a positive finite luminance"
             )));
         }
-        self.reference_white_nits = nits;
+        self.options.reference_white_nits = nits;
         Ok(())
     }
 
@@ -315,82 +314,17 @@ impl AvifDecoder {
     /// transformative properties applied in `ipma` order. Returns the
     /// resolved `AvifInfo` on success.
     pub fn decode_file(&mut self, file: &[u8]) -> Result<AvifInfo> {
-        let hdr = parse_header(file).map_err(core_err)?;
-        let primary_id = hdr
-            .meta
-            .primary_item_id
-            .ok_or_else(|| Error::invalid("avif: missing pitm"))?;
-        let primary_info = hdr
-            .meta
-            .item_by_id(primary_id)
-            .ok_or_else(|| Error::invalid("avif: pitm references unknown item"))?
-            .clone();
-
-        let brands = classify_brands(&hdr.major_brand, &hdr.compatible_brands).map_err(core_err)?;
-        let mif1 = crate::parser::audit_mif1(file).map_err(core_err)?;
-        let info = if primary_info.item_type == ITEM_TYPE_GRID {
-            build_info_grid(&hdr, primary_id, brands, mif1).map_err(core_err)?
-        } else if primary_info.item_type == ITEM_TYPE_AV01 {
-            let img = parse(file).map_err(core_err)?;
-            let has_alpha = find_alpha_item_id(&hdr.meta, primary_id).is_some();
-            build_info(&img, has_alpha, brands, mif1, file).map_err(core_err)?
-        } else if primary_info.item_type == ITEM_TYPE_IOVL
-            || primary_info.item_type == ITEM_TYPE_IDEN
-            || primary_info.item_type == ITEM_TYPE_TMAP
-        {
-            build_info_derived(&hdr, primary_id, brands, mif1).map_err(core_err)?
-        } else {
-            return Err(Error::unsupported(format!(
-                "avif: primary item type '{}' not supported",
-                String::from_utf8_lossy(&primary_info.item_type)
-            )));
-        };
-
-        let mut ctx = DecodeCtx {
-            tone_mapped: self.tone_mapped,
-            reference_white_nits: self.reference_white_nits,
-            ..DecodeCtx::default()
-        };
-        // Gain-map application: the `tmap` alternative of the primary
-        // (the primary itself when it is one) replaces the primary.
-        let target = if self.tone_mapped {
-            tone_map_of(&hdr, primary_id).unwrap_or(primary_id)
-        } else {
-            primary_id
-        };
-        let image = decode_item_output(&hdr, target, 0, &mut ctx, true)?;
-        let bit_depth = image.format.bit_depth;
-        let (frame, format) = from_heif(&image).map_err(core_err)?;
-        let mut out = avif_to_core_frame(frame);
-        // The output image's colour: the primary's `colr` (a derived
-        // primary's own, else its first input's — `AvifInfo::colour`
-        // resolves that), MIAF §7.3.6.4 default when absent; a
-        // reconstructed `tmap` carries the `tmap` item's own `colr`
-        // (the alternate colorimetry, HEIF Amd 1 §6.6.2.4.1).
-        let colour = if target != primary_id || primary_info.item_type == ITEM_TYPE_TMAP {
-            match hdr.meta.property_for(target, &COLR) {
-                Some(Property::Colr(c)) => Some(c.clone()),
-                _ => info.colour.clone(),
-            }
-        } else {
-            info.colour.clone()
-        };
-        let signal = color_signal_for(colour.as_ref());
-        out.set_color_signal(signal);
+        // The contract implementation does the work; this adapter only
+        // re-labels the result for the framework.
+        let decoded = crate::api_codec::decode_primary(file, &self.options).map_err(core_err)?;
+        let format = decoded.image.format;
+        let signal = color_signal_for(Some(&decoded.image.color.to_colr()));
+        let out = VideoFrame::from(decoded.image);
         self.color_signal = Some(signal);
         self.output_format = Some(labelled_pixel_format(format, &signal));
-        // A composited 10/12-bit monochrome + alpha frame rides the
-        // 16-bit `Ya16Le` storage with the coded values in the low
-        // bits; surface the effective depth through the core per-plane
-        // significant-bits side channel (one packed image plane, both
-        // components at the master depth per the av1-avif §4.1
-        // same-depth `shall`).
-        if format == AvifPixelFormat::Ya16Le && bit_depth < 16 {
-            out.set_significant_bits(vec![bit_depth]);
-        }
         self.pending.push(Frame::Video(out));
-        self.info = Some(info.clone());
-        Ok(info)
+        self.info = Some(decoded.info.clone());
+        Ok(decoded.info)
     }
 
     pub fn info(&self) -> Option<&AvifInfo> {
@@ -420,93 +354,20 @@ impl AvifDecoder {
     /// [`parse_avis`]; callers detecting this should fall back to the
     /// still-image [`decode_file`] path.
     pub fn decode_avis_file(&mut self, file: &[u8]) -> Result<usize> {
-        let meta = parse_avis(file).map_err(core_err)?;
-        if meta.samples.is_empty() {
-            return Err(Error::invalid("avis: track has zero samples"));
-        }
-        let av1c = meta.av1_codec_config.ok_or_else(|| {
-            Error::invalid(
-                "avis: track stsd → av01 → av1C is missing — cannot seed AV1 decoder \
-                 (av1-avif §2.2.1)",
-            )
-        })?;
-        // Eagerly validate the codec config — same shape as the
-        // still-image path uses for the av1C item property. 10/12-bit
-        // tracks pass straight through: AVIS sample frames are handed
-        // out exactly as the AV1 decoder emits them (little-endian
-        // 16-bit words for a `high_bitdepth` track), no composition
-        // step involved.
-        let cfg = parse_av1c(&av1c)?;
-        validate_av1_config(&cfg)?;
-        let signal = color_signal_for(meta.colr.as_ref());
-        self.color_signal = Some(signal);
-        self.output_format = layout_of_record(&cfg).map(|l| labelled_pixel_format(l, &signal));
-
-        let timescale = if meta.timescale == 0 {
-            1
-        } else {
-            meta.timescale
-        };
-        let mut params = CodecParameters::video(CodecId::new("av1"));
-        if let Some((w, h)) = meta.display_dims {
-            params.width = Some(w);
-            params.height = Some(h);
-        }
-        params.extradata = av1c.clone();
-
-        let mut av1 = oxideav_av1::registry::make_decoder(&params)?;
         let mut frames_queued = 0usize;
-        let mut cumulative_pts: u64 = 0;
-        for (i, s) in meta.samples.iter().enumerate() {
-            let bytes = sample_bytes(file, s).map_err(core_err)?;
-            if bytes.len() > MAX_AV1_ITEM_BYTES {
-                return Err(Error::invalid(format!(
-                    "avis: sample {i} payload {} bytes exceeds soft cap {} bytes",
-                    bytes.len(),
-                    MAX_AV1_ITEM_BYTES
-                )));
-            }
-            // Build a packet on stream 0 with the movie timescale so
-            // the framework consumer recovers presentation order
-            // without an extra remapping step.
-            let pkt = Packet::new(0, TimeBase::new(1, timescale as i64), bytes.to_vec())
-                .with_pts(cumulative_pts as i64);
-            cumulative_pts = cumulative_pts.saturating_add(s.duration as u64);
-            av1.send_packet(&pkt).map_err(|e| {
-                Error::invalid(format!(
-                    "avis: av1 decoder rejected sample {i} (offset={}, size={}, sync={}): {e}",
-                    s.offset, s.size, s.is_sync
-                ))
-            })?;
-            // Drain frames after every packet — most AV1 packets emit a
-            // single decoded frame, but show-existing-frame OBUs can
-            // produce zero, and a single packet can occasionally yield
-            // more than one display frame.
-            loop {
-                match av1.receive_frame() {
-                    Ok(frame) => {
-                        self.pending.push(with_signal(frame, signal));
-                        frames_queued += 1;
-                    }
-                    Err(Error::NeedMore) => break,
-                    Err(e) => return Err(e),
-                }
-            }
-        }
-        // Flush any frames the decoder buffered past the last packet
-        // (re-ordering in standard AV1 is rare for AVIS, but the trait
-        // contract requires the call).
-        let _ = av1.flush();
-        loop {
-            match av1.receive_frame() {
-                Ok(frame) => {
-                    self.pending.push(with_signal(frame, signal));
-                    frames_queued += 1;
-                }
-                Err(Error::NeedMore) => break,
-                Err(_) => break,
-            }
-        }
+        let seq = crate::api_codec::decode_sequence_with(
+            file,
+            &self.options,
+            None,
+            |frame, seq, _duration| {
+                self.pending.push(with_signal(frame, seq.signal));
+                frames_queued += 1;
+                Ok(())
+            },
+        )
+        .map_err(core_err)?;
+        self.color_signal = Some(seq.signal);
+        self.output_format = seq.layout.map(|l| labelled_pixel_format(l, &seq.signal));
         Ok(frames_queued)
     }
 }
@@ -523,11 +384,8 @@ fn with_signal(frame: Frame, signal: ColorSignal) -> Frame {
 /// framework `Error` variants. The decoder calls this on every
 /// container-side `Result<T>` so the trait surface still returns
 /// `oxideav_core::Result`.
-fn core_err(e: crate::error::AvifError) -> Error {
-    match e {
-        crate::error::AvifError::InvalidData(s) => Error::InvalidData(s),
-        crate::error::AvifError::Unsupported(s) => Error::Unsupported(s),
-    }
+pub(crate) fn core_err(e: crate::error::AvifError) -> Error {
+    Error::from(e)
 }
 
 /// Defensive sanity check on a parsed `av1C` record before its bytes are
@@ -546,7 +404,7 @@ fn core_err(e: crate::error::AvifError) -> Error {
 ///   `chroma_subsampling_y` set to 1 (4:0:0 carries no chroma planes).
 /// * AV1 §5.5.2 — 4:2:2 (sub_x=1, sub_y=0) is only valid for `seq_profile == 2`.
 /// * AV1 §5.5.2 — 4:4:4 (sub_x=0, sub_y=0) is only valid for `seq_profile ∈ {1, 2}`.
-fn validate_av1_config(cfg: &Av1CodecConfig) -> Result<()> {
+pub(crate) fn validate_av1_config(cfg: &Av1CodecConfig) -> Result<()> {
     if cfg.seq_profile > 2 {
         return Err(Error::invalid(format!(
             "av1C: seq_profile={} > 2 (AV1 §A.4)",
@@ -592,7 +450,7 @@ fn validate_av1_config(cfg: &Av1CodecConfig) -> Result<()> {
 /// `32 MiB` is generous — even a 8K HDR still tops out around 5 MiB in
 /// practice — and keeps the limit well above all real-world fixtures
 /// shipped under `tests/fixtures/`.
-const MAX_AV1_ITEM_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) const MAX_AV1_ITEM_BYTES: usize = 32 * 1024 * 1024;
 
 /// Decode a single av01 item's OBU bitstream into a `VideoFrame` plus
 /// its inferred `(format, width, height)` triple. The slim
@@ -752,9 +610,9 @@ pub const MAX_GRID_CANVAS_PIXELS: u64 = 1 << 28;
 pub const MAX_ITEM_DECODES: u32 = 4096;
 
 /// Per-file decode state: the `dimg` recursion stack (cycle guard),
-/// memoised item output images, and the decode budget.
-#[derive(Default)]
-struct DecodeCtx {
+/// memoised item output images, the decode budget and the caller's
+/// [`crate::DecodeOptions`] that steer the walk.
+pub(crate) struct DecodeCtx {
     stack: Vec<u32>,
     cache: std::collections::HashMap<(u32, bool), ItemImage>,
     decodes: u32,
@@ -762,13 +620,35 @@ struct DecodeCtx {
     tone_mapped: bool,
     /// HDR reference white for PQ-coded reconstructions.
     reference_white_nits: f64,
+    /// Cap on any derived canvas (grid / overlay) on the way to the
+    /// output, in pixels — the caller's bound, never above this
+    /// crate's own ([`MAX_GRID_CANVAS_PIXELS`] /
+    /// [`crate::overlay::MAX_OVERLAY_CANVAS_PIXELS`]).
+    max_pixels: u64,
+    /// Spatial layer to render for the top-level coded item instead
+    /// of its `lsel`.
+    layer: Option<u16>,
+}
+
+impl DecodeCtx {
+    pub(crate) fn new(opts: &crate::api::DecodeOptions) -> Self {
+        Self {
+            stack: Vec::new(),
+            cache: std::collections::HashMap::new(),
+            decodes: 0,
+            tone_mapped: opts.tone_mapped,
+            reference_white_nits: opts.reference_white_nits,
+            max_pixels: opts.max_pixels,
+            layer: opts.layer,
+        }
+    }
 }
 
 /// An image item's output image (HEIF §6.3) — the container crate's
 /// planar frame, which its composition layer works on directly. The
 /// crate-local layout (packed `Ya8` / `Ya16Le`, the framework
 /// `PixelFormat`) is produced once, for the primary's final output.
-type ItemImage = HeifFrame;
+pub(crate) type ItemImage = HeifFrame;
 
 fn heif_err(e: oxideav_heif::HeifError) -> Error {
     core_err(crate::error::AvifError::from(e))
@@ -794,7 +674,7 @@ fn heif_err(e: oxideav_heif::HeifError) -> Error {
 /// cycles are rejected before any decode; outputs are memoised per
 /// `(item, with_alpha)` so shared inputs decode once, and the total
 /// number of item decodes is capped by [`MAX_ITEM_DECODES`].
-fn decode_item_output(
+pub(crate) fn decode_item_output(
     hdr: &AvifHeader<'_>,
     item_id: u32,
     depth: u32,
@@ -842,7 +722,8 @@ fn decode_item_output_inner(
         .ok_or_else(|| Error::invalid(format!("avif: item {item_id} unknown")))?;
     let item_type = info.item_type;
     let mut image = if item_type == ITEM_TYPE_AV01 {
-        decode_coded_item(hdr, item_id)?
+        let layer = if depth == 0 { ctx.layer } else { None };
+        decode_coded_item(hdr, item_id, layer)?
     } else if item_type == ITEM_TYPE_TMAP {
         let (base, _gain) = tone_map_inputs(hdr, item_id)?;
         if depth == 0 && !ctx.tone_mapped {
@@ -921,8 +802,9 @@ fn decode_item_output_inner(
 }
 
 /// Decode one coded `av01` item: AV1 decode + the `ispe` clamp against
-/// a padded coded frame, re-laid out as the container frame.
-fn decode_coded_item(hdr: &AvifHeader<'_>, item_id: u32) -> Result<ItemImage> {
+/// a padded coded frame, re-laid out as the container frame. `layer`
+/// overrides the item's `lsel` choice of spatial layer.
+fn decode_coded_item(hdr: &AvifHeader<'_>, item_id: u32, layer: Option<u16>) -> Result<ItemImage> {
     let bytes = hdr.item_data(item_id).map_err(core_err)?;
     let av1c = match hdr.meta.property_for(item_id, &AV1C) {
         Some(Property::Av1C(b)) => b.clone(),
@@ -941,10 +823,10 @@ fn decode_coded_item(hdr: &AvifHeader<'_>, item_id: u32) -> Result<ItemImage> {
             Some(Property::A1op(a)) => Some(a.op_index),
             _ => None,
         },
-        layer_id: match hdr.meta.property_for(item_id, b"lsel") {
+        layer_id: layer.or(match hdr.meta.property_for(item_id, b"lsel") {
             Some(Property::Lsel(l)) => Some(l.layer_id),
             _ => None,
-        },
+        }),
     };
     let (core_frame, fmt_core, mut w, mut h) = decode_av01_item(&bytes, &av1c, ispe, select)?;
     let bit_depth = parse_av1c(&av1c)?.bit_depth();
@@ -989,10 +871,17 @@ fn decode_grid_item(
     if grid.output_width == 0 || grid.output_height == 0 {
         return Err(Error::invalid("avif: grid output dimensions zero"));
     }
-    if u64::from(grid.output_width) * u64::from(grid.output_height) > MAX_GRID_CANVAS_PIXELS {
+    let canvas = u64::from(grid.output_width) * u64::from(grid.output_height);
+    if canvas > MAX_GRID_CANVAS_PIXELS {
         return Err(Error::invalid(format!(
             "avif: grid canvas {}x{} exceeds {MAX_GRID_CANVAS_PIXELS} pixels",
             grid.output_width, grid.output_height
+        )));
+    }
+    if canvas > ctx.max_pixels {
+        return Err(Error::ResourceExhausted(format!(
+            "avif: grid canvas {}x{} exceeds the {} pixels allowed",
+            grid.output_width, grid.output_height, ctx.max_pixels
         )));
     }
     let mut tiles: Vec<HeifFrame> = Vec::with_capacity(tile_ids.len());
@@ -1028,7 +917,7 @@ const ALTR: BoxType = b(b"altr");
 /// one that shares an `altr` entity group with it (MIAF Amd 1
 /// §7.3.11.5, av1-avif §4.2.2). `None` when the file carries no such
 /// item.
-fn tone_map_of(hdr: &AvifHeader<'_>, primary_id: u32) -> Option<u32> {
+pub(crate) fn tone_map_of(hdr: &AvifHeader<'_>, primary_id: u32) -> Option<u32> {
     let meta = &hdr.meta;
     if meta.item_by_id(primary_id)?.item_type == ITEM_TYPE_TMAP {
         return Some(primary_id);
@@ -1171,6 +1060,12 @@ fn decode_overlay_item(
             desc.output_width,
             desc.output_height,
             crate::overlay::MAX_OVERLAY_CANVAS_PIXELS
+        )));
+    }
+    if area > ctx.max_pixels {
+        return Err(Error::ResourceExhausted(format!(
+            "avif: iovl canvas {}x{} exceeds the {} pixels allowed",
+            desc.output_width, desc.output_height, ctx.max_pixels
         )));
     }
     let mut inputs: Vec<(HeifFrame, bool)> = Vec::with_capacity(sources.len());

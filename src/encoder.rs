@@ -63,17 +63,16 @@ use oxideav_core::{
     Result, TimeBase,
 };
 
+use crate::api::EncodeOptions;
 use crate::meta::Colr;
-use crate::still::{
-    encode_still, identity_full_range_colr, StillChroma, StillEncodeOptions, StillImage,
-};
+use crate::still::{encode_still, identity_full_range_colr, StillChroma, StillImage};
 
 /// Frame-to-AVIF encoder: every video frame becomes one complete AVIF
 /// file packet. See the module docs for the input-format mapping and
 /// the option surface.
 pub struct AvifEncoder {
     params: CodecParameters,
-    opts: StillEncodeOptions,
+    opts: EncodeOptions,
     pending: Vec<Packet>,
     flushed: bool,
 }
@@ -94,15 +93,15 @@ impl AvifEncoder {
                 .and_then(|v| v.parse::<u8>().ok())
                 .unwrap_or(0)
         };
-        let opts = StillEncodeOptions {
-            base_q_idx: get_q("q"),
-            alpha_q_idx: get_q("alpha_q"),
-            premultiplied_alpha: params
+        let opts = EncodeOptions::new(
+            get_q("q"),
+            get_q("alpha_q"),
+            params
                 .options
                 .get("premultiplied")
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false),
-        };
+        );
         Self {
             params,
             opts,

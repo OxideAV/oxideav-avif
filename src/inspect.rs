@@ -17,7 +17,7 @@ use crate::meta::{
     Amve, Cclv, Clli, Colr, Ispe, Mdcv, Meta, Pasp, Pixi, Property, ITEM_TYPE_EXIF, ITEM_TYPE_MIME,
 };
 use crate::parser::{
-    classify_brands, parse, parse_header, AvifHeader, AvifImage, BrandClass, ITEM_TYPE_GRID,
+    classify_brands, parse, parse_header, AvifFile, AvifHeader, BrandClass, ITEM_TYPE_GRID,
 };
 
 const AV1C: BoxType = b(b"av1C");
@@ -1207,7 +1207,7 @@ fn decode_av1c_flags(av1c: &[u8]) -> (Option<u8>, bool, Option<(bool, bool)>) {
 }
 
 pub(crate) fn build_info(
-    img: &AvifImage<'_>,
+    img: &AvifFile<'_>,
     has_alpha: bool,
     brands: BrandClass,
     mif1_compliance: crate::derived::Mif1Compliance,

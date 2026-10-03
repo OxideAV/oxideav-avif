@@ -10,8 +10,8 @@
 
 use oxideav_avif::{
     audit_avif_profile_compliance, audit_mif1, audit_sequence_header_obu, classify_brands,
-    encode_still, encode_still_grid, inspect, parse, parse_header, AvifDecoder, Colr, StillChroma,
-    StillEncodeOptions, StillImage, StillProperties,
+    encode_still, encode_still_grid, inspect, parse, parse_header, AvifDecoder, Colr,
+    EncodeOptions, StillChroma, StillImage, StillProperties,
 };
 use oxideav_core::{CodecId, CodecParameters, Decoder, Frame, Packet, TimeBase};
 
@@ -132,7 +132,7 @@ fn psnr(a: &[u16], b: &[u16], bit_depth: u8) -> f64 {
 #[test]
 fn yuv420_8bit_lossless_round_trips_exact() {
     let img = build_image(32, 32, 8, StillChroma::Yuv420);
-    let avif = encode_still(&img, &StillEncodeOptions::default()).expect("encode");
+    let avif = encode_still(&img, &EncodeOptions::default()).expect("encode");
 
     // Container-level: mif1-compliant, Baseline brand, exactly one
     // Sequence Header OBU in the item payload (av1-avif §2.1).
@@ -177,7 +177,7 @@ fn depth_format_matrix_round_trips_exact() {
         for (chroma, nplanes) in chromas {
             let label = format!("{bit_depth}-bit {chroma:?}");
             let img = build_image(16, 16, bit_depth, chroma);
-            let avif = encode_still(&img, &StillEncodeOptions::default())
+            let avif = encode_still(&img, &EncodeOptions::default())
                 .unwrap_or_else(|e| panic!("{label}: encode failed: {e}"));
 
             // av1C fields mirror the pairing (av1-avif §2.2.1).
@@ -253,7 +253,7 @@ fn odd_dimensions_pad_and_clap_back_exact() {
     for (w, h, chroma) in cases {
         let label = format!("{w}x{h} {chroma:?}");
         let img = build_image(w, h, 8, chroma);
-        let avif = encode_still(&img, &StillEncodeOptions::default())
+        let avif = encode_still(&img, &EncodeOptions::default())
             .unwrap_or_else(|e| panic!("{label}: encode failed: {e}"));
         // ispe documents the padded coded extents; clap carries the
         // display crop.
@@ -284,7 +284,7 @@ fn rgb8_identity_round_trips_exact() {
     let (w, h) = (23u32, 15u32);
     let rgb: Vec<u8> = (0..w * h * 3).map(|i| ((i * 31) & 0xff) as u8).collect();
     let img = StillImage::rgb8(w, h, &rgb).expect("rgb8");
-    let avif = encode_still(&img, &StillEncodeOptions::default()).expect("encode");
+    let avif = encode_still(&img, &EncodeOptions::default()).expect("encode");
 
     // colr signals the identity triple, full range.
     let parsed = parse(&avif).expect("parse");
@@ -322,7 +322,7 @@ fn rgba8_alpha_round_trips_exact() {
     let (w, h) = (16u32, 16u32);
     let rgba: Vec<u8> = (0..w * h * 4).map(|i| ((i * 17) & 0xff) as u8).collect();
     let img = StillImage::rgba8(w, h, &rgba).expect("rgba8");
-    let avif = encode_still(&img, &StillEncodeOptions::default()).expect("encode");
+    let avif = encode_still(&img, &EncodeOptions::default()).expect("encode");
 
     let info = inspect(&avif).expect("inspect");
     assert!(info.has_alpha, "alpha auxiliary present");
@@ -352,7 +352,7 @@ fn yuv420_alpha_premultiplied_round_trips() {
     let img = build_image(w, h, 8, StillChroma::Yuv420);
     let alpha = plane(w, h, 8, 9);
     let img = img.with_alpha(alpha.clone()).expect("alpha");
-    let opts = StillEncodeOptions::default().with_premultiplied_alpha(true);
+    let opts = EncodeOptions::default().with_premultiplied_alpha(true);
     let avif = encode_still(&img, &opts).expect("encode");
 
     let hdr = oxideav_avif::parse_header(&avif).expect("parse_header");
@@ -385,7 +385,7 @@ fn full_range_flag_signalled_where_it_matters() {
             .collect::<Vec<_>>(),
     )
     .expect("rgba8");
-    let avif = encode_still(&img, &StillEncodeOptions::default()).expect("encode");
+    let avif = encode_still(&img, &EncodeOptions::default()).expect("encode");
     let hdr = oxideav_avif::parse_header(&avif).expect("parse_header");
     let primary = hdr.meta.primary_item_id.expect("pitm");
     let alpha_id = oxideav_avif::find_alpha_item_id(&hdr.meta, primary).expect("alpha id");
@@ -428,7 +428,7 @@ fn ten_bit_alpha_matches_master_depth_and_round_trips() {
     let img = build_image(w, h, 10, StillChroma::Yuv420);
     let alpha = plane(w, h, 10, 11);
     let img = img.with_alpha(alpha.clone()).expect("alpha");
-    let avif = encode_still(&img, &StillEncodeOptions::default()).expect("encode");
+    let avif = encode_still(&img, &EncodeOptions::default()).expect("encode");
 
     let info = inspect(&avif).expect("inspect");
     assert!(info.has_alpha);
@@ -472,7 +472,7 @@ fn twelve_bit_alpha_premultiplied_round_trips() {
     let img = build_image(w, h, 12, StillChroma::Yuv444);
     let alpha = plane(w, h, 12, 21);
     let img = img.with_alpha(alpha.clone()).expect("alpha");
-    let opts = StillEncodeOptions::default().with_premultiplied_alpha(true);
+    let opts = EncodeOptions::default().with_premultiplied_alpha(true);
     let avif = encode_still(&img, &opts).expect("encode");
 
     let hdr = parse_header(&avif).expect("parse_header");
@@ -499,7 +499,7 @@ fn hbd_monochrome_alpha_composites_packed_ya16le() {
         let img = build_image(w, h, depth, StillChroma::Monochrome);
         let alpha = plane(w, h, depth, 33);
         let img = img.with_alpha(alpha.clone()).expect("alpha");
-        let avif = encode_still(&img, &StillEncodeOptions::default()).expect("encode");
+        let avif = encode_still(&img, &EncodeOptions::default()).expect("encode");
 
         let vf = decode_own(&label, &avif);
         assert_eq!(vf.image_plane_count(), 1, "{label}: one packed plane");
@@ -527,7 +527,7 @@ fn hbd_monochrome_alpha_composites_packed_ya16le() {
 fn hbd_grid_encode_round_trips_exact_with_trim() {
     let (w, h) = (150u32, 130u32);
     let img = build_image(w, h, 10, StillChroma::Yuv420);
-    let avif = encode_still_grid(&img, &StillEncodeOptions::default(), 2, 2).expect("grid encode");
+    let avif = encode_still_grid(&img, &EncodeOptions::default(), 2, 2).expect("grid encode");
 
     let info = inspect(&avif).expect("inspect");
     assert!(info.is_grid, "grid primary");
@@ -555,7 +555,7 @@ fn hbd_odd_dimensions_pad_and_clap_back_exact() {
     for (w, h, depth, chroma) in cases {
         let label = format!("{w}x{h} {depth}-bit {chroma:?}");
         let img = build_image(w, h, depth, chroma);
-        let avif = encode_still(&img, &StillEncodeOptions::default())
+        let avif = encode_still(&img, &EncodeOptions::default())
             .unwrap_or_else(|e| panic!("{label}: encode failed: {e}"));
         let vf = decode_own(&label, &avif);
         assert_eq!(vf.planes[0].stride as u32, w * 2, "{label}: byte stride");
@@ -571,7 +571,7 @@ fn hbd_orientation_irot_rotates_samples_exact() {
     let (w, h) = (24u32, 16u32);
     let img = build_image(w, h, 10, StillChroma::Yuv444)
         .with_props(StillProperties::default().with_irot(Some(1)));
-    let avif = encode_still(&img, &StillEncodeOptions::default()).expect("encode");
+    let avif = encode_still(&img, &EncodeOptions::default()).expect("encode");
 
     let vf = decode_own("10-bit irot", &avif);
     assert_eq!(vf.planes[0].stride as u32, h * 2, "rotated byte stride");
@@ -603,7 +603,7 @@ fn pass_through_properties_round_trip() {
             .with_clli(Some(oxideav_avif::Clli::new(1000, 400)))
             .with_irot(Some(1)),
     );
-    let avif = encode_still(&img, &StillEncodeOptions::default()).expect("encode");
+    let avif = encode_still(&img, &EncodeOptions::default()).expect("encode");
 
     let info = inspect(&avif).expect("inspect");
     assert!(info.has_descriptive_metadata(), "Exif/XMP present");
@@ -653,11 +653,11 @@ fn grid_tiling_election_and_auto_encode() {
     // bound it is a single item. Exercise the grid arm directly.
     let (w, h) = (300u32, 70u32);
     let img = build_image(w, h, 8, StillChroma::Yuv420);
-    let single = encode_still_auto(&img, &StillEncodeOptions::default()).expect("auto");
+    let single = encode_still_auto(&img, &EncodeOptions::default()).expect("auto");
     assert!(!inspect(&single).expect("inspect").is_grid);
     let (cols, rows) = elect_grid_tiling(w, h, 128).expect("tiling");
     assert_eq!((cols, rows), (3, 1));
-    let grid = encode_still_grid(&img, &StillEncodeOptions::default(), cols, rows).expect("grid");
+    let grid = encode_still_grid(&img, &EncodeOptions::default(), cols, rows).expect("grid");
     let info = inspect(&grid).expect("inspect");
     assert!(info.is_grid);
     let vf = decode_own("elected grid", &grid);
@@ -712,8 +712,8 @@ fn layered_item_round_trips_and_selects_layers() {
     for layers in [vec![&mid, &top], vec![&base, &mid, &top]] {
         let n = layers.len();
         let label = format!("{n}-layer");
-        let avif = encode_still_layered(&layers, None, &StillEncodeOptions::default())
-            .expect("layered encode");
+        let avif =
+            encode_still_layered(&layers, None, &EncodeOptions::default()).expect("layered encode");
         let info = inspect(&avif).expect("inspect");
         assert_eq!(
             (info.width, info.height),
@@ -743,7 +743,7 @@ fn layered_item_round_trips_and_selects_layers() {
         assert_eq!(vf.planes[1].data, narrow(&top.u), "{label}: top U exact");
 
         // Pin the base layer.
-        let pinned = encode_still_layered(&layers, Some(0), &StillEncodeOptions::default())
+        let pinned = encode_still_layered(&layers, Some(0), &EncodeOptions::default())
             .expect("pinned encode");
         let info = inspect(&pinned).expect("inspect");
         let first = layers[0];
@@ -809,12 +809,12 @@ fn layered_item_round_trips_and_selects_layers() {
     }
 
     // Guards: layer count, mixed layouts, oversize lower layer.
-    assert!(encode_still_layered(&[&top], None, &StillEncodeOptions::default()).is_err());
+    assert!(encode_still_layered(&[&top], None, &EncodeOptions::default()).is_err());
     let hbd = build_image(32, 24, 10, StillChroma::Yuv420);
-    assert!(encode_still_layered(&[&hbd, &top], None, &StillEncodeOptions::default()).is_err());
+    assert!(encode_still_layered(&[&hbd, &top], None, &EncodeOptions::default()).is_err());
     let big = build_image(80, 48, 8, StillChroma::Yuv420);
-    assert!(encode_still_layered(&[&big, &top], None, &StillEncodeOptions::default()).is_err());
-    assert!(encode_still_layered(&[&mid, &top], Some(2), &StillEncodeOptions::default()).is_err());
+    assert!(encode_still_layered(&[&big, &top], None, &EncodeOptions::default()).is_err());
+    assert!(encode_still_layered(&[&mid, &top], Some(2), &EncodeOptions::default()).is_err());
 }
 
 // ───────────────────────── image sequences ─────────────────────────
@@ -1073,9 +1073,8 @@ fn lossy_encode_is_smaller_and_psnr_gated() {
     let v = plane(w / 2, h / 2, 8, 4);
     let img = StillImage::yuv(w, h, 8, StillChroma::Yuv420, y.clone(), u, v).expect("image");
 
-    let lossless = encode_still(&img, &StillEncodeOptions::default()).expect("lossless");
-    let lossy =
-        encode_still(&img, &StillEncodeOptions::default().with_base_q_idx(100)).expect("lossy");
+    let lossless = encode_still(&img, &EncodeOptions::default()).expect("lossless");
+    let lossy = encode_still(&img, &EncodeOptions::default().with_base_q_idx(100)).expect("lossy");
     assert!(
         lossy.len() < lossless.len(),
         "lossy {} must be smaller than lossless {}",
@@ -1099,7 +1098,7 @@ fn lossy_encode_is_smaller_and_psnr_gated() {
 fn grid_encode_round_trips_exact_with_trim() {
     let (w, h) = (150u32, 130u32);
     let img = build_image(w, h, 8, StillChroma::Yuv420);
-    let avif = encode_still_grid(&img, &StillEncodeOptions::default(), 2, 2).expect("grid encode");
+    let avif = encode_still_grid(&img, &EncodeOptions::default(), 2, 2).expect("grid encode");
 
     let info = inspect(&avif).expect("inspect");
     assert!(info.is_grid, "grid primary");
@@ -1127,21 +1126,21 @@ fn grid_encode_guards() {
     // 506 wide split into 9 columns → ceil(56.2) = 57 → 64-wide coded
     // tiles → 8 × 64 = 512 ≥ 506: column 8 starts past the canvas.
     let wide = build_image(506, 64, 8, StillChroma::Yuv420);
-    let err = encode_still_grid(&wide, &StillEncodeOptions::default(), 9, 1).unwrap_err();
+    let err = encode_still_grid(&wide, &EncodeOptions::default(), 9, 1).unwrap_err();
     assert!(err.to_string().contains("fully-trimmed"), "{err}");
     // Tiles below the 64-pixel floor are rejected.
     let img = build_image(16, 16, 8, StillChroma::Yuv420);
-    let err = encode_still_grid(&img, &StillEncodeOptions::default(), 2, 1).unwrap_err();
+    let err = encode_still_grid(&img, &EncodeOptions::default(), 2, 1).unwrap_err();
     assert!(err.to_string().contains("floor"), "{err}");
     let with_depth = build_image(128, 128, 8, StillChroma::Yuv420)
         .with_depth_map(plane(128, 128, 8, 5))
         .unwrap();
-    assert!(encode_still_grid(&with_depth, &StillEncodeOptions::default(), 2, 1).is_err());
+    assert!(encode_still_grid(&with_depth, &EncodeOptions::default(), 2, 1).is_err());
     let with_iden = img.with_props(
         StillProperties::default()
             .with_identity_derivation(Some(oxideav_avif::IdentityDerivation::default())),
     );
-    assert!(encode_still_grid(&with_iden, &StillEncodeOptions::default(), 2, 1).is_err());
+    assert!(encode_still_grid(&with_iden, &EncodeOptions::default(), 2, 1).is_err());
 }
 
 /// Grid + alpha: the alpha auxiliary of a grid primary is a hidden
@@ -1157,7 +1156,7 @@ fn grid_encode_with_alpha_round_trips_exact() {
         let img = build_image(w, h, depth, StillChroma::Yuv420)
             .with_alpha(plane(w, h, depth, 9))
             .unwrap();
-        let opts = StillEncodeOptions::default().with_premultiplied_alpha(premultiplied);
+        let opts = EncodeOptions::default().with_premultiplied_alpha(premultiplied);
         let avif = encode_still_grid(&img, &opts, 2, 2).expect("grid+alpha encode");
         let label = format!("grid alpha {depth}-bit");
 
@@ -1260,7 +1259,7 @@ fn depth_map_auxiliary_round_trips_exact() {
     let img = build_image(w, h, 10, StillChroma::Yuv420)
         .with_depth_map(depth_map.clone())
         .unwrap();
-    let avif = encode_still(&img, &StillEncodeOptions::default()).expect("encode");
+    let avif = encode_still(&img, &EncodeOptions::default()).expect("encode");
     let info = inspect(&avif).expect("inspect");
     let depth_id = info.depth_map_item_id.expect("depth aux surfaced");
     assert!(!info.has_alpha);
@@ -1306,7 +1305,7 @@ fn grid_pass_through_properties_round_trip() {
             .with_irot(Some(1))
             .with_pasp(Some(oxideav_avif::Pasp::new(4, 3))),
     );
-    let avif = encode_still_grid(&img, &StillEncodeOptions::default(), 2, 1).expect("grid encode");
+    let avif = encode_still_grid(&img, &EncodeOptions::default(), 2, 1).expect("grid encode");
     let info = inspect(&avif).expect("inspect");
     assert!(info.is_grid);
     assert_eq!(info.mdcv, Some(mdcv), "mdcv on the grid item");
@@ -1364,7 +1363,7 @@ fn hbd_avis_sequence_decodes_sample_exact() {
         StillImage::yuv(w, h, 10, StillChroma::Yuv420, y, u, v).expect("img1")
     };
     let lift = |img: &StillImage| -> (Vec<u8>, Vec<u8>) {
-        let avif = encode_still(img, &StillEncodeOptions::default()).expect("encode");
+        let avif = encode_still(img, &EncodeOptions::default()).expect("encode");
         let parsed = parse(&avif).expect("parse");
         (
             parsed.primary_item_data.to_vec(),
@@ -1600,7 +1599,7 @@ fn black_box_external_decoder_accepts_our_encodes() {
     for (chroma, depth, tag) in cases {
         let label = format!("black-box {depth}-bit {chroma:?}");
         let img = build_image(32, 32, depth, chroma);
-        let avif = encode_still(&img, &StillEncodeOptions::default()).expect("encode");
+        let avif = encode_still(&img, &EncodeOptions::default()).expect("encode");
         let in_path = tmp.join(format!("bb_{tag}.avif"));
         let out_path = tmp.join(format!("bb_{tag}.y4m"));
         std::fs::write(&in_path, &avif).expect("write avif");

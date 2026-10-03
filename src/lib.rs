@@ -2,6 +2,38 @@
 //! the ISOBMFF / HEIF container served by [`oxideav_heif`] and AV1
 //! pixel decode delegated to [`oxideav_av1`].
 //!
+//! # The image-crate API
+//!
+//! The root follows the workspace image-crate contract (see [`api`]):
+//! [`probe`] / [`info`] standalone; [`decode`] / [`decode_with`] /
+//! [`decode_rgb8`] / [`decode_rgba8`] / [`decode_all`] / [`decode_from`]
+//! and [`encode`] / [`encode_rgb8`] / [`encode_rgba8`] / [`encode_to`]
+//! with the default-on `registry` feature (the pixels come from the
+//! AV1 codec crate, which is framework-only). [`AvifImage`] is the
+//! decoded picture — planes + [`PixelFormat`] + [`ColorInfo`] +
+//! [`Metadata`] — with [`AvifImage::to_rgb8`] / [`AvifImage::to_rgba8`];
+//! [`AvifFile`] is the parsed container ([`parse`]).
+//!
+//! ```no_run
+//! # fn main() -> Result<(), oxideav_avif::Error> {
+//! let bytes = std::fs::read("in.avif").map_err(oxideav_avif::Error::from)?;
+//! if oxideav_avif::probe(&bytes) {
+//!     let info = oxideav_avif::info(&bytes)?;
+//!     let img = oxideav_avif::decode(&bytes)?;
+//!     let rgba: Vec<u8> = img.to_rgba8();
+//!     let out = oxideav_avif::encode_rgba8(
+//!         img.width(),
+//!         img.height(),
+//!         &rgba,
+//!         &oxideav_avif::EncodeOptions::default().with_quality(90),
+//!     )?;
+//!     assert_eq!((info.width, info.height), (img.width(), img.height()));
+//!     std::fs::write("out.avif", out).map_err(oxideav_avif::Error::from)?;
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! # Layering
 //!
 //! * **Container (`oxideav-heif`)**: the box reader ([`box_parser`] is
@@ -119,6 +151,7 @@
 //! pulled in only when `registry` is on.
 
 pub mod alpha;
+pub mod api;
 pub mod avis;
 pub mod box_parser;
 pub mod cicp;
@@ -140,6 +173,9 @@ pub mod transform;
 mod av1_config;
 
 #[cfg(feature = "registry")]
+pub mod api_codec;
+
+#[cfg(feature = "registry")]
 pub mod decoder;
 
 #[cfg(feature = "registry")]
@@ -153,6 +189,10 @@ pub mod signal;
 pub mod still;
 
 pub use alpha::{composite_alpha, find_alpha_item_id, ALPHA_URN_PREFIX};
+pub use api::{
+    info, probe, AvifImage, ColorInfo, DecodeOptions, EncodeOptions, Frame, ImageInfo, Metadata,
+    PixelFormat, Plane, RgbImage, RgbaImage, StillChroma,
+};
 pub use avis::{
     audit_avis_profile_compliance, audit_avis_sequence, audit_edit_list, inspect_avis, parse_avis,
     parse_prft, parse_producer_reference_times, parse_ssix, parse_subsegment_indexes, sample_bytes,
@@ -177,6 +217,8 @@ pub use derived::{
     ToneMapResolution, MAX_DERIVATION_DEPTH,
 };
 pub use error::{AvifError, Result};
+/// The crate error under the contract's name.
+pub type Error = AvifError;
 pub use grid::{composite_grid, ImageGrid};
 pub use image::{AvifFrame, AvifPixelFormat, AvifPlane};
 pub use inspect::{
@@ -200,7 +242,7 @@ pub use mux::{
 pub use overlay::{composite_overlay, OverlayInput, MAX_OVERLAY_CANVAS_PIXELS};
 pub use parser::{
     audit_mif1, classify_brands, item_bytes, item_bytes_owned, item_bytes_owned_full,
-    item_bytes_owned_with_idat, item_bytes_with_idat, parse, parse_header, AvifHeader, AvifImage,
+    item_bytes_owned_with_idat, item_bytes_with_idat, parse, parse_header, AvifFile, AvifHeader,
     BrandClass, BRAND_AVIF, BRAND_AVIO, BRAND_AVIS, BRAND_MA1A, BRAND_MA1B, BRAND_MIAF, BRAND_MIF1,
     BRAND_MSF1, ITEM_TYPE_AV01, ITEM_TYPE_GRID,
 };
@@ -216,6 +258,12 @@ pub use sample_group::{
 pub use transform::{apply_clap, apply_imir, apply_irot, crop_top_left};
 
 #[cfg(feature = "registry")]
+pub use api_codec::{
+    decode, decode_all, decode_all_with, decode_from, decode_rgb8, decode_rgba8, decode_with,
+    encode, encode_rgb8, encode_rgba8, encode_to,
+};
+
+#[cfg(feature = "registry")]
 pub use decoder::{make_decoder, AvifDecoder, MAX_GRID_CANVAS_PIXELS, MAX_ITEM_DECODES};
 
 #[cfg(feature = "registry")]
@@ -228,10 +276,13 @@ pub use sequence::{encode_sequence, SequenceEncodeOptions};
 pub use signal::{color_signal_for, labelled_pixel_format, miaf_default_signal};
 
 #[cfg(feature = "registry")]
+#[allow(deprecated)]
+pub use still::StillEncodeOptions;
+#[cfg(feature = "registry")]
 pub use still::{
     elect_grid_tiling, encode_still, encode_still_auto, encode_still_grid, encode_still_layered,
-    encode_still_overlay, GainMapSpec, OverlayCanvas, OverlayLayerImage, StillChroma,
-    StillEncodeOptions, StillImage, StillProperties, GRID_MIN_TILE_DIM, STILL_MAX_CODED_DIM,
+    encode_still_overlay, GainMapSpec, OverlayCanvas, OverlayLayerImage, StillImage,
+    StillProperties, GRID_MIN_TILE_DIM, STILL_MAX_CODED_DIM,
 };
 
 #[cfg(feature = "registry")]
@@ -266,6 +317,8 @@ mod registry_glue {
             match e {
                 AvifError::InvalidData(s) => Error::InvalidData(s),
                 AvifError::Unsupported(s) => Error::Unsupported(s),
+                AvifError::LimitExceeded(s) => Error::ResourceExhausted(s),
+                AvifError::Io(s) => Error::Io(std::io::Error::other(s)),
             }
         }
     }

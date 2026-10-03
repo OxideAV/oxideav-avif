@@ -15,7 +15,7 @@
 //! word mismatch.
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_avif::{encode_still, AvifDecoder, StillChroma, StillEncodeOptions, StillImage};
+use oxideav_avif::{encode_still, AvifDecoder, StillChroma, EncodeOptions, StillImage};
 use oxideav_core::{CodecId, Decoder, Frame, Packet, TimeBase};
 
 const MAX_WIDTH: usize = 40;
@@ -112,7 +112,7 @@ fuzz_target!(|data: &[u8]| {
         None => img,
     };
 
-    let avif = encode_still(&img, &StillEncodeOptions::default()).expect("encode_still");
+    let avif = encode_still(&img, &EncodeOptions::default()).expect("encode_still");
 
     let mut dec = AvifDecoder::new(CodecId::new(oxideav_avif::CODEC_ID_STR));
     let pkt = Packet::new(0, TimeBase::new(1, 1), avif);

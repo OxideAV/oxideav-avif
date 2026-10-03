@@ -10,8 +10,8 @@
 
 use oxideav_avif::{
     audit_iden_derivations, encode_still, encode_still_overlay, inspect, parse_header, AvifDecoder,
-    IdentityDerivation, OverlayCanvas, OverlayLayerImage, StillChroma, StillEncodeOptions,
-    StillImage, StillProperties, ITEM_TYPE_IDEN, ITEM_TYPE_IOVL,
+    EncodeOptions, IdentityDerivation, OverlayCanvas, OverlayLayerImage, StillChroma, StillImage,
+    StillProperties, ITEM_TYPE_IDEN, ITEM_TYPE_IOVL,
 };
 use oxideav_core::{CodecId, Decoder, Frame, Packet, TimeBase};
 
@@ -221,8 +221,8 @@ fn overlay_8bit_420_two_opaque_layers_round_trips_exact() {
         OverlayLayerImage::new(&base, 0, 0),
         OverlayLayerImage::new(&stamp, 8, 8),
     ];
-    let avif = encode_still_overlay(&canvas, &layers, &StillEncodeOptions::default())
-        .expect("overlay encode");
+    let avif =
+        encode_still_overlay(&canvas, &layers, &EncodeOptions::default()).expect("overlay encode");
 
     // Container: iovl primary, two hidden av01 inputs, resolved placements.
     let hdr = parse_header(&avif).expect("parse");
@@ -287,7 +287,7 @@ fn overlay_8bit_420_two_opaque_layers_round_trips_exact() {
         got_v.clone(),
     )
     .unwrap();
-    let flat = encode_still(&flat, &StillEncodeOptions::default()).expect("flat encode");
+    let flat = encode_still(&flat, &EncodeOptions::default()).expect("flat encode");
     assert_external_equivalent("overlay 420", &avif, &flat, 8);
 }
 
@@ -303,8 +303,8 @@ fn overlay_10bit_422_clipped_stamp_round_trips_exact() {
         OverlayLayerImage::new(&base, 0, 0),
         OverlayLayerImage::new(&stamp, -2, 12),
     ];
-    let avif = encode_still_overlay(&canvas, &layers, &StillEncodeOptions::default())
-        .expect("overlay encode");
+    let avif =
+        encode_still_overlay(&canvas, &layers, &EncodeOptions::default()).expect("overlay encode");
     let vf = decode_own("overlay 422p10", &avif);
     assert_eq!(vf.image_plane_count(), 3);
     let expect_y = expected_luma(24, 16, &[(&base, 0, 0), (&stamp, -2, 12)], None);
@@ -362,8 +362,8 @@ fn overlay_rgba_identity_alpha_over_and_transparent_fill() {
         OverlayLayerImage::new(&base, 0, 0),
         OverlayLayerImage::new(&stamp, 4, 2),
     ];
-    let avif = encode_still_overlay(&canvas, &layers, &StillEncodeOptions::default())
-        .expect("overlay encode");
+    let avif =
+        encode_still_overlay(&canvas, &layers, &EncodeOptions::default()).expect("overlay encode");
     let info = inspect(&avif).expect("inspect");
     assert!(info.overlay_resolutions[0].canvas_partially_filled());
 
@@ -444,8 +444,8 @@ fn overlay_12bit_mono_odd_offset_with_irot() {
         OverlayLayerImage::new(&base, 0, 0),
         OverlayLayerImage::new(&stamp, 3, 5),
     ];
-    let avif = encode_still_overlay(&canvas, &layers, &StillEncodeOptions::default())
-        .expect("overlay encode");
+    let avif =
+        encode_still_overlay(&canvas, &layers, &EncodeOptions::default()).expect("overlay encode");
     let info = inspect(&avif).expect("inspect");
     assert_eq!(
         (info.width, info.height),
@@ -473,7 +473,7 @@ fn overlay_12bit_mono_odd_offset_with_irot() {
         OverlayLayerImage::new(&base8, 0, 0),
         OverlayLayerImage::new(&stamp8, 3, 5),
     ];
-    let avif8 = encode_still_overlay(&canvas, &layers8, &StillEncodeOptions::default())
+    let avif8 = encode_still_overlay(&canvas, &layers8, &EncodeOptions::default())
         .expect("overlay encode 8-bit");
     let composed: Vec<u16> = expected_luma(12, 10, &[(&base8, 0, 0), (&stamp8, 3, 5)], None)
         .iter()
@@ -491,7 +491,7 @@ fn overlay_12bit_mono_odd_offset_with_irot() {
     )
     .unwrap()
     .with_props(props);
-    let flat = encode_still(&flat, &StillEncodeOptions::default()).expect("flat encode");
+    let flat = encode_still(&flat, &EncodeOptions::default()).expect("flat encode");
     assert_external_equivalent("overlay mono8 irot", &avif8, &flat, 8);
 }
 
@@ -507,15 +507,15 @@ fn overlay_encode_guards() {
             OverlayLayerImage::new(&a, 0, 0),
             OverlayLayerImage::new(&b, 0, 0),
         ],
-        &StillEncodeOptions::default(),
+        &EncodeOptions::default(),
     )
     .unwrap_err();
     assert!(err.to_string().contains("share one coded layout"), "{err}");
-    assert!(encode_still_overlay(&canvas, &[], &StillEncodeOptions::default()).is_err());
+    assert!(encode_still_overlay(&canvas, &[], &EncodeOptions::default()).is_err());
     assert!(encode_still_overlay(
         &OverlayCanvas::new(0, 8),
         &[OverlayLayerImage::new(&a, 0, 0)],
-        &StillEncodeOptions::default()
+        &EncodeOptions::default()
     )
     .is_err());
 }
@@ -535,7 +535,7 @@ fn identity_derivation_rotates_and_round_trips() {
         None,
     )));
     let img = img.with_props(props);
-    let avif = encode_still(&img, &StillEncodeOptions::default()).expect("encode");
+    let avif = encode_still(&img, &EncodeOptions::default()).expect("encode");
 
     let hdr = parse_header(&avif).expect("parse");
     let primary = hdr.meta.primary_item_id.unwrap();
@@ -567,7 +567,7 @@ fn identity_derivation_rotates_and_round_trips() {
     // like a plain encode carrying the same irot on the coded item.
     let flat_props = StillProperties::default().with_irot(Some(3));
     let flat = build_image(12, 8, 8, StillChroma::Yuv420, 21).with_props(flat_props);
-    let flat = encode_still(&flat, &StillEncodeOptions::default()).expect("flat encode");
+    let flat = encode_still(&flat, &EncodeOptions::default()).expect("flat encode");
     assert_external_equivalent("iden irot", &avif, &flat, 8);
 }
 
@@ -595,7 +595,7 @@ fn identity_derivation_clap_imir_with_alpha() {
         Some(1),
     )));
     let img = img.with_props(props);
-    let avif = encode_still(&img, &StillEncodeOptions::default()).expect("encode");
+    let avif = encode_still(&img, &EncodeOptions::default()).expect("encode");
     let info = inspect(&avif).expect("inspect");
     assert_eq!((info.width, info.height), (8, 4));
     let vf = decode_own("iden clap imir alpha", &avif);

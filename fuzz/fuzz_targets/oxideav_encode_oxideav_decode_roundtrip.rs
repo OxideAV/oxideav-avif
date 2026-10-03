@@ -14,7 +14,7 @@
 //! mismatch.
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_avif::{encode_still, AvifDecoder, StillEncodeOptions, StillImage};
+use oxideav_avif::{encode_still, AvifDecoder, EncodeOptions, StillImage};
 use oxideav_core::{CodecId, Decoder, Frame, Packet, TimeBase};
 
 const MAX_WIDTH: usize = 64;
@@ -48,7 +48,7 @@ fuzz_target!(|data: &[u8]| {
     // alpha auxiliary. Construction only fails on shape violations the
     // shaper cannot produce; encode failures are real bugs.
     let img = StillImage::rgba8(width, height, rgba).expect("rgba8 construction");
-    let avif = encode_still(&img, &StillEncodeOptions::default()).expect("encode_still");
+    let avif = encode_still(&img, &EncodeOptions::default()).expect("encode_still");
 
     // Decode back through our own decoder.
     let mut dec = AvifDecoder::new(CodecId::new(oxideav_avif::CODEC_ID_STR));

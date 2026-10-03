@@ -214,6 +214,7 @@ pub struct AvifMuxer {
     depth: Option<AuxCoded>,
     exif: Option<Vec<u8>>,
     xmp: Option<Vec<u8>>,
+    icc: Option<Vec<u8>>,
     identity: Option<IdentityDerivation>,
     layered_index: Option<[u32; 3]>,
     layer_selector: Option<u16>,
@@ -471,6 +472,7 @@ impl AvifMuxer {
             alpha: None,
             depth: None,
             exif: None,
+            icc: None,
             xmp: None,
             identity: None,
             layered_index: None,
@@ -573,6 +575,15 @@ impl AvifMuxer {
         self
     }
 
+    /// An ICC profile as a second, `prof`-type `colr` property on the
+    /// primary item, alongside the `nclx` one of [`Self::with_colr`]
+    /// (MIAF §7.3.6.4 allows one of each; the `nclx` is written first
+    /// so readers taking the first `colr` keep the matrix).
+    pub fn with_icc(mut self, profile: Vec<u8>) -> Self {
+        self.icc = Some(profile);
+        self
+    }
+
     /// Declare the AVIF Advanced profile (`MA1A`) instead of Baseline.
     pub fn advanced_profile(mut self) -> Self {
         self.profile_brand = ProfileBrand::Advanced;
@@ -661,6 +672,9 @@ impl AvifMuxer {
         }
         if let Some(colr) = &self.colr {
             props.push(prop_colr(colr)?);
+        }
+        if let Some(icc) = &self.icc {
+            props.push(prop_colr(&Colr::Icc(icc.clone()))?);
         }
         if let Some(pasp) = &self.pasp {
             props.push(prop_pasp(pasp));
@@ -877,6 +891,7 @@ pub struct AvifGridMuxer {
     amve: Option<Amve>,
     exif: Option<Vec<u8>>,
     xmp: Option<Vec<u8>>,
+    icc: Option<Vec<u8>>,
     alpha_tiles: Vec<GridTile>,
     alpha_pixi: Option<Vec<u8>>,
     premultiplied: bool,
@@ -902,6 +917,7 @@ impl AvifGridMuxer {
             clli: None,
             amve: None,
             exif: None,
+            icc: None,
             xmp: None,
             alpha_tiles: Vec::new(),
             alpha_pixi: None,
@@ -985,6 +1001,13 @@ impl AvifGridMuxer {
         self
     }
 
+    /// An ICC profile as a second, `prof`-type `colr` property on the
+    /// grid item, alongside the `nclx` one of [`Self::with_colr`].
+    pub fn with_icc(mut self, profile: Vec<u8>) -> Self {
+        self.icc = Some(profile);
+        self
+    }
+
     /// `pixi` on the grid item.
     pub fn with_pixi(mut self, bits: Vec<u8>) -> Self {
         self.pixi = Some(bits);
@@ -1045,6 +1068,9 @@ impl AvifGridMuxer {
         }
         if let Some(colr) = &self.colr {
             grid_props.push(prop_colr(colr)?);
+        }
+        if let Some(icc) = &self.icc {
+            grid_props.push(prop_colr(&Colr::Icc(icc.clone()))?);
         }
         if let Some(pasp) = &self.pasp {
             grid_props.push(prop_pasp(pasp));

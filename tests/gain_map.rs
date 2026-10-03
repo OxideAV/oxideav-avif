@@ -7,8 +7,8 @@
 
 use oxideav_avif::meta::{Colr, Property};
 use oxideav_avif::{
-    encode_still, gain_map_metadata, inspect, parse_header, AvifDecoder, GainMapSpec, StillChroma,
-    StillEncodeOptions, StillImage, StillProperties,
+    encode_still, gain_map_metadata, inspect, parse_header, AvifDecoder, EncodeOptions,
+    GainMapSpec, StillChroma, StillImage, StillProperties,
 };
 use oxideav_core::{
     CodecId, CodecParameters, ColorSignal, Decoder, Frame, Packet, PixelFormat, TimeBase,
@@ -281,7 +281,7 @@ fn authored() -> (StillImage, Vec<u8>) {
         Some(10),
         0,
     ))));
-    let file = encode_still(&base, &StillEncodeOptions::default()).expect("encode_still");
+    let file = encode_still(&base, &EncodeOptions::default()).expect("encode_still");
     (base, file)
 }
 
