@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.13](https://github.com/OxideAV/oxideav-avif/compare/v0.0.12...v0.0.13) - 2026-10-03
+
+### Other
+
+- harmonise with the wave-1 rulings — ColorRange, u32 frames, Io(std::io::Error), Option limits, validated new, parameter-driven frame bridge
+- README in the image-crate contract order; CHANGELOG for the contract surface, the AvifFile rename and the deprecations
+- contract_api harness (probe / info / decode_with / to_rgba8 / decode_all_with / lossless re-encode) + two findings fixed
+- the image-crate contract — probe / info standalone, decode* / encode* under registry, AvifImage is the picture, AvifFile the container
+
 ### Added
 
 - **The workspace image-crate API** (`IMAGE_CRATE_API.md`) at the
