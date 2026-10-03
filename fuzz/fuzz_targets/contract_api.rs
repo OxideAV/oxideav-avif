@@ -26,10 +26,10 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let opts = DecodeOptions::default()
-        .with_max_width(MAX_SIDE)
-        .with_max_height(MAX_SIDE)
-        .with_max_pixels(MAX_PIXELS)
-        .with_max_bytes(1 << 20)
+        .with_max_width(Some(MAX_SIDE))
+        .with_max_height(Some(MAX_SIDE))
+        .with_max_pixels(Some(MAX_PIXELS))
+        .with_max_bytes(Some(1 << 20))
         .with_strict(knob & 1 != 0)
         .with_tone_mapped(knob & 2 != 0)
         .with_layer(if knob & 4 != 0 {
@@ -77,9 +77,9 @@ fuzz_target!(|data: &[u8]| {
                     // Limits only: the re-encode is a plain single-layer
                     // still, so the layer / strict knobs do not apply.
                     let plain = DecodeOptions::default()
-                        .with_max_width(MAX_SIDE)
-                        .with_max_height(MAX_SIDE)
-                        .with_max_pixels(MAX_PIXELS);
+                        .with_max_width(Some(MAX_SIDE))
+                        .with_max_height(Some(MAX_SIDE))
+                        .with_max_pixels(Some(MAX_PIXELS));
                     let back = decode_with(&bytes, &plain).expect("own output decodes");
                     assert_eq!(back.planes, img.planes);
                     assert_eq!(back.format(), img.format());

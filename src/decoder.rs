@@ -679,8 +679,9 @@ pub(crate) struct DecodeCtx {
     /// HDR reference white for PQ-coded reconstructions.
     reference_white_nits: f64,
     /// Cap on any derived canvas (grid / overlay) on the way to the
-    /// output, in pixels — the caller's bound, never above this
-    /// crate's own ([`MAX_GRID_CANVAS_PIXELS`] /
+    /// output, in pixels — the caller's bound (`u64::MAX` when
+    /// unlimited), applied alongside this crate's own
+    /// ([`MAX_GRID_CANVAS_PIXELS`] /
     /// [`crate::overlay::MAX_OVERLAY_CANVAS_PIXELS`]).
     max_pixels: u64,
     /// Spatial layer to render for the top-level coded item instead
@@ -696,7 +697,7 @@ impl DecodeCtx {
             decodes: 0,
             tone_mapped: opts.tone_mapped,
             reference_white_nits: opts.reference_white_nits,
-            max_pixels: opts.max_pixels,
+            max_pixels: opts.max_pixels.unwrap_or(u64::MAX),
             layer: opts.layer,
         }
     }

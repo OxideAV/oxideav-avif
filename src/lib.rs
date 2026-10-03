@@ -190,8 +190,8 @@ pub mod still;
 
 pub use alpha::{composite_alpha, find_alpha_item_id, ALPHA_URN_PREFIX};
 pub use api::{
-    info, probe, AvifImage, ColorInfo, DecodeOptions, EncodeOptions, Frame, ImageInfo, Metadata,
-    PixelFormat, Plane, RgbImage, RgbaImage, StillChroma,
+    info, probe, AvifImage, ColorInfo, ColorRange, DecodeOptions, EncodeOptions, Frame, ImageInfo,
+    Metadata, PixelFormat, Plane, RgbImage, RgbaImage, StillChroma,
 };
 pub use avis::{
     audit_avis_profile_compliance, audit_avis_sequence, audit_edit_list, inspect_avis, parse_avis,
@@ -318,7 +318,7 @@ mod registry_glue {
                 AvifError::InvalidData(s) => Error::InvalidData(s),
                 AvifError::Unsupported(s) => Error::Unsupported(s),
                 AvifError::LimitExceeded(s) => Error::ResourceExhausted(s),
-                AvifError::Io(s) => Error::Io(std::io::Error::other(s)),
+                AvifError::Io(e) => Error::Io(e),
             }
         }
     }

@@ -8,11 +8,11 @@ use std::io::{Read, Write};
 use std::time::Duration;
 
 use oxideav_core::frame::{VideoFrame, VideoPlane};
-use oxideav_core::{CodecId, CodecParameters, ColorRange, ColorSignal, Packet, TimeBase};
+use oxideav_core::{CodecId, CodecParameters, ColorSignal, Packet, TimeBase};
 
 use crate::api::{
     burst_members, exif_item_body, exif_tiff_bytes, has_moov, item_colrs, AvifImage, ColorInfo,
-    DecodeOptions, EncodeOptions, Frame, Metadata, RgbImage, RgbaImage, StillChroma,
+    ColorRange, DecodeOptions, EncodeOptions, Frame, Metadata, RgbImage, RgbaImage, StillChroma,
 };
 use crate::av1_config::{parse_av1c, Av1CodecConfig};
 use crate::avis::{parse_avis, sample_bytes};
@@ -40,7 +40,7 @@ pub(crate) fn from_core_err(e: oxideav_core::Error) -> Error {
         oxideav_core::Error::InvalidData(s) => Error::InvalidData(s),
         oxideav_core::Error::Unsupported(s) => Error::Unsupported(s),
         oxideav_core::Error::ResourceExhausted(s) => Error::LimitExceeded(s),
-        oxideav_core::Error::Io(e) => Error::Io(e.to_string()),
+        oxideav_core::Error::Io(e) => Error::Io(e),
         other => Error::InvalidData(other.to_string()),
     }
 }
@@ -77,36 +77,91 @@ impl From<AvifImage> for VideoFrame {
 
 impl From<ColorSignal> for ColorInfo {
     fn from(s: ColorSignal) -> Self {
-        // An unspecified range reads as the MIAF default (full).
-        let full_range = s.range != ColorRange::Limited;
-        ColorInfo::new(full_range, s.primaries.0, s.transfer.0, s.matrix.0)
+        let range = match s.range {
+            oxideav_core::ColorRange::Full => ColorRange::Full,
+            oxideav_core::ColorRange::Limited => ColorRange::Limited,
+            _ => ColorRange::Unspecified,
+        };
+        ColorInfo::new(range, s.primaries.0, s.transfer.0, s.matrix.0)
     }
 }
 
+/// The storage layout behind a framework pixel-format label, plus what
+/// the label itself says about the colour: the `YuvJ*` family is full
+/// range, the `Gbrp*` / `Gbrap*` family the identity matrix (planes
+/// G B R [A], exactly this crate's 4:4:4 layout).
+fn storage_layout_of(
+    fmt: oxideav_core::PixelFormat,
+) -> Result<(AvifPixelFormat, Option<ColorRange>, bool)> {
+    use oxideav_core::PixelFormat as P;
+    Ok(match fmt {
+        P::YuvJ420P => (AvifPixelFormat::Yuv420P, Some(ColorRange::Full), false),
+        P::YuvJ422P => (AvifPixelFormat::Yuv422P, Some(ColorRange::Full), false),
+        P::YuvJ444P => (AvifPixelFormat::Yuv444P, Some(ColorRange::Full), false),
+        P::Gbrp8 => (AvifPixelFormat::Yuv444P, None, true),
+        P::Gbrap8 => (AvifPixelFormat::Yuva444P, None, true),
+        P::Gbrp10Le => (AvifPixelFormat::Yuv444P10Le, None, true),
+        P::Gbrap10Le => (AvifPixelFormat::Yuva444P10Le, None, true),
+        P::Gbrp12Le => (AvifPixelFormat::Yuv444P12Le, None, true),
+        P::Gbrap12Le => (AvifPixelFormat::Yuva444P12Le, None, true),
+        other => (AvifPixelFormat::try_from(other)?, None, false),
+    })
+}
+
 impl AvifImage {
-    /// A picture from a framework frame plus the geometry the frame
-    /// itself does not carry. Only the image planes are taken (a
-    /// side-channel record is not a plane); the frame's `ColorSignal`
-    /// becomes `color` (MIAF default when absent) and its
-    /// significant-bits channel the depth of a `Ya16Le` picture.
-    pub fn from_video_frame(
-        frame: VideoFrame,
-        width: u32,
-        height: u32,
-        format: AvifPixelFormat,
-    ) -> Self {
-        let color = frame
-            .color_signal()
-            .map(ColorInfo::from)
-            .unwrap_or_default();
+    /// A picture from a framework frame plus the parameters that carry
+    /// what the frame does not: `width`, `height` and `pixel_format`
+    /// (the storage layouts by name, plus the `YuvJ*` full-range and
+    /// `Gbrp*` / `Gbrap*` identity-matrix labels this crate's decoder
+    /// emits). Only the image planes are copied (a side-channel record
+    /// is not a plane); `color` is the frame's `ColorSignal`, else the
+    /// parameters' stream-level one, else (fully unspecified) the MIAF
+    /// default, with the label's own range / matrix applied; the frame's
+    /// significant-bits channel sets the depth of a `Ya16Le` picture.
+    pub fn from_video_frame(frame: &VideoFrame, params: &CodecParameters) -> Result<Self> {
+        let width = params
+            .width
+            .ok_or_else(|| Error::invalid("avif: CodecParameters.width required"))?;
+        let height = params
+            .height
+            .ok_or_else(|| Error::invalid("avif: CodecParameters.height required"))?;
+        let label = params
+            .pixel_format
+            .ok_or_else(|| Error::invalid("avif: CodecParameters.pixel_format required"))?;
+        let (format, label_range, identity) = storage_layout_of(label)?;
+        // The frame's own record refines the stream-level signal; an
+        // entirely unspecified signal means the MIAF default.
+        let signal = frame.color_signal().unwrap_or(params.color_signal);
+        let mut color = if signal.is_unspecified() {
+            ColorInfo::default()
+        } else {
+            ColorInfo::from(signal)
+        };
+        if let Some(range) = label_range {
+            color.range = range;
+        }
+        if identity {
+            color.matrix = 0;
+        }
+        if color.range == ColorRange::Unspecified {
+            color.range = ColorRange::Full;
+        }
         let bit_depth = match frame.significant_bits() {
             Some(bits) if format == AvifPixelFormat::Ya16Le && !bits.is_empty() => bits[0],
             _ => format.bit_depth(),
         };
-        let planes = core_to_avif_frame(frame).planes;
-        Self::new(width, height, format, planes)
+        let planes = core_to_avif_frame(frame.clone()).planes;
+        Ok(Self::new(width, height, format, planes)?
             .with_color(color)
-            .with_bit_depth(bit_depth)
+            .with_bit_depth(bit_depth))
+    }
+}
+
+impl TryFrom<(&VideoFrame, &CodecParameters)> for AvifImage {
+    type Error = Error;
+
+    fn try_from((frame, params): (&VideoFrame, &CodecParameters)) -> Result<Self> {
+        AvifImage::from_video_frame(frame, params)
     }
 }
 
@@ -423,7 +478,7 @@ fn sequence_picture(
     opts.check_dims(w, h)?;
     let format = AvifPixelFormat::try_from(fmt_core)?;
     let planes = core_to_avif_frame(vf).planes;
-    Ok(AvifImage::new(w, h, format, planes).with_color(ColorInfo::from(seq.signal)))
+    Ok(AvifImage::new(w, h, format, planes)?.with_color(ColorInfo::from(seq.signal)))
 }
 
 /// Decode the primary picture with [`DecodeOptions::default`] — a
@@ -921,13 +976,16 @@ mod tests {
                 Plane::new(2, vec![0; 4]),
                 Plane::new(2, vec![0; 4]),
             ],
-        );
+        )
+        .unwrap();
         assert!(matches!(
             encode(&img, &EncodeOptions::default()),
             Err(Error::Unsupported(_))
         ));
-        // Plane count mismatch.
-        let img = AvifImage::new(4, 4, PixelFormat::Yuv420P, vec![Plane::new(4, vec![0; 16])]);
+        // Plane count mismatch (fields assigned after construction).
+        let mut img =
+            AvifImage::new(4, 4, PixelFormat::Gray8, vec![Plane::new(4, vec![0; 16])]).unwrap();
+        img.format = PixelFormat::Yuv420P;
         assert!(matches!(
             encode(&img, &EncodeOptions::default()),
             Err(Error::InvalidData(_))
@@ -973,7 +1031,7 @@ mod tests {
         let info = crate::info(&bytes).unwrap();
         assert!(info.is_sequence);
         let frames = decode_all(&bytes).unwrap();
-        assert_eq!(frames.len(), info.frames);
+        assert_eq!(frames.len(), info.frames as usize);
         assert!(frames
             .iter()
             .all(|f| f.delay.is_some_and(|d| d > Duration::ZERO)));
@@ -999,17 +1057,17 @@ mod tests {
     fn limits_and_strictness_refuse_before_decoding() {
         let bytes = fixture("monochrome.avif");
         let info = crate::info(&bytes).unwrap();
-        let too_small = DecodeOptions::default().with_max_width(info.width - 1);
+        let too_small = DecodeOptions::default().with_max_width(Some(info.width - 1));
         assert!(matches!(
             decode_with(&bytes, &too_small),
             Err(Error::LimitExceeded(_))
         ));
-        let few_pixels = DecodeOptions::default().with_max_pixels(16);
+        let few_pixels = DecodeOptions::default().with_max_pixels(Some(16));
         assert!(matches!(
             decode_with(&bytes, &few_pixels),
             Err(Error::LimitExceeded(_))
         ));
-        let few_bytes = DecodeOptions::default().with_max_bytes(bytes.len() - 1);
+        let few_bytes = DecodeOptions::default().with_max_bytes(Some(bytes.len() as u64 - 1));
         assert!(matches!(
             decode_with(&bytes, &few_bytes),
             Err(Error::LimitExceeded(_))
@@ -1050,15 +1108,31 @@ mod tests {
             vf.color_signal(),
             Some(color_signal_for(Some(&img.color.to_colr())))
         );
-        let back = AvifImage::from_video_frame(vf, 4, 2, PixelFormat::Yuva444P);
+        let mut params = CodecParameters::video(CodecId::new(crate::CODEC_ID_STR));
+        params.width = Some(4);
+        params.height = Some(2);
+        params.pixel_format = Some(oxideav_core::PixelFormat::Yuva444P);
+        let back = AvifImage::from_video_frame(&vf, &params).unwrap();
         assert_eq!(back, img);
+        // The decoder's own label for the same picture works too.
+        params.pixel_format = Some(oxideav_core::PixelFormat::Gbrap8);
+        let back = AvifImage::try_from((&vf, &params)).unwrap();
+        assert_eq!(back, img);
+        // Missing geometry is an error, not a guess.
+        params.width = None;
+        assert!(AvifImage::from_video_frame(&vf, &params).is_err());
         // Ya16Le carries its depth on the significant-bits channel.
         let ya = AvifImage::new(2, 1, PixelFormat::Ya16Le, vec![Plane::new(8, vec![0; 8])])
+            .unwrap()
             .with_bit_depth(12);
         let vf = VideoFrame::from(ya.clone());
         assert_eq!(vf.significant_bits(), Some(&[12u8][..]));
+        let mut params = CodecParameters::video(CodecId::new(crate::CODEC_ID_STR));
+        params.width = Some(2);
+        params.height = Some(1);
+        params.pixel_format = Some(oxideav_core::PixelFormat::Ya16Le);
         assert_eq!(
-            AvifImage::from_video_frame(vf, 2, 1, PixelFormat::Ya16Le).bit_depth,
+            AvifImage::from_video_frame(&vf, &params).unwrap().bit_depth,
             12
         );
     }

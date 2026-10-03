@@ -13,8 +13,11 @@
 use core::fmt;
 
 /// Crate-local error type for the AVIF parser + decoder pipeline.
+///
+/// Not `Clone` / `PartialEq` (the `Io` payload is a `std::io::Error`):
+/// match on the variant or compare `Display` output.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum AvifError {
     /// Bitstream / box layout / property was malformed.
     InvalidData(String),
@@ -26,9 +29,8 @@ pub enum AvifError {
     /// length) — refused before any allocation.
     LimitExceeded(String),
     /// A read / write on a caller-supplied stream failed
-    /// ([`crate::decode_from`] / [`crate::encode_to`]); carries the
-    /// `std::io::Error`'s message.
-    Io(String),
+    /// ([`crate::decode_from`] / [`crate::encode_to`]).
+    Io(std::io::Error),
 }
 
 impl AvifError {
@@ -54,16 +56,23 @@ impl fmt::Display for AvifError {
             Self::InvalidData(s) => write!(f, "invalid data: {s}"),
             Self::Unsupported(s) => write!(f, "unsupported: {s}"),
             Self::LimitExceeded(s) => write!(f, "limit exceeded: {s}"),
-            Self::Io(s) => write!(f, "I/O error: {s}"),
+            Self::Io(e) => write!(f, "I/O error: {e}"),
         }
     }
 }
 
-impl std::error::Error for AvifError {}
+impl std::error::Error for AvifError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 impl From<std::io::Error> for AvifError {
     fn from(e: std::io::Error) -> Self {
-        Self::Io(e.to_string())
+        Self::Io(e)
     }
 }
 

@@ -66,6 +66,37 @@ pub type Plane = AvifPlane;
 // Colour + metadata
 // ---------------------------------------------------------------------
 
+/// Nominal sample range of a picture (H.273 `VideoFullRangeFlag`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ColorRange {
+    /// Not signalled. AVIF never produces this on decode (MIAF
+    /// §7.3.6.4 supplies a default); it reads as full range wherever a
+    /// flag must be written.
+    #[default]
+    Unspecified,
+    /// Limited (video / studio) range: `VideoFullRangeFlag == 0`.
+    Limited,
+    /// Full (PC) range: `VideoFullRangeFlag == 1`.
+    Full,
+}
+
+impl ColorRange {
+    /// `VideoFullRangeFlag` as a bool (`Unspecified` → full, the MIAF
+    /// default).
+    pub fn is_full(self) -> bool {
+        self != ColorRange::Limited
+    }
+
+    /// From an H.273 `VideoFullRangeFlag`.
+    pub fn from_flag(full_range: bool) -> Self {
+        if full_range {
+            ColorRange::Full
+        } else {
+            ColorRange::Limited
+        }
+    }
+}
+
 /// The H.273 colour description of a picture: nominal range plus the
 /// `ColourPrimaries` / `TransferCharacteristics` /
 /// `MatrixCoefficients` code points (one byte each on the wire).
@@ -77,9 +108,8 @@ pub type Plane = AvifPlane;
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ColorInfo {
-    /// `VideoFullRangeFlag`: `true` = full (PC) range, `false` =
-    /// limited (studio) range.
-    pub full_range: bool,
+    /// Nominal sample range.
+    pub range: ColorRange,
     /// H.273 §8.1 `ColourPrimaries` (1 = BT.709, 9 = BT.2020, 12 =
     /// Display P3, 2 = unspecified).
     pub primaries: u8,
@@ -93,9 +123,9 @@ pub struct ColorInfo {
 
 impl ColorInfo {
     /// Every field as a positional argument, in declaration order.
-    pub const fn new(full_range: bool, primaries: u8, transfer: u8, matrix: u8) -> Self {
+    pub const fn new(range: ColorRange, primaries: u8, transfer: u8, matrix: u8) -> Self {
         Self {
-            full_range,
+            range,
             primaries,
             transfer,
             matrix,
@@ -105,14 +135,14 @@ impl ColorInfo {
     /// The MIAF §7.3.6.4 default for an item without CICP: BT.709
     /// primaries, sRGB transfer, BT.601 matrix, full range.
     pub const fn miaf_default() -> Self {
-        Self::new(true, 1, 13, 6)
+        Self::new(ColorRange::Full, 1, 13, 6)
     }
 
     /// The description the RGB constructors use: BT.709 primaries,
     /// sRGB transfer, the identity matrix (planes are G, B, R), full
     /// range.
     pub const fn identity_full_range() -> Self {
-        Self::new(true, 1, 13, 0)
+        Self::new(ColorRange::Full, 1, 13, 0)
     }
 
     /// The effective colour of an item from its `colr` (MIAF
@@ -129,7 +159,7 @@ impl ColorInfo {
             }) => {
                 let code = |v: u16| u8::try_from(v).unwrap_or(2);
                 Self::new(
-                    *full_range,
+                    ColorRange::from_flag(*full_range),
                     code(*colour_primaries),
                     code(*transfer_characteristics),
                     code(*matrix_coefficients),
@@ -145,7 +175,7 @@ impl ColorInfo {
             colour_primaries: u16::from(self.primaries),
             transfer_characteristics: u16::from(self.transfer),
             matrix_coefficients: u16::from(self.matrix),
-            full_range: self.full_range,
+            full_range: self.range.is_full(),
         }
     }
 
@@ -154,9 +184,9 @@ impl ColorInfo {
         self.matrix == 0
     }
 
-    /// Setter: replace `full_range`.
-    pub fn with_full_range(mut self, full_range: bool) -> Self {
-        self.full_range = full_range;
+    /// Setter: replace `range`.
+    pub fn with_range(mut self, range: ColorRange) -> Self {
+        self.range = range;
         self
     }
     /// Setter: replace `primaries`.
@@ -376,11 +406,13 @@ pub struct AvifImage {
 impl AvifImage {
     /// A picture from its planes; colour defaults to the MIAF default
     /// ([`ColorInfo::miaf_default`]), metadata to none, `bit_depth` to
-    /// the layout's (set [`Self::with_bit_depth`] for `Ya16Le`). The
-    /// planes are not validated here — a mismatch surfaces as an error
-    /// from the functions that read them.
-    pub fn new(width: u32, height: u32, format: PixelFormat, planes: Vec<Plane>) -> Self {
-        Self {
+    /// the layout's (set [`Self::with_bit_depth`] for `Ya16Le`, whose
+    /// words hold 10- or 12-bit values). The plane geometry is
+    /// validated — `format.plane_count()` planes, each at least its
+    /// extent at the layout's bytes per sample under its stride —
+    /// so an inconsistent picture cannot exist ([`Error::InvalidData`]).
+    pub fn new(width: u32, height: u32, format: PixelFormat, planes: Vec<Plane>) -> Result<Self> {
+        let img = Self {
             width,
             height,
             format,
@@ -388,7 +420,58 @@ impl AvifImage {
             color: ColorInfo::default(),
             metadata: Metadata::default(),
             bit_depth: format.bit_depth(),
+        };
+        img.validate_geometry()?;
+        Ok(img)
+    }
+
+    /// Plane count and per-plane coverage of `width × height` at
+    /// `format` (chroma extents by ceiling division; the packed YA
+    /// layouts carry two samples per pixel in one plane).
+    pub(crate) fn validate_geometry(&self) -> Result<()> {
+        if self.width == 0 || self.height == 0 {
+            return Err(Error::invalid(
+                "avif: picture dimensions must be at least 1x1",
+            ));
         }
+        let expect = self.format.plane_count();
+        if self.planes.len() != expect {
+            return Err(Error::invalid(format!(
+                "avif: {:?} needs {expect} planes, picture carries {}",
+                self.format,
+                self.planes.len()
+            )));
+        }
+        let bps = self.format.bytes_per_sample();
+        let (sx, sy) = self.format.chroma_subsampling();
+        let (w, h) = (self.width as usize, self.height as usize);
+        for (i, plane) in self.planes.iter().enumerate() {
+            let (cols, rows) = if self.format.is_packed_ya() {
+                (w * 2, h)
+            } else if i == 1 || i == 2 {
+                (w.div_ceil(1 << sx), h.div_ceil(1 << sy))
+            } else {
+                (w, h)
+            };
+            let row_bytes = cols * bps;
+            let need = plane
+                .stride
+                .checked_mul(rows - 1)
+                .and_then(|v| v.checked_add(row_bytes));
+            let short = match need {
+                Some(n) => plane.data.len() < n,
+                None => true,
+            };
+            if plane.stride < row_bytes || short {
+                return Err(Error::invalid(format!(
+                    "avif: plane {i} ({} bytes, stride {}) does not cover {rows} rows of \
+                     {row_bytes} bytes",
+                    plane.data.len(),
+                    plane.stride
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Packed 8-bit RGB (`3 × width × height` bytes) as an
@@ -397,7 +480,7 @@ impl AvifImage {
     ///
     /// # Panics
     ///
-    /// When `data.len() != 3 × width × height`.
+    /// When `data.len() != 3 × width × height` or either extent is 0.
     pub fn from_rgb8(width: u32, height: u32, data: Vec<u8>) -> Self {
         let n = width as usize * height as usize;
         assert_eq!(
@@ -418,6 +501,7 @@ impl AvifImage {
         let w = width as usize;
         let planes = vec![Plane::new(w, g), Plane::new(w, b), Plane::new(w, r)];
         Self::new(width, height, PixelFormat::Yuv444P, planes)
+            .expect("planes built to the layout")
             .with_color(ColorInfo::identity_full_range())
     }
 
@@ -427,7 +511,7 @@ impl AvifImage {
     ///
     /// # Panics
     ///
-    /// When `data.len() != 4 × width × height`.
+    /// When `data.len() != 4 × width × height` or either extent is 0.
     pub fn from_rgba8(width: u32, height: u32, data: Vec<u8>) -> Self {
         let n = width as usize * height as usize;
         assert_eq!(
@@ -455,6 +539,7 @@ impl AvifImage {
             Plane::new(w, a),
         ];
         Self::new(width, height, PixelFormat::Yuva444P, planes)
+            .expect("planes built to the layout")
             .with_color(ColorInfo::identity_full_range())
     }
 
@@ -530,9 +615,10 @@ impl AvifImage {
     ///
     /// # Panics
     ///
-    /// Only when the planes assigned to this image do not cover
-    /// `width × height` at `format` (an image produced by this crate
-    /// always does); [`Self::try_to_rgb8`] reports that as an error.
+    /// Never for a picture this crate decoded or [`Self::new`]
+    /// validated; only when the public fields were later assigned
+    /// planes that do not cover `width × height` at `format`
+    /// ([`Self::try_to_rgb8`] reports that as an error).
     pub fn to_rgb8(&self) -> Vec<u8> {
         self.rgb_bytes_or_bt601(3)
             .expect("AvifImage::to_rgb8: planes inconsistent with width/height/format")
@@ -655,7 +741,7 @@ pub struct ImageInfo {
     pub format: PixelFormat,
     /// Pictures a [`crate::decode_all`] yields: samples of a sequence,
     /// entities of the primary's burst group, else 1.
-    pub frames: usize,
+    pub frames: u32,
     pub has_alpha: bool,
     /// The primary's effective colour (MIAF default when unsignalled).
     pub color: ColorInfo,
@@ -675,7 +761,7 @@ impl ImageInfo {
         width: u32,
         height: u32,
         format: PixelFormat,
-        frames: usize,
+        frames: u32,
         has_alpha: bool,
         color: ColorInfo,
         has_icc: bool,
@@ -702,20 +788,21 @@ impl ImageInfo {
 
 /// Bounds and switches for [`crate::decode_with`]. The limits are
 /// checked against the header before any pixel allocation and reported
-/// as [`Error::LimitExceeded`].
+/// as [`Error::LimitExceeded`]; `None` means unlimited.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DecodeOptions {
-    /// Refuse a picture wider than this (default 16384, the largest
-    /// AV1 coded extent this crate composes).
-    pub max_width: u32,
-    /// Refuse a picture taller than this (default 16384).
-    pub max_height: u32,
+    /// Refuse a picture wider than this (default `Some(16384)`, the
+    /// largest AV1 coded extent this crate composes).
+    pub max_width: Option<u32>,
+    /// Refuse a picture taller than this (default `Some(16384)`).
+    pub max_height: Option<u32>,
     /// Refuse a picture — or any derived canvas on the way to it —
-    /// with more pixels than this (default `1 << 28`).
-    pub max_pixels: u64,
-    /// Refuse an input longer than this many bytes (default: no bound).
-    pub max_bytes: usize,
+    /// with more pixels than this (default `Some(1 << 28)`).
+    pub max_pixels: Option<u64>,
+    /// Refuse an input longer than this many bytes (default
+    /// `Some(1 << 30)`, 1 GiB).
+    pub max_bytes: Option<u64>,
     /// Strict conformance: the `ftyp` must declare an AVIF brand
     /// (`avif` / `avis` / `avio`; a HEIF-structural-only brand set is
     /// refused) and a file claiming `mif1` must carry every HEIF
@@ -739,10 +826,10 @@ pub struct DecodeOptions {
 impl Default for DecodeOptions {
     fn default() -> Self {
         Self {
-            max_width: 16_384,
-            max_height: 16_384,
-            max_pixels: 1 << 28,
-            max_bytes: usize::MAX,
+            max_width: Some(16_384),
+            max_height: Some(16_384),
+            max_pixels: Some(1 << 28),
+            max_bytes: Some(1 << 30),
             strict: false,
             tone_mapped: false,
             reference_white_nits: oxideav_heif::gainmap::DEFAULT_HDR_REFERENCE_WHITE_NITS,
@@ -756,23 +843,23 @@ impl DecodeOptions {
     pub fn new() -> Self {
         Self::default()
     }
-    /// Setter: replace `max_width`.
-    pub fn with_max_width(mut self, max_width: u32) -> Self {
+    /// Setter: replace `max_width` (`None` = unlimited).
+    pub fn with_max_width(mut self, max_width: Option<u32>) -> Self {
         self.max_width = max_width;
         self
     }
-    /// Setter: replace `max_height`.
-    pub fn with_max_height(mut self, max_height: u32) -> Self {
+    /// Setter: replace `max_height` (`None` = unlimited).
+    pub fn with_max_height(mut self, max_height: Option<u32>) -> Self {
         self.max_height = max_height;
         self
     }
-    /// Setter: replace `max_pixels`.
-    pub fn with_max_pixels(mut self, max_pixels: u64) -> Self {
+    /// Setter: replace `max_pixels` (`None` = unlimited).
+    pub fn with_max_pixels(mut self, max_pixels: Option<u64>) -> Self {
         self.max_pixels = max_pixels;
         self
     }
-    /// Setter: replace `max_bytes`.
-    pub fn with_max_bytes(mut self, max_bytes: usize) -> Self {
+    /// Setter: replace `max_bytes` (`None` = unlimited).
+    pub fn with_max_bytes(mut self, max_bytes: Option<u64>) -> Self {
         self.max_bytes = max_bytes;
         self
     }
@@ -800,11 +887,12 @@ impl DecodeOptions {
     /// Check an input length against `max_bytes`
     /// ([`Error::LimitExceeded`] when over).
     pub fn check_bytes(&self, len: usize) -> Result<()> {
-        if len > self.max_bytes {
-            return Err(Error::limit(format!(
-                "avif: input is {len} bytes, more than the {} allowed",
-                self.max_bytes
-            )));
+        if let Some(max) = self.max_bytes {
+            if len as u64 > max {
+                return Err(Error::limit(format!(
+                    "avif: input is {len} bytes, more than the {max} allowed"
+                )));
+            }
         }
         Ok(())
     }
@@ -812,18 +900,20 @@ impl DecodeOptions {
     /// Check a picture's extents against `max_width` / `max_height` /
     /// `max_pixels` ([`Error::LimitExceeded`] when over).
     pub fn check_dims(&self, width: u32, height: u32) -> Result<()> {
-        if width > self.max_width || height > self.max_height {
+        if self.max_width.is_some_and(|m| width > m) || self.max_height.is_some_and(|m| height > m)
+        {
             return Err(Error::limit(format!(
-                "avif: picture is {width}x{height}, more than the {}x{} allowed",
+                "avif: picture is {width}x{height}, more than the {:?}x{:?} allowed",
                 self.max_width, self.max_height
             )));
         }
         let pixels = u64::from(width) * u64::from(height);
-        if pixels > self.max_pixels {
-            return Err(Error::limit(format!(
-                "avif: picture holds {pixels} pixels, more than the {} allowed",
-                self.max_pixels
-            )));
+        if let Some(max) = self.max_pixels {
+            if pixels > max {
+                return Err(Error::limit(format!(
+                    "avif: picture holds {pixels} pixels, more than the {max} allowed"
+                )));
+            }
         }
         Ok(())
     }
@@ -1110,7 +1200,11 @@ fn still_info(bytes: &[u8]) -> Result<ImageInfo> {
     });
     let has_icc = icc.is_some() || matches!(info.colour, Some(Colr::Icc(_)));
     let burst = burst_members(&hdr.meta, primary_id);
-    let frames = if burst.is_empty() { 1 } else { burst.len() };
+    let frames = if burst.is_empty() {
+        1
+    } else {
+        u32::try_from(burst.len()).unwrap_or(u32::MAX)
+    };
     Ok(ImageInfo::new(
         info.width,
         info.height,
@@ -1163,7 +1257,7 @@ fn sequence_info(bytes: &[u8]) -> Result<ImageInfo> {
         width,
         height,
         format,
-        meta.samples.len(),
+        u32::try_from(meta.samples.len()).unwrap_or(u32::MAX),
         false,
         ColorInfo::from_colr(meta.colr.as_ref()),
         has_icc,
@@ -1249,14 +1343,17 @@ mod tests {
             Plane::new(1, vec![128]),
         ];
         let img = AvifImage::new(2, 2, PixelFormat::Yuv420P, planes)
-            .with_color(ColorInfo::new(false, 1, 1, 1));
+            .unwrap()
+            .with_color(ColorInfo::new(ColorRange::Limited, 1, 1, 1));
         let rgb = img.to_rgb8();
         assert_eq!(&rgb[0..3], &[0, 0, 0]);
         assert_eq!(&rgb[3..6], &[255, 255, 255]);
         // Y = 128 limited → (128 − 16) × 255 / 219 = 130.4 → 130.
         assert_eq!(&rgb[6..9], &[130, 130, 130]);
         // The same samples full range: 16 and 235 stay.
-        let full = img.clone().with_color(ColorInfo::new(true, 1, 1, 1));
+        let full = img
+            .clone()
+            .with_color(ColorInfo::new(ColorRange::Full, 1, 1, 1));
         let rgb = full.to_rgb8();
         assert_eq!(&rgb[0..3], &[16, 16, 16]);
         assert_eq!(&rgb[3..6], &[235, 235, 235]);
@@ -1269,7 +1366,7 @@ mod tests {
             .iter()
             .flat_map(|v| v.to_le_bytes())
             .collect();
-        let img = AvifImage::new(4, 1, PixelFormat::Gray10Le, vec![Plane::new(8, words)]);
+        let img = AvifImage::new(4, 1, PixelFormat::Gray10Le, vec![Plane::new(8, words)]).unwrap();
         let rgb = img.to_rgb8();
         assert_eq!(rgb[0], 0);
         assert_eq!(rgb[3], 255);
@@ -1286,9 +1383,12 @@ mod tests {
             Plane::new(1, vec![128]),
         ];
         let img = AvifImage::new(2, 2, PixelFormat::Yuv420P, planes)
-            .with_color(ColorInfo::new(false, 1, 1, 131));
+            .unwrap()
+            .with_color(ColorInfo::new(ColorRange::Limited, 1, 1, 131));
         assert!(matches!(img.try_to_rgb8(), Err(Error::Unsupported(_))));
-        let bt601 = img.clone().with_color(ColorInfo::new(false, 1, 1, 6));
+        let bt601 = img
+            .clone()
+            .with_color(ColorInfo::new(ColorRange::Limited, 1, 1, 6));
         assert_eq!(img.to_rgb8(), bt601.to_rgb8());
         assert_eq!(img.to_rgba8(), bt601.to_rgba8());
     }
@@ -1300,18 +1400,45 @@ mod tests {
             1,
             PixelFormat::Ya8,
             vec![Plane::new(4, vec![200, 10, 50, 255])],
-        );
+        )
+        .unwrap();
         let rgba = img.to_rgba8();
         assert_eq!(rgba, vec![200, 200, 200, 10, 50, 50, 50, 255]);
         assert!(img.has_alpha());
     }
 
     #[test]
-    fn inconsistent_planes_are_an_error_not_a_panic() {
-        let img = AvifImage::new(4, 4, PixelFormat::Yuv420P, vec![Plane::new(4, vec![0; 4])]);
-        assert!(img.try_to_rgb8().is_err());
-        assert!(img.as_bytes().is_some());
-        assert_eq!(img.into_raw().len(), 4);
+    fn inconsistent_planes_cannot_be_constructed() {
+        // Plane count.
+        assert!(matches!(
+            AvifImage::new(4, 4, PixelFormat::Yuv420P, vec![Plane::new(4, vec![0; 4])]),
+            Err(Error::InvalidData(_))
+        ));
+        // Short chroma plane (2x2 needs 4 bytes).
+        let short = vec![
+            Plane::new(4, vec![0; 16]),
+            Plane::new(2, vec![0; 3]),
+            Plane::new(2, vec![0; 4]),
+        ];
+        assert!(AvifImage::new(4, 4, PixelFormat::Yuv420P, short).is_err());
+        // Zero extent.
+        assert!(AvifImage::new(0, 4, PixelFormat::Gray8, vec![Plane::new(0, vec![])]).is_err());
+        // Odd 4:2:0 extents use ceiling chroma; a wider stride is fine.
+        let odd = vec![
+            Plane::new(3, vec![0; 9]),
+            Plane::new(4, vec![0; 8]),
+            Plane::new(2, vec![0; 4]),
+        ];
+        let img = AvifImage::new(3, 3, PixelFormat::Yuv420P, odd).unwrap();
+        assert!(img.as_bytes().is_none());
+        assert_eq!(img.to_rgb8().len(), 27);
+        // A picture whose public fields were assigned inconsistent
+        // planes afterwards is reported, not a panic, by the try_ view.
+        let mut broken =
+            AvifImage::new(2, 2, PixelFormat::Gray8, vec![Plane::new(2, vec![0; 4])]).unwrap();
+        broken.planes.clear();
+        assert!(broken.try_to_rgb8().is_err());
+        assert_eq!(broken.into_raw().len(), 0);
     }
 
     #[test]
@@ -1342,15 +1469,24 @@ mod tests {
     #[test]
     fn decode_limits_are_reported_as_limit_exceeded() {
         let o = DecodeOptions::default()
-            .with_max_width(8)
-            .with_max_pixels(10);
+            .with_max_width(Some(8))
+            .with_max_pixels(Some(10));
         assert!(matches!(o.check_dims(9, 1), Err(Error::LimitExceeded(_))));
         assert!(matches!(o.check_dims(4, 4), Err(Error::LimitExceeded(_))));
         assert!(o.check_dims(5, 2).is_ok());
         assert!(matches!(
-            DecodeOptions::default().with_max_bytes(3).check_bytes(4),
+            DecodeOptions::default()
+                .with_max_bytes(Some(3))
+                .check_bytes(4),
             Err(Error::LimitExceeded(_))
         ));
+        let unlimited = DecodeOptions::default()
+            .with_max_width(None)
+            .with_max_height(None)
+            .with_max_pixels(None)
+            .with_max_bytes(None);
+        assert!(unlimited.check_dims(u32::MAX, u32::MAX).is_ok());
+        assert!(unlimited.check_bytes(usize::MAX).is_ok());
     }
 
     #[test]
@@ -1366,7 +1502,7 @@ mod tests {
         assert_eq!(i.bit_depth, 10);
         assert_eq!(i.frames, 1);
         assert!(!i.is_sequence);
-        assert!(i.color.full_range);
+        assert_eq!(i.color.range, ColorRange::Full);
         assert!(i.width > 0 && i.height > 0);
 
         let bytes = std::fs::read(concat!(

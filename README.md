@@ -54,8 +54,9 @@ workspace are framework-only. So:
 | default (`registry` on) | everything above plus `decode`, `decode_with`, `decode_rgb8`, `decode_rgba8`, `decode_all` / `decode_all_with`, `decode_from`, `encode`, `encode_rgb8`, `encode_rgba8`, `encode_to`, the pixel encoder (`still`), `avis` sequence encode, and the framework `Decoder` / `Encoder` |
 
 A standalone caller that pairs the container model with its own AV1
-decoder builds an `AvifImage::new(width, height, format, planes)` from
-the composed planes and gets `to_rgba8()` like everyone else.
+decoder builds an `AvifImage::new(width, height, format, planes)?`
+(plane geometry validated) from the composed planes and gets
+`to_rgba8()` like everyone else.
 
 ```toml
 [dependencies]
@@ -85,7 +86,9 @@ runs `decode_with` / `decode_all_with` with the decoder's
 `set_options`), and emits every frame with its `ColorSignal`; the
 encoder maps a `VideoFrame` onto the still encoder (`q` / `alpha_q` /
 `premultiplied` options). `From<AvifImage> for VideoFrame` and
-`AvifImage::from_video_frame` move pictures between the two worlds.
+`AvifImage::from_video_frame(&frame, &params)` (also
+`TryFrom<(&VideoFrame, &CodecParameters)>`) move pictures between the
+two worlds.
 Codec id `"avif"`, capability `avif_heif_av1_decode`;
 `CodecParameters::extradata` is the `av1C` record.
 
@@ -122,8 +125,9 @@ signalling), `chroma` for the RGB one-call paths, `embed_exif` /
 `embed_xmp` / `embed_icc`. `StillEncodeOptions` is the deprecated
 alias.
 
-`DecodeOptions` (`Default` = lenient, 16384 × 16384, `1 << 28`
-pixels): `max_width`, `max_height`, `max_pixels` (also caps every
+`DecodeOptions` (`Default` = lenient, `Some(16384)` × `Some(16384)`,
+`Some(1 << 28)` pixels, `Some(1 << 30)` input bytes; `None` =
+unlimited): `max_width`, `max_height`, `max_pixels` (also caps every
 grid / overlay canvas on the way), `max_bytes`, `strict` (an AVIF
 brand is required, a claimed `mif1` must carry its mandatory boxes),
 `tone_mapped` (apply a `tmap` gain map — default off: the base
@@ -133,7 +137,8 @@ layer of a layered primary instead of its `lsel`).
 ## Metadata and colour
 
 `AvifImage::color` is the item's `colr` `nclx` as `ColorInfo
-{ full_range, primaries, transfer, matrix }` (H.273 code points); with
+{ range: ColorRange, primaries, transfer, matrix }` (H.273 code
+points; `ColorRange::{Unspecified, Limited, Full}`); with
 no CICP the MIAF §7.3.6.4 default applies — BT.709 / sRGB / BT.601,
 **full range**. `to_rgb8` / `to_rgba8` invert the signalled matrix at
 the signalled range exactly (round-to-nearest, chroma replicated to

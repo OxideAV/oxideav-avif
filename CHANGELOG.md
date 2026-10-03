@@ -19,10 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `metadata: Metadata`, `bit_depth`) with `new` / `from_rgb8` /
   `from_rgba8` (identity-matrix 4:4:4, exact) / `as_bytes` / `into_raw`
   / `to_rgb8` / `to_rgba8` (+ `try_` variants), `RgbImage` /
-  `RgbaImage`, `Frame { image, delay }`, `ColorInfo`, `Metadata`,
-  `DecodeOptions` (`max_width` / `max_height` / `max_pixels` /
-  `max_bytes` / `strict` / `tone_mapped` / `reference_white_nits` /
-  `layer`), `EncodeOptions`, the aliases `PixelFormat` (=
+  `RgbaImage`, `Frame { image, delay }`, `ColorInfo { range:
+  ColorRange, primaries, transfer, matrix }`, `ColorRange`,
+  `Metadata`, `DecodeOptions` (`max_width` / `max_height` /
+  `max_pixels` / `max_bytes` as `Option`s, `None` = unlimited;
+  `strict` / `tone_mapped` / `reference_white_nits` / `layer`),
+  `EncodeOptions`, the aliases `PixelFormat` (=
   `AvifPixelFormat`), `Plane` (= `AvifPlane`) and `Error` (=
   `AvifError`). With `registry`: `decode`, `decode_with`,
   `decode_rgb8`, `decode_rgba8`, `decode_all` / `decode_all_with`
@@ -32,10 +34,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   extents), `encode_rgb8` / `encode_rgba8` (8-bit 4:2:0 at the MIAF
   default colour by default, 4:4:4 at odd extents, alpha as the
   auxiliary), `encode_to`; `From<AvifImage> for VideoFrame`,
-  `AvifImage::from_video_frame`, `From<ColorSignal> for ColorInfo`.
+  `AvifImage::from_video_frame(&VideoFrame, &CodecParameters)` /
+  `TryFrom<(&VideoFrame, &CodecParameters)>` (dimensions and the
+  layout label from the parameters), `From<ColorSignal> for ColorInfo`.
+  `AvifImage::new` validates the plane geometry and returns `Result`.
 - `AvifError::LimitExceeded` (a `DecodeOptions` bound, mapped to the
-  framework's `ResourceExhausted`) and `AvifError::Io`
-  (`From<std::io::Error>`).
+  framework's `ResourceExhausted`) and `AvifError::Io(std::io::Error)`
+  (`From<std::io::Error>`, `Error::source`). `AvifError` no longer
+  derives `Clone` / `PartialEq` / `Eq`: match on the variant or compare
+  `Display`.
 - `AvifDecoder::{options, set_options, with_options}` — the decoder
   runs the contract functions with a full `DecodeOptions`.
 - `AvifMuxer::with_icc` / `AvifGridMuxer::with_icc` and
