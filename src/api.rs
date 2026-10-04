@@ -477,19 +477,17 @@ impl AvifImage {
     /// Packed 8-bit RGB (`3 × width × height` bytes) as an
     /// identity-matrix 4:4:4 picture: planes G, B, R, full range,
     /// BT.709 primaries / sRGB transfer. Exact in both directions.
-    ///
-    /// # Panics
-    ///
-    /// When `data.len() != 3 × width × height` or either extent is 0.
-    pub fn from_rgb8(width: u32, height: u32, data: Vec<u8>) -> Self {
+    /// [`Error::InvalidData`] when `data.len() != 3 × width × height`
+    /// or either extent is 0.
+    pub fn from_rgb8(width: u32, height: u32, data: Vec<u8>) -> Result<Self> {
         let n = width as usize * height as usize;
-        assert_eq!(
-            data.len(),
-            n * 3,
-            "AvifImage::from_rgb8: {width}x{height} RGB needs {} bytes, got {}",
-            n * 3,
-            data.len()
-        );
+        if width == 0 || height == 0 || data.len() != n * 3 {
+            return Err(Error::invalid(format!(
+                "avif: from_rgb8 {width}x{height} needs {} RGB bytes, got {}",
+                n * 3,
+                data.len()
+            )));
+        }
         let mut g = Vec::with_capacity(n);
         let mut b = Vec::with_capacity(n);
         let mut r = Vec::with_capacity(n);
@@ -500,27 +498,24 @@ impl AvifImage {
         }
         let w = width as usize;
         let planes = vec![Plane::new(w, g), Plane::new(w, b), Plane::new(w, r)];
-        Self::new(width, height, PixelFormat::Yuv444P, planes)
-            .expect("planes built to the layout")
-            .with_color(ColorInfo::identity_full_range())
+        Ok(Self::new(width, height, PixelFormat::Yuv444P, planes)?
+            .with_color(ColorInfo::identity_full_range()))
     }
 
     /// Packed 8-bit RGBA (`4 × width × height` bytes) as an
     /// identity-matrix 4:4:4 picture with a full-resolution alpha
     /// plane (planes G, B, R, A). Exact in both directions.
-    ///
-    /// # Panics
-    ///
-    /// When `data.len() != 4 × width × height` or either extent is 0.
-    pub fn from_rgba8(width: u32, height: u32, data: Vec<u8>) -> Self {
+    /// [`Error::InvalidData`] when `data.len() != 4 × width × height`
+    /// or either extent is 0.
+    pub fn from_rgba8(width: u32, height: u32, data: Vec<u8>) -> Result<Self> {
         let n = width as usize * height as usize;
-        assert_eq!(
-            data.len(),
-            n * 4,
-            "AvifImage::from_rgba8: {width}x{height} RGBA needs {} bytes, got {}",
-            n * 4,
-            data.len()
-        );
+        if width == 0 || height == 0 || data.len() != n * 4 {
+            return Err(Error::invalid(format!(
+                "avif: from_rgba8 {width}x{height} needs {} RGBA bytes, got {}",
+                n * 4,
+                data.len()
+            )));
+        }
         let mut g = Vec::with_capacity(n);
         let mut b = Vec::with_capacity(n);
         let mut r = Vec::with_capacity(n);
@@ -538,9 +533,8 @@ impl AvifImage {
             Plane::new(w, r),
             Plane::new(w, a),
         ];
-        Self::new(width, height, PixelFormat::Yuva444P, planes)
-            .expect("planes built to the layout")
-            .with_color(ColorInfo::identity_full_range())
+        Ok(Self::new(width, height, PixelFormat::Yuva444P, planes)?
+            .with_color(ColorInfo::identity_full_range()))
     }
 
     /// Setter: replace `color`.
@@ -1314,7 +1308,7 @@ mod tests {
     #[test]
     fn rgb_round_trips_through_identity_planes() {
         let rgb: Vec<u8> = (0..3 * 4 * 2).map(|i| (i * 7 % 256) as u8).collect();
-        let img = AvifImage::from_rgb8(4, 2, rgb.clone());
+        let img = AvifImage::from_rgb8(4, 2, rgb.clone()).unwrap();
         assert_eq!(img.format(), PixelFormat::Yuv444P);
         assert!(img.color.is_identity_matrix());
         assert_eq!(img.to_rgb8(), rgb);
@@ -1322,7 +1316,7 @@ mod tests {
         assert_eq!(rgba.len(), 4 * 2 * 4);
         assert!(rgba.chunks_exact(4).all(|p| p[3] == 255));
         let with_alpha: Vec<u8> = (0..4 * 4 * 2).map(|i| (i * 13 % 256) as u8).collect();
-        let img = AvifImage::from_rgba8(4, 2, with_alpha.clone());
+        let img = AvifImage::from_rgba8(4, 2, with_alpha.clone()).unwrap();
         assert_eq!(img.format(), PixelFormat::Yuva444P);
         assert_eq!(img.to_rgba8(), with_alpha);
         assert_eq!(

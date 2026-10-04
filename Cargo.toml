@@ -12,6 +12,8 @@ readme = "README.md"
 homepage = "https://github.com/OxideAV/oxideav-avif"
 keywords = ["multimedia", "image", "avif", "av1", "codec"]
 categories = ["multimedia::encoding", "multimedia::images"]
+# crates.io caps packages at 10 MiB; the fixture corpus and fuzz tree stay in git only.
+exclude = ["/tests", "/fuzz"]
 
 [dependencies]
 # Framework + AV1 deps are gated behind the default-on `registry`

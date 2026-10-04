@@ -5,6 +5,10 @@
 //! `avifgainmaputil` (tone-map / print the metadata) when it is
 //! installed and skip otherwise.
 
+// Registry-only: the codec path and the framework traits need the
+// default `registry` feature; the standalone build skips this file.
+#![cfg(feature = "registry")]
+
 use oxideav_avif::meta::{Colr, Property};
 use oxideav_avif::{
     encode_still, gain_map_metadata, inspect, parse_header, AvifDecoder, EncodeOptions,

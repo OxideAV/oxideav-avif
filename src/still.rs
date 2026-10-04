@@ -971,6 +971,59 @@ pub(crate) fn pixi_bits(img: &StillImage) -> Vec<u8> {
 /// [`STILL_MAX_CODED_DIM`] per axis — larger canvases go through
 /// [`encode_still_grid`].
 pub fn encode_still(img: &StillImage, opts: &EncodeOptions) -> Result<Vec<u8>> {
+    let (mux, max_profile) = still_muxer(img, opts)?;
+    apply_profile_brand_mux(mux, max_profile).build()
+}
+
+/// `images[0]` as the primary item plus every further image as a coded
+/// item of a `brst` image-burst group (HEIF §6.8.9) — the
+/// [`crate::encode_all`] shape for delay-less frames. Every member
+/// carries its own `colr` / ICC / `pixi` / `clap` and alpha
+/// auxiliary; Exif / XMP ride on the primary only (item metadata
+/// references are per item and the burst reader composes the
+/// primary's). Each picture must fit the single-item bound.
+pub fn encode_still_burst(images: &[StillImage], opts: &EncodeOptions) -> Result<Vec<u8>> {
+    let Some(first) = images.first() else {
+        return Err(Error::invalid("avif burst: no images"));
+    };
+    let (mut mux, mut max_profile) = still_muxer(first, opts)?;
+    for (i, img) in images.iter().enumerate().skip(1) {
+        img.validate()?;
+        let (pw, ph) = (coded_extent(img.width), coded_extent(img.height));
+        if pw > STILL_MAX_CODED_DIM || ph > STILL_MAX_CODED_DIM {
+            return Err(Error::unsupported(format!(
+                "avif burst: image {i} coded extents {pw}x{ph} exceed the single-item bound \
+                 {STILL_MAX_CODED_DIM}",
+            )));
+        }
+        let coded = encode_primary(img, pw, ph, opts.base_q_idx)?;
+        max_profile = max_profile.max(coded.seq_profile);
+        let mut member = crate::mux::BurstMember::new(pw, ph, coded.payload, coded.av1c);
+        member.pixi = Some(pixi_bits(img));
+        member.colr = img.colr.clone();
+        member.icc = img.props.icc.clone();
+        if (pw, ph) != (img.width, img.height) {
+            member.clap = Some(top_left_clap(img.width, img.height, pw, ph));
+        }
+        if let Some(alpha) = &img.alpha {
+            let coded_alpha = encode_alpha(img, alpha, pw, ph, opts.alpha_q_idx)?;
+            max_profile = max_profile.max(coded_alpha.seq_profile);
+            member.alpha = Some(crate::mux::BurstAlpha::new(
+                coded_alpha.payload,
+                coded_alpha.av1c,
+                Some(vec![img.bit_depth]),
+                opts.premultiplied_alpha,
+            ));
+        }
+        mux = mux.with_burst_member(member);
+    }
+    apply_profile_brand_mux(mux, max_profile).build()
+}
+
+/// The muxer holding `img` as the primary item with all its
+/// properties, auxiliaries and metadata, plus the highest AV1
+/// sequence profile coded (for the profile brand).
+fn still_muxer(img: &StillImage, opts: &EncodeOptions) -> Result<(AvifMuxer, u8)> {
     img.validate()?;
     let (pw, ph) = (coded_extent(img.width), coded_extent(img.height));
     if pw > STILL_MAX_CODED_DIM || ph > STILL_MAX_CODED_DIM {
@@ -1074,8 +1127,7 @@ pub fn encode_still(img: &StillImage, opts: &EncodeOptions) -> Result<Vec<u8>> {
         max_profile = max_profile.max(coded_depth.seq_profile);
         mux = mux.with_depth(coded_depth.payload, coded_depth.av1c);
     }
-    mux = apply_profile_brand_mux(mux, max_profile);
-    mux.build()
+    Ok((mux, max_profile))
 }
 
 pub(crate) fn apply_profile_brand_mux(mux: AvifMuxer, seq_profile: u8) -> AvifMuxer {

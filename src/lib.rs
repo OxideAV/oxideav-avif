@@ -14,7 +14,11 @@
 //! [`Metadata`] — with [`AvifImage::to_rgb8`] / [`AvifImage::to_rgba8`];
 //! [`AvifFile`] is the parsed container ([`parse`]).
 //!
-//! ```no_run
+//! The one-screen example needs the default `registry` feature (the
+//! `decode*` / `encode*` paths go through the AV1 codec crate):
+//!
+#![cfg_attr(feature = "registry", doc = "```no_run")]
+#![cfg_attr(not(feature = "registry"), doc = "```ignore")]
 //! # fn main() -> Result<(), oxideav_avif::Error> {
 //! let bytes = std::fs::read("in.avif").map_err(oxideav_avif::Error::from)?;
 //! if oxideav_avif::probe(&bytes) {
@@ -236,8 +240,8 @@ pub use meta::{
     ITEM_TYPE_URI,
 };
 pub use mux::{
-    encode_still_av1, AvifGridMuxer, AvifMuxer, AvifOverlayMuxer, EntityGroupSpec, GridTile,
-    IdentityDerivation, OverlayLayer, ToneMapItem,
+    encode_still_av1, AvifGridMuxer, AvifMuxer, AvifOverlayMuxer, BurstAlpha, BurstMember,
+    EntityGroupSpec, GridTile, IdentityDerivation, OverlayLayer, ToneMapItem,
 };
 pub use overlay::{composite_overlay, OverlayInput, MAX_OVERLAY_CANVAS_PIXELS};
 pub use parser::{
@@ -260,7 +264,7 @@ pub use transform::{apply_clap, apply_imir, apply_irot, crop_top_left};
 #[cfg(feature = "registry")]
 pub use api_codec::{
     decode, decode_all, decode_all_with, decode_from, decode_rgb8, decode_rgba8, decode_with,
-    encode, encode_rgb8, encode_rgba8, encode_to,
+    encode, encode_all, encode_rgb8, encode_rgba8, encode_to,
 };
 
 #[cfg(feature = "registry")]
@@ -280,9 +284,9 @@ pub use signal::{color_signal_for, labelled_pixel_format, miaf_default_signal};
 pub use still::StillEncodeOptions;
 #[cfg(feature = "registry")]
 pub use still::{
-    elect_grid_tiling, encode_still, encode_still_auto, encode_still_grid, encode_still_layered,
-    encode_still_overlay, GainMapSpec, OverlayCanvas, OverlayLayerImage, StillImage,
-    StillProperties, GRID_MIN_TILE_DIM, STILL_MAX_CODED_DIM,
+    elect_grid_tiling, encode_still, encode_still_auto, encode_still_burst, encode_still_grid,
+    encode_still_layered, encode_still_overlay, GainMapSpec, OverlayCanvas, OverlayLayerImage,
+    StillImage, StillProperties, GRID_MIN_TILE_DIM, STILL_MAX_CODED_DIM,
 };
 
 #[cfg(feature = "registry")]

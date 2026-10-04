@@ -5,6 +5,10 @@
 //! [`Property::Pixi`] with its channel descriptors) and the AVIF
 //! decode of the item is unchanged.
 
+// Registry-only: the codec path and the framework traits need the
+// default `registry` feature; the standalone build skips this file.
+#![cfg(feature = "registry")]
+
 use oxideav_avif::meta::Property;
 use oxideav_avif::{inspect, parse, parse_header, AvifDecoder};
 use oxideav_core::{CodecId, CodecParameters, Decoder, Frame, Packet, TimeBase};

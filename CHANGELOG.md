@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Fallible constructors (`IMAGE_CRATE_API` fleet sweep, breaking).**
+  `AvifImage::from_rgb8` / `from_rgba8` return `Result<AvifImage,
+  AvifError>` (like `new` already did) instead of panicking on a zero
+  dimension or a buffer that does not match `width × height`; the
+  infallible signatures are not kept.
+
+### Added
+
+- `encode_all(&[Frame], &EncodeOptions)`, the mirror of `decode_all`:
+  delay-less frames become the primary plus a `brst` image burst
+  (`encode_still_burst`, `AvifMuxer::with_burst_member` /
+  `BurstMember` / `BurstAlpha`), timed frames an `avis` sequence with
+  per-sample durations at timescale 1000 (`encode_sequence` stays the
+  uniform-duration depth name). `decode_all(encode_all(frames)) ==
+  frames` is pinned at the lossless default.
+- `Cargo.toml` `exclude = ["/tests", "/fuzz"]` (crates.io 10 MiB cap).
+
 ## [0.0.13](https://github.com/OxideAV/oxideav-avif/compare/v0.0.12...v0.0.13) - 2026-10-03
 
 ### Other

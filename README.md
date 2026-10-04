@@ -109,12 +109,15 @@ by name. Decode yields the storage layout; `color.matrix == 0`
 |---|---|
 | `encode(&AvifImage)` | the image's own layout and depth; alpha as the AV1-coded alpha auxiliary item; `Error::Unsupported` for sub-sampled chroma at odd extents (never a silent conversion) |
 | `encode_rgb8` / `encode_rgba8` | 8-bit 4:2:0 (`EncodeOptions::chroma`; 4:4:4 at odd extents), MIAF default colour (BT.709 / sRGB / BT.601, full range), alpha as the auxiliary |
-| `encode(&AvifImage::from_rgb8(..))` | identity-matrix 4:4:4 — byte-exact RGB at the default lossless quality |
+| `encode(&AvifImage::from_rgb8(..)?)` | identity-matrix 4:4:4 — byte-exact RGB at the default lossless quality |
 | canvases past 4096 coded pixels per axis | `grid` tiling (`encode_still_auto`) |
+| `encode_all(&[Frame], &EncodeOptions)` | the mirror of `decode_all`: delay-less frames → the primary plus a `brst` image burst (`encode_still_burst`; per-member colour / ICC / alpha / `clap`, Exif / XMP on the primary), timed frames → an `avis` image sequence (`encode_sequence` at timescale 1000, each frame's delay in ms; no alpha — `Unsupported`); all frames share frame 0's geometry, depth and layout; `decode_all(encode_all(f)) == f` at the lossless default |
 
 `decode_all` returns every sample of an `avis` image sequence (with
 its `delay`), the entities of the primary's `brst` burst group, else
-the primary alone.
+the primary alone. `AvifImage::new` / `from_rgb8` / `from_rgba8` are
+`Result`s that refuse a zero dimension or a buffer that does not match
+the geometry with `InvalidData`.
 
 ## Options
 

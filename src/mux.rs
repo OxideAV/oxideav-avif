@@ -223,6 +223,81 @@ pub struct AvifMuxer {
     item_name: Option<String>,
     entity_groups: Vec<EntityGroupSpec>,
     tone_map: Option<ToneMapItem>,
+    burst: Vec<BurstMember>,
+}
+
+/// One further picture of an image burst (HEIF §6.8.9 `brst`): a coded
+/// `av01` item written after the primary and grouped with it (the
+/// primary is the first entity, members follow in push order).
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct BurstMember {
+    /// Coded width (`ispe`).
+    pub width: u32,
+    /// Coded height (`ispe`).
+    pub height: u32,
+    /// AV1 Image Item Data.
+    pub payload: Vec<u8>,
+    /// `av1C` record.
+    pub av1c: Vec<u8>,
+    /// `pixi` bits per channel.
+    pub pixi: Option<Vec<u8>>,
+    /// The member's `colr`.
+    pub colr: Option<Colr>,
+    /// ICC profile (`colr` `prof`).
+    pub icc: Option<Vec<u8>>,
+    /// Crop back to the visible extents when the coded size was padded.
+    pub clap: Option<Clap>,
+    /// Alpha auxiliary item.
+    pub alpha: Option<BurstAlpha>,
+}
+
+/// The alpha auxiliary of a [`BurstMember`].
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct BurstAlpha {
+    /// AV1 Image Item Data of the alpha plane.
+    pub payload: Vec<u8>,
+    /// `av1C` record.
+    pub av1c: Vec<u8>,
+    /// `pixi` bits per channel.
+    pub pixi: Option<Vec<u8>>,
+    /// `prem` reference (premultiplied alpha).
+    pub premultiplied: bool,
+}
+
+impl BurstAlpha {
+    /// An alpha auxiliary from its coded picture.
+    pub fn new(
+        payload: Vec<u8>,
+        av1c: Vec<u8>,
+        pixi: Option<Vec<u8>>,
+        premultiplied: bool,
+    ) -> Self {
+        Self {
+            payload,
+            av1c,
+            pixi,
+            premultiplied,
+        }
+    }
+}
+
+impl BurstMember {
+    /// A member from its coded picture; everything else via field assignment.
+    pub fn new(width: u32, height: u32, payload: Vec<u8>, av1c: Vec<u8>) -> Self {
+        Self {
+            width,
+            height,
+            payload,
+            av1c,
+            pixi: None,
+            colr: None,
+            icc: None,
+            clap: None,
+            alpha: None,
+        }
+    }
 }
 
 /// A `tmap` tone-map derived item (HEIF Amd 1:2025 §6.6.2.4,
@@ -482,7 +557,15 @@ impl AvifMuxer {
             item_name: None,
             entity_groups: Vec::new(),
             tone_map: None,
+            burst: Vec::new(),
         }
+    }
+
+    /// Add a further picture of an image burst; the file gets a `brst`
+    /// entity group of the primary followed by every member.
+    pub fn with_burst_member(mut self, member: BurstMember) -> Self {
+        self.burst.push(member);
+        self
     }
 
     /// Attach a `tmap` tone-map derived item over the primary (see
@@ -802,6 +885,42 @@ impl AvifMuxer {
                 tprops.push(prop_pixi(bits));
             }
             w.add_tone_map(primary_id, gain, &tm.metadata, alternate, tprops)?;
+        }
+        if !self.burst.is_empty() {
+            let mut members = vec![primary_id];
+            for m in self.burst {
+                let mut mprops = vec![prop_av1c(&m.av1c, "burst ")?, prop_ispe(m.width, m.height)];
+                if let Some(bits) = &m.pixi {
+                    mprops.push(prop_pixi(bits));
+                }
+                if let Some(colr) = &m.colr {
+                    mprops.push(prop_colr(colr)?);
+                }
+                if let Some(icc) = &m.icc {
+                    mprops.push(prop_colr(&Colr::Icc(icc.clone()))?);
+                }
+                if let Some(clap) = &m.clap {
+                    mprops.push(prop_clap(clap));
+                }
+                let id = w.add_coded_item(*b"av01", m.payload, mprops);
+                if let Some(a) = m.alpha {
+                    let mut aprops = vec![
+                        prop_av1c(&a.av1c, "burst alpha ")?,
+                        prop_ispe(m.width, m.height),
+                        prop_auxc(crate::alpha::ALPHA_URN_PREFIX),
+                    ];
+                    if let Some(bits) = &a.pixi {
+                        aprops.push(prop_pixi(bits));
+                    }
+                    let aid = w.add_alpha(id, *b"av01", a.payload, aprops, a.premultiplied);
+                    w.set_hidden(aid, true);
+                }
+                members.push(id);
+            }
+            // Group ids share the item id space; the writer's items are
+            // numbered from 1, so start the group well past them.
+            let group_id = 1000 + members.len() as u32;
+            w.add_entity_group(*b"brst", group_id, members);
         }
         for g in self.entity_groups {
             w.add_entity_group_with_flags(g.grouping_type, g.group_id, g.flags, g.entity_ids);

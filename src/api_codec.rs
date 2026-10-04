@@ -699,6 +699,62 @@ fn still_of(image: &AvifImage, opts: &EncodeOptions) -> Result<StillImage> {
     Ok(still.with_props(props))
 }
 
+/// Encode `frames` as one file — the mirror of [`decode_all`]. Frames
+/// without a `delay` are coded as image items: one is exactly
+/// [`encode`], several become the primary plus a `brst` image-burst
+/// group ([`crate::encode_still_burst`]; each member with its own
+/// colour, ICC, alpha auxiliary and `clap`, Exif / XMP on the primary).
+/// Frames with a `delay` become the samples of an `avis` image
+/// sequence ([`crate::encode_sequence`] at timescale 1000 with each
+/// frame's delay in milliseconds, `opts.base_q_idx` as the quality);
+/// every frame must then carry a delay, since an `avis` file holds
+/// samples only, and the sequence encoder carries no alpha
+/// (`Error::Unsupported`). All frames share frame 0's geometry, depth
+/// and chroma layout.
+///
+/// `decode_all(encode_all(frames)) == frames` holds for planes and
+/// colour at the lossless default (`base_q_idx = 0`); burst members
+/// read back without the primary's Exif / XMP, sequence samples with
+/// their delays.
+pub fn encode_all(frames: &[Frame], opts: &EncodeOptions) -> Result<Vec<u8>> {
+    if frames.is_empty() {
+        return Err(Error::invalid("avif encode_all: no frames"));
+    }
+    let timed = frames.iter().filter(|f| f.delay.is_some()).count();
+    if timed == 0 {
+        if let [single] = frames {
+            return encode(&single.image, opts);
+        }
+        let stills: Vec<StillImage> = frames
+            .iter()
+            .map(|f| still_of(&f.image, opts))
+            .collect::<Result<_>>()?;
+        return crate::still::encode_still_burst(&stills, opts);
+    }
+    if timed != frames.len() {
+        return Err(Error::invalid(
+            "avif encode_all: an avis image sequence holds timed samples only — give every \
+             frame a delay, or none for an image burst",
+        ));
+    }
+    let stills: Vec<StillImage> = frames
+        .iter()
+        .map(|f| still_of(&f.image, opts))
+        .collect::<Result<_>>()?;
+    let durations: Vec<u32> = frames
+        .iter()
+        .map(|f| {
+            f.delay
+                .map(|d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX))
+                .unwrap_or(0)
+        })
+        .collect();
+    let seq_opts = crate::sequence::SequenceEncodeOptions::default()
+        .with_timescale(1000)
+        .with_base_q_idx(opts.base_q_idx);
+    crate::sequence::encode_sequence_timed(&stills, &seq_opts, Some(&durations))
+}
+
 /// Encode a picture as it is: its layout and depth (8 / 10 / 12-bit
 /// 4:2:0 / 4:2:2 / 4:4:4 / monochrome, alpha as the AV1-coded alpha
 /// auxiliary item, an identity-matrix picture as the RGB it holds),
@@ -820,7 +876,7 @@ fn box_filter(plane: &[u16], w: usize, h: usize, sx: u32, sy: u32) -> Vec<u16> {
 /// `opts.chroma` — 4:2:0 by default, 4:4:4 at odd extents (see
 /// [`EncodeOptions::chroma`]); `opts.base_q_idx` / [`EncodeOptions::with_quality`]
 /// set the quality. For byte-exact RGB use
-/// `encode(&AvifImage::from_rgb8(..), ..)`, which codes the identity
+/// `encode(&AvifImage::from_rgb8(..).unwrap(), ..)`, which codes the identity
 /// matrix in 4:4:4.
 pub fn encode_rgb8(width: u32, height: u32, rgb: &[u8], opts: &EncodeOptions) -> Result<Vec<u8>> {
     let still = still_of_rgb(width, height, rgb, 3, opts)?;
@@ -847,6 +903,7 @@ pub fn encode_to<W: Write>(image: &AvifImage, opts: &EncodeOptions, mut w: W) ->
 mod tests {
     use super::*;
     use crate::api::{PixelFormat, Plane};
+    use crate::info;
 
     fn fixture(name: &str) -> Vec<u8> {
         std::fs::read(format!(
@@ -854,6 +911,88 @@ mod tests {
             env!("CARGO_MANIFEST_DIR")
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn encode_all_mirrors_decode_all() {
+        use std::time::Duration;
+        let pic = |seed: u8, alpha: bool| -> AvifImage {
+            let n = 16 * 8;
+            if alpha {
+                let rgba: Vec<u8> = (0..n * 4)
+                    .map(|i| ((i * 31 + seed as usize * 17) % 251) as u8)
+                    .collect();
+                AvifImage::from_rgba8(16, 8, rgba).unwrap()
+            } else {
+                let rgb: Vec<u8> = (0..n * 3)
+                    .map(|i| ((i * 29 + seed as usize * 13) % 251) as u8)
+                    .collect();
+                AvifImage::from_rgb8(16, 8, rgb).unwrap()
+            }
+        };
+        let opts = EncodeOptions::default();
+
+        // One delay-less frame is exactly `encode`.
+        let one = pic(1, false);
+        assert_eq!(
+            encode_all(&[Frame::new(one.clone(), None)], &opts).unwrap(),
+            encode(&one, &opts).unwrap()
+        );
+
+        // Several delay-less frames: a `brst` burst, lossless, with
+        // each member's alpha; the primary is frame 0.
+        let burst = vec![
+            Frame::new(pic(1, true), None),
+            Frame::new(pic(2, true), None),
+            Frame::new(pic(3, true), None),
+        ];
+        let bytes = encode_all(&burst, &opts).unwrap();
+        assert_eq!(info(&bytes).unwrap().frames, 3);
+        assert_eq!(decode(&bytes).unwrap(), burst[0].image);
+        assert_eq!(decode_all(&bytes).unwrap(), burst);
+
+        // Timed frames: an `avis` sequence with the delays in ms.
+        let seq = vec![
+            Frame::new(pic(4, false), Some(Duration::from_millis(40))),
+            Frame::new(pic(5, false), Some(Duration::from_millis(1500))),
+            Frame::new(pic(6, false), Some(Duration::from_millis(1))),
+        ];
+        let bytes = encode_all(&seq, &opts).unwrap();
+        assert!(is_sequence_file(&bytes));
+        assert_eq!(info(&bytes).unwrap().frames, 3);
+        let back = decode_all(&bytes).unwrap();
+        assert_eq!(back.len(), 3);
+        for (i, (got, want)) in back.iter().zip(&seq).enumerate() {
+            assert_eq!(got.delay, want.delay, "sample {i} delay");
+            assert_eq!(got.image.planes, want.image.planes, "sample {i} planes");
+            assert_eq!(got.image.format, want.image.format, "sample {i} layout");
+            assert_eq!(got.image.color, want.image.color, "sample {i} colour");
+        }
+
+        // Rejections: nothing; mixed timed / untimed; alpha in a sequence.
+        assert!(matches!(encode_all(&[], &opts), Err(Error::InvalidData(_))));
+        let mixed = [seq[0].clone(), burst[0].clone()];
+        assert!(matches!(
+            encode_all(&mixed, &opts),
+            Err(Error::InvalidData(_))
+        ));
+        let timed_alpha = [
+            Frame::new(pic(1, true), Some(Duration::from_millis(10))),
+            Frame::new(pic(2, true), Some(Duration::from_millis(10))),
+        ];
+        assert!(matches!(
+            encode_all(&timed_alpha, &opts),
+            Err(Error::Unsupported(_))
+        ));
+        // Fallible constructors.
+        assert!(matches!(
+            AvifImage::from_rgb8(2, 2, vec![0; 11]),
+            Err(Error::InvalidData(_))
+        ));
+        assert!(matches!(
+            AvifImage::from_rgba8(0, 2, vec![]),
+            Err(Error::InvalidData(_))
+        ));
     }
 
     #[test]
@@ -877,12 +1016,14 @@ mod tests {
     #[test]
     fn lossless_round_trip_is_exact_for_planes_colour_and_metadata() {
         let rgba: Vec<u8> = (0..16 * 8 * 4).map(|i| (i * 31 % 251) as u8).collect();
-        let img = AvifImage::from_rgba8(16, 8, rgba.clone()).with_metadata(Metadata::new(
-            Some(vec![0x11; 8]),
-            Some(b"MM\0\x2a\0\0\0\x08".to_vec()),
-            Some(b"<x:xmpmeta/>".to_vec()),
-            None,
-        ));
+        let img = AvifImage::from_rgba8(16, 8, rgba.clone())
+            .unwrap()
+            .with_metadata(Metadata::new(
+                Some(vec![0x11; 8]),
+                Some(b"MM\0\x2a\0\0\0\x08".to_vec()),
+                Some(b"<x:xmpmeta/>".to_vec()),
+                None,
+            ));
         let bytes = encode(&img, &EncodeOptions::default()).unwrap();
         assert!(crate::probe(&bytes));
         let info = crate::info(&bytes).unwrap();
@@ -1099,7 +1240,9 @@ mod tests {
 
     #[test]
     fn framework_frame_conversions_round_trip() {
-        let img = AvifImage::from_rgba8(4, 2, (0..32).collect()).with_bit_depth(8);
+        let img = AvifImage::from_rgba8(4, 2, (0..32).collect())
+            .unwrap()
+            .with_bit_depth(8);
         let vf = VideoFrame::from(img.clone());
         // Four image planes; the colour signal rides as a side-channel
         // record behind them.

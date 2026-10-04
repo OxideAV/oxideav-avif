@@ -122,9 +122,29 @@ impl Default for SequenceEncodeOptions {
 /// auxiliaries are not carried (an auxiliary image sequence track is
 /// out of scope here).
 pub fn encode_sequence(frames: &[StillImage], opts: &SequenceEncodeOptions) -> Result<Vec<u8>> {
+    encode_sequence_timed(frames, opts, None)
+}
+
+/// [`encode_sequence`] with one display duration per frame (in
+/// `opts.timescale` units) instead of the uniform `frame_duration`;
+/// `None` is the uniform case.
+pub(crate) fn encode_sequence_timed(
+    frames: &[StillImage],
+    opts: &SequenceEncodeOptions,
+    durations: Option<&[u32]>,
+) -> Result<Vec<u8>> {
     let first = frames
         .first()
         .ok_or_else(|| Error::invalid("avif sequence: no frames"))?;
+    if let Some(d) = durations {
+        if d.len() != frames.len() {
+            return Err(Error::invalid(format!(
+                "avif sequence: {} durations for {} frames",
+                d.len(),
+                frames.len()
+            )));
+        }
+    }
     if opts.timescale == 0 || opts.frame_duration == 0 {
         return Err(Error::invalid(
             "avif sequence: timescale and frame_duration must be non-zero",
@@ -293,8 +313,11 @@ pub fn encode_sequence(frames: &[StillImage], opts: &SequenceEncodeOptions) -> R
     still.set_primary(cover);
     writer.still = Some(still);
     writer.cover_sample = Some(0);
-    for (data, sync) in samples {
-        writer.push_sample(data, opts.frame_duration, sync);
+    for (i, (data, sync)) in samples.into_iter().enumerate() {
+        let duration = durations
+            .and_then(|d| d.get(i).copied())
+            .unwrap_or(opts.frame_duration);
+        writer.push_sample(data, duration, sync);
     }
     Ok(writer.write_to_vec()?)
 }
