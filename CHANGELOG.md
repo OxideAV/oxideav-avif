@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.14](https://github.com/OxideAV/oxideav-avif/compare/v0.0.13...v0.0.14) - 2026-10-05
+
+### Other
+
+- follow heif 0.0.9 — range requirement, RgbImage16 / Plane / LimitExceeded names
+- fallible from_rgb8/from_rgba8, encode_all (burst + timed avis), exclude tests/fuzz — image-crate API fleet sweep
+
 ### Changed
 
 - `oxideav-heif` requirement is `>=0.0.9, <0.1` (a `0.0.x` caret requirement is exact, so `0.0.7` kept avif on a heif without the registry containers); adopted the 0.0.9 names (`RgbImage16`, `Plane`, `HeifError::LimitExceeded`).
