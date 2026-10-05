@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `oxideav-heif` requirement is `>=0.0.9, <0.1` (a `0.0.x` caret requirement is exact, so `0.0.7` kept avif on a heif without the registry containers); adopted the 0.0.9 names (`RgbImage16`, `Plane`, `HeifError::LimitExceeded`).
+
+### Changed
+
 - **Fallible constructors (`IMAGE_CRATE_API` fleet sweep, breaking).**
   `AvifImage::from_rgb8` / `from_rgba8` return `Result<AvifImage,
   AvifError>` (like `new` already did) instead of panicking on a zero

@@ -27,7 +27,9 @@ oxideav-av1 = { version = "0.1", optional = true }
 # The ISOBMFF / HEIF container layer (box reader, `meta` item model,
 # item payload resolution, derived-image graph, composition, sequence
 # tables, writer). Always on: the standalone build talks to it too.
-oxideav-heif = { version = "0.0.7", default-features = false }
+# `0.0.x` requirements are exact under caret semantics; the range keeps
+# avif on the latest heif 0.0 line (0.0.9 brought the registry containers).
+oxideav-heif = { version = ">=0.0.9, <0.1", default-features = false }
 
 [features]
 default = ["registry"]

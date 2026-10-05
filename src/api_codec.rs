@@ -798,7 +798,7 @@ fn still_of_rgb(
     }
     let color = ColorInfo::miaf_default();
     let colr = oxideav_heif::props::Colr::from(&color.to_colr());
-    let rgb = oxideav_heif::rgb::RgbImage::new(
+    let rgb = oxideav_heif::rgb::RgbImage16::new(
         width,
         height,
         channels,

@@ -44,7 +44,7 @@ use oxideav_heif::gainmap::{
     reconstruct_tone_map, GainMapMetadata, DEFAULT_HDR_REFERENCE_WHITE_NITS,
 };
 use oxideav_heif::props as hprops;
-use oxideav_heif::{Chroma, HeifFrame, HeifPixelFormat, HeifPlane};
+use oxideav_heif::{Chroma, HeifFrame, HeifPixelFormat, Plane};
 
 /// Re-export the `inspect` entry point so the registry-gated public API
 /// keeps its historical shape (`oxideav_avif::inspect`).
@@ -1193,7 +1193,7 @@ fn alpha_as_gray(alpha: &ItemImage, master_w: u32, master_h: u32) -> Result<Item
         width: master_w,
         height: master_h,
         format,
-        planes: vec![HeifPlane {
+        planes: vec![Plane {
             stride: master_w as usize * bps,
             data,
         }],

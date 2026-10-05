@@ -85,7 +85,7 @@ impl From<oxideav_heif::HeifError> for AvifError {
         match e {
             oxideav_heif::HeifError::InvalidData(s) => Self::InvalidData(s),
             oxideav_heif::HeifError::Unsupported(s) => Self::Unsupported(s),
-            oxideav_heif::HeifError::ResourceExhausted(s) => Self::InvalidData(s),
+            oxideav_heif::HeifError::LimitExceeded(s) => Self::InvalidData(s),
             // An error class the container adds later is still a
             // refusal of the input from this crate's point of view.
             other => Self::InvalidData(other.to_string()),

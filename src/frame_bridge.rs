@@ -9,7 +9,7 @@
 //! bit-for-bit, 16-bit little-endian words stay words, packed YA is
 //! split into (or re-interleaved from) a luma plane and an alpha plane.
 
-use oxideav_heif::{Chroma, HeifFrame, HeifPixelFormat, HeifPlane};
+use oxideav_heif::{Chroma, HeifFrame, HeifPixelFormat, Plane};
 
 use crate::error::{AvifError as Error, Result};
 use crate::image::{AvifFrame, AvifPixelFormat, AvifPlane};
@@ -93,11 +93,11 @@ pub(crate) fn to_heif(
             y.extend_from_slice(&px[..bps]);
             a.extend_from_slice(&px[bps..]);
         }
-        planes.push(HeifPlane {
+        planes.push(Plane {
             stride: w * bps,
             data: y,
         });
-        planes.push(HeifPlane {
+        planes.push(Plane {
             stride: w * bps,
             data: a,
         });
@@ -106,7 +106,7 @@ pub(crate) fn to_heif(
             let (pw, ph) = hf.plane_dims(p, width, height);
             let row_bytes = pw as usize * bps;
             let data = tight_plane(src, row_bytes, ph as usize, "colour")?;
-            planes.push(HeifPlane {
+            planes.push(Plane {
                 stride: row_bytes,
                 data,
             });
@@ -196,7 +196,7 @@ pub(crate) fn trim_top_left(frame: &HeifFrame, w: u32, h: u32) -> Result<HeifFra
                 .ok_or_else(|| Error::invalid(format!("avif: trim reads past plane {p}")))?;
             data.extend_from_slice(row);
         }
-        planes.push(HeifPlane {
+        planes.push(Plane {
             stride: row_bytes,
             data,
         });
@@ -291,11 +291,11 @@ mod tests {
             height: 1,
             format: HeifPixelFormat::new(Chroma::Mono, 8, true).unwrap(),
             planes: vec![
-                HeifPlane {
+                Plane {
                     stride: 2,
                     data: vec![10, 20],
                 },
-                HeifPlane {
+                Plane {
                     stride: 2,
                     data: vec![255, 0],
                 },

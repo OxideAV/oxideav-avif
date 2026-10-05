@@ -19,7 +19,7 @@ use oxideav_core::{
 };
 use oxideav_heif::gainmap::{GainMapChannel, GainMapMetadata, Rational};
 use oxideav_heif::props as hprops;
-use oxideav_heif::{to_rgb, Chroma, HeifFrame, HeifPixelFormat, HeifPlane};
+use oxideav_heif::{to_rgb, Chroma, HeifFrame, HeifPixelFormat, Plane};
 
 /// `avifgainmaputil combine` of a 32×24 sRGB base gradient and a
 /// BT.2100 PQ alternate gradient (lossless, 8-bit 4:4:4, 4:4:4 8-bit
@@ -73,7 +73,7 @@ fn ycbcr_to_rgb(
     colr: &Colr,
 ) -> Vec<u16> {
     let bps = if bit_depth > 8 { 2 } else { 1 };
-    let plane = |p: &Vec<u16>| HeifPlane {
+    let plane = |p: &Vec<u16>| Plane {
         stride: width as usize * bps,
         data: if bps == 1 {
             p.iter().map(|&v| v as u8).collect()
