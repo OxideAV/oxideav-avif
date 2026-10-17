@@ -65,8 +65,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lossless packed RGB, `YuvJ420P` for a lossy one, `YuvJ*` for an
   8-bit `Yuv*` input written without `colr`).
 
+- **`speed` / `threads` on the registry encoder; `EncodeOptions::speed`
+  / `threads`.** `speed` = `fast` (default) / `balanced` / `thorough`
+  ([`EncodeSpeed`]); `threads` = the AV1 tile-search workers (`0` =
+  the budget of `Encoder::set_execution_context`, which the encoder now
+  honours). The tile layout of every coded item is derived from the
+  picture size alone (`TILE_LAYOUT_THREADS` = 8 nominal workers: tiles
+  ≥ 256 × 128 px, at most 8), so the bytes never depend on the budget.
+
 ### Changed
 
+- **Every coded item goes through the AV1 still encoder
+  (`oxideav_av1::encoder::still`) at `Fast` effort instead of the
+  exhaustive KEY-frame search.** Image items are coded
+  `still_picture = 1` with the reduced still-picture header (image-
+  sequence samples keep a full non-still header), `color_range` is
+  signalled natively instead of spliced into the sequence header, and
+  the tile layout follows the picture size. A 12 MP 4:2:0 picture
+  through the registry encoder at quality 50: 6.1 s serial / 1.3 s on
+  8 workers (identical bytes), where the previous search took 376 s
+  for the same picture as a 4 × 3 grid; the exhaustive search is
+  `speed=thorough` (`EncodeSpeed::Thorough`) and codes ~34 % fewer
+  bytes on that synthetic picture at the same `base_q_idx`. Lossless
+  (`base_q_idx = 0`) stays sample-exact; the 16 × 16 ladder: Yuv420P
+  592 B exact → quality 50 324 B 37.4 dB → quality 10 294 B 25.0 dB.
+  File bytes differ from every earlier release for the same input.
 - `make_encoder` refuses an option bag it cannot parse instead of
   silently coding at the defaults (see above).
 

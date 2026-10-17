@@ -46,6 +46,7 @@
 //! any conformant reader) to the input samples exactly. Lossy encodes
 //! are validated PSNR-gated in the test suite.
 
+use crate::api::EncodeSpeed;
 use crate::error::{AvifError as Error, Result};
 use crate::meta::{Clap, Colr};
 use crate::mux::{
@@ -53,8 +54,10 @@ use crate::mux::{
     ToneMapItem,
 };
 
-use oxideav_av1::encoder::key_frame::encode_key_frame_yuv_with_q;
 use oxideav_av1::encoder::scalable_gop::encode_spatial_layered_gop_yuv_with_q;
+use oxideav_av1::encoder::still::{
+    auto_tile_layout, encode_key_frame_yuv_with_options, encode_still_yuv, StillOptions, StillSpeed,
+};
 use oxideav_av1::encoder::temporal_unit::encode_sequence_header_obu;
 use oxideav_av1::encoder::yuv_frame::{ChromaFormat, YuvFrame};
 use oxideav_av1::{parse_obu, ObuType, SequenceHeader};
@@ -849,9 +852,59 @@ pub(crate) fn full_range_temporal_unit(unit: &[u8], seq: &SequenceHeader) -> Res
     Ok(out)
 }
 
-/// Encode one coded item from (already padded) planes. `full_range`
-/// re-signals §5.5.2 `color_range = 1` in the emitted sequence header
-/// (see [`full_range_temporal_unit`]).
+/// The nominal worker count the AV1 tile layout of every coded item is
+/// derived from ([`oxideav_av1::encoder::still::auto_tile_layout`]):
+/// fixed, so the coded bytes never depend on the thread budget the
+/// search actually runs on (tiles ≥ 256 px wide / 128 px tall, at
+/// most 8 of them).
+pub const TILE_LAYOUT_THREADS: usize = 8;
+
+/// How one coded item's AV1 search runs: effort, worker threads and
+/// the sequence-header shape — `still` codes `still_picture = 1` with
+/// the reduced still-picture header (an image item), `!still` a KEY
+/// frame under a full non-still header (an image-sequence sample).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CodedTuning {
+    pub(crate) speed: EncodeSpeed,
+    pub(crate) threads: usize,
+    pub(crate) still: bool,
+}
+
+impl CodedTuning {
+    /// An image item under `opts`.
+    pub(crate) fn of(opts: &EncodeOptions) -> Self {
+        Self {
+            speed: opts.speed,
+            threads: opts.threads.max(1),
+            still: true,
+        }
+    }
+
+    /// An image-sequence sample (`still_picture = 0`).
+    pub(crate) fn sequence(speed: EncodeSpeed, threads: usize) -> Self {
+        Self {
+            speed,
+            threads: threads.max(1),
+            still: false,
+        }
+    }
+}
+
+fn still_speed(speed: EncodeSpeed) -> StillSpeed {
+    match speed {
+        EncodeSpeed::Fast => StillSpeed::Fast,
+        EncodeSpeed::Balanced => StillSpeed::Balanced,
+        EncodeSpeed::Thorough => StillSpeed::Thorough,
+    }
+}
+
+/// Encode one coded item from (already padded) planes through the AV1
+/// still encoder: `q` is the `base_q_idx` (`0` = lossless),
+/// `full_range` signals §5.5.2 `color_range = 1` in the emitted
+/// sequence header, `tuning` the effort / threads / header shape. The
+/// tile layout comes from the picture size alone
+/// ([`TILE_LAYOUT_THREADS`]), so the bytes are the same at any thread
+/// count.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_coded_item(
     pw: u32,
@@ -863,6 +916,7 @@ pub(crate) fn encode_coded_item(
     v: Vec<u16>,
     q: u8,
     full_range: bool,
+    tuning: CodedTuning,
     stage: &str,
 ) -> Result<CodedItem> {
     let frame = YuvFrame {
@@ -874,19 +928,29 @@ pub(crate) fn encode_coded_item(
         u,
         v,
     };
-    let coded = encode_key_frame_yuv_with_q(&frame, q).map_err(|e| av1_err(stage, e))?;
+    let mut so = StillOptions::new(q);
+    so.speed = still_speed(tuning.speed);
+    so.full_range = full_range;
+    so.reduced_header = true;
+    let (cols, rows) = auto_tile_layout(pw, ph, TILE_LAYOUT_THREADS);
+    so.tile_cols_log2 = cols;
+    so.tile_rows_log2 = rows;
+    so.auto_tiles = false;
+    so.threads = tuning.threads.max(1);
+    let coded = if tuning.still {
+        encode_still_yuv(&frame, &so)
+    } else {
+        encode_key_frame_yuv_with_options(&frame, &so)
+    }
+    .map_err(|e| av1_err(stage, e))?;
     // The AV1 Image Item Data is the content of a sync AV1 sample
     // (av1-avif §2.1) — the encoder's §7.5 temporal-unit bytes
     // (TD + SH + frame OBU; exactly one Sequence Header OBU, the
-    // §2.1 `shall`).
-    let payload = if full_range {
-        full_range_temporal_unit(&coded.temporal_unit_bytes, &coded.seq)?
-    } else {
-        coded.temporal_unit_bytes
-    };
+    // §2.1 `shall`). `color_range` is coded natively from
+    // `so.full_range`.
     let av1c = av1c_from_seq(&coded.seq);
     Ok(CodedItem {
-        payload,
+        payload: coded.temporal_unit_bytes,
         av1c,
         seq_profile: coded.seq.seq_profile,
     })
@@ -906,7 +970,13 @@ pub(crate) fn colr_is_full_range(img: &StillImage) -> bool {
 
 /// Pad the image's planes to the coded extents and encode the primary
 /// coded item.
-fn encode_primary(img: &StillImage, pw: u32, ph: u32, q: u8) -> Result<CodedItem> {
+fn encode_primary(
+    img: &StillImage,
+    pw: u32,
+    ph: u32,
+    q: u8,
+    tuning: CodedTuning,
+) -> Result<CodedItem> {
     let (w, h) = (img.width as usize, img.height as usize);
     let y = pad_plane(&img.y, w, h, pw as usize, ph as usize);
     let (u, v) = if img.chroma.has_chroma() {
@@ -930,13 +1000,21 @@ fn encode_primary(img: &StillImage, pw: u32, ph: u32, q: u8) -> Result<CodedItem
         v,
         q,
         colr_is_full_range(img),
+        tuning,
         "primary",
     )
 }
 
 /// Encode the alpha plane as a monochrome coded item at the same
 /// coded extents and bit depth as the master (av1-avif §4.1).
-fn encode_alpha(img: &StillImage, alpha: &[u16], pw: u32, ph: u32, q: u8) -> Result<CodedItem> {
+fn encode_alpha(
+    img: &StillImage,
+    alpha: &[u16],
+    pw: u32,
+    ph: u32,
+    q: u8,
+    tuning: CodedTuning,
+) -> Result<CodedItem> {
     let (w, h) = (img.width as usize, img.height as usize);
     let a = pad_plane(alpha, w, h, pw as usize, ph as usize);
     // av1-avif §4.1 `shall`s on the auxiliary stream: `mono_chrome = 1`
@@ -953,6 +1031,7 @@ fn encode_alpha(img: &StillImage, alpha: &[u16], pw: u32, ph: u32, q: u8) -> Res
         Vec::new(),
         q,
         true,
+        tuning,
         "alpha",
     )
 }
@@ -996,7 +1075,7 @@ pub fn encode_still_burst(images: &[StillImage], opts: &EncodeOptions) -> Result
                  {STILL_MAX_CODED_DIM}",
             )));
         }
-        let coded = encode_primary(img, pw, ph, opts.base_q_idx)?;
+        let coded = encode_primary(img, pw, ph, opts.base_q_idx, CodedTuning::of(opts))?;
         max_profile = max_profile.max(coded.seq_profile);
         let mut member = crate::mux::BurstMember::new(pw, ph, coded.payload, coded.av1c);
         member.pixi = Some(pixi_bits(img));
@@ -1006,7 +1085,8 @@ pub fn encode_still_burst(images: &[StillImage], opts: &EncodeOptions) -> Result
             member.clap = Some(top_left_clap(img.width, img.height, pw, ph));
         }
         if let Some(alpha) = &img.alpha {
-            let coded_alpha = encode_alpha(img, alpha, pw, ph, opts.alpha_q_idx)?;
+            let coded_alpha =
+                encode_alpha(img, alpha, pw, ph, opts.alpha_q_idx, CodedTuning::of(opts))?;
             max_profile = max_profile.max(coded_alpha.seq_profile);
             member.alpha = Some(crate::mux::BurstAlpha::new(
                 coded_alpha.payload,
@@ -1032,7 +1112,7 @@ fn still_muxer(img: &StillImage, opts: &EncodeOptions) -> Result<(AvifMuxer, u8)
              {STILL_MAX_CODED_DIM}; use encode_still_grid",
         )));
     }
-    let primary = encode_primary(img, pw, ph, opts.base_q_idx)?;
+    let primary = encode_primary(img, pw, ph, opts.base_q_idx, CodedTuning::of(opts))?;
     let mut max_profile = primary.seq_profile;
 
     // ispe documents the coded extents (av1-avif §2.2.2); clap crops
@@ -1085,7 +1165,7 @@ fn still_muxer(img: &StillImage, opts: &EncodeOptions) -> Result<(AvifMuxer, u8)
                 gm.map.width, gm.map.height
             )));
         }
-        let coded_map = encode_primary(&gm.map, gw, gh, gm.q)?;
+        let coded_map = encode_primary(&gm.map, gw, gh, gm.q, CodedTuning::of(opts))?;
         max_profile = max_profile.max(coded_map.seq_profile);
         let channels = if gm.map.chroma == StillChroma::Monochrome {
             1
@@ -1112,7 +1192,8 @@ fn still_muxer(img: &StillImage, opts: &EncodeOptions) -> Result<(AvifMuxer, u8)
         });
     }
     if let Some(alpha) = &img.alpha {
-        let coded_alpha = encode_alpha(img, alpha, pw, ph, opts.alpha_q_idx)?;
+        let coded_alpha =
+            encode_alpha(img, alpha, pw, ph, opts.alpha_q_idx, CodedTuning::of(opts))?;
         max_profile = max_profile.max(coded_alpha.seq_profile);
         mux = mux
             .with_alpha(
@@ -1123,7 +1204,8 @@ fn still_muxer(img: &StillImage, opts: &EncodeOptions) -> Result<(AvifMuxer, u8)
             .with_alpha_pixi(vec![img.bit_depth]);
     }
     if let Some(depth) = &img.depth_map {
-        let coded_depth = encode_alpha(img, depth, pw, ph, opts.alpha_q_idx)?;
+        let coded_depth =
+            encode_alpha(img, depth, pw, ph, opts.alpha_q_idx, CodedTuning::of(opts))?;
         max_profile = max_profile.max(coded_depth.seq_profile);
         mux = mux.with_depth(coded_depth.payload, coded_depth.av1c);
     }
@@ -1257,6 +1339,7 @@ pub fn encode_still_grid(
                 tv,
                 opts.base_q_idx,
                 colr_is_full_range(img),
+                CodedTuning::of(opts),
                 "grid tile",
             )?;
             max_profile = max_profile.max(coded.seq_profile);
@@ -1280,6 +1363,7 @@ pub fn encode_still_grid(
                     Vec::new(),
                     opts.alpha_q_idx,
                     true,
+                    CodedTuning::of(opts),
                     "grid alpha tile",
                 )?;
                 max_profile = max_profile.max(coded_alpha.seq_profile);
@@ -1462,13 +1546,14 @@ pub fn encode_still_overlay(
                 "avif still: overlay layer {i} coded extents {pw}x{ph} exceed {STILL_MAX_CODED_DIM}"
             )));
         }
-        let coded = encode_primary(img, pw, ph, opts.base_q_idx)?;
+        let coded = encode_primary(img, pw, ph, opts.base_q_idx, CodedTuning::of(opts))?;
         max_profile = max_profile.max(coded.seq_profile);
         let clap = ((pw, ph) != (img.width, img.height))
             .then(|| top_left_clap(img.width, img.height, pw, ph));
         let alpha = match &img.alpha {
             Some(a) => {
-                let coded_alpha = encode_alpha(img, a, pw, ph, opts.alpha_q_idx)?;
+                let coded_alpha =
+                    encode_alpha(img, a, pw, ph, opts.alpha_q_idx, CodedTuning::of(opts))?;
                 max_profile = max_profile.max(coded_alpha.seq_profile);
                 Some((coded_alpha.payload, coded_alpha.av1c))
             }
@@ -1669,7 +1754,8 @@ pub fn encode_still_layered(
     }
     if selected == layers.len() - 1 {
         if let Some(alpha) = &top.alpha {
-            let coded_alpha = encode_alpha(top, alpha, pw, ph, opts.alpha_q_idx)?;
+            let coded_alpha =
+                encode_alpha(top, alpha, pw, ph, opts.alpha_q_idx, CodedTuning::of(opts))?;
             max_profile = max_profile.max(coded_alpha.seq_profile);
             mux = mux
                 .with_alpha(

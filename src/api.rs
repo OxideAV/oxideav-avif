@@ -965,6 +965,24 @@ impl StillChroma {
     }
 }
 
+/// Search effort of the AV1 still encoder behind every coded item
+/// ([`EncodeOptions::speed`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EncodeSpeed {
+    /// The production point (default): the reduced search ladders —
+    /// a 12 MP 8-bit still in seconds single-threaded, about a second
+    /// on 8 threads.
+    #[default]
+    Fast,
+    /// A fuller search (rect partitions, refined deblock, fuller CDEF
+    /// / restoration sweeps): roughly 2.5 × the wall clock for a small
+    /// rate gain.
+    Balanced,
+    /// The exhaustive search with every election: minutes per 12 MP
+    /// picture.
+    Thorough,
+}
+
 /// Tuning for the encoders ([`crate::encode`], [`crate::encode_rgb8`],
 /// [`crate::encode_rgba8`], [`crate::still::encode_still`] …). The
 /// default is a lossless colour encode (`base_q_idx = 0`), lossless
@@ -996,6 +1014,12 @@ pub struct EncodeOptions {
     /// Embed `metadata.icc` as an ICC `colr` next to the `nclx` one
     /// (default `true`).
     pub embed_icc: bool,
+    /// Search effort of the AV1 encode (default [`EncodeSpeed::Fast`]).
+    pub speed: EncodeSpeed,
+    /// Worker threads for the AV1 tile search of every coded item
+    /// (default `1`). The tile layout is derived from the picture size
+    /// alone, so the coded bytes never depend on this value.
+    pub threads: usize,
 }
 
 impl Default for EncodeOptions {
@@ -1008,6 +1032,8 @@ impl Default for EncodeOptions {
             embed_exif: true,
             embed_xmp: true,
             embed_icc: true,
+            speed: EncodeSpeed::Fast,
+            threads: 1,
         }
     }
 }
@@ -1057,6 +1083,16 @@ impl EncodeOptions {
     /// Setter: replace `embed_icc`.
     pub fn with_embed_icc(mut self, embed_icc: bool) -> Self {
         self.embed_icc = embed_icc;
+        self
+    }
+    /// Setter: replace `speed`.
+    pub fn with_speed(mut self, speed: EncodeSpeed) -> Self {
+        self.speed = speed;
+        self
+    }
+    /// Setter: replace `threads` (clamped to at least 1).
+    pub fn with_threads(mut self, threads: usize) -> Self {
+        self.threads = threads.max(1);
         self
     }
 

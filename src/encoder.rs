@@ -85,9 +85,14 @@
 //!   extents promote to 4:4:4). Planar frames keep their own layout.
 //! * `premultiplied` — `true` to emit the `prem` iref declaring
 //!   premultiplied alpha (default `false`).
+//! * `speed` — `fast` (default) / `balanced` / `thorough`: the AV1
+//!   search effort ([`EncodeSpeed`]).
+//! * `threads` — worker threads for the AV1 tile search; `0` (default)
+//!   follows the budget of [`Encoder::set_execution_context`] (serial
+//!   until one is granted). The tile layout is derived from the
+//!   picture size alone, so the bytes never depend on the budget.
 //!
-//! With neither `quality` nor `q` the encode is lossless — the bytes
-//! of every earlier release.
+//! With neither `quality` nor `q` the encode is lossless.
 
 use oxideav_core::frame::VideoFrame;
 use oxideav_core::{
@@ -95,7 +100,7 @@ use oxideav_core::{
     Error, Frame, OptionField, OptionKind, OptionValue, Packet, PixelFormat, Result, TimeBase,
 };
 
-use crate::api::{ColorInfo, EncodeOptions};
+use crate::api::{ColorInfo, EncodeOptions, EncodeSpeed};
 use crate::meta::Colr;
 use crate::still::{encode_still, identity_full_range_colr, StillChroma, StillImage};
 
@@ -161,6 +166,11 @@ pub struct AvifEncoderOptions {
     pub chroma: StillChroma,
     /// Emit the `prem` iref (`premultiplied`).
     pub premultiplied: bool,
+    /// AV1 search effort (`speed`).
+    pub speed: EncodeSpeed,
+    /// Explicit worker threads (`threads`); `None` = the execution
+    /// context's budget.
+    pub threads: Option<usize>,
 }
 
 impl Default for AvifEncoderOptions {
@@ -171,6 +181,8 @@ impl Default for AvifEncoderOptions {
             alpha_q: None,
             chroma: StillChroma::Yuv420,
             premultiplied: false,
+            speed: EncodeSpeed::Fast,
+            threads: None,
         }
     }
 }
@@ -205,6 +217,16 @@ impl AvifEncoderOptions {
         self.premultiplied = premultiplied;
         self
     }
+    /// Setter: replace `speed`.
+    pub fn with_speed(mut self, speed: EncodeSpeed) -> Self {
+        self.speed = speed;
+        self
+    }
+    /// Setter: replace `threads` (`None` = the execution context's budget).
+    pub fn with_threads(mut self, threads: Option<usize>) -> Self {
+        self.threads = threads;
+        self
+    }
 
     /// Strict parse of a parameter set's option bag.
     pub fn from_params(params: &CodecParameters) -> Result<Self> {
@@ -234,6 +256,8 @@ impl AvifEncoderOptions {
             "alpha_q" => into.alpha_q = self.alpha_q,
             "chroma" => into.chroma = self.chroma,
             "premultiplied" => into.premultiplied = self.premultiplied,
+            "speed" => into.speed = self.speed,
+            "threads" => into.threads = self.threads,
             other => return Err(Error::invalid(format!("unknown option '{other}'"))),
         }
         Ok(())
@@ -241,7 +265,9 @@ impl AvifEncoderOptions {
 
     /// The still-encoder tuning these options resolve to: `q` else the
     /// `quality` mapping else lossless for the colour planes, the same
-    /// for alpha with `alpha_q`; `chroma` / `premultiplied` as given.
+    /// for alpha with `alpha_q`; `chroma` / `premultiplied` / `speed`
+    /// as given; `threads` as given, else `1` (the encoder fills the
+    /// execution context's budget in per frame).
     pub fn resolve(&self) -> EncodeOptions {
         let from_quality = self.quality.map(quality_to_base_q_idx).unwrap_or(0);
         EncodeOptions::new(
@@ -250,6 +276,8 @@ impl AvifEncoderOptions {
             self.premultiplied,
         )
         .with_chroma(self.chroma)
+        .with_speed(self.speed)
+        .with_threads(self.threads.unwrap_or(1))
     }
 }
 
@@ -295,6 +323,18 @@ impl CodecOptionsStruct for AvifEncoderOptions {
             default: OptionValue::Bool(false),
             help: "Emit the prem reference declaring the colour planes premultiplied by alpha (signalling only)",
         },
+        OptionField {
+            name: "speed",
+            kind: OptionKind::Enum(&["fast", "balanced", "thorough"]),
+            default: OptionValue::String(String::new()),
+            help: "AV1 search effort (default fast)",
+        },
+        OptionField {
+            name: "threads",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(0),
+            help: "Worker threads for the AV1 tile search (bytes never depend on it); 0 = the execution context's budget (serial unless granted)",
+        },
     ];
 
     fn apply(&mut self, key: &str, value: &OptionValue) -> Result<()> {
@@ -315,6 +355,22 @@ impl CodecOptionsStruct for AvifEncoderOptions {
                 }
             }
             "premultiplied" => self.premultiplied = value.as_bool()?,
+            "speed" => {
+                self.speed = match value.as_str()? {
+                    "fast" => EncodeSpeed::Fast,
+                    "balanced" => EncodeSpeed::Balanced,
+                    "thorough" => EncodeSpeed::Thorough,
+                    other => {
+                        return Err(Error::invalid(format!(
+                            "avif encode: speed '{other}' is not fast / balanced / thorough"
+                        )))
+                    }
+                }
+            }
+            "threads" => {
+                let n = value.as_u32()?;
+                self.threads = (n > 0).then_some(n as usize);
+            }
             other => return Err(Error::invalid(format!("unknown option '{other}'"))),
         }
         Ok(())
@@ -327,6 +383,10 @@ impl CodecOptionsStruct for AvifEncoderOptions {
 pub struct AvifEncoder {
     params: CodecParameters,
     opts: EncodeOptions,
+    /// `threads` given explicitly (wins over the execution context).
+    threads_option: Option<usize>,
+    /// The budget of the last [`Encoder::set_execution_context`].
+    exec_threads: usize,
     pending: Vec<Packet>,
     flushed: bool,
 }
@@ -363,15 +423,20 @@ impl AvifEncoder {
         Self {
             params,
             opts: opts.resolve(),
+            threads_option: opts.threads,
+            exec_threads: 1,
             pending: Vec::new(),
             flushed: false,
         }
     }
 
     /// The still-encoder tuning this encoder codes with (`q`,
-    /// `alpha_q`, the `quality` mapping, `chroma`, `premultiplied`).
-    pub fn encode_options(&self) -> &EncodeOptions {
-        &self.opts
+    /// `alpha_q`, the `quality` mapping, `chroma`, `premultiplied`,
+    /// `speed`, and the worker threads the next frame runs on: the
+    /// explicit `threads` option, else the execution context's budget).
+    pub fn encode_options(&self) -> EncodeOptions {
+        self.opts
+            .with_threads(self.threads_option.unwrap_or(self.exec_threads))
     }
 
     /// The colour a lossy packed-RGB frame is converted to Y′CbCr
@@ -851,7 +916,7 @@ impl Encoder for AvifEncoder {
         if let Some(label) = coded_label(&img) {
             self.params.pixel_format = Some(label);
         }
-        let bytes = encode_still(&img, &self.opts)?;
+        let bytes = encode_still(&img, &self.encode_options())?;
         let mut pkt = Packet::new(0, TimeBase::new(1, 90_000), bytes);
         if let Some(pts) = vf.pts {
             pkt = pkt.with_pts(pts);
@@ -875,6 +940,13 @@ impl Encoder for AvifEncoder {
     fn flush(&mut self) -> Result<()> {
         self.flushed = true;
         Ok(())
+    }
+
+    /// The worker budget for the AV1 tile search of every coded item;
+    /// an explicit `threads` option wins over it. The bytes never
+    /// depend on the budget (the tile layout follows the picture size).
+    fn set_execution_context(&mut self, ctx: &oxideav_core::ExecutionContext) {
+        self.exec_threads = ctx.threads.max(1);
     }
 }
 

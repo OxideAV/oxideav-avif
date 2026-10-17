@@ -194,8 +194,8 @@ pub mod still;
 
 pub use alpha::{composite_alpha, find_alpha_item_id, ALPHA_URN_PREFIX};
 pub use api::{
-    info, probe, AvifImage, ColorInfo, ColorRange, DecodeOptions, EncodeOptions, Frame, ImageInfo,
-    Metadata, PixelFormat, Plane, RgbImage, RgbaImage, StillChroma,
+    info, probe, AvifImage, ColorInfo, ColorRange, DecodeOptions, EncodeOptions, EncodeSpeed,
+    Frame, ImageInfo, Metadata, PixelFormat, Plane, RgbImage, RgbaImage, StillChroma,
 };
 pub use avis::{
     audit_avis_profile_compliance, audit_avis_sequence, audit_edit_list, inspect_avis, parse_avis,
@@ -290,7 +290,7 @@ pub use still::StillEncodeOptions;
 pub use still::{
     elect_grid_tiling, encode_still, encode_still_auto, encode_still_burst, encode_still_grid,
     encode_still_layered, encode_still_overlay, GainMapSpec, OverlayCanvas, OverlayLayerImage,
-    StillImage, StillProperties, GRID_MIN_TILE_DIM, STILL_MAX_CODED_DIM,
+    StillImage, StillProperties, GRID_MIN_TILE_DIM, STILL_MAX_CODED_DIM, TILE_LAYOUT_THREADS,
 };
 
 #[cfg(feature = "registry")]

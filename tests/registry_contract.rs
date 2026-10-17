@@ -19,8 +19,8 @@
 use oxideav_avif::{AvifDecoder, ENCODER_PIXEL_FORMATS};
 use oxideav_core::frame::{VideoFrame, VideoPlane};
 use oxideav_core::{
-    CodecId, CodecOptions, CodecParameters, Decoder, Error, ExecutionContext, Frame, Packet,
-    PixelFormat, RuntimeContext, TimeBase,
+    CodecId, CodecOptions, CodecParameters, Decoder, Encoder, Error, ExecutionContext, Frame,
+    Packet, PixelFormat, RuntimeContext, TimeBase,
 };
 
 const AVIF: &str = oxideav_avif::CODEC_ID_STR;
@@ -226,7 +226,15 @@ fn capabilities_declare_layouts_flags_and_quality() {
     let names: Vec<&str> = schema.iter().map(|f| f.name).collect();
     assert_eq!(
         names,
-        ["quality", "q", "alpha_q", "chroma", "premultiplied"]
+        [
+            "quality",
+            "q",
+            "alpha_q",
+            "chroma",
+            "premultiplied",
+            "speed",
+            "threads"
+        ]
     );
     let schema = ctx
         .codecs
@@ -356,6 +364,10 @@ fn registry_encoder_refuses_unknown_or_out_of_range_options() {
     ));
     assert!(matches!(
         bad(CodecOptions::new().set("chroma", "411")),
+        Some(Error::InvalidData(_))
+    ));
+    assert!(matches!(
+        bad(CodecOptions::new().set("speed", "fastest")),
         Some(Error::InvalidData(_))
     ));
     // The historical lenient constructor keeps ignoring them.
@@ -522,6 +534,55 @@ fn lossy_packed_rgb_lands_on_ycbcr_lossless_keeps_identity() {
 }
 
 // ─────────────────────────── thread budget ───────────────────────────
+
+/// The registry encoder codes the same bytes at any worker budget
+/// (the tile layout follows the picture size), serially by default,
+/// on the execution context's budget or the explicit `threads`
+/// option; a 1024 × 256 picture is laid out as 8 tiles.
+#[test]
+fn encoder_thread_budget_leaves_the_bytes_unchanged() {
+    let ctx = registry();
+    let (w, h) = (1024u32, 256u32);
+    let f = frame(PixelFormat::Yuv420P, w, h);
+    let p = params(
+        PixelFormat::Yuv420P,
+        w,
+        h,
+        CodecOptions::new().set("quality", "70"),
+    );
+    let (serial, _) = encode(&ctx, &p, &f);
+    let mut enc = ctx.codecs.first_encoder(&p).expect("encoder");
+    enc.set_execution_context(&ExecutionContext::with_threads(4));
+    enc.send_frame(&f).expect("send");
+    let budget = enc.receive_packet().expect("packet").data;
+    assert_eq!(budget, serial, "budget 4");
+    let (explicit, _) = encode(
+        &ctx,
+        &params(
+            PixelFormat::Yuv420P,
+            w,
+            h,
+            CodecOptions::new().set("quality", "70").set("threads", "3"),
+        ),
+        &f,
+    );
+    assert_eq!(explicit, serial, "threads=3");
+    let e = oxideav_avif::AvifEncoder::try_with_params(params(
+        PixelFormat::Yuv420P,
+        w,
+        h,
+        CodecOptions::new().set("threads", "3"),
+    ))
+    .expect("encoder");
+    assert_eq!(e.encode_options().threads, 3);
+    let mut e = oxideav_avif::AvifEncoder::try_with_params(p).expect("encoder");
+    assert_eq!(e.encode_options().threads, 1);
+    e.set_execution_context(&ExecutionContext::with_threads(6));
+    assert_eq!(e.encode_options().threads, 6);
+    // The picture decodes back and is labelled as coded.
+    let dp = params(PixelFormat::Yuv420P, w, h, CodecOptions::new());
+    assert_eq!(decode(&ctx, &dp, &serial).1, PixelFormat::YuvJ420P);
+}
 
 const FIXTURES: &[(&str, &[u8])] = &[
     (

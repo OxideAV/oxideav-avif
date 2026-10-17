@@ -95,6 +95,46 @@ fn main() {
         t1 / tn
     );
 
+    // The registry encoder on the same picture (quality 50): serial vs
+    // the budget — identical bytes, the wall clock is the point.
+    let registry_frame = Frame::Video(oxideav_core::frame::VideoFrame {
+        pts: Some(0),
+        planes: [
+            (&input.y, width),
+            (&input.u, width / 2),
+            (&input.v, width / 2),
+        ]
+        .iter()
+        .map(|(p, w)| oxideav_core::frame::VideoPlane {
+            stride: *w as usize,
+            data: p.iter().map(|&v| v as u8).collect(),
+        })
+        .collect(),
+    });
+    let mut p = CodecParameters::video(CodecId::new(oxideav_avif::CODEC_ID_STR));
+    p.width = Some(width);
+    p.height = Some(height);
+    p.pixel_format = Some(oxideav_core::PixelFormat::Yuv420P);
+    p.options = oxideav_core::CodecOptions::new().set("quality", "50");
+    let encode_registry = |budget: usize| -> (Vec<u8>, f64) {
+        let mut enc = oxideav_avif::make_encoder(&p).expect("encoder");
+        if budget > 1 {
+            enc.set_execution_context(&ExecutionContext::with_threads(budget));
+        }
+        let t = Instant::now();
+        enc.send_frame(&registry_frame).expect("send");
+        let pkt = enc.receive_packet().expect("packet");
+        (pkt.data, t.elapsed().as_secs_f64())
+    };
+    let (e1, te1) = encode_registry(1);
+    let (en, ten) = encode_registry(threads);
+    assert_eq!(e1, en, "registry encoder: byte-identical at any budget");
+    eprintln!(
+        "registry encode (quality 50): {} bytes, serial {te1:.2} s, {threads} workers {ten:.2} s ({:.2}x), identical bytes",
+        e1.len(),
+        te1 / ten
+    );
+
     // The same picture as a 4 × 3 grid of single-tile items.
     let t = Instant::now();
     let still = StillImage::yuv(

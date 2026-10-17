@@ -27,13 +27,15 @@
 //! crate's inter encoder; the first sample of each group is the sync
 //! sample.
 
+use crate::api::EncodeSpeed;
 use crate::error::{AvifError as Error, Result};
 use crate::mux::{
     prop_av1c, prop_clap, prop_colr, prop_ispe, prop_pixi, sequence_brands, ProfileBrand,
 };
 use crate::still::{
     av1_err, av1c_from_seq, coded_extent, colr_is_full_range, encode_coded_item,
-    full_range_temporal_unit, pad_plane, pixi_bits, top_left_clap, StillImage, STILL_MAX_CODED_DIM,
+    full_range_temporal_unit, pad_plane, pixi_bits, top_left_clap, CodedTuning, StillImage,
+    STILL_MAX_CODED_DIM,
 };
 use oxideav_av1::encoder::inter_frame::{encode_gop_yuv_with_q, GOP_MAX_FRAMES};
 use oxideav_av1::encoder::yuv_frame::YuvFrame;
@@ -220,6 +222,7 @@ pub(crate) fn encode_sequence_timed(
                 f.v.clone(),
                 opts.base_q_idx,
                 full_range,
+                CodedTuning::sequence(EncodeSpeed::Fast, 1),
                 "sequence frame",
             )?;
             if av1c.is_none() {
