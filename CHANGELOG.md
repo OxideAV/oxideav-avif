@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`quality` on the registry encoder (image-gateway contract, round
+  476).** The framework's advisory `quality` option (0..=100, 100 =
+  lossless, the default) maps onto the AV1 quantiser when `q` is not
+  given — `base_q_idx = ((100 − quality) × 255 + 50) / 100`, the
+  `EncodeOptions::with_quality` curve (90 → 26, 50 → 128, 10 → 230) —
+  and onto the alpha auxiliary when `alpha_q` is not given; an
+  explicit `q` / `alpha_q` wins; neither given keeps the lossless
+  bytes of every earlier release. `quality_to_base_q_idx` is public.
+- **Declared input layouts.** `ENCODER_PIXEL_FORMATS` lists the 27
+  layouts the registry encoder accepts (planar Y′CbCr 8 / 10 / 12-bit
+  incl. `YuvJ*`, grey 8 / 10 / 12, packed `Rgb24` / `Rgba` / `Bgr24` /
+  `Bgra`, planar `Gbrp(a)` 8 / 10 / 12, `Yuva420P`, `Ya8`) and is the
+  registry entry's `accepted_pixel_formats`; `lossy` and `lossless`
+  are both declared. Any other label is a typed `Unsupported` naming
+  it.
+- **Lossy packed RGB codes as Y′CbCr.** A packed RGB(A) / BGR(A) frame
+  at a lossy quality is converted to Y′CbCr (the stream's signalled
+  matrix / range where given, else the MIAF default BT.601 full
+  range) and coded in the new `chroma` option's layout (`420`, the
+  default, `422`, `444`; odd extents promote to 4:4:4); the lossless
+  identity-matrix 4:4:4 coding (byte-exact) stays at quality 100.
+- **Option schemas.** `AvifEncoderOptions` (`quality`, `q`,
+  `alpha_q`, `chroma`, `premultiplied`) and `AvifDecoderOptions`
+  (`gain_map`, `reference_white`, `threads`, `max_width`,
+  `max_height`, `max_pixels`, `max_bytes`, `strict`, `layer`) are
+  declared on the registry entry (`encoder_options` /
+  `decoder_options`), so the gateway hands `quality` through and
+  `oxideav list` can enumerate the knobs. `make_encoder` /
+  `AvifEncoder::try_with_params` and `AvifDecoder::with_params` parse
+  strictly (an unknown key, a malformed or out-of-range value is
+  `InvalidData`); `AvifEncoder::with_params` keeps ignoring them.
+- **Execution context on the decoder.** `AvifDecoder` honours
+  `Decoder::set_execution_context`: the worker budget is handed to the
+  AV1 decoder of every coded item and sequence sample (oxideav-av1
+  0.1.21 walks a multi-tile intra frame tile-parallel and runs its
+  post-filters by row band, byte-identical at any budget). The
+  `threads` decoder option (`DecodeOptions::threads` /
+  `with_threads`, `worker_count`) fixes the budget explicitly and wins
+  over the context; `AvifDecoder::effective_options` / `threads`
+  report what the next decode runs with. A 12 MP tiled 4:2:0 still
+  (`examples/decode_threads`) decodes in 0.34 s serial → 0.07 s on 8
+  workers on the development machine.
+- `Decoder::output_pixel_format` is implemented (the label of the
+  last decoded file, `AvifDecoder::output_format`), and the encoder's
+  `output_params` carry the coded label after a frame (`Gbrp8` for
+  lossless packed RGB, `YuvJ420P` for a lossy one, `YuvJ*` for an
+  8-bit `Yuv*` input written without `colr`).
+
+### Changed
+
+- `make_encoder` refuses an option bag it cannot parse instead of
+  silently coding at the defaults (see above).
+
 ## [0.0.14](https://github.com/OxideAV/oxideav-avif/compare/v0.0.13...v0.0.14) - 2026-10-05
 
 ### Other

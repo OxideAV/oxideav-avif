@@ -21,7 +21,8 @@
 use oxideav_core::frame::{VideoFrame, VideoPlane};
 use oxideav_core::Decoder;
 use oxideav_core::{
-    CodecId, CodecParameters, ColorSignal, Error, Frame, Packet, PixelFormat, Result, TimeBase,
+    CodecId, CodecParameters, ColorSignal, Error, ExecutionContext, Frame, Packet, PixelFormat,
+    Result, TimeBase,
 };
 
 use crate::api::DecodeOptions;
@@ -182,8 +183,13 @@ pub struct AvifDecoder {
     /// The framework label of the last decoded file's frames.
     output_format: Option<PixelFormat>,
     /// The contract options the decode runs with (gain-map
-    /// application, reference white, limits, strictness, layer).
+    /// application, reference white, limits, strictness, layer,
+    /// an explicit `threads`).
     options: DecodeOptions,
+    /// The worker budget of the last [`Decoder::set_execution_context`]
+    /// (serial until one is granted). An explicit `options.threads`
+    /// wins over it; see [`Self::effective_options`].
+    exec_threads: usize,
 }
 
 impl AvifDecoder {
@@ -195,32 +201,43 @@ impl AvifDecoder {
             color_signal: None,
             output_format: None,
             options: DecodeOptions::default(),
+            exec_threads: 1,
         }
     }
 
-    /// Build a decoder from a parameter set: the `gain_map` codec
-    /// option (`base`, the default, or `apply`) selects
+    /// The options a decode runs with: [`Self::options`] with the
+    /// execution context's worker budget filled in when no explicit
+    /// `threads` was set (the `threads` codec option or
+    /// [`DecodeOptions::with_threads`]).
+    pub fn effective_options(&self) -> DecodeOptions {
+        let mut o = self.options;
+        if o.threads.is_none() && self.exec_threads > 1 {
+            o.threads = Some(self.exec_threads);
+        }
+        o
+    }
+
+    /// The worker budget the next decode runs the AV1 decoder with.
+    pub fn threads(&self) -> usize {
+        self.effective_options().worker_count()
+    }
+
+    /// Build a decoder from a parameter set, its options parsed
+    /// strictly against [`AvifDecoderOptions`]'s schema: `gain_map`
+    /// (`base`, the default, or `apply`) selects
     /// [`set_tone_mapped`](Self::set_tone_mapped); `reference_white`
     /// (cd/m², default 203) sets
-    /// [`set_reference_white`](Self::set_reference_white). Any other
-    /// value is refused.
+    /// [`set_reference_white`](Self::set_reference_white); `threads`
+    /// fixes the AV1 worker budget (`0`, the default, follows the
+    /// execution context); `max_width` / `max_height` / `max_pixels` /
+    /// `max_bytes` (`0` = unlimited), `strict` and `layer` (`-1` =
+    /// the file's `lsel`) set the matching [`DecodeOptions`] fields.
+    /// An unknown key or a malformed value is refused.
     pub fn with_params(params: &CodecParameters) -> Result<Self> {
+        let o = oxideav_core::parse_options::<AvifDecoderOptions>(&params.options)?;
         let mut d = Self::new(params.codec_id.clone());
-        match params.options.get("gain_map") {
-            None | Some("base") => {}
-            Some("apply") => d.options.tone_mapped = true,
-            Some(other) => {
-                return Err(Error::invalid(format!(
-                    "avif: gain_map option '{other}' — expected 'base' or 'apply'"
-                )))
-            }
-        }
-        if let Some(v) = params.options.get("reference_white") {
-            let nits: f64 = v.parse().map_err(|_| {
-                Error::invalid(format!("avif: reference_white '{v}' is not a number"))
-            })?;
-            d.set_reference_white(nits)?;
-        }
+        d.options = o.apply_to(d.options);
+        d.set_reference_white(o.reference_white)?;
         Ok(d)
     }
 
@@ -316,7 +333,8 @@ impl AvifDecoder {
     pub fn decode_file(&mut self, file: &[u8]) -> Result<AvifInfo> {
         // The contract implementation does the work; this adapter only
         // re-labels the result for the framework.
-        let decoded = crate::api_codec::decode_primary(file, &self.options).map_err(core_err)?;
+        let decoded =
+            crate::api_codec::decode_primary(file, &self.effective_options()).map_err(core_err)?;
         let format = decoded.image.format;
         let signal = color_signal_for(Some(&decoded.image.color.to_colr()));
         let out = VideoFrame::from(decoded.image);
@@ -355,17 +373,14 @@ impl AvifDecoder {
     /// still-image [`decode_file`] path.
     pub fn decode_avis_file(&mut self, file: &[u8]) -> Result<usize> {
         let mut frames_queued = 0usize;
-        let seq = crate::api_codec::decode_sequence_with(
-            file,
-            &self.options,
-            None,
-            |frame, seq, _duration| {
+        let opts = self.effective_options();
+        let seq =
+            crate::api_codec::decode_sequence_with(file, &opts, None, |frame, seq, _duration| {
                 self.pending.push(with_signal(frame, seq.signal));
                 frames_queued += 1;
                 Ok(())
-            },
-        )
-        .map_err(core_err)?;
+            })
+            .map_err(core_err)?;
         self.color_signal = Some(seq.signal);
         self.output_format = seq.layout.map(|l| labelled_pixel_format(l, &seq.signal));
         Ok(frames_queued)
@@ -473,6 +488,7 @@ fn decode_av01_item(
     av1c: &[u8],
     ispe: Option<(u32, u32)>,
     select: LayerSelect,
+    threads: usize,
 ) -> Result<(VideoFrame, PixelFormat, u32, u32)> {
     if obu_bytes.len() > MAX_AV1_ITEM_BYTES {
         return Err(Error::invalid(format!(
@@ -497,6 +513,11 @@ fn decode_av01_item(
             }
             params.extradata = av1c.to_vec();
             let mut av1 = oxideav_av1::registry::make_decoder(&params)?;
+            if threads > 1 {
+                // The budget is advisory and the output is
+                // byte-identical at any value (oxideav-av1 0.1.21).
+                av1.set_execution_context(&ExecutionContext::with_threads(threads));
+            }
             let pkt = Packet::new(0, TimeBase::new(1, 90_000), obu_bytes.to_vec());
             av1.send_packet(&pkt)?;
             let mut out = Vec::new();
@@ -687,6 +708,8 @@ pub(crate) struct DecodeCtx {
     /// Spatial layer to render for the top-level coded item instead
     /// of its `lsel`.
     layer: Option<u16>,
+    /// Worker budget handed to every AV1 item decode (`≥ 1`).
+    threads: usize,
 }
 
 impl DecodeCtx {
@@ -699,6 +722,7 @@ impl DecodeCtx {
             reference_white_nits: opts.reference_white_nits,
             max_pixels: opts.max_pixels.unwrap_or(u64::MAX),
             layer: opts.layer,
+            threads: opts.worker_count(),
         }
     }
 }
@@ -782,7 +806,7 @@ fn decode_item_output_inner(
     let item_type = info.item_type;
     let mut image = if item_type == ITEM_TYPE_AV01 {
         let layer = if depth == 0 { ctx.layer } else { None };
-        decode_coded_item(hdr, item_id, layer)?
+        decode_coded_item(hdr, item_id, layer, ctx.threads)?
     } else if item_type == ITEM_TYPE_TMAP {
         let (base, _gain) = tone_map_inputs(hdr, item_id)?;
         if depth == 0 && !ctx.tone_mapped {
@@ -862,8 +886,14 @@ fn decode_item_output_inner(
 
 /// Decode one coded `av01` item: AV1 decode + the `ispe` clamp against
 /// a padded coded frame, re-laid out as the container frame. `layer`
-/// overrides the item's `lsel` choice of spatial layer.
-fn decode_coded_item(hdr: &AvifHeader<'_>, item_id: u32, layer: Option<u16>) -> Result<ItemImage> {
+/// overrides the item's `lsel` choice of spatial layer; `threads` is
+/// the AV1 decoder's worker budget.
+fn decode_coded_item(
+    hdr: &AvifHeader<'_>,
+    item_id: u32,
+    layer: Option<u16>,
+    threads: usize,
+) -> Result<ItemImage> {
     let bytes = hdr.item_data(item_id).map_err(core_err)?;
     let av1c = match hdr.meta.property_for(item_id, &AV1C) {
         Some(Property::Av1C(b)) => b.clone(),
@@ -887,7 +917,8 @@ fn decode_coded_item(hdr: &AvifHeader<'_>, item_id: u32, layer: Option<u16>) -> 
             _ => None,
         }),
     };
-    let (core_frame, fmt_core, mut w, mut h) = decode_av01_item(&bytes, &av1c, ispe, select)?;
+    let (core_frame, fmt_core, mut w, mut h) =
+        decode_av01_item(&bytes, &av1c, ispe, select, threads)?;
     let bit_depth = parse_av1c(&av1c)?.bit_depth();
     let mut frame = core_to_avif_frame(core_frame);
     let format = from_core_pix(fmt_core)?;
@@ -1260,6 +1291,177 @@ impl Decoder for AvifDecoder {
         self.info = None;
         self.color_signal = None;
         self.output_format = None;
+        Ok(())
+    }
+
+    /// The worker budget for the AV1 decode of every item / sample
+    /// (see [`DecodeOptions::threads`]); an explicit `threads` option
+    /// wins over it. Byte-identical output at any budget.
+    fn set_execution_context(&mut self, ctx: &ExecutionContext) {
+        self.exec_threads = ctx.threads.max(1);
+    }
+
+    /// The label of the frames of the last decoded file
+    /// ([`AvifDecoder::output_format`]); `None` before the first
+    /// decode.
+    fn output_pixel_format(&self) -> Option<PixelFormat> {
+        self.output_format
+    }
+}
+
+/// The registry decoder's option schema (see
+/// [`AvifDecoder::with_params`]), parsed strictly through
+/// [`oxideav_core::parse_options`].
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AvifDecoderOptions {
+    /// `gain_map=apply` (`tone_mapped`): the `tmap` alternative of the
+    /// primary with its gain map applied; default `false` = the base.
+    pub tone_mapped: bool,
+    /// `reference_white` in cd/m² (default 203).
+    pub reference_white: f64,
+    /// `threads`: the AV1 worker budget; `0` (default) follows the
+    /// execution context.
+    pub threads: u32,
+    /// `max_width` (`0` = unlimited; default 16384).
+    pub max_width: u32,
+    /// `max_height` (`0` = unlimited; default 16384).
+    pub max_height: u32,
+    /// `max_pixels` (`0` = unlimited; default `1 << 28`).
+    pub max_pixels: u32,
+    /// `max_bytes` (`0` = unlimited; default `1 << 30`).
+    pub max_bytes: u32,
+    /// `strict` conformance (default `false`).
+    pub strict: bool,
+    /// `layer`: the spatial layer to render (`-1` = the file's `lsel`).
+    pub layer: i32,
+}
+
+impl Default for AvifDecoderOptions {
+    fn default() -> Self {
+        let d = DecodeOptions::default();
+        Self {
+            tone_mapped: d.tone_mapped,
+            reference_white: d.reference_white_nits,
+            threads: 0,
+            max_width: d.max_width.unwrap_or(0),
+            max_height: d.max_height.unwrap_or(0),
+            max_pixels: d
+                .max_pixels
+                .map(|p| p.min(u64::from(u32::MAX)) as u32)
+                .unwrap_or(0),
+            max_bytes: d
+                .max_bytes
+                .map(|p| p.min(u64::from(u32::MAX)) as u32)
+                .unwrap_or(0),
+            strict: d.strict,
+            layer: -1,
+        }
+    }
+}
+
+impl AvifDecoderOptions {
+    /// The defaults (the [`DecodeOptions`] defaults, serial, the
+    /// file's `lsel`).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fold these options into a [`DecodeOptions`] (every field set).
+    pub fn apply_to(&self, mut o: DecodeOptions) -> DecodeOptions {
+        let nz32 = |v: u32| (v > 0).then_some(v);
+        o.tone_mapped = self.tone_mapped;
+        o.reference_white_nits = self.reference_white;
+        o.threads = (self.threads > 0).then_some(self.threads as usize);
+        o.max_width = nz32(self.max_width);
+        o.max_height = nz32(self.max_height);
+        o.max_pixels = nz32(self.max_pixels).map(u64::from);
+        o.max_bytes = nz32(self.max_bytes).map(u64::from);
+        o.strict = self.strict;
+        o.layer = u16::try_from(self.layer).ok();
+        o
+    }
+}
+
+impl oxideav_core::CodecOptionsStruct for AvifDecoderOptions {
+    const SCHEMA: &'static [oxideav_core::OptionField] = &[
+        oxideav_core::OptionField {
+            name: "gain_map",
+            kind: oxideav_core::OptionKind::Enum(&["base", "apply"]),
+            default: oxideav_core::OptionValue::String(String::new()),
+            help: "base (default): the primary as readers without tone-map support show it; apply: the tmap alternative with its gain map applied",
+        },
+        oxideav_core::OptionField {
+            name: "reference_white",
+            kind: oxideav_core::OptionKind::F32,
+            default: oxideav_core::OptionValue::F32(203.0),
+            help: "HDR reference white in cd/m2 for a PQ-coded tone-mapped reconstruction (default 203)",
+        },
+        oxideav_core::OptionField {
+            name: "threads",
+            kind: oxideav_core::OptionKind::U32,
+            default: oxideav_core::OptionValue::U32(0),
+            help: "AV1 decode worker budget (tile / band / wave / stripe parallel, byte-identical); 0 = the execution context's budget (serial unless granted)",
+        },
+        oxideav_core::OptionField {
+            name: "max_width",
+            kind: oxideav_core::OptionKind::U32,
+            default: oxideav_core::OptionValue::U32(16_384),
+            help: "Refuse a picture wider than this (0 = unlimited)",
+        },
+        oxideav_core::OptionField {
+            name: "max_height",
+            kind: oxideav_core::OptionKind::U32,
+            default: oxideav_core::OptionValue::U32(16_384),
+            help: "Refuse a picture taller than this (0 = unlimited)",
+        },
+        oxideav_core::OptionField {
+            name: "max_pixels",
+            kind: oxideav_core::OptionKind::U32,
+            default: oxideav_core::OptionValue::U32(1 << 28),
+            help: "Refuse a picture or derived canvas with more pixels than this (0 = unlimited)",
+        },
+        oxideav_core::OptionField {
+            name: "max_bytes",
+            kind: oxideav_core::OptionKind::U32,
+            default: oxideav_core::OptionValue::U32(1 << 30),
+            help: "Refuse an input longer than this many bytes (0 = unlimited)",
+        },
+        oxideav_core::OptionField {
+            name: "strict",
+            kind: oxideav_core::OptionKind::Bool,
+            default: oxideav_core::OptionValue::Bool(false),
+            help: "Strict conformance: an AVIF brand is required and a claimed mif1 must carry its mandatory boxes",
+        },
+        oxideav_core::OptionField {
+            name: "layer",
+            kind: oxideav_core::OptionKind::I32,
+            default: oxideav_core::OptionValue::I32(-1),
+            help: "Spatial layer of a layered primary to render (-1 = the file's lsel)",
+        },
+    ];
+
+    fn apply(&mut self, key: &str, value: &oxideav_core::OptionValue) -> Result<()> {
+        match key {
+            "gain_map" => self.tone_mapped = value.as_str()? == "apply",
+            "reference_white" => self.reference_white = f64::from(value.as_f32()?),
+            "threads" => self.threads = value.as_u32()?,
+            "max_width" => self.max_width = value.as_u32()?,
+            "max_height" => self.max_height = value.as_u32()?,
+            "max_pixels" => self.max_pixels = value.as_u32()?,
+            "max_bytes" => self.max_bytes = value.as_u32()?,
+            "strict" => self.strict = value.as_bool()?,
+            "layer" => {
+                let l = value.as_i32()?;
+                if l < -1 || l > i32::from(u16::MAX) {
+                    return Err(Error::invalid(format!(
+                        "avif: layer {l} is outside -1..=65535"
+                    )));
+                }
+                self.layer = l;
+            }
+            other => return Err(Error::invalid(format!("unknown option '{other}'"))),
+        }
         Ok(())
     }
 }

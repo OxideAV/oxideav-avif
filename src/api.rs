@@ -815,6 +815,12 @@ pub struct DecodeOptions {
     /// the file's `lsel` choice (av1-avif §2.3.2.2); `None` honours the
     /// file.
     pub layer: Option<u16>,
+    /// Worker budget for the AV1 decode of every coded item / sample
+    /// (the `ExecutionContext` handed to `oxideav-av1`, which walks a
+    /// multi-tile intra frame tile-parallel and runs its post-filters
+    /// by row band — byte-identical to the serial decode at any
+    /// budget). `None` or `Some(1)` = serial, the default.
+    pub threads: Option<usize>,
 }
 
 impl Default for DecodeOptions {
@@ -828,6 +834,7 @@ impl Default for DecodeOptions {
             tone_mapped: false,
             reference_white_nits: oxideav_heif::gainmap::DEFAULT_HDR_REFERENCE_WHITE_NITS,
             layer: None,
+            threads: None,
         }
     }
 }
@@ -876,6 +883,16 @@ impl DecodeOptions {
     pub fn with_layer(mut self, layer: Option<u16>) -> Self {
         self.layer = layer;
         self
+    }
+    /// Setter: replace `threads` (`None` / `Some(1)` = serial).
+    pub fn with_threads(mut self, threads: Option<usize>) -> Self {
+        self.threads = threads;
+        self
+    }
+
+    /// The worker budget as a count (`threads`, at least 1).
+    pub fn worker_count(&self) -> usize {
+        self.threads.unwrap_or(1).max(1)
     }
 
     /// Check an input length against `max_bytes`

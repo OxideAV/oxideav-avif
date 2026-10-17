@@ -395,6 +395,11 @@ where
     params.extradata = av1c;
 
     let mut av1 = oxideav_av1::registry::make_decoder(&params).map_err(from_core_err)?;
+    if opts.worker_count() > 1 {
+        av1.set_execution_context(&oxideav_core::ExecutionContext::with_threads(
+            opts.worker_count(),
+        ));
+    }
     let mut delivered = 0usize;
     let done = |delivered: usize| limit.is_some_and(|n| delivered >= n);
     let mut cumulative_pts: u64 = 0;
@@ -783,6 +788,28 @@ fn still_of_rgb(
     channels: usize,
     opts: &EncodeOptions,
 ) -> Result<StillImage> {
+    still_of_rgb_in(
+        width,
+        height,
+        data,
+        channels,
+        ColorInfo::miaf_default(),
+        opts.chroma,
+    )
+}
+
+/// [`still_of_rgb`] converting with `color` (a `nclx` description whose
+/// matrix the converter has a kernel for; the result carries it as its
+/// `colr`) into `chroma` (odd extents fall back to 4:4:4) — the
+/// registry encoder's lossy packed-RGB path.
+pub(crate) fn still_of_rgb_in(
+    width: u32,
+    height: u32,
+    data: &[u8],
+    channels: usize,
+    color: ColorInfo,
+    chroma: StillChroma,
+) -> Result<StillImage> {
     let n = width as usize * height as usize;
     if width == 0 || height == 0 {
         return Err(Error::invalid(
@@ -796,7 +823,6 @@ fn still_of_rgb(
             data.len()
         )));
     }
-    let color = ColorInfo::miaf_default();
     let colr = oxideav_heif::props::Colr::from(&color.to_colr());
     let rgb = oxideav_heif::rgb::RgbImage16::new(
         width,
@@ -805,7 +831,7 @@ fn still_of_rgb(
         8,
         data.iter().map(|&b| u16::from(b)).collect(),
     );
-    let mut chroma = opts.chroma;
+    let mut chroma = chroma;
     let (sx, sy) = chroma.subsampling();
     if (sx == 1 && width % 2 != 0) || (sy == 1 && height % 2 != 0) {
         chroma = StillChroma::Yuv444;

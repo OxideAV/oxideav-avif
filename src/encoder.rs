@@ -20,10 +20,15 @@
 //! * Planar YUV, high bit depth: `Yuv420P10Le` / `Yuv422P10Le` /
 //!   `Yuv444P10Le` / `Yuv420P12Le` / `Yuv422P12Le` / `Yuv444P12Le` /
 //!   `Gray10Le` / `Gray12Le` (little-endian 2-byte samples).
-//! * Packed RGB(A): `Rgb24` / `Rgba` / `Bgr24` / `Bgra` — coded via
-//!   the H.273 identity matrix in 4:4:4 (lossless-capable; see
-//!   [`crate::still::StillImage::rgb8`]); the alpha channel becomes
-//!   an alpha auxiliary item.
+//! * Packed RGB(A): `Rgb24` / `Rgba` / `Bgr24` / `Bgra` — at the
+//!   lossless quality coded via the H.273 identity matrix in 4:4:4
+//!   (byte-exact; see [`crate::still::StillImage::rgb8`]); at a lossy
+//!   quality converted to Y′CbCr (the signalled matrix, else the MIAF
+//!   default BT.601, at the signalled range, else full) and coded in
+//!   the `chroma` layout (4:2:0 by default, 4:4:4 at odd extents) —
+//!   the coding a lossy RGB picture is expected to land on (the
+//!   identity matrix spends bits on the un-decorrelated planes). The
+//!   alpha channel becomes an alpha auxiliary item either way.
 //! * Planar RGB(A): `Gbrp8` / `Gbrap8` / `Gbrp10Le` / `Gbrap10Le` /
 //!   `Gbrp12Le` / `Gbrap12Le` (planes G, B, R [, A] — the layout the
 //!   decoder labels an identity-matrix item with): coded as an
@@ -47,25 +52,274 @@
 //! The encoder's [`Encoder::output_params`] carry the signal the file
 //! was written with.
 //!
+//! The encoder's [`Encoder::output_params`] carry the **coded**
+//! label after a frame — what the file decodes back as — rather than
+//! the input label: packed RGB(A) codes as `Gbrp8` / `Gbrap8`
+//! losslessly and as Y′CbCr at a lossy quality; an 8-bit `Yuv*` label
+//! (no implied range) is written without `colr`, which MIAF reads as
+//! full range, so it decodes back as `YuvJ*` — the samples are stored
+//! as given either way; set `color_signal.range = Limited` to write a
+//! limited-range `colr` instead.
+//!
+//! The accepted layouts are published as [`ENCODER_PIXEL_FORMATS`]
+//! (the registry's `CodecCapabilities::accepted_pixel_formats`, the
+//! set a gateway's conversion ladder reads); any other label is a
+//! typed `Unsupported` error naming it.
+//!
 //! # Options
 //!
-//! Codec options (string map on [`CodecParameters::options`]):
+//! Codec options (string map on [`CodecParameters::options`]; the
+//! schema is [`AvifEncoderOptions`], declared on the registry entry):
 //!
+//! * `quality` — `0..=100`, `100` = lossless (the default). When `q`
+//!   is not given, `base_q_idx = ((100 − quality) × 255 + 50) / 100`
+//!   (the [`EncodeOptions::with_quality`] mapping: 100 → 0, 90 → 26,
+//!   75 → 64, 50 → 128, 10 → 230, 0 → 255); the alpha auxiliary
+//!   follows the same mapping when `alpha_q` is not given.
 //! * `q` — AV1 `base_q_idx` for the colour planes, `0..=255`
-//!   (default `0` = lossless).
-//! * `alpha_q` — `base_q_idx` for the alpha auxiliary (default `0`).
+//!   (`0` = lossless). An explicit `q` wins over `quality`.
+//! * `alpha_q` — `base_q_idx` for the alpha auxiliary; wins over
+//!   `quality` for that plane.
+//! * `chroma` — `420` (default) / `422` / `444`: the Y′CbCr layout a
+//!   packed RGB(A) / BGR(A) frame is coded in at a lossy quality (odd
+//!   extents promote to 4:4:4). Planar frames keep their own layout.
 //! * `premultiplied` — `true` to emit the `prem` iref declaring
 //!   premultiplied alpha (default `false`).
+//!
+//! With neither `quality` nor `q` the encode is lossless — the bytes
+//! of every earlier release.
 
 use oxideav_core::frame::VideoFrame;
 use oxideav_core::{
-    CodecId, CodecParameters, ColorRange, ColorSignal, Encoder, Error, Frame, Packet, PixelFormat,
-    Result, TimeBase,
+    parse_options, CodecId, CodecOptionsStruct, CodecParameters, ColorRange, ColorSignal, Encoder,
+    Error, Frame, OptionField, OptionKind, OptionValue, Packet, PixelFormat, Result, TimeBase,
 };
 
-use crate::api::EncodeOptions;
+use crate::api::{ColorInfo, EncodeOptions};
 use crate::meta::Colr;
 use crate::still::{encode_still, identity_full_range_colr, StillChroma, StillImage};
+
+/// Every input layout the encoder accepts (the module docs' list) —
+/// the registry's `accepted_pixel_formats`. A frame in any other
+/// layout is refused with a typed `Unsupported` error naming it.
+pub const ENCODER_PIXEL_FORMATS: &[PixelFormat] = &[
+    // Planar Y′CbCr, 8-bit (+ the full-range J labels) and grey.
+    PixelFormat::Yuv420P,
+    PixelFormat::Yuv422P,
+    PixelFormat::Yuv444P,
+    PixelFormat::YuvJ420P,
+    PixelFormat::YuvJ422P,
+    PixelFormat::YuvJ444P,
+    PixelFormat::Gray8,
+    // Planar Y′CbCr / grey, 10- and 12-bit little-endian words.
+    PixelFormat::Yuv420P10Le,
+    PixelFormat::Yuv422P10Le,
+    PixelFormat::Yuv444P10Le,
+    PixelFormat::Yuv420P12Le,
+    PixelFormat::Yuv422P12Le,
+    PixelFormat::Yuv444P12Le,
+    PixelFormat::Gray10Le,
+    PixelFormat::Gray12Le,
+    // Packed RGB(A) / BGR(A).
+    PixelFormat::Rgb24,
+    PixelFormat::Rgba,
+    PixelFormat::Bgr24,
+    PixelFormat::Bgra,
+    // Planar RGB(A) — the identity-matrix 4:4:4 coding at 8 / 10 / 12 bits.
+    PixelFormat::Gbrp8,
+    PixelFormat::Gbrap8,
+    PixelFormat::Gbrp10Le,
+    PixelFormat::Gbrap10Le,
+    PixelFormat::Gbrp12Le,
+    PixelFormat::Gbrap12Le,
+    // Alpha-carrying planar / interleaved grey + alpha.
+    PixelFormat::Yuva420P,
+    PixelFormat::Ya8,
+];
+
+/// The `quality` → `base_q_idx` mapping of the module docs
+/// (`((100 − quality) × 255 + 50) / 100`; qualities above 100 clamp).
+pub fn quality_to_base_q_idx(quality: u8) -> u8 {
+    EncodeOptions::default().with_quality(quality).base_q_idx
+}
+
+/// The registry encoder's option schema (see the module docs): the
+/// typed form of the `quality` / `q` / `alpha_q` / `chroma` /
+/// `premultiplied` codec options, parsed strictly at construction
+/// through [`oxideav_core::parse_options`] (an unknown key or a
+/// malformed value is `InvalidData`).
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AvifEncoderOptions {
+    /// `quality` 0..=100 (100 = lossless); `None` when not given.
+    pub quality: Option<u8>,
+    /// Explicit colour `base_q_idx` (`q`); wins over `quality`.
+    pub q: Option<u8>,
+    /// Explicit alpha `base_q_idx` (`alpha_q`); wins over `quality`.
+    pub alpha_q: Option<u8>,
+    /// Chroma layout for a lossy packed-RGB encode (`chroma`).
+    pub chroma: StillChroma,
+    /// Emit the `prem` iref (`premultiplied`).
+    pub premultiplied: bool,
+}
+
+impl Default for AvifEncoderOptions {
+    fn default() -> Self {
+        Self {
+            quality: None,
+            q: None,
+            alpha_q: None,
+            chroma: StillChroma::Yuv420,
+            premultiplied: false,
+        }
+    }
+}
+
+impl AvifEncoderOptions {
+    /// The defaults (lossless, 4:2:0 for lossy RGB, straight alpha).
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// Setter: replace `quality`.
+    pub fn with_quality(mut self, quality: Option<u8>) -> Self {
+        self.quality = quality;
+        self
+    }
+    /// Setter: replace `q`.
+    pub fn with_q(mut self, q: Option<u8>) -> Self {
+        self.q = q;
+        self
+    }
+    /// Setter: replace `alpha_q`.
+    pub fn with_alpha_q(mut self, alpha_q: Option<u8>) -> Self {
+        self.alpha_q = alpha_q;
+        self
+    }
+    /// Setter: replace `chroma`.
+    pub fn with_chroma(mut self, chroma: StillChroma) -> Self {
+        self.chroma = chroma;
+        self
+    }
+    /// Setter: replace `premultiplied`.
+    pub fn with_premultiplied(mut self, premultiplied: bool) -> Self {
+        self.premultiplied = premultiplied;
+        self
+    }
+
+    /// Strict parse of a parameter set's option bag.
+    pub fn from_params(params: &CodecParameters) -> Result<Self> {
+        parse_options::<Self>(&params.options)
+    }
+
+    /// Lenient parse: unknown keys and malformed values are ignored
+    /// (the historical [`AvifEncoder::with_params`] behaviour).
+    fn from_params_lenient(params: &CodecParameters) -> Self {
+        let mut out = Self::default();
+        for (k, v) in params.options.iter() {
+            let one = oxideav_core::CodecOptions::new().set(k, v);
+            if let Ok(parsed) = parse_options::<Self>(&one) {
+                if let Err(e) = parsed.apply_into(&mut out, k) {
+                    debug_assert!(false, "lenient option apply: {e}");
+                }
+            }
+        }
+        out
+    }
+
+    /// Copy the field named `key` from `self` into `into`.
+    fn apply_into(&self, into: &mut Self, key: &str) -> Result<()> {
+        match key {
+            "quality" => into.quality = self.quality,
+            "q" => into.q = self.q,
+            "alpha_q" => into.alpha_q = self.alpha_q,
+            "chroma" => into.chroma = self.chroma,
+            "premultiplied" => into.premultiplied = self.premultiplied,
+            other => return Err(Error::invalid(format!("unknown option '{other}'"))),
+        }
+        Ok(())
+    }
+
+    /// The still-encoder tuning these options resolve to: `q` else the
+    /// `quality` mapping else lossless for the colour planes, the same
+    /// for alpha with `alpha_q`; `chroma` / `premultiplied` as given.
+    pub fn resolve(&self) -> EncodeOptions {
+        let from_quality = self.quality.map(quality_to_base_q_idx).unwrap_or(0);
+        EncodeOptions::new(
+            self.q.unwrap_or(from_quality),
+            self.alpha_q.unwrap_or(from_quality),
+            self.premultiplied,
+        )
+        .with_chroma(self.chroma)
+    }
+}
+
+fn parse_u8_option(key: &str, v: &OptionValue, max: u32) -> Result<u8> {
+    let n = v.as_u32()?;
+    if n > max {
+        return Err(Error::invalid(format!(
+            "avif encode: option '{key}' = {n} is outside 0..={max}"
+        )));
+    }
+    Ok(n as u8)
+}
+
+impl CodecOptionsStruct for AvifEncoderOptions {
+    const SCHEMA: &'static [OptionField] = &[
+        OptionField {
+            name: "quality",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(100),
+            help: "Quality 0..=100 (100 = lossless): when q is not given, base_q_idx = ((100 - quality) * 255 + 50) / 100 for the colour planes and, when alpha_q is not given, for the alpha auxiliary",
+        },
+        OptionField {
+            name: "q",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(0),
+            help: "AV1 base_q_idx 0..=255 for the colour planes (0 = lossless); wins over quality",
+        },
+        OptionField {
+            name: "alpha_q",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(0),
+            help: "AV1 base_q_idx 0..=255 for the alpha auxiliary (0 = lossless); wins over quality",
+        },
+        OptionField {
+            name: "chroma",
+            kind: OptionKind::Enum(&["420", "422", "444"]),
+            default: OptionValue::String(String::new()),
+            help: "Y'CbCr layout a packed RGB(A) / BGR(A) frame is coded in at a lossy quality (default 420; odd extents promote to 444); lossless RGB keeps the identity-matrix 4:4:4 coding",
+        },
+        OptionField {
+            name: "premultiplied",
+            kind: OptionKind::Bool,
+            default: OptionValue::Bool(false),
+            help: "Emit the prem reference declaring the colour planes premultiplied by alpha (signalling only)",
+        },
+    ];
+
+    fn apply(&mut self, key: &str, value: &OptionValue) -> Result<()> {
+        match key {
+            "quality" => self.quality = Some(parse_u8_option(key, value, 100)?),
+            "q" => self.q = Some(parse_u8_option(key, value, 255)?),
+            "alpha_q" => self.alpha_q = Some(parse_u8_option(key, value, 255)?),
+            "chroma" => {
+                self.chroma = match value.as_str()? {
+                    "420" => StillChroma::Yuv420,
+                    "422" => StillChroma::Yuv422,
+                    "444" => StillChroma::Yuv444,
+                    other => {
+                        return Err(Error::invalid(format!(
+                            "avif encode: chroma '{other}' is not 420 / 422 / 444"
+                        )))
+                    }
+                }
+            }
+            "premultiplied" => self.premultiplied = value.as_bool()?,
+            other => return Err(Error::invalid(format!("unknown option '{other}'"))),
+        }
+        Ok(())
+    }
+}
 
 /// Frame-to-AVIF encoder: every video frame becomes one complete AVIF
 /// file packet. See the module docs for the input-format mapping and
@@ -83,31 +337,77 @@ impl AvifEncoder {
         Self::with_params(CodecParameters::video(codec_id))
     }
 
-    /// Build an encoder from an explicit parameter set. Option parsing
-    /// happens here (construction time), never on the frame path.
+    /// Build an encoder from an explicit parameter set, reading the
+    /// options leniently: unknown keys and malformed values are
+    /// ignored (the historical behaviour of this constructor).
+    /// [`Self::try_with_params`] — what [`make_encoder`] and the
+    /// registry use — refuses them instead. Option parsing happens
+    /// here (construction time), never on the frame path.
     pub fn with_params(params: CodecParameters) -> Self {
-        let get_q = |key: &str| -> u8 {
-            params
-                .options
-                .get(key)
-                .and_then(|v| v.parse::<u8>().ok())
-                .unwrap_or(0)
-        };
-        let opts = EncodeOptions::new(
-            get_q("q"),
-            get_q("alpha_q"),
-            params
-                .options
-                .get("premultiplied")
-                .map(|v| v == "true" || v == "1")
-                .unwrap_or(false),
-        );
+        let opts = AvifEncoderOptions::from_params_lenient(&params);
+        Self::from_options(params, opts)
+    }
+
+    /// Build an encoder from a parameter set whose options are parsed
+    /// strictly against [`AvifEncoderOptions`]'s schema: an unknown
+    /// key, a malformed value or one outside its range is
+    /// `InvalidData`.
+    pub fn try_with_params(params: CodecParameters) -> Result<Self> {
+        let opts = AvifEncoderOptions::from_params(&params)?;
+        Ok(Self::from_options(params, opts))
+    }
+
+    /// Build an encoder from a parameter set and already-parsed
+    /// options (the option bag on `params` is not read again).
+    pub fn from_options(params: CodecParameters, opts: AvifEncoderOptions) -> Self {
         Self {
             params,
-            opts,
+            opts: opts.resolve(),
             pending: Vec::new(),
             flushed: false,
         }
+    }
+
+    /// The still-encoder tuning this encoder codes with (`q`,
+    /// `alpha_q`, the `quality` mapping, `chroma`, `premultiplied`).
+    pub fn encode_options(&self) -> &EncodeOptions {
+        &self.opts
+    }
+
+    /// The colour a lossy packed-RGB frame is converted to Y′CbCr
+    /// with: the stream's signalled primaries / transfer / matrix /
+    /// range where specified (a matrix the converter has no kernel for
+    /// falls back), the MIAF default (BT.709 / sRGB / BT.601, full
+    /// range) otherwise.
+    fn lossy_rgb_color(&self) -> ColorInfo {
+        let signal = self.params.color_signal;
+        let mut color = ColorInfo::miaf_default();
+        if !signal.primaries.is_unspecified() {
+            color.primaries = signal.primaries.0;
+        }
+        if !signal.transfer.is_unspecified() {
+            color.transfer = signal.transfer.0;
+        }
+        let m = signal.matrix.0;
+        if !signal.matrix.is_unspecified()
+            && m != 0
+            && oxideav_heif::rgb::matrix_kr_kb(u16::from(m)).is_some()
+        {
+            color.matrix = m;
+        }
+        match self.params.resolved_color_range() {
+            ColorRange::Limited => color.range = crate::api::ColorRange::Limited,
+            ColorRange::Full => color.range = crate::api::ColorRange::Full,
+            _ => {}
+        }
+        color
+    }
+
+    /// The Y′CbCr conversion a packed RGB(A) frame goes through — only
+    /// at a lossy colour quality (the lossless identity-matrix coding
+    /// is byte-exact and stays).
+    fn lossy_rgb(&self) -> Option<(ColorInfo, StillChroma)> {
+        (self.opts.base_q_idx > 0).then(|| (self.lossy_rgb_color(), self.opts.chroma))
     }
 
     /// Convert one framework video frame into a [`StillImage`] per the
@@ -157,10 +457,10 @@ impl AvifEncoder {
             PixelFormat::Yuv444P12Le => planar16(vf, width, height, 12, StillChroma::Yuv444)?,
             PixelFormat::Gray10Le => planar16(vf, width, height, 10, StillChroma::Monochrome)?,
             PixelFormat::Gray12Le => planar16(vf, width, height, 12, StillChroma::Monochrome)?,
-            PixelFormat::Rgb24 => packed_rgb(vf, width, height, 3, [0, 1, 2])?,
-            PixelFormat::Bgr24 => packed_rgb(vf, width, height, 3, [2, 1, 0])?,
-            PixelFormat::Rgba => packed_rgb(vf, width, height, 4, [0, 1, 2])?,
-            PixelFormat::Bgra => packed_rgb(vf, width, height, 4, [2, 1, 0])?,
+            PixelFormat::Rgb24 => packed_rgb(vf, width, height, 3, [0, 1, 2], self.lossy_rgb())?,
+            PixelFormat::Bgr24 => packed_rgb(vf, width, height, 3, [2, 1, 0], self.lossy_rgb())?,
+            PixelFormat::Rgba => packed_rgb(vf, width, height, 4, [0, 1, 2], self.lossy_rgb())?,
+            PixelFormat::Bgra => packed_rgb(vf, width, height, 4, [2, 1, 0], self.lossy_rgb())?,
             PixelFormat::Yuva420P => yuva420(vf, width, height)?,
             PixelFormat::Ya8 => ya8(vf, width, height)?,
             PixelFormat::Gbrp8 => planar_gbr(vf, width, height, 8, false)?,
@@ -356,13 +656,16 @@ fn planar16(
 
 /// Packed RGB(A)/BGR(A): `rgb_at` gives the byte offsets of R, G, B
 /// within each `bpp`-byte pixel; a 4th byte (when `bpp == 4`) is the
-/// alpha channel.
+/// alpha channel. `lossy` = `Some((colour, chroma))` converts the
+/// picture to Y′CbCr in `colour` and codes it in `chroma` (odd extents
+/// 4:4:4); `None` keeps the byte-exact identity-matrix 4:4:4 coding.
 fn packed_rgb(
     vf: &VideoFrame,
     width: u32,
     height: u32,
     bpp: usize,
     rgb_at: [usize; 3],
+    lossy: Option<(ColorInfo, StillChroma)>,
 ) -> Result<StillImage> {
     if vf.image_plane_count() != 1 {
         return Err(Error::invalid(format!(
@@ -396,12 +699,36 @@ fn packed_rgb(
             }
         }
     }
-    let img = StillImage::rgb8(width, height, &rgb)?;
+    let img = match lossy {
+        Some((color, chroma)) => {
+            crate::api_codec::still_of_rgb_in(width, height, &rgb, 3, color, chroma)?
+        }
+        None => StillImage::rgb8(width, height, &rgb)?,
+    };
     if bpp == 4 {
         Ok(img.with_alpha(alpha)?)
     } else {
         Ok(img)
     }
+}
+
+/// The framework label of the layout an item is coded in (what the
+/// crate's decoder reports for the file): planar RGB for the identity
+/// matrix, `YuvJ*` for full-range 8-bit Y′CbCr, the storage label
+/// otherwise.
+fn coded_label(img: &StillImage) -> Option<PixelFormat> {
+    let (sx, sy) = img.chroma.subsampling();
+    let layout = crate::image::AvifPixelFormat::from_layout(
+        img.bit_depth,
+        sx as u8,
+        sy as u8,
+        img.chroma == StillChroma::Monochrome,
+        img.alpha.is_some(),
+    )?;
+    Some(crate::signal::labelled_pixel_format(
+        layout,
+        &signal_of(img),
+    ))
 }
 
 /// Planar RGB(A) (`Gbrp*` / `Gbrap*`: planes G, B, R [, A]) → an
@@ -518,6 +845,12 @@ impl Encoder for AvifEncoder {
         };
         let img = self.frame_to_still(vf)?;
         self.params.color_signal = signal_of(&img);
+        // The output parameters carry the coded layout's label (what
+        // the file decodes back as), not the input label: `Rgb24` is
+        // coded as `Gbrp8` losslessly and as Y′CbCr at a lossy quality.
+        if let Some(label) = coded_label(&img) {
+            self.params.pixel_format = Some(label);
+        }
         let bytes = encode_still(&img, &self.opts)?;
         let mut pkt = Packet::new(0, TimeBase::new(1, 90_000), bytes);
         if let Some(pts) = vf.pts {
@@ -546,9 +879,12 @@ impl Encoder for AvifEncoder {
 }
 
 /// Direct factory endpoint (matches the crate's dual-API convention):
-/// build a boxed AVIF [`Encoder`] from a parameter set.
+/// build a boxed AVIF [`Encoder`] from a parameter set. The options
+/// are parsed strictly ([`AvifEncoder::try_with_params`]): an unknown
+/// key or a malformed value is `InvalidData` here rather than silently
+/// ignored.
 pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
-    Ok(Box::new(AvifEncoder::with_params(params.clone())))
+    Ok(Box::new(AvifEncoder::try_with_params(params.clone())?))
 }
 
 #[cfg(test)]

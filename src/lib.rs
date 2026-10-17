@@ -268,10 +268,14 @@ pub use api_codec::{
 };
 
 #[cfg(feature = "registry")]
-pub use decoder::{make_decoder, AvifDecoder, MAX_GRID_CANVAS_PIXELS, MAX_ITEM_DECODES};
+pub use decoder::{
+    make_decoder, AvifDecoder, AvifDecoderOptions, MAX_GRID_CANVAS_PIXELS, MAX_ITEM_DECODES,
+};
 
 #[cfg(feature = "registry")]
-pub use encoder::{make_encoder, AvifEncoder};
+pub use encoder::{
+    make_encoder, quality_to_base_q_idx, AvifEncoder, AvifEncoderOptions, ENCODER_PIXEL_FORMATS,
+};
 
 #[cfg(feature = "registry")]
 pub use sequence::{encode_sequence, SequenceEncodeOptions};
@@ -334,15 +338,29 @@ mod registry_glue {
     /// on the resulting frames. The encoder factory ([`make_encoder`])
     /// yields the pixel-in AVIF encoder (one complete AVIF file per
     /// frame; see [`crate::encoder`] for the format/option surface).
+    ///
+    /// The capabilities declare what the encoder truly accepts
+    /// ([`crate::encoder::ENCODER_PIXEL_FORMATS`] — the set a
+    /// gateway's conversion ladder reads) and that it codes both
+    /// losslessly (`q` 0 / `quality` 100, the default) and lossily;
+    /// the option schemas ([`crate::encoder::AvifEncoderOptions`],
+    /// [`crate::decoder::AvifDecoderOptions`]) are attached so the
+    /// framework's advisory `quality` and `threads` reach the codec.
     pub fn register_codecs(reg: &mut CodecRegistry) {
         let caps = CodecCapabilities::video("avif_heif_av1_decode")
+            .with_decode()
+            .with_encode()
             .with_lossy(true)
-            .with_intra_only(true);
+            .with_lossless(true)
+            .with_intra_only(true)
+            .with_pixel_formats(crate::encoder::ENCODER_PIXEL_FORMATS.to_vec());
         reg.register(
             CodecInfo::new(CodecId::new(CODEC_ID_STR))
                 .capabilities(caps)
                 .decoder(make_decoder)
-                .encoder(make_encoder),
+                .encoder(make_encoder)
+                .encoder_options::<crate::encoder::AvifEncoderOptions>()
+                .decoder_options::<crate::decoder::AvifDecoderOptions>(),
         );
     }
 

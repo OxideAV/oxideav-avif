@@ -84,8 +84,14 @@ functions above: `send_packet` (one complete AVIF file per packet)
 runs `decode_with` / `decode_all_with` with the decoder's
 `DecodeOptions` (`gain_map=apply` / `reference_white` codec options,
 `set_options`), and emits every frame with its `ColorSignal`; the
-encoder maps a `VideoFrame` onto the still encoder (`q` / `alpha_q` /
-`premultiplied` options). `From<AvifImage> for VideoFrame` and
+encoder maps a `VideoFrame` onto the still encoder (`quality` / `q` /
+`alpha_q` / `chroma` / `premultiplied` options — the schemas are
+`AvifEncoderOptions` / `AvifDecoderOptions`, declared on the registry
+entry, parsed strictly). The decoder honours
+`Decoder::set_execution_context` (the AV1 worker budget; the `threads`
+option fixes it) and the encoder declares its 27 accepted input
+layouts (`ENCODER_PIXEL_FORMATS`) as the registry's
+`accepted_pixel_formats`. `From<AvifImage> for VideoFrame` and
 `AvifImage::from_video_frame(&frame, &params)` (also
 `TryFrom<(&VideoFrame, &CodecParameters)>`) move pictures between the
 two worlds.
@@ -135,7 +141,21 @@ grid / overlay canvas on the way), `max_bytes`, `strict` (an AVIF
 brand is required, a claimed `mif1` must carry its mandatory boxes),
 `tone_mapped` (apply a `tmap` gain map — default off: the base
 image), `reference_white_nits` (203), `layer` (render this spatial
-layer of a layered primary instead of its `lsel`).
+layer of a layered primary instead of its `lsel`), `threads` (the AV1
+worker budget for every coded item / sample — byte-identical at any
+budget; `None` = serial, or the execution context's budget on the
+registry decoder).
+
+Registry encoder options (`AvifEncoderOptions`): `quality` 0..=100
+(100 = lossless, the default; `base_q_idx = ((100 − quality) × 255 +
+50) / 100` when `q` is absent, the alpha auxiliary likewise when
+`alpha_q` is absent), `q` / `alpha_q` (explicit `base_q_idx`, win over
+`quality`), `chroma` (`420` default / `422` / `444`: the Y′CbCr layout
+a packed RGB(A) frame is coded in at a lossy quality; odd extents
+4:4:4; lossless RGB keeps the byte-exact identity coding),
+`premultiplied`. Measured on a 16 × 16 textured picture: Yuv420P 596 B
+exact → quality 50 332 B 38.7 dB → quality 10 304 B 26.4 dB; Rgb24 800
+B exact (identity) → 50 337 B 30.8 dB (4:2:0) → 10 315 B 24.7 dB.
 
 ## Metadata and colour
 
@@ -234,7 +254,8 @@ PSNR-gated in the test suite; black-box acceptance decodes the
 emitted files through an external AVIF decoder binary where one is
 installed. The registry `Encoder` (`make_encoder` / `AvifEncoder`)
 rides the same pipeline: one video frame in, one complete AVIF file
-packet out (`q` / `alpha_q` / `premultiplied` codec options).
+packet out (`quality` / `q` / `alpha_q` / `chroma` / `premultiplied`
+codec options; 27 declared input layouts).
 
 The **container muxer** (`mux` module) remains available standalone:
 given an already-coded AV1 Image Item Data payload plus its `av1C`
@@ -266,7 +287,8 @@ passes `audit_mif1`. At this layer the AV1 bitstream is taken
 | Auxiliary classification | `auxC` URN routed to `Alpha` / `DepthMap` / `HdrGainMap` / `Other` |
 | Container encoder / muxer (`mux`) | `AvifMuxer` / `AvifGridMuxer` / `AvifOverlayMuxer` / `encode_still_av1` decide the AVIF layout — brands (profile tri-state `MA1B` default / `MA1A` / general-brands-only per av1-avif §8.1), item order (primary = item 1, a `grid` / `iovl` before its inputs), per-item property sets with their essential flags (`av1C` / `clap` / `irot` / `imir` / `lsel` / `a1op` essential), `auxC` URNs, the grid / overlay descriptors — and `oxideav-heif`'s `HeifWriter` serialises `meta` (`iloc` v1, derived bodies in `idat`, de-duplicated `ipco`, `prem` master → alpha) + `mdat`. Round-trips through `parse` byte-for-byte; passes `audit_mif1`; opens in `heif-info` / ImageMagick / ffmpeg (and `avifdec` for coded / grid primaries) |
 | Pixel → AVIF still encoder (`still`) | `StillImage` + `encode_still` / `encode_still_grid` drive oxideav-av1's conformance-grade KEY-frame encoder: 8/10/12-bit × 4:2:0/4:2:2/4:4:4/monochrome; RGB(A) via the H.273 identity matrix in 4:4:4 (byte-exact lossless); alpha as a same-depth monochrome auxiliary with in-stream full-range signalling (the §5.5.2 `color_range` bit re-signalled by re-encoding the Sequence Header OBU — av1-avif §4.1 readers ignore `colr` on alpha); arbitrary extents via edge-replicated pad + top-left `clap` (§2.2.3) with `ispe` = coded extents (§2.2.2 `shall`); grid tiling (HEIF §6.6.2) with right/bottom trim; `ftyp` profile brand elected from `seq_profile` (§8). Lossless round-trips sample-exact through the crate's own decoder; lossy PSNR-gated; black-box-accepted by an external AVIF decoder binary |
-| Registry `Encoder` | one video frame → one complete AVIF file packet: planar YUV 8-bit (+ `YuvJ*` full-range), 10/12-bit LE planar, `Gray8/10/12`, packed `Rgb24`/`Rgba`/`Bgr24`/`Bgra` (identity 4:4:4, alpha auxiliary), `Yuva420P`, `Ya8`; codec options `q`/`alpha_q`/`premultiplied` |
+| Registry `Encoder` | one video frame → one complete AVIF file packet; 27 declared input layouts (`ENCODER_PIXEL_FORMATS`, the registry's `accepted_pixel_formats`): planar YUV 8-bit (+ `YuvJ*` full-range), 10/12-bit LE planar, `Gray8/10/12`, packed `Rgb24`/`Rgba`/`Bgr24`/`Bgra` (identity 4:4:4 when lossless, Y′CbCr in the `chroma` layout when lossy; alpha auxiliary), planar `Gbrp(a)` 8/10/12, `Yuva420P`, `Ya8`; codec options `quality` (0..=100 → `base_q_idx`, 100 = lossless) / `q` / `alpha_q` / `chroma` / `premultiplied`, declared as a schema; `lossy` + `lossless` capability flags |
+| Registry `Decoder` threads | `set_execution_context` / the `threads` option hand the worker budget to the AV1 decoder of every coded item and sequence sample (tile / band / wave / stripe parallel, byte-identical at any budget); 12 MP tiled still 0.34 s serial → 0.07 s on 8 workers (4.8×) (`examples/decode_threads`) |
 | Derived images | `iovl` overlay + `iden` identity + `tmap` tone-map derivations resolved end-to-end (HEIF §6.3 / §6.6.2, av1-avif §4.2.2) via a box-graph geometry resolver — no AV1 decode: `transform_chain` / `output_dims_from_reconstructed` apply `irot`/`imir`/`clap`/`iscl` in `ipma` order (§6.3); `reconstructed_dims` resolves grid/iovl descriptor dims + recursive `iden` inputs + `tmap` base-input extents + `sato` own/`ispe`-or-input extents + coded `ispe` (cycle-guarded, depth 16; descriptor bytes resolve through `iloc` construction methods 0/1/**2**); `resolve_overlays` clips each `OverlayPlacement` against the canvas (§6.6.2.2.3); `resolve_iden_derivations` folds the iden's own transforms over its source; `resolve_tone_maps` resolves each `tmap`'s base/gain-map input ids + rendered (base) extents + per-gain-map coded extents, flagging gain-map up-sampling. Surfaced on `AvifInfo::{overlay_resolutions, iden_resolutions, tone_map_resolutions}`; `inspect()` accepts `iovl`/`iden`/`tmap`/`sato` derived primaries. **Pixel composition** (`oxideav-heif`'s `compose`, through `overlay::composite_overlay` and the decoder's recursive output-image path): `iovl` canvases painted in `dimg` order with the §6.9.1 alpha rendering (straight / `prem`), canvas opacity seeded from the RGBA fill (converted with the output's H.273 matrix at every `colr`), inputs clipped at the canvas edge, an input at an odd offset on a subsampled axis or carrying alpha promotes the canvas to 4:4:4, monochrome inputs stay monochrome, `MAX_OVERLAY_CANVAS_PIXELS` bound; `iden` = its input's output image (alpha inherited) plus the iden's own transforms; both writable via `AvifOverlayMuxer` / `encode_still_overlay` and `AvifMuxer::with_identity_derivation`. **`tmap` pixel reconstruction** (HEIF Amd 1:2025 §6.6.2.4 + ISO 21496-1, av1-avif §4.2.2): base by default, opt-in applied decode (`AvifDecoder::set_tone_mapped` / `gain_map=apply`) through the container's normative reconstruction in the `tmap` item's `colr` at its `pixi` depth, matching `avifgainmaputil tonemap` within 1 code both ways; authored via `StillProperties::gain_map` / `AvifMuxer::with_tone_map`. `sato` remains geometry-only (no container counterpart) |
 | Unified derivation graph (`build_derivation_graph` / `inspect::derivation_graph`) | one decode-free traversal (HEIF §6.6) that walks any derived primary into a `DerivationGraph` — every reachable node (`DerivationNode` { `DerivationKind` ∈ Coded/Grid/Overlay/Identity/ToneMap/SampleTransform/Unknown, reconstructed + output dims, depth }) plus the de-duplicated coded-`av01` leaf decode set in first-visit order. Handles **nested** derivations (iden-of-grid, tmap-over-grid) and **diamond** graphs (shared leaf listed once); iterative pre-order with a `MAX_DERIVATION_DEPTH` cycle guard (`truncated` flag). Accessors: `output_dims` / `root_is_coded` / `coded_leaf_dims` (decode-buffer sizing) / `nodes_at_depth` / `derived_node_count`. No pixel composition — the dependency planner a renderer feeds its AV1 decoder |
 | Entity grouping (`grpl`) | typed `EntityGroup` per `EntityToGroupBox` (retaining the 24-bit `flags`); `altr` / `ster` / `eqiv` / `pano` / `prgr` progressive-rendering (§6.8.10) / `brst` burst (§6.8.9) / `msrc` multi-source (HEIF §9.4) / `tsyn` time-synchronized capture (§6.8.3) / `iaug` audio-to-image (§6.8.4, `audio_repeats()` = flags-LSB) / `slid` slideshow (§6.8.9) / `albc` album + `favc` favorites user-collections (§6.8.7) / the five §6.8.6 bracketed capture-time sets `aebr`/`wbbr`/`fobr`/`afbr`/`dobr` (`BracketingKind` / `is_bracketed_set`). `inspect::entity_groups` enumerates the file's `grpl` decode-free for the typed projections |
