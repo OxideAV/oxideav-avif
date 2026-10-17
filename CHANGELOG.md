@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.15](https://github.com/OxideAV/oxideav-avif/compare/v0.0.14...v0.0.15) - 2026-10-17
+
+### Other
+
+- every coded item through the AV1 still encoder at Fast effort — speed / threads options, execution budget on the encoder, 12 MP in 6.1 s serial / 1.3 s on 8 workers (was 376 s)
+- grid tiles decode in parallel under the execution budget
+- decode_threads — 12 MP tiled 4:2:0 still, serial vs budgeted decode
+- honour the image-gateway contract — quality → base_q_idx, 27 declared input layouts, lossy packed RGB as Y′CbCr, option schemas, decoder execution context
+
 ### Added
 
 - **`quality` on the registry encoder (image-gateway contract, round
