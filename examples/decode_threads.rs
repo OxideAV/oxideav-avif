@@ -3,7 +3,9 @@
 //! derived from the thread count), wrapped in an AVIF, then decoded
 //! through the registry decoder serial and under an
 //! `ExecutionContext` budget. Prints the wall clock of each and checks
-//! the outputs are byte-identical.
+//! the outputs are byte-identical. A second leg codes the same picture
+//! as a HEIF `grid` of single-tile items (`encode_still_grid`, 4 × 3
+//! tiles) — the budget is then spent across the grid's tiles.
 //!
 //! ```text
 //! cargo run --release --example decode_threads -- [threads] [width] [height]
@@ -14,6 +16,7 @@ use std::time::Instant;
 use oxideav_av1::encoder::still::{encode_still_yuv, StillOptions};
 use oxideav_av1::encoder::yuv_frame::{ChromaFormat, YuvFrame};
 use oxideav_av1::Av1CodecConfig;
+use oxideav_avif::{encode_still_grid, EncodeOptions, StillChroma, StillImage};
 use oxideav_core::{CodecId, CodecParameters, ExecutionContext, Frame, Packet, TimeBase};
 
 fn plane(w: u32, h: u32, seed: u32) -> Vec<u16> {
@@ -89,6 +92,32 @@ fn main() {
     assert_eq!(serial, parallel, "byte-identical at any budget");
     eprintln!(
         "decode: serial {t1:.3} s, {threads} workers {tn:.3} s ({:.2}x), identical bytes",
+        t1 / tn
+    );
+
+    // The same picture as a 4 × 3 grid of single-tile items.
+    let t = Instant::now();
+    let still = StillImage::yuv(
+        width,
+        height,
+        8,
+        StillChroma::Yuv420,
+        input.y.clone(),
+        input.u.clone(),
+        input.v.clone(),
+    )
+    .expect("still");
+    let grid = encode_still_grid(&still, &EncodeOptions::new(120, 0, false), 4, 3).expect("grid");
+    eprintln!(
+        "{width}x{height} as a 4x3 grid: {} bytes, encoded in {:.2} s (serial encoder)",
+        grid.len(),
+        t.elapsed().as_secs_f64()
+    );
+    let (serial, t1) = decode(&grid, 1);
+    let (parallel, tn) = decode(&grid, threads);
+    assert_eq!(serial, parallel, "grid: byte-identical at any budget");
+    eprintln!(
+        "grid decode: serial {t1:.3} s, {threads} workers {tn:.3} s ({:.2}x), identical bytes",
         t1 / tn
     );
 }

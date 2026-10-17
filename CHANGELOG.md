@@ -51,6 +51,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   report what the next decode runs with. A 12 MP tiled 4:2:0 still
   (`examples/decode_threads`) decodes in 0.34 s serial → 0.07 s on 8
   workers on the development machine.
+- **Grid tiles decode in parallel under the budget.** A `grid`
+  primary's distinct tiles are decoded round-robin on up to `threads`
+  workers (each tile on a child context with the AV1 budget split
+  evenly; outputs memoised, the decode budget and the cycle guard
+  kept, the first failing tile in tile order reported), so a camera-
+  style grid of single-tile items also spends the budget: the 12 MP
+  picture as a 4 × 3 grid decodes in 0.31 s serial → 0.07 s on 8
+  workers (4.7×), byte-identical.
 - `Decoder::output_pixel_format` is implemented (the label of the
   last decoded file, `AvifDecoder::output_format`), and the encoder's
   `output_params` carry the coded label after a frame (`Gbrp8` for

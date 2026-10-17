@@ -584,6 +584,78 @@ fn decoder_thread_budget_is_byte_identical_to_serial() {
     }
 }
 
+/// A `grid` primary (2 × 2 tiles of 64 × 64 — the MIAF tile floor —
+/// lossless with an alpha grid, lossy without) decodes identically
+/// serial and on a budget — the budget is spent across the tiles.
+#[test]
+fn grid_tiles_decode_identically_under_a_budget() {
+    use oxideav_avif::{encode_still_grid, EncodeOptions, StillChroma, StillImage};
+    let (w, h) = (128u32, 128u32);
+    let plane = |c: usize, pw: u32, ph: u32| -> Vec<u16> {
+        (0..pw as usize * ph as usize)
+            .map(|i| {
+                u16::from(texel(
+                    i % pw as usize,
+                    i / pw as usize,
+                    c,
+                    pw as usize,
+                    ph as usize,
+                ))
+            })
+            .collect()
+    };
+    let ctx = registry();
+    for (alpha, q) in [(true, 0u8), (false, 100)] {
+        let mut still = StillImage::yuv(
+            w,
+            h,
+            8,
+            StillChroma::Yuv420,
+            plane(0, w, h),
+            plane(1, w / 2, h / 2),
+            plane(2, w / 2, h / 2),
+        )
+        .expect("still");
+        if alpha {
+            still = still.with_alpha(plane(3, w, h)).expect("alpha");
+        }
+        let file = encode_still_grid(&still, &EncodeOptions::new(q, q, false), 2, 2).expect("grid");
+        let info = oxideav_avif::inspect(&file).expect("inspect");
+        assert!(info.has_grid(), "a grid primary");
+        let p = params(PixelFormat::Yuv420P, 0, 0, CodecOptions::new());
+        let mut serial = ctx.codecs.first_decoder(&p).expect("decoder");
+        let want = decode_all_frames(serial.as_mut(), &file);
+        for budget in [3usize, 8] {
+            let mut d = ctx.codecs.first_decoder(&p).expect("decoder");
+            d.set_execution_context(&ExecutionContext::with_threads(budget));
+            assert_eq!(
+                decode_all_frames(d.as_mut(), &file),
+                want,
+                "alpha {alpha} q {q}: budget {budget}"
+            );
+            assert_eq!(
+                d.output_pixel_format(),
+                Some(if alpha {
+                    PixelFormat::Yuva420P
+                } else {
+                    PixelFormat::YuvJ420P
+                })
+            );
+        }
+        if q == 0 {
+            // Lossless: the tiles stitch back to the source exactly.
+            let got = &want[0];
+            let n = (w * h) as usize;
+            let y: Vec<u8> = still.y.iter().map(|&v| v as u8).collect();
+            assert_eq!(
+                &got[..n],
+                &y[..],
+                "alpha {alpha}: luma exact through the grid"
+            );
+        }
+    }
+}
+
 #[test]
 fn decoder_options_parse_strictly_and_threads_resolve() {
     let p = |o: CodecOptions| params(PixelFormat::Yuv420P, 0, 0, o);

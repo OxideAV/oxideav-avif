@@ -975,7 +975,11 @@ fn decode_grid_item(
         )));
     }
     let mut tiles: Vec<HeifFrame> = Vec::with_capacity(tile_ids.len());
+    if ctx.threads > 1 && tile_ids.len() > 1 {
+        decode_tiles_parallel(hdr, &tile_ids, depth + 1, ctx)?;
+    }
     for (i, tid) in tile_ids.iter().enumerate() {
+        // Serial, or the memoised output of the parallel walk above.
         let tile = decode_item_output(hdr, *tid, depth + 1, ctx, false)?;
         if let Some(first) = tiles.first() {
             if first.format != tile.format {
@@ -994,6 +998,100 @@ fn decode_grid_item(
         tiles.push(tile);
     }
     crate::grid::composite_grid_frames(&grid, &tiles).map_err(core_err)
+}
+
+/// Decode the distinct, not-yet-memoised tiles of a grid on up to
+/// `ctx.threads` workers (round-robin over the tile order, each tile
+/// on a child context with the AV1 budget split evenly — a 12-tile
+/// grid on 8 workers codes each tile serially; the same output image
+/// as the serial walk, item by item). Outputs land in `ctx.cache` and
+/// the decode budget / cycle guard are kept: each child starts from
+/// the parent's derivation stack, its decode count is added back
+/// under [`MAX_ITEM_DECODES`], and the first failing tile in tile
+/// order is reported.
+fn decode_tiles_parallel(
+    hdr: &AvifHeader<'_>,
+    tile_ids: &[u32],
+    depth: u32,
+    ctx: &mut DecodeCtx,
+) -> Result<()> {
+    let mut todo: Vec<u32> = Vec::with_capacity(tile_ids.len());
+    for &tid in tile_ids {
+        if !todo.contains(&tid) && !ctx.cache.contains_key(&(tid, false)) {
+            todo.push(tid);
+        }
+    }
+    if todo.len() < 2 {
+        return Ok(());
+    }
+    if ctx.decodes.saturating_add(todo.len() as u32) > MAX_ITEM_DECODES {
+        return Err(Error::invalid(format!(
+            "avif: derivation graph needs more than {MAX_ITEM_DECODES} item decodes"
+        )));
+    }
+    let workers = ExecutionContext::with_threads(ctx.threads).effective_workers(todo.len());
+    let per_tile = (ctx.threads / workers).max(1);
+    let seed = DecodeCtx {
+        stack: ctx.stack.clone(),
+        cache: std::collections::HashMap::new(),
+        decodes: 0,
+        tone_mapped: ctx.tone_mapped,
+        reference_white_nits: ctx.reference_white_nits,
+        max_pixels: ctx.max_pixels,
+        layer: None,
+        threads: per_tile,
+    };
+    // (tile index, tile id, output, decodes spent)
+    type TileOut = (usize, u32, Result<ItemImage>, u32);
+    let outs: Vec<TileOut> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|w| {
+                let todo = &todo;
+                let seed = &seed;
+                scope.spawn(move || {
+                    let mut out: Vec<TileOut> = Vec::new();
+                    for (i, &tid) in todo.iter().enumerate().skip(w).step_by(workers) {
+                        let mut child = DecodeCtx {
+                            stack: seed.stack.clone(),
+                            cache: std::collections::HashMap::new(),
+                            ..*seed
+                        };
+                        let r = decode_item_output(hdr, tid, depth, &mut child, false);
+                        out.push((i, tid, r, child.decodes));
+                    }
+                    out
+                })
+            })
+            .collect();
+        let mut all = Vec::with_capacity(todo.len());
+        for h in handles {
+            match h.join() {
+                Ok(v) => all.extend(v),
+                Err(_) => all.push((
+                    usize::MAX,
+                    0,
+                    Err(Error::invalid("avif: a grid tile decode worker panicked")),
+                    0,
+                )),
+            }
+        }
+        all
+    });
+    let mut outs = outs;
+    outs.sort_by_key(|o| o.0);
+    let mut spent = 0u32;
+    for (_, tid, r, n) in outs {
+        spent = spent.saturating_add(n);
+        let image = r?;
+        ctx.cache.insert((tid, false), image);
+    }
+    ctx.decodes = ctx.decodes.saturating_add(spent);
+    if ctx.decodes > MAX_ITEM_DECODES {
+        return Err(Error::invalid(format!(
+            "avif: derivation graph needs more than {MAX_ITEM_DECODES} item decodes"
+        )));
+    }
+    Ok(())
 }
 
 const COLR: BoxType = b(b"colr");
