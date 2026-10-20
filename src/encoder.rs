@@ -108,6 +108,16 @@
 //!   follows the budget of [`Encoder::set_execution_context`] (serial
 //!   until one is granted). The tile layout is derived from the
 //!   picture size alone, so the bytes never depend on the budget.
+//! * `grid` — `auto` (default) / `none` / a tile edge in pixels
+//!   (`64..=4096`): how the picture splits into coded items
+//!   ([`GridTiling`]). `auto` codes one item up to
+//!   [`crate::still::AUTO_GRID_MAX_SINGLE_PIXELS`] luma samples and a
+//!   `grid` of [`crate::still::AUTO_GRID_TILE`]-pixel tiles above it
+//!   (the tiles coded on the budget's workers, each with a bounded
+//!   working set); `none` is one item whenever the coded extents fit
+//!   [`crate::still::STILL_MAX_CODED_DIM`]; a tile edge forces a grid
+//!   of tiles at most that size. The decoded pixels are the same on
+//!   every shape.
 //!
 //! With neither `quality` nor `q` the encode is lossless.
 
@@ -117,10 +127,10 @@ use oxideav_core::{
     Error, Frame, OptionField, OptionKind, OptionValue, Packet, PixelFormat, Result, TimeBase,
 };
 
-use crate::api::{exif_item_body, ColorInfo, EncodeOptions, EncodeSpeed, Metadata};
+use crate::api::{exif_item_body, ColorInfo, EncodeOptions, EncodeSpeed, GridTiling, Metadata};
 use crate::meta::Colr;
 use crate::still::{
-    encode_still, identity_full_range_colr, StillChroma, StillImage, StillProperties,
+    encode_still_auto, identity_full_range_colr, StillChroma, StillImage, StillProperties,
 };
 
 /// Every input layout the encoder accepts (the module docs' list) —
@@ -190,6 +200,8 @@ pub struct AvifEncoderOptions {
     /// Explicit worker threads (`threads`); `None` = the execution
     /// context's budget.
     pub threads: Option<usize>,
+    /// How the picture splits into coded items (`grid`).
+    pub grid: GridTiling,
 }
 
 impl Default for AvifEncoderOptions {
@@ -202,6 +214,7 @@ impl Default for AvifEncoderOptions {
             premultiplied: false,
             speed: EncodeSpeed::Fast,
             threads: None,
+            grid: GridTiling::Auto,
         }
     }
 }
@@ -246,6 +259,11 @@ impl AvifEncoderOptions {
         self.threads = threads;
         self
     }
+    /// Setter: replace `grid`.
+    pub fn with_grid(mut self, grid: GridTiling) -> Self {
+        self.grid = grid;
+        self
+    }
 
     /// Strict parse of a parameter set's option bag.
     pub fn from_params(params: &CodecParameters) -> Result<Self> {
@@ -277,6 +295,7 @@ impl AvifEncoderOptions {
             "premultiplied" => into.premultiplied = self.premultiplied,
             "speed" => into.speed = self.speed,
             "threads" => into.threads = self.threads,
+            "grid" => into.grid = self.grid,
             other => return Err(Error::invalid(format!("unknown option '{other}'"))),
         }
         Ok(())
@@ -297,6 +316,33 @@ impl AvifEncoderOptions {
         .with_chroma(self.chroma)
         .with_speed(self.speed)
         .with_threads(self.threads.unwrap_or(1))
+        .with_grid(self.grid)
+    }
+}
+
+/// Parse the `grid` option: `auto` / `none` / a tile edge in pixels.
+fn parse_grid_option(v: &OptionValue) -> Result<GridTiling> {
+    let s = v.as_str()?;
+    match s {
+        "auto" => Ok(GridTiling::Auto),
+        "none" | "single" => Ok(GridTiling::Single),
+        other => {
+            let edge: u32 = other.parse().map_err(|_| {
+                Error::invalid(format!(
+                    "avif encode: grid '{other}' is not auto / none / a tile edge in pixels"
+                ))
+            })?;
+            if !(crate::still::GRID_MIN_TILE_DIM..=crate::still::STILL_MAX_CODED_DIM)
+                .contains(&edge)
+            {
+                return Err(Error::invalid(format!(
+                    "avif encode: grid tile edge {edge} is outside {}..={}",
+                    crate::still::GRID_MIN_TILE_DIM,
+                    crate::still::STILL_MAX_CODED_DIM
+                )));
+            }
+            Ok(GridTiling::MaxTile(edge))
+        }
     }
 }
 
@@ -352,7 +398,13 @@ impl CodecOptionsStruct for AvifEncoderOptions {
             name: "threads",
             kind: OptionKind::U32,
             default: OptionValue::U32(0),
-            help: "Worker threads for the AV1 tile search (bytes never depend on it); 0 = the execution context's budget (serial unless granted)",
+            help: "Worker threads for the AV1 tile search and the grid's tiles (bytes never depend on it); 0 = the execution context's budget (serial unless granted)",
+        },
+        OptionField {
+            name: "grid",
+            kind: OptionKind::String,
+            default: OptionValue::String(String::new()),
+            help: "How the picture splits into coded items (default auto): auto (one item up to 1 MP, a grid of 512-pixel tiles above it), none (one item up to 4096 per axis), or a tile edge 64..=4096 in pixels; the pixels decode the same on every shape",
         },
     ];
 
@@ -390,6 +442,7 @@ impl CodecOptionsStruct for AvifEncoderOptions {
                 let n = value.as_u32()?;
                 self.threads = (n > 0).then_some(n as usize);
             }
+            "grid" => self.grid = parse_grid_option(value)?,
             other => return Err(Error::invalid(format!("unknown option '{other}'"))),
         }
         Ok(())
@@ -947,7 +1000,7 @@ impl Encoder for AvifEncoder {
         if let Some(label) = coded_label(&img) {
             self.params.pixel_format = Some(label);
         }
-        let bytes = encode_still(&img, &self.encode_options())?;
+        let bytes = encode_still_auto(&img, &self.encode_options())?;
         let mut pkt = Packet::new(0, TimeBase::new(1, 90_000), bytes);
         if let Some(pts) = vf.pts {
             pkt = pkt.with_pts(pts);

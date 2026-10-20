@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`grid` policy — the 12 MP registry encode in 1.2 s / 162 MiB on 8
+  workers (was 2.2 s / 607 MiB).** `EncodeOptions::grid`
+  (`GridTiling::Auto` / `Single` / `MaxTile(edge)`, the registry's
+  `grid=auto|none|<edge>` option) decides how a picture splits into
+  coded items: `auto` (the default) codes one item up to
+  `AUTO_GRID_MAX_SINGLE_PIXELS` (1 MP) luma samples and a `grid` of
+  `AUTO_GRID_TILE` (512)-pixel tiles above it — the AV1 encoder's
+  working set follows the coded item's area, so a 12 MP single item is
+  465 MiB serial where 48 tiles are 92 MiB. The grid's tiles are cut
+  straight from the picture and coded on up to `threads` workers
+  (`ExecutionContext::effective_workers`, each tile with a share of the
+  budget); the bytes never depend on the worker count. `encode` and
+  the registry encoder go through `encode_still_auto`, which honours
+  the policy (`elect_grid_for` is the election table); `encode_still`
+  / `encode_still_grid` stay the explicit shapes. Measured on the
+  4032 × 3024 device sample at quality 60, 8-bit 4:2:0
+  (`examples/encode_budget`): single item 7.99 s / 465 MiB (1 worker),
+  2.97 s / 553 MiB (4), 2.20 s / 607 MiB (8), 1 982 694 B, 35.76 dB
+  luma; 512-pixel grid 7.77 s / 92 MiB, 2.08 s / 116 MiB, 1.21 s /
+  162 MiB, 2 038 848 B (+2.8 %), 35.77 dB; 1024-pixel grid 7.25 s /
+  114 MiB, 2.03 s / 200 MiB, 1.43 s / 299 MiB, +1.6 %, 35.96 dB.
+
 - **Metadata through the registry (image-gateway contract, r477 blob
   wave).** The framework encoder writes the ICC profile, Exif block and
   XMP packet a picture carries as oxideav-core 0.1.40 metadata blobs —

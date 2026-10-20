@@ -983,6 +983,34 @@ pub enum EncodeSpeed {
     Thorough,
 }
 
+/// How a picture is split into coded items — the `grid` policy of
+/// [`EncodeOptions`] (the registry's `grid` option). A `grid` derived
+/// image (HEIF §6.6.2.3) codes the picture as independent AV1 tiles,
+/// each with its own working set, so a large picture's memory and
+/// wall clock follow the tile size and the worker budget instead of
+/// the whole canvas; the single-item coding keeps cross-tile
+/// prediction and the smallest file for pictures the AV1 encoder
+/// holds comfortably.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum GridTiling {
+    /// Single item up to [`crate::still::AUTO_GRID_MAX_SINGLE_PIXELS`]
+    /// luma samples (or the single-item coded bound), a grid of tiles
+    /// at most [`crate::still::AUTO_GRID_TILE`] pixels per axis above
+    /// it — the production default (see the README's budget table).
+    #[default]
+    Auto,
+    /// One coded item whenever the coded extents fit the single-item
+    /// bound ([`crate::still::STILL_MAX_CODED_DIM`] per axis); larger
+    /// canvases take the fewest tiles that fit it.
+    Single,
+    /// A grid of tiles at most this many pixels per axis (at least
+    /// [`crate::still::GRID_MIN_TILE_DIM`], at most
+    /// [`crate::still::STILL_MAX_CODED_DIM`]) whenever the picture
+    /// exceeds it on either axis; a picture that fits is one item.
+    MaxTile(u32),
+}
+
 /// Tuning for the encoders ([`crate::encode`], [`crate::encode_rgb8`],
 /// [`crate::encode_rgba8`], [`crate::still::encode_still`] …). The
 /// default is a lossless colour encode (`base_q_idx = 0`), lossless
@@ -1018,8 +1046,17 @@ pub struct EncodeOptions {
     pub speed: EncodeSpeed,
     /// Worker threads for the AV1 tile search of every coded item
     /// (default `1`). The tile layout is derived from the picture size
-    /// alone, so the coded bytes never depend on this value.
+    /// alone, so the coded bytes never depend on this value. The
+    /// tiles of a grid are coded on up to this many workers at once
+    /// (each with a share of the budget) — the bytes never depend on
+    /// that either.
     pub threads: usize,
+    /// How the picture splits into coded items (default
+    /// [`GridTiling::Auto`]). Honoured by [`crate::encode`] and the
+    /// registry encoder ([`crate::still::encode_still_auto`]);
+    /// [`crate::still::encode_still`] / [`crate::still::encode_still_grid`]
+    /// are the explicit shapes and ignore it.
+    pub grid: GridTiling,
 }
 
 impl Default for EncodeOptions {
@@ -1034,6 +1071,7 @@ impl Default for EncodeOptions {
             embed_icc: true,
             speed: EncodeSpeed::Fast,
             threads: 1,
+            grid: GridTiling::Auto,
         }
     }
 }
@@ -1093,6 +1131,11 @@ impl EncodeOptions {
     /// Setter: replace `threads` (clamped to at least 1).
     pub fn with_threads(mut self, threads: usize) -> Self {
         self.threads = threads.max(1);
+        self
+    }
+    /// Setter: replace `grid`.
+    pub fn with_grid(mut self, grid: GridTiling) -> Self {
+        self.grid = grid;
         self
     }
 

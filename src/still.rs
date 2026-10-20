@@ -46,7 +46,7 @@
 //! any conformant reader) to the input samples exactly. Lossy encodes
 //! are validated PSNR-gated in the test suite.
 
-use crate::api::EncodeSpeed;
+use crate::api::{EncodeSpeed, GridTiling};
 use crate::error::{AvifError as Error, Result};
 use crate::meta::{Clap, Colr};
 use crate::mux::{
@@ -670,23 +670,80 @@ pub fn elect_grid_tiling(width: u32, height: u32, max_tile: u32) -> Option<(u16,
     Some((per_axis(width)?, per_axis(height)?))
 }
 
-/// Encode `img` as a single coded item when its coded extents fit
-/// [`STILL_MAX_CODED_DIM`], otherwise as a grid with the tiling from
-/// [`elect_grid_tiling`]. The one-call entry point for arbitrary
-/// canvases.
+/// The tile edge [`GridTiling::Auto`] splits a large picture into:
+/// the AV1 encoder's working set follows the coded item's area, so a
+/// 12 MP picture as one item costs several hundred MiB where 512-pixel
+/// tiles keep each worker's share small (see the README's budget
+/// table); the tiles code independently, so the worker budget scales
+/// the wall clock.
+pub const AUTO_GRID_TILE: u32 = 512;
+
+/// The largest picture (luma samples) [`GridTiling::Auto`] still
+/// codes as one item: below it the single item's working set is
+/// modest and cross-tile prediction keeps the file smaller.
+pub const AUTO_GRID_MAX_SINGLE_PIXELS: u64 = 1_048_576;
+
+/// The `(columns, rows)` tiling `grid` asks for on a `width × height`
+/// picture, `None` for a single coded item. Every policy falls back to
+/// the fewest tiles within [`STILL_MAX_CODED_DIM`] when the coded
+/// extents exceed the single-item bound; an explicit
+/// [`GridTiling::MaxTile`] edge is clamped to
+/// [`GRID_MIN_TILE_DIM`]`..=`[`STILL_MAX_CODED_DIM`]. `Err` when no
+/// tiling satisfies the bounds (a zero extent).
+pub fn elect_grid_for(width: u32, height: u32, grid: GridTiling) -> Result<Option<(u16, u16)>> {
+    let (pw, ph) = (coded_extent(width), coded_extent(height));
+    let fits_single = pw <= STILL_MAX_CODED_DIM && ph <= STILL_MAX_CODED_DIM;
+    let max_tile = match grid {
+        GridTiling::Single => {
+            if fits_single {
+                return Ok(None);
+            }
+            STILL_MAX_CODED_DIM
+        }
+        GridTiling::Auto => {
+            let pixels = u64::from(width) * u64::from(height);
+            if fits_single
+                && (pixels <= AUTO_GRID_MAX_SINGLE_PIXELS
+                    || (pw <= AUTO_GRID_TILE && ph <= AUTO_GRID_TILE))
+            {
+                return Ok(None);
+            }
+            AUTO_GRID_TILE
+        }
+        GridTiling::MaxTile(edge) => {
+            let edge = edge.clamp(GRID_MIN_TILE_DIM, STILL_MAX_CODED_DIM);
+            if pw <= edge && ph <= edge {
+                return Ok(None);
+            }
+            edge
+        }
+        #[allow(unreachable_patterns)]
+        _ => STILL_MAX_CODED_DIM,
+    };
+    let tiling = elect_grid_tiling(width, height, max_tile).ok_or_else(|| {
+        Error::unsupported(format!(
+            "avif still: no grid tiling for {width}x{height} within {max_tile}-pixel tiles"
+        ))
+    })?;
+    Ok(Some(tiling))
+}
+
+/// Encode `img` under the options' [`EncodeOptions::grid`] policy: a
+/// single coded item, or a `grid` of tiles from [`elect_grid_for`]
+/// (tiles coded on up to [`EncodeOptions::threads`] workers). The
+/// one-call entry point for arbitrary canvases; the shape a picture
+/// lands on never changes its decoded pixels, only the working set
+/// and the bytes.
 pub fn encode_still_auto(img: &StillImage, opts: &EncodeOptions) -> Result<Vec<u8>> {
-    let (pw, ph) = (coded_extent(img.width), coded_extent(img.height));
-    if pw <= STILL_MAX_CODED_DIM && ph <= STILL_MAX_CODED_DIM {
-        return encode_still(img, opts);
+    // The shapes a grid cannot carry stay single items (the tiling
+    // refuses them by type otherwise).
+    let single_only = img.props.identity_derivation.is_some()
+        || img.depth_map.is_some()
+        || img.props.gain_map.is_some();
+    match elect_grid_for(img.width, img.height, opts.grid)? {
+        Some((columns, rows)) if !single_only => encode_still_grid(img, opts, columns, rows),
+        _ => encode_still(img, opts),
     }
-    let (columns, rows) = elect_grid_tiling(img.width, img.height, STILL_MAX_CODED_DIM)
-        .ok_or_else(|| {
-            Error::unsupported(format!(
-                "avif still: no grid tiling for {}x{} within {STILL_MAX_CODED_DIM}-pixel tiles",
-                img.width, img.height
-            ))
-        })?;
-    encode_still_grid(img, opts, columns, rows)
 }
 
 fn widen(p: &[u8]) -> Vec<u16> {
@@ -1313,47 +1370,52 @@ pub fn encode_still_grid(
     if let Some(axis) = props.imir {
         muxer = muxer.with_imir(axis);
     }
-    let mut max_profile = 0u8;
-    for r in 0..rows as usize {
-        for c in 0..columns as usize {
-            let x0 = c * tile_w as usize;
-            let y0 = r * tile_h as usize;
-            let ty = extract_rect(&img.y, w, h, x0, y0, tile_w as usize, tile_h as usize);
-            let (tu, tv) = if img.chroma.has_chroma() {
-                let (tcx, tcy) = (x0 >> sx, y0 >> sy);
-                let (tcw, tch) = ((tile_w >> sx) as usize, (tile_h >> sy) as usize);
-                (
-                    extract_rect(&img.u, cw as usize, ch as usize, tcx, tcy, tcw, tch),
-                    extract_rect(&img.v, cw as usize, ch as usize, tcx, tcy, tcw, tch),
-                )
-            } else {
-                (Vec::new(), Vec::new())
-            };
-            let coded = encode_coded_item(
-                tile_w,
-                tile_h,
-                img.bit_depth,
-                img.chroma.to_av1(),
-                ty,
-                tu,
-                tv,
-                opts.base_q_idx,
-                colr_is_full_range(img),
-                CodedTuning::of(opts),
-                "grid tile",
-            )?;
-            max_profile = max_profile.max(coded.seq_profile);
-            muxer = muxer.tile(GridTile {
-                width: tile_w,
-                height: tile_h,
-                payload: coded.payload,
-                av1c: coded.av1c,
-            });
-            if let Some(alpha) = &img.alpha {
+    // One tile at a time per worker: cut straight from the picture
+    // (edge-replicated at the right / bottom overflow) and coded with
+    // a share of the budget, so the working set is the picture plus
+    // `workers` tiles' worth of encoder state. The tiles are
+    // independent, so the bytes never depend on the worker count.
+    let tile_count = rows as usize * columns as usize;
+    let workers =
+        oxideav_core::ExecutionContext::with_threads(opts.threads).effective_workers(tile_count);
+    let per_tile = CodedTuning {
+        threads: (opts.threads / workers).max(1),
+        ..CodedTuning::of(opts)
+    };
+    let code_tile = |index: usize| -> Result<(CodedItem, Option<CodedItem>)> {
+        let (r, c) = (index / columns as usize, index % columns as usize);
+        let x0 = c * tile_w as usize;
+        let y0 = r * tile_h as usize;
+        let ty = extract_rect(&img.y, w, h, x0, y0, tile_w as usize, tile_h as usize);
+        let (tu, tv) = if img.chroma.has_chroma() {
+            let (tcx, tcy) = (x0 >> sx, y0 >> sy);
+            let (tcw, tch) = ((tile_w >> sx) as usize, (tile_h >> sy) as usize);
+            (
+                extract_rect(&img.u, cw as usize, ch as usize, tcx, tcy, tcw, tch),
+                extract_rect(&img.v, cw as usize, ch as usize, tcx, tcy, tcw, tch),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let coded = encode_coded_item(
+            tile_w,
+            tile_h,
+            img.bit_depth,
+            img.chroma.to_av1(),
+            ty,
+            tu,
+            tv,
+            opts.base_q_idx,
+            colr_is_full_range(img),
+            per_tile,
+            "grid tile",
+        )?;
+        let alpha = match &img.alpha {
+            Some(alpha) => {
                 // Alpha tiles: same geometry, monochrome, full range
                 // (av1-avif §4.1) — stitched by a hidden alpha `grid`.
                 let ta = extract_rect(alpha, w, h, x0, y0, tile_w as usize, tile_h as usize);
-                let coded_alpha = encode_coded_item(
+                Some(encode_coded_item(
                     tile_w,
                     tile_h,
                     img.bit_depth,
@@ -1363,17 +1425,32 @@ pub fn encode_still_grid(
                     Vec::new(),
                     opts.alpha_q_idx,
                     true,
-                    CodedTuning::of(opts),
+                    per_tile,
                     "grid alpha tile",
-                )?;
-                max_profile = max_profile.max(coded_alpha.seq_profile);
-                muxer = muxer.alpha_tile(GridTile {
-                    width: tile_w,
-                    height: tile_h,
-                    payload: coded_alpha.payload,
-                    av1c: coded_alpha.av1c,
-                });
+                )?)
             }
+            None => None,
+        };
+        Ok((coded, alpha))
+    };
+    let coded_tiles = code_in_parallel(tile_count, workers, &code_tile)?;
+    let mut max_profile = 0u8;
+    for (coded, coded_alpha) in coded_tiles {
+        max_profile = max_profile.max(coded.seq_profile);
+        muxer = muxer.tile(GridTile {
+            width: tile_w,
+            height: tile_h,
+            payload: coded.payload,
+            av1c: coded.av1c,
+        });
+        if let Some(coded_alpha) = coded_alpha {
+            max_profile = max_profile.max(coded_alpha.seq_profile);
+            muxer = muxer.alpha_tile(GridTile {
+                width: tile_w,
+                height: tile_h,
+                payload: coded_alpha.payload,
+                av1c: coded_alpha.av1c,
+            });
         }
     }
     if img.alpha.is_some() {
@@ -1387,6 +1464,54 @@ pub fn encode_still_grid(
         _ => muxer.no_profile_brand(),
     };
     muxer.build()
+}
+
+/// Run `job(0..count)` on up to `workers` scoped threads (round-robin
+/// over the job order, one job in flight per worker) and return the
+/// outputs in job order; the first failing job in job order is the
+/// error. `workers == 1` runs inline on the caller's thread.
+fn code_in_parallel<T, F>(count: usize, workers: usize, job: &F) -> Result<Vec<T>>
+where
+    T: Send,
+    F: Fn(usize) -> Result<T> + Sync,
+{
+    if workers <= 1 || count < 2 {
+        return (0..count).map(job).collect();
+    }
+    let mut slots: Vec<Option<Result<T>>> = (0..count).map(|_| None).collect();
+    let outs: Vec<Vec<(usize, Result<T>)>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|w| {
+                scope.spawn(move || {
+                    (w..count)
+                        .step_by(workers)
+                        .map(|i| (i, job(i)))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| {
+                h.join().unwrap_or_else(|_| {
+                    vec![(
+                        usize::MAX,
+                        Err(Error::invalid("avif still: a tile encode worker panicked")),
+                    )]
+                })
+            })
+            .collect()
+    });
+    for (i, r) in outs.into_iter().flatten() {
+        if i == usize::MAX {
+            return Err(Error::invalid("avif still: a tile encode worker panicked"));
+        }
+        slots[i] = Some(r);
+    }
+    slots
+        .into_iter()
+        .map(|s| s.unwrap_or_else(|| Err(Error::invalid("avif still: a tile was never coded"))))
+        .collect()
 }
 
 /// The canvas of an overlay-derived encode ([`encode_still_overlay`]).

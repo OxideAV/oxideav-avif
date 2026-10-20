@@ -233,7 +233,8 @@ fn capabilities_declare_layouts_flags_and_quality() {
             "chroma",
             "premultiplied",
             "speed",
-            "threads"
+            "threads",
+            "grid"
         ]
     );
     let schema = ctx
@@ -860,4 +861,153 @@ fn blobs_ride_the_registry_frame_over_stream() {
     let (vf, _) = decode(&ctx, &CodecParameters::video(CodecId::new(AVIF)), &plain);
     assert!(vf.blobs().is_empty());
     assert!(plain.len() < bytes.len());
+}
+
+// ───────────────────────────── grid policy ──────────────────────────
+
+/// The `grid` policy: `auto` codes a picture above 1 MP as a grid of
+/// 512-pixel tiles and a smaller one as a single item, `none` keeps
+/// one item up to the coded bound, a tile edge forces that tiling;
+/// the pixels decode the same on every shape, the bytes never depend
+/// on the worker budget, and the option parses strictly.
+#[test]
+fn grid_policy_elects_shapes_and_tiles_code_on_the_budget() {
+    use oxideav_avif::{
+        elect_grid_for, GridTiling, AUTO_GRID_MAX_SINGLE_PIXELS, AUTO_GRID_TILE,
+        STILL_MAX_CODED_DIM,
+    };
+    // The election table.
+    assert_eq!(elect_grid_for(1024, 1024, GridTiling::Auto).unwrap(), None);
+    assert_eq!(elect_grid_for(1100, 900, GridTiling::Auto).unwrap(), None);
+    assert_eq!(
+        elect_grid_for(4032, 3024, GridTiling::Auto).unwrap(),
+        Some((8, 6))
+    );
+    assert_eq!(
+        elect_grid_for(1200, 900, GridTiling::Auto).unwrap(),
+        Some((3, 2))
+    );
+    assert_eq!(
+        elect_grid_for(4032, 3024, GridTiling::Single).unwrap(),
+        None
+    );
+    assert_eq!(
+        elect_grid_for(8000, 100, GridTiling::Single).unwrap(),
+        Some((2, 1))
+    );
+    assert_eq!(
+        elect_grid_for(4032, 3024, GridTiling::MaxTile(1024)).unwrap(),
+        Some((4, 3))
+    );
+    assert_eq!(
+        elect_grid_for(500, 500, GridTiling::MaxTile(512)).unwrap(),
+        None
+    );
+    assert_eq!(
+        elect_grid_for(500, 500, GridTiling::MaxTile(8)).unwrap(),
+        Some((8, 8))
+    );
+    assert_eq!(elect_grid_for(0, 10, GridTiling::Auto).unwrap(), None);
+    assert!(elect_grid_for(5000, 0, GridTiling::Single).is_err());
+    assert_eq!(AUTO_GRID_TILE, 512);
+    assert_eq!(AUTO_GRID_MAX_SINGLE_PIXELS, 1 << 20);
+    assert_eq!(STILL_MAX_CODED_DIM, 4096);
+
+    let ctx = registry();
+    let (w, h) = (1200u32, 900u32);
+    let f = frame(PixelFormat::Yuv420P, w, h);
+    let shape = |opts: CodecOptions, threads: usize| -> (Vec<u8>, Option<(u16, u16)>) {
+        let p = params(PixelFormat::Yuv420P, w, h, opts.set("quality", "70"));
+        let mut enc = ctx.codecs.first_encoder(&p).expect("encoder");
+        enc.set_execution_context(&ExecutionContext::with_threads(threads));
+        enc.send_frame(&f).expect("send_frame");
+        let bytes = enc.receive_packet().expect("packet").data;
+        let tiles = grid_tiles(&bytes);
+        (bytes, tiles)
+    };
+    let (auto1, tiles) = shape(CodecOptions::new(), 1);
+    assert_eq!(tiles, Some((3, 2)), "1 MP+ codes as a grid by default");
+    let (auto8, _) = shape(CodecOptions::new(), 8);
+    assert_eq!(auto1, auto8, "the bytes never depend on the worker budget");
+    let (none, tiles) = shape(CodecOptions::new().set("grid", "none"), 8);
+    assert_eq!(tiles, None, "grid=none is one item");
+    let (edge, tiles) = shape(CodecOptions::new().set("grid", "256"), 4);
+    assert_eq!(tiles, Some((5, 4)));
+    let (small_single, tiles) = shape(CodecOptions::new().set("grid", "2048"), 2);
+    assert_eq!(tiles, None, "a tile edge the picture fits is one item");
+    assert_eq!(small_single, none);
+
+    // Every shape decodes to the same picture (within the quantiser)
+    // and the same label.
+    let dp = CodecParameters::video(CodecId::new(AVIF));
+    let (vf_auto, label) = decode(&ctx, &dp, &auto1);
+    let (vf_none, label2) = decode(&ctx, &dp, &none);
+    let (vf_edge, _) = decode(&ctx, &dp, &edge);
+    assert_eq!(label, PixelFormat::YuvJ420P);
+    assert_eq!(label, label2);
+    let src = planes_of(&f)[0].data.clone();
+    for (name, vf) in [("auto", &vf_auto), ("none", &vf_none), ("256", &vf_edge)] {
+        let y = tight_plane(vf, 0, w as usize, h as usize);
+        let psnr = psnr8(&src, &y);
+        assert!(psnr > 30.0, "{name}: luma PSNR {psnr:.2} dB");
+    }
+    let y_auto = tight_plane(&vf_auto, 0, w as usize, h as usize);
+    let y_none = tight_plane(&vf_none, 0, w as usize, h as usize);
+    let agree = psnr8(&y_auto, &y_none);
+    assert!(
+        agree > 30.0,
+        "shapes agree within the quantiser: {agree:.2} dB"
+    );
+
+    // Strict parse.
+    for bad in ["0", "32", "5000", "sometimes", "-1"] {
+        let p = params(
+            PixelFormat::Yuv420P,
+            16,
+            16,
+            CodecOptions::new().set("grid", bad),
+        );
+        assert!(
+            matches!(oxideav_avif::make_encoder(&p), Err(Error::InvalidData(_))),
+            "grid={bad} must be refused"
+        );
+    }
+    let opts = oxideav_avif::AvifEncoderOptions::from_params(&params(
+        PixelFormat::Yuv420P,
+        16,
+        16,
+        CodecOptions::new().set("grid", "1024"),
+    ))
+    .expect("parse");
+    assert_eq!(opts.grid, GridTiling::MaxTile(1024));
+    assert_eq!(opts.resolve().grid, GridTiling::MaxTile(1024));
+    assert_eq!(
+        oxideav_avif::AvifEncoderOptions::default().grid,
+        GridTiling::Auto
+    );
+}
+
+/// `(columns, rows)` of a file whose primary is a `grid`, `None` for a
+/// coded primary.
+fn grid_tiles(bytes: &[u8]) -> Option<(u16, u16)> {
+    let info = oxideav_avif::inspect(bytes).expect("inspect");
+    if !info.is_grid {
+        return None;
+    }
+    let hdr = oxideav_avif::parse_header(bytes).expect("header");
+    let body = hdr
+        .item_data(hdr.meta.primary_item_id.expect("primary"))
+        .expect("grid body");
+    let grid = oxideav_avif::ImageGrid::parse(&body).expect("grid descriptor");
+    Some((grid.columns, grid.rows))
+}
+
+/// One plane of a frame, tightly packed.
+fn tight_plane(vf: &VideoFrame, i: usize, w: usize, h: usize) -> Vec<u8> {
+    let p = &vf.planes[i];
+    let mut out = Vec::with_capacity(w * h);
+    for row in 0..h {
+        out.extend_from_slice(&p.data[row * p.stride..row * p.stride + w]);
+    }
+    out
 }
