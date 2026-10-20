@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Metadata through the registry (image-gateway contract, r477 blob
+  wave).** The framework encoder writes the ICC profile, Exif block and
+  XMP packet a picture carries as oxideav-core 0.1.40 metadata blobs —
+  `CodecParameters::blobs` (stream-level) refined by the frame's own
+  blobs record, a frame blob overriding a stream blob of the same kind:
+  `BlobKind::ICC` becomes the `prof` `colr` property next to the `nclx`
+  one, `BlobKind::EXIF` (the TIFF-structured block from its byte-order
+  mark) the `Exif` item with the 4-byte offset header the encoder
+  writes, `BlobKind::XMP` the `mime` item; kinds AVIF has no item for
+  are dropped. The framework decoder puts the same three kinds on every
+  frame it emits (`VideoFrame::blobs`), `AvifImage::from_video_frame`
+  reads them (frame over stream) into `metadata`, and
+  `Metadata::to_blobs` / `from_blobs` / `from_refined_blobs` make the
+  contract record and the blobs one source of truth. `HEIC → AVIF`
+  through the gateway no longer drops the profile / Exif / XMP.
+
 ## [0.0.15](https://github.com/OxideAV/oxideav-avif/compare/v0.0.14...v0.0.15) - 2026-10-17
 
 ### Other

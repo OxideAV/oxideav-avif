@@ -8,7 +8,9 @@ use std::io::{Read, Write};
 use std::time::Duration;
 
 use oxideav_core::frame::{VideoFrame, VideoPlane};
-use oxideav_core::{CodecId, CodecParameters, ColorSignal, Packet, TimeBase};
+use oxideav_core::{
+    BlobKind, CodecId, CodecParameters, ColorSignal, MetadataBlob, Packet, TimeBase,
+};
 
 use crate::api::{
     burst_members, exif_item_body, exif_tiff_bytes, has_moov, item_colrs, AvifImage, ColorInfo,
@@ -49,10 +51,72 @@ pub(crate) fn from_core_err(e: oxideav_core::Error) -> Error {
 // Framework frame conversions
 // ---------------------------------------------------------------------
 
+// ---------------------------------------------------------------------
+// Metadata ≡ blobs (oxideav-core 0.1.40 carriage)
+// ---------------------------------------------------------------------
+
+impl Metadata {
+    /// The metadata as framework blobs, in the order ICC / Exif / XMP
+    /// (the kinds that are set): [`BlobKind::ICC`] carries the raw
+    /// profile, [`BlobKind::EXIF`] the TIFF-structured block from its
+    /// byte-order mark (the `Exif` item's 4-byte offset header is this
+    /// crate's framing, never part of the blob), [`BlobKind::XMP`] the
+    /// packet bytes. `gamma` has no blob form (it is a `gAMA`-style
+    /// number, not an opaque payload) and is not carried.
+    pub fn to_blobs(&self) -> Vec<MetadataBlob> {
+        let mut out = Vec::with_capacity(3);
+        if let Some(icc) = &self.icc {
+            out.push(MetadataBlob::new(BlobKind::ICC, icc.clone()));
+        }
+        if let Some(exif) = &self.exif {
+            out.push(MetadataBlob::new(BlobKind::EXIF, exif.clone()));
+        }
+        if let Some(xmp) = &self.xmp {
+            out.push(
+                MetadataBlob::new(BlobKind::XMP, xmp.clone()).with_mime("application/rdf+xml"),
+            );
+        }
+        out
+    }
+
+    /// The metadata a blob list describes: the first ICC / Exif / XMP
+    /// blob of each kind (other kinds are not this crate's to carry —
+    /// an AVIF file has no item for them). `gamma` stays `None`.
+    pub fn from_blobs(blobs: &[MetadataBlob]) -> Self {
+        let first = |kind: &BlobKind| blobs.iter().find(|b| b.is(kind)).map(|b| b.data.clone());
+        Self::new(
+            first(&BlobKind::ICC),
+            first(&BlobKind::EXIF),
+            first(&BlobKind::XMP),
+            None,
+        )
+    }
+
+    /// The metadata of a picture whose frame record carries `frame`
+    /// and whose stream carries `stream`: a frame blob overrides a
+    /// stream blob of the same kind, every other stream blob stands.
+    pub fn from_refined_blobs(stream: &[MetadataBlob], frame: &[MetadataBlob]) -> Self {
+        let pick = |kind: &BlobKind| {
+            frame
+                .iter()
+                .chain(stream.iter())
+                .find(|b| b.is(kind))
+                .map(|b| b.data.clone())
+        };
+        Self::new(
+            pick(&BlobKind::ICC),
+            pick(&BlobKind::EXIF),
+            pick(&BlobKind::XMP),
+            None,
+        )
+    }
+}
+
 /// The picture as a framework frame: the planes as given, the colour
-/// as the frame's `ColorSignal` side channel, and — for `Ya16Le`,
-/// whose words are wider than the coded depth — the depth on the
-/// significant-bits side channel.
+/// as the frame's `ColorSignal` side channel, its ICC / Exif / XMP as
+/// the frame's metadata blobs ([`Metadata::to_blobs`]), and — for
+/// `Ya16Le`, whose words are wider than the coded depth — the depth
+/// on the significant-bits side channel.
 impl From<AvifImage> for VideoFrame {
     fn from(img: AvifImage) -> Self {
         let signal = color_signal_for(Some(&img.color.to_colr()));
@@ -70,6 +134,10 @@ impl From<AvifImage> for VideoFrame {
         vf.set_color_signal(signal);
         if img.format == AvifPixelFormat::Ya16Le && img.bit_depth < 16 {
             vf.set_significant_bits(vec![img.bit_depth]);
+        }
+        let blobs = img.metadata.to_blobs();
+        if !blobs.is_empty() {
+            vf.set_blobs(blobs);
         }
         vf
     }
@@ -117,7 +185,9 @@ impl AvifImage {
     /// is not a plane); `color` is the frame's `ColorSignal`, else the
     /// parameters' stream-level one, else (fully unspecified) the MIAF
     /// default, with the label's own range / matrix applied; the frame's
-    /// significant-bits channel sets the depth of a `Ya16Le` picture.
+    /// significant-bits channel sets the depth of a `Ya16Le` picture;
+    /// `metadata` is the frame's ICC / Exif / XMP blobs refined over
+    /// the parameters' stream-level ones ([`Metadata::from_refined_blobs`]).
     pub fn from_video_frame(frame: &VideoFrame, params: &CodecParameters) -> Result<Self> {
         let width = params
             .width
@@ -151,9 +221,11 @@ impl AvifImage {
             _ => format.bit_depth(),
         };
         let planes = core_to_avif_frame(frame.clone()).planes;
+        let metadata = Metadata::from_refined_blobs(params.blobs(), &frame.blobs());
         Ok(Self::new(width, height, format, planes)?
             .with_color(color)
-            .with_bit_depth(bit_depth))
+            .with_bit_depth(bit_depth)
+            .with_metadata(metadata))
     }
 }
 

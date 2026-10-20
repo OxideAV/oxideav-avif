@@ -19,8 +19,8 @@
 use oxideav_avif::{AvifDecoder, ENCODER_PIXEL_FORMATS};
 use oxideav_core::frame::{VideoFrame, VideoPlane};
 use oxideav_core::{
-    CodecId, CodecOptions, CodecParameters, Decoder, Encoder, Error, ExecutionContext, Frame,
-    Packet, PixelFormat, RuntimeContext, TimeBase,
+    BlobKind, CodecId, CodecOptions, CodecParameters, Decoder, Encoder, Error, ExecutionContext,
+    Frame, MetadataBlob, Packet, PixelFormat, RuntimeContext, TimeBase,
 };
 
 const AVIF: &str = oxideav_avif::CODEC_ID_STR;
@@ -762,4 +762,102 @@ fn decoder_options_parse_strictly_and_threads_resolve() {
         AvifDecoder::with_params(&p(CodecOptions::new().set("reference_white", "-1"))),
         Err(Error::InvalidData(_))
     ));
+}
+
+/// A minimal TIFF-structured Exif block (little-endian header, one
+/// empty IFD) — the `BlobKind::EXIF` payload convention.
+fn exif_block() -> Vec<u8> {
+    let mut v = b"II*\0".to_vec();
+    v.extend_from_slice(&8u32.to_le_bytes());
+    v.extend_from_slice(&0u16.to_le_bytes());
+    v.extend_from_slice(&0u32.to_le_bytes());
+    v
+}
+
+/// Metadata through the registry (image-gateway contract, r477 blob
+/// wave): stream blobs on the parameters, frame blobs on the record,
+/// the frame's kind winning; ICC lands as the `prof` `colr`, Exif as
+/// the `Exif` item (offset header written by the encoder, stripped by
+/// the decoder), XMP as the `mime` item; kinds AVIF cannot carry are
+/// dropped; the decoder puts the three back on its frame and the
+/// contract image's `metadata` is the same source of truth.
+#[test]
+fn blobs_ride_the_registry_frame_over_stream() {
+    let ctx = registry();
+    let icc_stream = b"stream-side ICC profile bytes".to_vec();
+    let icc_frame = b"frame-side ICC profile bytes (wins)".to_vec();
+    let exif = exif_block();
+    let xmp = b"<?xpacket begin='' id='W5M0MpCehiHzreSzNTczkc9d'?>\
+<x:xmpmeta xmlns:x='adobe:ns:meta/'/><?xpacket end='w'?>"
+        .to_vec();
+    let mut p = params(
+        PixelFormat::Yuv420P,
+        16,
+        16,
+        CodecOptions::new().set("quality", "80"),
+    );
+    p.blobs = vec![
+        MetadataBlob::new(BlobKind::ICC, icc_stream.clone()),
+        MetadataBlob::new(BlobKind::EXIF, exif.clone()),
+        MetadataBlob::new(BlobKind::IPTC, b"no AVIF carriage".to_vec()),
+    ];
+    let mut f = frame(PixelFormat::Yuv420P, 16, 16);
+    if let Frame::Video(v) = &mut f {
+        v.set_blobs(vec![
+            MetadataBlob::new(BlobKind::ICC, icc_frame.clone()),
+            MetadataBlob::new(BlobKind::XMP, xmp.clone()).with_mime("application/rdf+xml"),
+        ]);
+    }
+    let (bytes, _) = encode(&ctx, &p, &f);
+
+    // The contract view of the written file.
+    let img = oxideav_avif::decode(&bytes).expect("decode");
+    assert_eq!(
+        img.metadata.icc.as_deref(),
+        Some(&icc_frame[..]),
+        "frame ICC over stream ICC"
+    );
+    assert_eq!(
+        img.metadata.exif.as_deref(),
+        Some(&exif[..]),
+        "stream Exif stands"
+    );
+    assert_eq!(img.metadata.xmp.as_deref(), Some(&xmp[..]), "frame XMP");
+    let info = oxideav_avif::info(&bytes).expect("info");
+    assert!(info.has_exif && info.has_xmp && info.has_icc);
+
+    // The registry decoder puts the same three on its frame.
+    let (vf, _) = decode(&ctx, &CodecParameters::video(CodecId::new(AVIF)), &bytes);
+    let blobs = vf.blobs();
+    assert_eq!(blobs.len(), 3, "ICC / Exif / XMP, nothing else: {blobs:?}");
+    assert_eq!(vf.blob(&BlobKind::ICC).expect("icc").data, icc_frame);
+    assert_eq!(vf.blob(&BlobKind::EXIF).expect("exif").data, exif);
+    let x = vf.blob(&BlobKind::XMP).expect("xmp");
+    assert_eq!(x.data, xmp);
+    assert_eq!(x.mime.as_deref(), Some("application/rdf+xml"));
+    assert!(vf.blob(&BlobKind::IPTC).is_none());
+    assert_eq!(img.metadata, oxideav_avif::Metadata::from_blobs(&blobs));
+    assert_eq!(img.metadata.to_blobs(), blobs);
+
+    // The frame conversion refines the same way.
+    let back = oxideav_avif::AvifImage::from_video_frame(&vf, &p).expect("from_video_frame");
+    assert_eq!(back.metadata, img.metadata);
+    let mut bare = vf.clone();
+    bare.set_blobs(Vec::new());
+    let stream_only = oxideav_avif::AvifImage::from_video_frame(&bare, &p).expect("stream only");
+    assert_eq!(stream_only.metadata.icc.as_deref(), Some(&icc_stream[..]));
+    assert_eq!(stream_only.metadata.exif.as_deref(), Some(&exif[..]));
+    assert!(stream_only.metadata.xmp.is_none());
+
+    // Without blobs the file carries no metadata items at all.
+    let (plain, _) = encode(
+        &ctx,
+        &params(PixelFormat::Yuv420P, 16, 16, CodecOptions::new()),
+        &frame(PixelFormat::Yuv420P, 16, 16),
+    );
+    let info = oxideav_avif::info(&plain).expect("info");
+    assert!(!info.has_exif && !info.has_xmp && !info.has_icc);
+    let (vf, _) = decode(&ctx, &CodecParameters::video(CodecId::new(AVIF)), &plain);
+    assert!(vf.blobs().is_empty());
+    assert!(plain.len() < bytes.len());
 }

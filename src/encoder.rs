@@ -61,6 +61,23 @@
 //! as given either way; set `color_signal.range = Limited` to write a
 //! limited-range `colr` instead.
 //!
+//! # Metadata
+//!
+//! The ICC profile, Exif block and XMP packet a picture carries as
+//! oxideav-core 0.1.40 metadata blobs are written as the file's
+//! metadata: [`CodecParameters::blobs`] (stream-level) refined by the
+//! frame's own blobs record (a frame blob overrides a stream blob of
+//! the same kind — [`crate::Metadata::from_refined_blobs`]).
+//! `BlobKind::ICC` becomes the `prof` `colr` property next to the
+//! `nclx` one, `BlobKind::EXIF` (the TIFF-structured block from its
+//! byte-order mark) an `Exif` item whose 4-byte offset header this
+//! encoder writes, `BlobKind::XMP` a `mime` item. Other kinds have no
+//! AVIF carriage and are dropped; the decoder puts the same three
+//! kinds back on its frames, so `decode(encode(frame))` carries the
+//! metadata round. There is no "embed" switch on this path: a caller
+//! that wants a blob withheld strips it from the parameters / frame
+//! (the gateway's strip rules).
+//!
 //! The accepted layouts are published as [`ENCODER_PIXEL_FORMATS`]
 //! (the registry's `CodecCapabilities::accepted_pixel_formats`, the
 //! set a gateway's conversion ladder reads); any other label is a
@@ -100,9 +117,11 @@ use oxideav_core::{
     Error, Frame, OptionField, OptionKind, OptionValue, Packet, PixelFormat, Result, TimeBase,
 };
 
-use crate::api::{ColorInfo, EncodeOptions, EncodeSpeed};
+use crate::api::{exif_item_body, ColorInfo, EncodeOptions, EncodeSpeed, Metadata};
 use crate::meta::Colr;
-use crate::still::{encode_still, identity_full_range_colr, StillChroma, StillImage};
+use crate::still::{
+    encode_still, identity_full_range_colr, StillChroma, StillImage, StillProperties,
+};
 
 /// Every input layout the encoder accepts (the module docs' list) —
 /// the registry's `accepted_pixel_formats`. A frame in any other
@@ -544,6 +563,18 @@ impl AvifEncoder {
         };
         Ok(apply_color_signal(img, &self.params))
     }
+
+    /// The container metadata of a frame: its ICC / Exif / XMP blobs
+    /// refined over the stream's (see the module docs), in the item
+    /// framing the muxer expects (the Exif body gets its offset
+    /// header).
+    fn metadata_props(&self, vf: &VideoFrame) -> StillProperties {
+        let meta = Metadata::from_refined_blobs(self.params.blobs(), &vf.blobs());
+        StillProperties::default()
+            .with_exif(meta.exif.as_deref().map(exif_item_body))
+            .with_xmp(meta.xmp)
+            .with_icc(meta.icc)
+    }
 }
 
 /// Fold the stream's [`CodecParameters::color_signal`] into the item's
@@ -908,7 +939,7 @@ impl Encoder for AvifEncoder {
                 )))
             }
         };
-        let img = self.frame_to_still(vf)?;
+        let img = self.frame_to_still(vf)?.with_props(self.metadata_props(vf));
         self.params.color_signal = signal_of(&img);
         // The output parameters carry the coded layout's label (what
         // the file decodes back as), not the input label: `Rgb24` is
