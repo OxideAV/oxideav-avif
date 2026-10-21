@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Odd extents on sub-sampled layouts are a typed refusal.** A
+  `Yuv420P` / `Yuv422P` (8 / 10 / 12-bit, `YuvJ*`, `Yuva420P`) frame at
+  an odd extent on the sub-sampled axis is `Unsupported` from the
+  registry encoder (the contract path's rule) — a 2 × 1 `Yuv420P12Le`
+  frame reached a zero-height chroma plane and panicked in the fuzz
+  harness; every plane-length check is now underflow-proof.
+- **Empty metadata payloads are not written.** An empty ICC / Exif /
+  XMP blob (or contract `Metadata` field) is nothing to carry and no
+  item is written for it — a zero-length item extent reads as "the
+  whole data" under ISO/IEC 14496-12 §8.11.3, and the fuzz harness saw
+  an empty XMP blob come back as 57 bytes of something else.
+  `Metadata::from_blobs` / `from_refined_blobs` skip empty payloads.
+- **`info()` reports the extents a decode yields**: the primary's
+  `clap` (when it fits) and an odd `irot` quarter turn are applied to
+  the `ispe` extents, so a 3 × 1 picture padded to its 8 × 8 coded
+  item is `3 × 1` on both paths (was `8 × 8` from `info`, `3 × 1` from
+  `decode`).
+
 ### Changed
 
 - **The registry encoder's default is `quality` 60, not lossless.** A
@@ -24,6 +44,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Black-box interop gate (`tests/interop.rs`).** Twenty-one shapes
+  the registry encoder writes — the declared layouts at the default
+  and lossless qualities, 10 / 12-bit, planar RGB, alpha, premultiplied
+  alpha, ICC / Exif / XMP, the automatic grid with and without alpha, a
+  `grid=256` grid — are handed to every AVIF reader installed on the
+  host (`sips`, `magick identify`, `ffmpeg`, `heif-info`, `avifdec`),
+  each as an opaque process; a reader that is installed must accept
+  every file and report the extents. All 21 × 5 cells open on this
+  Mac, one reader gap recorded: `sips` yields no picture for a file
+  carrying the `prem` item reference (HEIF §6.9.1, a `mif2` reader
+  requirement) that the other four decode with the alpha.
+- **Fuzz target `registry_encoder_options`**: layout × geometry × every
+  codec option (in and out of range, malformed) × stream / frame blobs
+  through the registry encoder and decoder — never panics, the file
+  decodes to the announced label, ICC / Exif / XMP round-trip frame
+  over stream (two findings fixed above). The fuzz lockfile moves to
+  oxideav-core 0.1.40 / oxideav-av1 0.1.21 (the harnesses did not build
+  against the blob-less 0.1.37 any more).
 - **One-pass packed-RGB coding and the reader-side tile cap.** A lossy
   `Rgb24` / `Rgba` / `Bgr24` / `Bgra` frame is converted straight from
   its packed rows into the Y′CbCr coding planes (H.273 §8.3 per pixel,

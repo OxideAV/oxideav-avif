@@ -860,6 +860,19 @@ pub(crate) fn av1c_from_seq(seq: &SequenceHeader) -> Vec<u8> {
     vec![b0, b1, b2, 0x00]
 }
 
+/// A metadata payload worth an item: an empty Exif / XMP / ICC block
+/// is nothing to carry (and a zero-length item extent reads as "the
+/// whole data" under ISO/IEC 14496-12 §8.11.3, so it must never be
+/// written).
+fn non_empty(payload: &Option<Vec<u8>>) -> Option<&Vec<u8>> {
+    payload.as_ref().filter(|p| !p.is_empty())
+}
+
+/// An `Exif` item body with something after its 4-byte offset header.
+fn exif_worth_writing(body: &Option<Vec<u8>>) -> Option<&Vec<u8>> {
+    body.as_ref().filter(|p| p.len() > 4)
+}
+
 /// Map an AV1-encoder error into the crate error type with context.
 pub(crate) fn av1_err(stage: &str, e: oxideav_av1::Error) -> Error {
     Error::invalid(format!("avif still: AV1 {stage} encode failed: {e}"))
@@ -1166,7 +1179,7 @@ pub fn encode_still_burst(images: &[StillImage], opts: &EncodeOptions) -> Result
         let mut member = crate::mux::BurstMember::new(pw, ph, coded.payload, coded.av1c);
         member.pixi = Some(pixi_bits(img));
         member.colr = img.colr.clone();
-        member.icc = img.props.icc.clone();
+        member.icc = non_empty(&img.props.icc).cloned();
         if (pw, ph) != (img.width, img.height) {
             member.clap = Some(top_left_clap(img.width, img.height, pw, ph));
         }
@@ -1211,13 +1224,13 @@ fn still_muxer(img: &StillImage, opts: &EncodeOptions) -> Result<(AvifMuxer, u8)
         mux = mux.with_colr(colr.clone());
     }
     let props = &img.props;
-    if let Some(exif) = &props.exif {
+    if let Some(exif) = exif_worth_writing(&props.exif) {
         mux = mux.with_exif(exif.clone());
     }
-    if let Some(xmp) = &props.xmp {
+    if let Some(xmp) = non_empty(&props.xmp) {
         mux = mux.with_xmp(xmp.clone());
     }
-    if let Some(icc) = &props.icc {
+    if let Some(icc) = non_empty(&props.icc) {
         mux = mux.with_icc(icc.clone());
     }
     if let Some(mdcv) = props.mdcv {
@@ -1372,13 +1385,13 @@ pub fn encode_still_grid(
         muxer = muxer.with_colr(colr.clone());
     }
     let props = &img.props;
-    if let Some(exif) = &props.exif {
+    if let Some(exif) = exif_worth_writing(&props.exif) {
         muxer = muxer.with_exif(exif.clone());
     }
-    if let Some(xmp) = &props.xmp {
+    if let Some(xmp) = non_empty(&props.xmp) {
         muxer = muxer.with_xmp(xmp.clone());
     }
-    if let Some(icc) = &props.icc {
+    if let Some(icc) = non_empty(&props.icc) {
         muxer = muxer.with_icc(icc.clone());
     }
     if let Some(mdcv) = props.mdcv {

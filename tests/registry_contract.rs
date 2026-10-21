@@ -872,6 +872,25 @@ fn blobs_ride_the_registry_frame_over_stream() {
     assert_eq!(stream_only.metadata.exif.as_deref(), Some(&exif[..]));
     assert!(stream_only.metadata.xmp.is_none());
 
+    // Empty payloads are nothing to carry: no item is written (a
+    // zero-length item extent would read as "the whole data" — the
+    // fuzz harness found an empty XMP blob coming back as 57 bytes of
+    // something else).
+    let mut p_empty = params(PixelFormat::Yuv420P, 16, 16, CodecOptions::new());
+    p_empty.blobs = vec![MetadataBlob::new(BlobKind::ICC, Vec::new())];
+    let mut f_empty = frame(PixelFormat::Yuv420P, 16, 16);
+    if let Frame::Video(v) = &mut f_empty {
+        v.set_blobs(vec![
+            MetadataBlob::new(BlobKind::EXIF, Vec::new()),
+            MetadataBlob::new(BlobKind::XMP, Vec::new()),
+        ]);
+    }
+    let (empties, _) = encode(&ctx, &p_empty, &f_empty);
+    let info = oxideav_avif::info(&empties).expect("info");
+    assert!(!info.has_exif && !info.has_xmp && !info.has_icc, "{info:?}");
+    let (vf, _) = decode(&ctx, &CodecParameters::video(CodecId::new(AVIF)), &empties);
+    assert!(vf.blobs().is_empty(), "{:?}", vf.blobs());
+
     // Without blobs the file carries no metadata items at all.
     let (plain, _) = encode(
         &ctx,
@@ -883,6 +902,61 @@ fn blobs_ride_the_registry_frame_over_stream() {
     let (vf, _) = decode(&ctx, &CodecParameters::video(CodecId::new(AVIF)), &plain);
     assert!(vf.blobs().is_empty());
     assert!(plain.len() < bytes.len());
+}
+
+/// Sub-sampled layouts at odd extents are refused by type (never a
+/// zero-height chroma plane: a 2 × 1 `Yuv420P12Le` frame panicked in
+/// the fuzz harness), packed / 4:4:4 layouts take odd extents, and a
+/// short plane is `InvalidData`.
+#[test]
+fn odd_extents_refuse_subsampled_layouts_by_type_and_short_planes_by_data() {
+    let ctx = registry();
+    for (fmt, w, h) in [
+        (PixelFormat::Yuv420P12Le, 2, 1),
+        (PixelFormat::Yuv420P, 3, 2),
+        (PixelFormat::YuvJ420P, 2, 3),
+        (PixelFormat::Yuv422P10Le, 1, 2),
+        (PixelFormat::Yuva420P, 2, 1),
+    ] {
+        let mut enc = ctx
+            .codecs
+            .first_encoder(&params(fmt, w, h, CodecOptions::new()))
+            .expect("encoder");
+        let mut f = frame(fmt, w.max(2), h.max(2));
+        if let Frame::Video(v) = &mut f {
+            v.planes
+                .iter_mut()
+                .for_each(|p| p.data.truncate(p.stride * h as usize));
+        }
+        assert!(
+            matches!(enc.send_frame(&f), Err(Error::Unsupported(_))),
+            "{fmt:?} {w}x{h}"
+        );
+    }
+    for (fmt, w, h) in [
+        (PixelFormat::Yuv444P, 3, 1),
+        (PixelFormat::Rgb24, 1, 3),
+        (PixelFormat::Rgba, 3, 3),
+        (PixelFormat::Gray12Le, 1, 1),
+        (PixelFormat::Ya8, 5, 1),
+    ] {
+        let (bytes, _) = encode(
+            &ctx,
+            &params(fmt, w, h, CodecOptions::new()),
+            &frame(fmt, w, h),
+        );
+        let info = oxideav_avif::info(&bytes).expect("info");
+        assert_eq!((info.width, info.height), (w, h), "{fmt:?}");
+    }
+    let mut enc = ctx
+        .codecs
+        .first_encoder(&params(PixelFormat::Yuv420P, 16, 16, CodecOptions::new()))
+        .expect("encoder");
+    let mut f = frame(PixelFormat::Yuv420P, 16, 16);
+    if let Frame::Video(v) = &mut f {
+        v.planes[1].data.truncate(10);
+    }
+    assert!(matches!(enc.send_frame(&f), Err(Error::InvalidData(_))));
 }
 
 // ───────────────────────────── grid policy ──────────────────────────

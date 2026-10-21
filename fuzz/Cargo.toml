@@ -105,3 +105,13 @@ name = "contract_api"
 path = "fuzz_targets/contract_api.rs"
 test = false
 doc = false
+
+# r478 — the registry encoder's option / blob paths: layout × geometry
+# × every codec option (in and out of range) × stream / frame blobs;
+# never panics, the file decodes to the announced label, ICC / Exif /
+# XMP round-trip frame-over-stream. Fully in-tree; never skips.
+[[bin]]
+name = "registry_encoder_options"
+path = "fuzz_targets/registry_encoder_options.rs"
+test = false
+doc = false

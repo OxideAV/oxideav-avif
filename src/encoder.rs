@@ -587,6 +587,32 @@ impl AvifEncoder {
             .pixel_format
             .ok_or_else(|| Error::invalid("avif encode: CodecParameters.pixel_format required"))?;
 
+        // Sub-sampled chroma needs even extents on the sub-sampled
+        // axis (the contract path's rule): a typed refusal, never a
+        // zero-height chroma plane.
+        let (sx, sy) = match fmt {
+            PixelFormat::Yuv420P
+            | PixelFormat::YuvJ420P
+            | PixelFormat::Yuv420P10Le
+            | PixelFormat::Yuv420P12Le
+            | PixelFormat::Yuva420P => (1, 1),
+            PixelFormat::Yuv422P
+            | PixelFormat::YuvJ422P
+            | PixelFormat::Yuv422P10Le
+            | PixelFormat::Yuv422P12Le => (1, 0),
+            _ => (0, 0),
+        };
+        if (sx == 1 && width % 2 != 0) || (sy == 1 && height % 2 != 0) {
+            return Err(Error::unsupported(format!(
+                "avif encode: {fmt:?} at {width}x{height} — this encoder codes sub-sampled \
+                 chroma only at even extents; hand it a 4:4:4 or packed layout"
+            )));
+        }
+        if width == 0 || height == 0 {
+            return Err(Error::invalid(
+                "avif encode: dimensions must be at least 1x1",
+            ));
+        }
         let img = match fmt {
             PixelFormat::Yuv420P | PixelFormat::YuvJ420P => planar8(
                 vf,
@@ -708,10 +734,19 @@ fn signal_of(img: &StillImage) -> ColorSignal {
     crate::signal::color_signal_for(img.colr.as_ref())
 }
 
+/// The bytes `h` rows of `row_bytes` need at `stride` (the last row
+/// unpadded); 0 rows need none.
+fn plane_bytes(stride: usize, row_bytes: usize, h: usize) -> usize {
+    match h.checked_sub(1) {
+        Some(rows) => rows.saturating_mul(stride).saturating_add(row_bytes),
+        None => 0,
+    }
+}
+
 /// Extract one tightly-packed plane (`w × h` samples, 1 byte each)
 /// from a frame plane whose stride may exceed the row width.
 fn pack8(plane: &oxideav_core::frame::VideoPlane, w: usize, h: usize) -> Result<Vec<u16>> {
-    if plane.data.len() < plane.stride * (h - 1) + w || plane.stride < w {
+    if plane.data.len() < plane_bytes(plane.stride, w, h) || plane.stride < w {
         return Err(Error::invalid(format!(
             "avif encode: plane too short (stride {}, need {w}x{h})",
             plane.stride
@@ -728,7 +763,7 @@ fn pack8(plane: &oxideav_core::frame::VideoPlane, w: usize, h: usize) -> Result<
 /// Extract one tightly-packed plane of little-endian 2-byte samples.
 fn pack16le(plane: &oxideav_core::frame::VideoPlane, w: usize, h: usize) -> Result<Vec<u16>> {
     let row_bytes = w * 2;
-    if plane.data.len() < plane.stride * (h - 1) + row_bytes || plane.stride < row_bytes {
+    if plane.data.len() < plane_bytes(plane.stride, row_bytes, h) || plane.stride < row_bytes {
         return Err(Error::invalid(format!(
             "avif encode: 16-bit plane too short (stride {}, need {w}x{h}x2)",
             plane.stride
@@ -849,7 +884,7 @@ fn packed_rgb(
     let plane = &vf.planes[0];
     let (w, h) = (width as usize, height as usize);
     let row_bytes = w * bpp;
-    if plane.data.len() < plane.stride * (h - 1) + row_bytes || plane.stride < row_bytes {
+    if plane.data.len() < plane_bytes(plane.stride, row_bytes, h) || plane.stride < row_bytes {
         return Err(Error::invalid(format!(
             "avif encode: packed plane too short (stride {}, need {w}x{h}x{bpp})",
             plane.stride
@@ -1060,7 +1095,7 @@ fn ya8(vf: &VideoFrame, width: u32, height: u32) -> Result<StillImage> {
     let plane = &vf.planes[0];
     let (w, h) = (width as usize, height as usize);
     let row_bytes = w * 2;
-    if plane.data.len() < plane.stride * (h - 1) + row_bytes || plane.stride < row_bytes {
+    if plane.data.len() < plane_bytes(plane.stride, row_bytes, h) || plane.stride < row_bytes {
         return Err(Error::invalid(format!(
             "avif encode: Ya8 plane too short (stride {}, need {w}x{h}x2)",
             plane.stride

@@ -1295,9 +1295,27 @@ fn still_info(bytes: &[u8]) -> Result<ImageInfo> {
     } else {
         u32::try_from(burst.len()).unwrap_or(u32::MAX)
     };
+    // What a decode yields: the primary's `clap` (when it fits — a
+    // degenerate aperture passes the frame through) then an odd
+    // `irot` quarter turn swaps the axes (HEIF §6.5.10 order).
+    let (mut width, mut height) = (info.width, info.height);
+    for prop in hdr.meta.properties_for(primary_id) {
+        match prop {
+            crate::meta::Property::Clap(clap) => {
+                if let Some((w, h)) = crate::transform::clap_extent(clap, width, height) {
+                    width = w;
+                    height = h;
+                }
+            }
+            crate::meta::Property::Irot(irot) if irot.angle & 1 == 1 => {
+                std::mem::swap(&mut width, &mut height);
+            }
+            _ => {}
+        }
+    }
     Ok(ImageInfo::new(
-        info.width,
-        info.height,
+        width,
+        height,
         format,
         frames,
         info.has_alpha,

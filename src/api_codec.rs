@@ -79,11 +79,17 @@ impl Metadata {
         out
     }
 
-    /// The metadata a blob list describes: the first ICC / Exif / XMP
-    /// blob of each kind (other kinds are not this crate's to carry —
-    /// an AVIF file has no item for them). `gamma` stays `None`.
+    /// The metadata a blob list describes: the first non-empty ICC /
+    /// Exif / XMP blob of each kind (other kinds are not this crate's
+    /// to carry — an AVIF file has no item for them; an empty payload
+    /// is nothing to carry). `gamma` stays `None`.
     pub fn from_blobs(blobs: &[MetadataBlob]) -> Self {
-        let first = |kind: &BlobKind| blobs.iter().find(|b| b.is(kind)).map(|b| b.data.clone());
+        let first = |kind: &BlobKind| {
+            blobs
+                .iter()
+                .find(|b| b.is(kind) && !b.data.is_empty())
+                .map(|b| b.data.clone())
+        };
         Self::new(
             first(&BlobKind::ICC),
             first(&BlobKind::EXIF),
@@ -94,13 +100,14 @@ impl Metadata {
 
     /// The metadata of a picture whose frame record carries `frame`
     /// and whose stream carries `stream`: a frame blob overrides a
-    /// stream blob of the same kind, every other stream blob stands.
+    /// stream blob of the same kind, every other stream blob stands;
+    /// empty payloads are skipped.
     pub fn from_refined_blobs(stream: &[MetadataBlob], frame: &[MetadataBlob]) -> Self {
         let pick = |kind: &BlobKind| {
             frame
                 .iter()
                 .chain(stream.iter())
-                .find(|b| b.is(kind))
+                .find(|b| b.is(kind) && !b.data.is_empty())
                 .map(|b| b.data.clone())
         };
         Self::new(
