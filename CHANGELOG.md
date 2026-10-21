@@ -59,9 +59,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   codec option (in and out of range, malformed) × stream / frame blobs
   through the registry encoder and decoder — never panics, the file
   decodes to the announced label, ICC / Exif / XMP round-trip frame
-  over stream (two findings fixed above). The fuzz lockfile moves to
-  oxideav-core 0.1.40 / oxideav-av1 0.1.21 (the harnesses did not build
-  against the blob-less 0.1.37 any more).
+  over stream (two findings fixed above; 11.5 min clean after them).
 - **One-pass packed-RGB coding and the reader-side tile cap.** A lossy
   `Rgb24` / `Rgba` / `Bgr24` / `Bgra` frame is converted straight from
   its packed rows into the Y′CbCr coding planes (H.273 §8.3 per pixel,
