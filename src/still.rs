@@ -683,14 +683,31 @@ pub const AUTO_GRID_TILE: u32 = 512;
 /// modest and cross-tile prediction keeps the file smaller.
 pub const AUTO_GRID_MAX_SINGLE_PIXELS: u64 = 1_048_576;
 
+/// The most coded tiles (colour and alpha together) an automatic grid
+/// holds: every coded item carries its own `av1C` in the `ipco`
+/// (decoder configurations are never shared between items in the
+/// container writer's layout), and readers in the wild cap the `ipco`
+/// at 100 child boxes. [`GridTiling::Auto`] doubles the tile edge
+/// from [`AUTO_GRID_TILE`] until the tiles fit under this bound; an
+/// explicit [`GridTiling::MaxTile`] is honoured as given (a
+/// 4032 × 3024 picture at `grid=256` is 192 tiles, which such readers
+/// refuse).
+pub const AUTO_GRID_MAX_TILES: u32 = 90;
+
 /// The `(columns, rows)` tiling `grid` asks for on a `width × height`
-/// picture, `None` for a single coded item. Every policy falls back to
-/// the fewest tiles within [`STILL_MAX_CODED_DIM`] when the coded
-/// extents exceed the single-item bound; an explicit
-/// [`GridTiling::MaxTile`] edge is clamped to
-/// [`GRID_MIN_TILE_DIM`]`..=`[`STILL_MAX_CODED_DIM`]. `Err` when no
-/// tiling satisfies the bounds (a zero extent).
-pub fn elect_grid_for(width: u32, height: u32, grid: GridTiling) -> Result<Option<(u16, u16)>> {
+/// picture (`alpha` when it carries an alpha plane — its tiles count
+/// towards [`AUTO_GRID_MAX_TILES`]), `None` for a single coded item.
+/// Every policy falls back to the fewest tiles within
+/// [`STILL_MAX_CODED_DIM`] when the coded extents exceed the
+/// single-item bound; an explicit [`GridTiling::MaxTile`] edge is
+/// clamped to [`GRID_MIN_TILE_DIM`]`..=`[`STILL_MAX_CODED_DIM`]. `Err`
+/// when no tiling satisfies the bounds (a zero extent).
+pub fn elect_grid_for(
+    width: u32,
+    height: u32,
+    alpha: bool,
+    grid: GridTiling,
+) -> Result<Option<(u16, u16)>> {
     let (pw, ph) = (coded_extent(width), coded_extent(height));
     let fits_single = pw <= STILL_MAX_CODED_DIM && ph <= STILL_MAX_CODED_DIM;
     let max_tile = match grid {
@@ -708,7 +725,19 @@ pub fn elect_grid_for(width: u32, height: u32, grid: GridTiling) -> Result<Optio
             {
                 return Ok(None);
             }
-            AUTO_GRID_TILE
+            let per_tile = if alpha { 2 } else { 1 };
+            let mut edge = AUTO_GRID_TILE;
+            while edge < STILL_MAX_CODED_DIM {
+                match elect_grid_tiling(width, height, edge) {
+                    Some((c, r))
+                        if u32::from(c) * u32::from(r) * per_tile <= AUTO_GRID_MAX_TILES =>
+                    {
+                        break
+                    }
+                    _ => edge = (edge * 2).min(STILL_MAX_CODED_DIM),
+                }
+            }
+            edge
         }
         GridTiling::MaxTile(edge) => {
             let edge = edge.clamp(GRID_MIN_TILE_DIM, STILL_MAX_CODED_DIM);
@@ -740,7 +769,7 @@ pub fn encode_still_auto(img: &StillImage, opts: &EncodeOptions) -> Result<Vec<u
     let single_only = img.props.identity_derivation.is_some()
         || img.depth_map.is_some()
         || img.props.gain_map.is_some();
-    match elect_grid_for(img.width, img.height, opts.grid)? {
+    match elect_grid_for(img.width, img.height, img.alpha.is_some(), opts.grid)? {
         Some((columns, rows)) if !single_only => encode_still_grid(img, opts, columns, rows),
         _ => encode_still(img, opts),
     }

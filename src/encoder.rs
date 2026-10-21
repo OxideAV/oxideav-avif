@@ -831,34 +831,123 @@ fn packed_rgb(
             plane.stride
         )));
     }
-    let mut rgb = Vec::with_capacity(w * h * 3);
-    let mut alpha = if bpp == 4 {
-        Vec::with_capacity(w * h)
-    } else {
-        Vec::new()
-    };
-    for row in 0..h {
-        let s = row * plane.stride;
-        for px in plane.data[s..s + row_bytes].chunks_exact(bpp) {
-            rgb.push(px[rgb_at[0]]);
-            rgb.push(px[rgb_at[1]]);
-            rgb.push(px[rgb_at[2]]);
-            if bpp == 4 {
-                alpha.push(px[3] as u16);
-            }
-        }
-    }
     let img = match lossy {
-        Some((color, chroma)) => {
-            crate::api_codec::still_of_rgb_in(width, height, &rgb, 3, color, chroma)?
+        // Straight from the packed rows into the coding planes: no
+        // packed copy, no 4:4:4 intermediate (the conversion is the
+        // same arithmetic as the contract path's, pinned in the tests).
+        Some((color, chroma)) => packed_rgb_to_ycbcr(plane, w, h, bpp, rgb_at, color, chroma),
+        None => {
+            let mut rgb = Vec::with_capacity(w * h * 3);
+            for row in 0..h {
+                let s = row * plane.stride;
+                for px in plane.data[s..s + row_bytes].chunks_exact(bpp) {
+                    rgb.push(px[rgb_at[0]]);
+                    rgb.push(px[rgb_at[1]]);
+                    rgb.push(px[rgb_at[2]]);
+                }
+            }
+            StillImage::rgb8(width, height, &rgb)?
         }
-        None => StillImage::rgb8(width, height, &rgb)?,
     };
     if bpp == 4 {
+        let mut alpha = Vec::with_capacity(w * h);
+        for row in 0..h {
+            let s = row * plane.stride;
+            alpha.extend(
+                plane.data[s..s + row_bytes]
+                    .chunks_exact(bpp)
+                    .map(|px| u16::from(px[3])),
+            );
+        }
         Ok(img.with_alpha(alpha)?)
     } else {
         Ok(img)
     }
+}
+
+/// The H.273 §8.3 quantisation of an 8-bit picture under `color`:
+/// `(luma offset, luma scale, chroma mid, chroma scale)` — equations
+/// 20–22 for limited range (16 / 219 / 128 / 224), 38–40 for full
+/// range (0 / 255 / 128 / 255).
+fn ycbcr_scales(color: &ColorInfo) -> (f64, f64, f64, f64) {
+    if color.range == crate::api::ColorRange::Limited {
+        (16.0, 219.0, 128.0, 224.0)
+    } else {
+        (0.0, 255.0, 128.0, 255.0)
+    }
+}
+
+/// Packed 8-bit RGB(A) rows → the Y′CbCr coding planes of `chroma`
+/// in one pass: every pixel is converted to 4:4:4 exactly (H.273
+/// §8.3, `(Kr, Kb)` of the signalled matrix — the MIAF default BT.601
+/// for an unspecified one — rounded to nearest at the signalled
+/// range), the chroma of a sub-sampled layout box-filtered from the
+/// rounded 4:4:4 values (`(a + b + c + d + 2) >> 2` per 2×2 for
+/// 4:2:0, `(a + b + 1) >> 1` per pair for 4:2:2); odd extents promote
+/// to 4:4:4. The same numbers as the contract path's conversion
+/// ([`crate::api_codec`]'s `still_of_rgb_in`) without its packed /
+/// 4:4:4 intermediates: the working set is the output planes.
+fn packed_rgb_to_ycbcr(
+    plane: &oxideav_core::frame::VideoPlane,
+    w: usize,
+    h: usize,
+    bpp: usize,
+    rgb_at: [usize; 3],
+    color: ColorInfo,
+    chroma: StillChroma,
+) -> StillImage {
+    let chroma = match chroma {
+        StillChroma::Yuv420 if w % 2 != 0 || h % 2 != 0 => StillChroma::Yuv444,
+        StillChroma::Yuv422 if w % 2 != 0 => StillChroma::Yuv444,
+        StillChroma::Monochrome => StillChroma::Yuv444,
+        other => other,
+    };
+    let (kr, kb) = oxideav_heif::rgb::matrix_kr_kb(u16::from(color.matrix))
+        .unwrap_or_else(|| oxideav_heif::rgb::matrix_kr_kb(6).expect("BT.601"));
+    let kg = 1.0 - kr - kb;
+    let (y_off, y_scale, mid, c_scale) = ycbcr_scales(&color);
+    let (sx, sy) = chroma_shift(chroma);
+    let (cw, ch) = (w >> sx, h >> sy);
+    let mut y_plane = Vec::with_capacity(w * h);
+    let mut u_plane = vec![0u16; cw * ch];
+    let mut v_plane = vec![0u16; cw * ch];
+    let count = 1u32 << (sx + sy);
+    let round = |v: f64| v.round().clamp(0.0, 255.0) as u16;
+    // Rows go in pairs for 4:2:0 so the 2×2 sum closes per row pair
+    // without a full-resolution chroma plane: `acc` holds the running
+    // Cb / Cr sums of the chroma row under construction.
+    let mut acc_u = vec![0u32; cw];
+    let mut acc_v = vec![0u32; cw];
+    for row in 0..h {
+        let s = row * plane.stride;
+        let cy = row >> sy;
+        for (x, px) in plane.data[s..s + w * bpp].chunks_exact(bpp).enumerate() {
+            let r = f64::from(px[rgb_at[0]]) / 255.0;
+            let g = f64::from(px[rgb_at[1]]) / 255.0;
+            let b = f64::from(px[rgb_at[2]]) / 255.0;
+            let ey = kr * r + kg * g + kb * b;
+            let pb = (b - ey) / (2.0 * (1.0 - kb));
+            let pr = (r - ey) / (2.0 * (1.0 - kr));
+            y_plane.push(round(y_off + y_scale * ey));
+            let cb = round(mid + c_scale * pb);
+            let cr = round(mid + c_scale * pr);
+            acc_u[x >> sx] += u32::from(cb);
+            acc_v[x >> sx] += u32::from(cr);
+        }
+        // The last luma row of this chroma row: close the sums.
+        if (row >> sy) != ((row + 1) >> sy) || row + 1 == h {
+            let base = cy * cw;
+            for i in 0..cw {
+                u_plane[base + i] = ((acc_u[i] + count / 2) / count) as u16;
+                v_plane[base + i] = ((acc_v[i] + count / 2) / count) as u16;
+                acc_u[i] = 0;
+                acc_v[i] = 0;
+            }
+        }
+    }
+    StillImage::yuv(w as u32, h as u32, 8, chroma, y_plane, u_plane, v_plane)
+        .expect("planes sized to the layout")
+        .with_colr(color.to_colr())
 }
 
 /// The framework label of the layout an item is coded in (what the
@@ -1048,6 +1137,74 @@ mod tests {
     use super::*;
     use oxideav_core::frame::{VideoFrame, VideoPlane};
     use oxideav_core::Decoder;
+
+    /// The one-pass packed-RGB conversion is sample-identical to the
+    /// contract path's (`still_of_rgb_in`: 4:4:4 then box filter) for
+    /// every matrix the converter has a kernel for, both ranges, the
+    /// three layouts, odd extents, BGR order and a padded stride.
+    #[test]
+    fn packed_rgb_one_pass_matches_the_contract_conversion() {
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 24) as u8
+        };
+        for (w, h) in [(16usize, 12usize), (17, 9), (8, 2), (1, 1), (30, 31)] {
+            for matrix in [1u8, 2, 4, 5, 6, 7, 9] {
+                for range in [
+                    crate::api::ColorRange::Full,
+                    crate::api::ColorRange::Limited,
+                ] {
+                    for chroma in [
+                        StillChroma::Yuv420,
+                        StillChroma::Yuv422,
+                        StillChroma::Yuv444,
+                    ] {
+                        for (bpp, order) in [(3usize, [0usize, 1, 2]), (4, [2, 1, 0])] {
+                            let color = ColorInfo::new(range, 1, 13, matrix);
+                            let stride = w * bpp + 5;
+                            let mut data = vec![0u8; stride * h];
+                            for row in 0..h {
+                                for b in &mut data[row * stride..row * stride + w * bpp] {
+                                    *b = next();
+                                }
+                            }
+                            let plane = oxideav_core::frame::VideoPlane { stride, data };
+                            let fast = packed_rgb_to_ycbcr(&plane, w, h, bpp, order, color, chroma);
+                            let mut rgb = Vec::with_capacity(w * h * 3);
+                            for row in 0..h {
+                                for px in plane.data[row * stride..row * stride + w * bpp]
+                                    .chunks_exact(bpp)
+                                {
+                                    rgb.extend_from_slice(&[
+                                        px[order[0]],
+                                        px[order[1]],
+                                        px[order[2]],
+                                    ]);
+                                }
+                            }
+                            let slow = crate::api_codec::still_of_rgb_in(
+                                w as u32, h as u32, &rgb, 3, color, chroma,
+                            )
+                            .expect("contract conversion");
+                            let label = format!("{w}x{h} m{matrix} {range:?} {chroma:?} bpp{bpp}");
+                            assert_eq!(fast.chroma, slow.chroma, "{label}");
+                            assert_eq!(fast.y, slow.y, "{label}: Y");
+                            assert_eq!(fast.u, slow.u, "{label}: Cb");
+                            assert_eq!(fast.v, slow.v, "{label}: Cr");
+                            assert_eq!(
+                                format!("{:?}", fast.colr),
+                                format!("{:?}", slow.colr),
+                                "{label}: colr"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     fn video_params(fmt: PixelFormat, w: u32, h: u32) -> CodecParameters {
         let mut p = CodecParameters::video(CodecId::new(crate::CODEC_ID_STR));

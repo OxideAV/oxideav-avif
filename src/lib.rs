@@ -290,8 +290,9 @@ pub use still::StillEncodeOptions;
 pub use still::{
     elect_grid_for, elect_grid_tiling, encode_still, encode_still_auto, encode_still_burst,
     encode_still_grid, encode_still_layered, encode_still_overlay, GainMapSpec, OverlayCanvas,
-    OverlayLayerImage, StillImage, StillProperties, AUTO_GRID_MAX_SINGLE_PIXELS, AUTO_GRID_TILE,
-    GRID_MIN_TILE_DIM, STILL_MAX_CODED_DIM, TILE_LAYOUT_THREADS,
+    OverlayLayerImage, StillImage, StillProperties, AUTO_GRID_MAX_SINGLE_PIXELS,
+    AUTO_GRID_MAX_TILES, AUTO_GRID_TILE, GRID_MIN_TILE_DIM, STILL_MAX_CODED_DIM,
+    TILE_LAYOUT_THREADS,
 };
 
 #[cfg(feature = "registry")]

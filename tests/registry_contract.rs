@@ -873,44 +873,39 @@ fn blobs_ride_the_registry_frame_over_stream() {
 #[test]
 fn grid_policy_elects_shapes_and_tiles_code_on_the_budget() {
     use oxideav_avif::{
-        elect_grid_for, GridTiling, AUTO_GRID_MAX_SINGLE_PIXELS, AUTO_GRID_TILE,
-        STILL_MAX_CODED_DIM,
+        elect_grid_for, GridTiling, AUTO_GRID_MAX_SINGLE_PIXELS, AUTO_GRID_MAX_TILES,
+        AUTO_GRID_TILE, STILL_MAX_CODED_DIM,
     };
     // The election table.
-    assert_eq!(elect_grid_for(1024, 1024, GridTiling::Auto).unwrap(), None);
-    assert_eq!(elect_grid_for(1100, 900, GridTiling::Auto).unwrap(), None);
+    let elect = |w, h, a, g| elect_grid_for(w, h, a, g).unwrap();
+    assert_eq!(elect(1024, 1024, false, GridTiling::Auto), None);
+    assert_eq!(elect(1100, 900, false, GridTiling::Auto), None);
+    assert_eq!(elect(4032, 3024, false, GridTiling::Auto), Some((8, 6)));
+    assert_eq!(elect(1200, 900, false, GridTiling::Auto), Some((3, 2)));
+    assert_eq!(elect(4032, 3024, false, GridTiling::Single), None);
+    assert_eq!(elect(8000, 100, false, GridTiling::Single), Some((2, 1)));
     assert_eq!(
-        elect_grid_for(4032, 3024, GridTiling::Auto).unwrap(),
-        Some((8, 6))
-    );
-    assert_eq!(
-        elect_grid_for(1200, 900, GridTiling::Auto).unwrap(),
-        Some((3, 2))
-    );
-    assert_eq!(
-        elect_grid_for(4032, 3024, GridTiling::Single).unwrap(),
-        None
-    );
-    assert_eq!(
-        elect_grid_for(8000, 100, GridTiling::Single).unwrap(),
-        Some((2, 1))
-    );
-    assert_eq!(
-        elect_grid_for(4032, 3024, GridTiling::MaxTile(1024)).unwrap(),
+        elect(4032, 3024, false, GridTiling::MaxTile(1024)),
         Some((4, 3))
     );
+    assert_eq!(elect(500, 500, false, GridTiling::MaxTile(512)), None);
+    assert_eq!(elect(500, 500, false, GridTiling::MaxTile(8)), Some((8, 8)));
+    assert_eq!(elect(0, 10, false, GridTiling::Auto), None);
+    assert!(elect_grid_for(5000, 0, false, GridTiling::Single).is_err());
+    // The reader-side ipco cap: colour + alpha tiles stay under
+    // AUTO_GRID_MAX_TILES by doubling the tile edge (12 MP with alpha
+    // = 2 × 12 tiles of 1024; 48 MP = 48 tiles of 1024, 96 with alpha
+    // would exceed it so 2048: 4 × 3); an explicit edge is honoured.
+    assert_eq!(elect(4032, 3024, true, GridTiling::Auto), Some((4, 3)));
+    assert_eq!(elect(8000, 6000, false, GridTiling::Auto), Some((8, 6)));
+    assert_eq!(elect(8000, 6000, true, GridTiling::Auto), Some((4, 3)));
     assert_eq!(
-        elect_grid_for(500, 500, GridTiling::MaxTile(512)).unwrap(),
-        None
+        elect(4032, 3024, true, GridTiling::MaxTile(256)),
+        Some((16, 12))
     );
-    assert_eq!(
-        elect_grid_for(500, 500, GridTiling::MaxTile(8)).unwrap(),
-        Some((8, 8))
-    );
-    assert_eq!(elect_grid_for(0, 10, GridTiling::Auto).unwrap(), None);
-    assert!(elect_grid_for(5000, 0, GridTiling::Single).is_err());
     assert_eq!(AUTO_GRID_TILE, 512);
     assert_eq!(AUTO_GRID_MAX_SINGLE_PIXELS, 1 << 20);
+    assert_eq!(AUTO_GRID_MAX_TILES, 90);
     assert_eq!(STILL_MAX_CODED_DIM, 4096);
 
     let ctx = registry();

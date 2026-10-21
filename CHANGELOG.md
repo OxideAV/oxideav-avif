@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **One-pass packed-RGB coding and the reader-side tile cap.** A lossy
+  `Rgb24` / `Rgba` / `Bgr24` / `Bgra` frame is converted straight from
+  its packed rows into the Y′CbCr coding planes (H.273 §8.3 per pixel,
+  the chroma of a sub-sampled layout box-filtered from the rounded
+  4:4:4 values — sample-identical to the contract path's conversion,
+  pinned for every matrix / range / layout / channel order / padded
+  stride) with no packed copy and no 4:4:4 intermediate: the 12 MP
+  RGB encode's peak falls from 288 / 361 MiB (1 / 8 workers) to 91 /
+  161 MiB. `GridTiling::Auto` keeps colour + alpha tiles under
+  `AUTO_GRID_MAX_TILES` (90) by doubling the tile edge (12 MP with
+  alpha → 4 × 3 tiles of 1024): every coded item carries its own `av1C`
+  in the `ipco` (the container writer never shares decoder
+  configurations) and readers in the wild cap the `ipco` at 100 child
+  boxes — a 192-tile `grid=256` file is refused by `magick identify` /
+  `heif-info`; `elect_grid_for` takes the alpha flag.
+
 - **`grid` policy — the 12 MP registry encode in 1.2 s / 162 MiB on 8
   workers (was 2.2 s / 607 MiB).** `EncodeOptions::grid`
   (`GridTiling::Auto` / `Single` / `MaxTile(edge)`, the registry's
