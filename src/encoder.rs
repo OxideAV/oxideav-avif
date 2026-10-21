@@ -88,11 +88,16 @@
 //! Codec options (string map on [`CodecParameters::options`]; the
 //! schema is [`AvifEncoderOptions`], declared on the registry entry):
 //!
-//! * `quality` — `0..=100`, `100` = lossless (the default). When `q`
-//!   is not given, `base_q_idx = ((100 − quality) × 255 + 50) / 100`
-//!   (the [`EncodeOptions::with_quality`] mapping: 100 → 0, 90 → 26,
-//!   75 → 64, 50 → 128, 10 → 230, 0 → 255); the alpha auxiliary
-//!   follows the same mapping when `alpha_q` is not given.
+//! * `quality` — `0..=100`, `100` = lossless; absent =
+//!   [`DEFAULT_QUALITY`] (60, the production default — see the
+//!   README's quality table). When `q` is not given, `base_q_idx =
+//!   ((100 − quality) × 255 + 50) / 100` (the
+//!   [`EncodeOptions::with_quality`] mapping: 100 → 0, 90 → 26,
+//!   75 → 64, 60 → 102, 50 → 128, 10 → 230, 0 → 255); the alpha
+//!   auxiliary follows the same mapping when `alpha_q` is not given
+//!   and `quality` is — with neither, alpha is coded losslessly
+//!   (coverage artefacts are far more visible than colour ones and a
+//!   flat alpha plane is cheap).
 //! * `q` — AV1 `base_q_idx` for the colour planes, `0..=255`
 //!   (`0` = lossless). An explicit `q` wins over `quality`.
 //! * `alpha_q` — `base_q_idx` for the alpha auxiliary; wins over
@@ -119,7 +124,8 @@
 //!   of tiles at most that size. The decoded pixels are the same on
 //!   every shape.
 //!
-//! With neither `quality` nor `q` the encode is lossless.
+//! With neither `quality` nor `q` the colour planes code at
+//! [`DEFAULT_QUALITY`]; `quality=100` or `q=0` is the lossless path.
 
 use oxideav_core::frame::VideoFrame;
 use oxideav_core::{
@@ -177,6 +183,16 @@ pub fn quality_to_base_q_idx(quality: u8) -> u8 {
     EncodeOptions::default().with_quality(quality).base_q_idx
 }
 
+/// The colour quality the registry encoder codes at when the caller
+/// sets neither `quality` nor `q`: `base_q_idx` 102. On the 12 MP
+/// device sample (8-bit 4:2:0) it writes 2.04 MB at 35.8 dB luma —
+/// the size the picture's own camera HEIC has — where 50 is 1.48 MB /
+/// 33.5 dB, 70 is 2.62 MB / 38.2 dB, 90 is 4.81 MB / 44.8 dB and the
+/// lossless coding 12.0 MB; it is also the `quality` the HEIF
+/// container's own AV1 items default to, so one dial means one thing
+/// across the family.
+pub const DEFAULT_QUALITY: u8 = 60;
+
 /// The registry encoder's option schema (see the module docs): the
 /// typed form of the `quality` / `q` / `alpha_q` / `chroma` /
 /// `premultiplied` codec options, parsed strictly at construction
@@ -220,7 +236,9 @@ impl Default for AvifEncoderOptions {
 }
 
 impl AvifEncoderOptions {
-    /// The defaults (lossless, 4:2:0 for lossy RGB, straight alpha).
+    /// The defaults ([`DEFAULT_QUALITY`] colour, lossless alpha, 4:2:0
+    /// for lossy RGB, straight alpha, `fast`, the budget's threads,
+    /// `grid=auto`).
     pub fn new() -> Self {
         Self::default()
     }
@@ -302,15 +320,21 @@ impl AvifEncoderOptions {
     }
 
     /// The still-encoder tuning these options resolve to: `q` else the
-    /// `quality` mapping else lossless for the colour planes, the same
-    /// for alpha with `alpha_q`; `chroma` / `premultiplied` / `speed`
-    /// as given; `threads` as given, else `1` (the encoder fills the
-    /// execution context's budget in per frame).
+    /// `quality` mapping else [`DEFAULT_QUALITY`] for the colour
+    /// planes; `alpha_q` else the `quality` mapping when `quality` was
+    /// given, else lossless for the alpha auxiliary; `chroma` /
+    /// `premultiplied` / `speed` / `grid` as given; `threads` as
+    /// given, else `1` (the encoder fills the execution context's
+    /// budget in per frame).
     pub fn resolve(&self) -> EncodeOptions {
-        let from_quality = self.quality.map(quality_to_base_q_idx).unwrap_or(0);
+        let colour = self
+            .quality
+            .map(quality_to_base_q_idx)
+            .unwrap_or_else(|| quality_to_base_q_idx(DEFAULT_QUALITY));
+        let alpha = self.quality.map(quality_to_base_q_idx).unwrap_or(0);
         EncodeOptions::new(
-            self.q.unwrap_or(from_quality),
-            self.alpha_q.unwrap_or(from_quality),
+            self.q.unwrap_or(colour),
+            self.alpha_q.unwrap_or(alpha),
             self.premultiplied,
         )
         .with_chroma(self.chroma)
@@ -361,14 +385,14 @@ impl CodecOptionsStruct for AvifEncoderOptions {
         OptionField {
             name: "quality",
             kind: OptionKind::U32,
-            default: OptionValue::U32(100),
-            help: "Quality 0..=100 (100 = lossless): when q is not given, base_q_idx = ((100 - quality) * 255 + 50) / 100 for the colour planes and, when alpha_q is not given, for the alpha auxiliary",
+            default: OptionValue::U32(60),
+            help: "Quality 0..=100 (100 = lossless; absent = 60): when q is not given, base_q_idx = ((100 - quality) * 255 + 50) / 100 for the colour planes and, when alpha_q is not given, for the alpha auxiliary (lossless when quality is absent too)",
         },
         OptionField {
             name: "q",
             kind: OptionKind::U32,
-            default: OptionValue::U32(0),
-            help: "AV1 base_q_idx 0..=255 for the colour planes (0 = lossless); wins over quality",
+            default: OptionValue::U32(102),
+            help: "AV1 base_q_idx 0..=255 for the colour planes (0 = lossless; absent = quality's, 102 by default); wins over quality",
         },
         OptionField {
             name: "alpha_q",
@@ -1230,12 +1254,20 @@ mod tests {
         })
     }
 
-    /// Trait-level end-to-end: send a Yuv420P frame, receive one
-    /// complete AVIF file packet, decode it back pixel-exact through
-    /// the crate's own decoder.
+    /// Trait-level end-to-end: send a Yuv420P frame at `quality=100`,
+    /// receive one complete AVIF file packet, decode it back
+    /// pixel-exact through the crate's own decoder; the same frame
+    /// with no option codes at [`DEFAULT_QUALITY`] (lossy, smaller).
     #[test]
     fn encoder_trait_round_trips_yuv420_frame() {
-        let params = video_params(PixelFormat::Yuv420P, 16, 16);
+        let mut params = video_params(PixelFormat::Yuv420P, 16, 16);
+        let defaults = make_encoder(&params).expect("default encoder");
+        let mut defaults = defaults;
+        defaults
+            .send_frame(&planar_frame(&[(16, 16), (8, 8), (8, 8)], 3))
+            .expect("send_frame");
+        let lossy = defaults.receive_packet().expect("default packet");
+        params.options = oxideav_core::CodecOptions::new().set("quality", "100");
         let mut enc = make_encoder(&params).expect("make encoder");
         let frame = planar_frame(&[(16, 16), (8, 8), (8, 8)], 3);
         enc.send_frame(&frame).expect("send_frame");
@@ -1248,8 +1280,20 @@ mod tests {
         enc.flush().expect("flush");
         assert!(matches!(enc.receive_packet(), Err(Error::Eof)));
 
+        assert!(
+            lossy.data.len() < pkt.data.len(),
+            "the default quality codes lossily: {} vs lossless {}",
+            lossy.data.len(),
+            pkt.data.len()
+        );
+        assert_eq!(
+            AvifEncoderOptions::default().resolve().base_q_idx,
+            quality_to_base_q_idx(DEFAULT_QUALITY)
+        );
+        assert_eq!(AvifEncoderOptions::default().resolve().alpha_q_idx, 0);
+
         // The packet is a complete AVIF file that decodes back to the
-        // input planes exactly (lossless default).
+        // input planes exactly (quality 100 = lossless).
         let mut dec = crate::decoder::AvifDecoder::new(CodecId::new(crate::CODEC_ID_STR));
         dec.send_packet(&Packet::new(0, TimeBase::new(1, 1), pkt.data.clone()))
             .expect("decode muxed file");

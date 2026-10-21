@@ -394,6 +394,7 @@ fn encoder_writes_the_signalled_colr_and_range() {
     params.height = Some(h);
     params.pixel_format = Some(PixelFormat::Yuv420P10Le);
     params.color_signal = ColorSignal::from_code_points(9, 16, 9, true);
+    params.options = oxideav_core::CodecOptions::new().set("quality", "100");
     let mut enc = oxideav_avif::make_encoder(&params).expect("encoder");
     let plane16 = |n: usize, v: u16| -> Vec<u8> { (0..n).flat_map(|_| v.to_le_bytes()).collect() };
     let frame = oxideav_core::frame::VideoFrame {
@@ -481,6 +482,7 @@ fn planar_rgb_input_round_trips_as_planar_rgb() {
         params.width = Some(w);
         params.height = Some(h);
         params.pixel_format = Some(fmt);
+        params.options = oxideav_core::CodecOptions::new().set("quality", "100");
         let mut enc = oxideav_avif::make_encoder(&params).expect("encoder");
         let n = (w * h) as usize;
         let max = (1u32 << depth) - 1;

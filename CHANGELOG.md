@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The registry encoder's default is `quality` 60, not lossless.** A
+  caller that sets neither `quality` nor `q` now codes the colour
+  planes at `base_q_idx` 102 (`DEFAULT_QUALITY` = 60) and the alpha
+  auxiliary losslessly (alpha follows `quality` only when `quality` is
+  given; `alpha_q` always wins); `quality=100` / `q=0` is the explicit
+  lossless path, unchanged. On the 12 MP device sample (8-bit 4:2:0,
+  8 workers): 50 → 1.48 MB / 33.5 dB luma, **60 → 2.04 MB / 35.8 dB**
+  (the size of the picture's own camera HEIC), 70 → 2.62 MB / 38.2 dB,
+  80 → 3.36 MB / 40.9 dB, 90 → 4.81 MB / 44.8 dB, 100 → 12.0 MB
+  lossless — and 60 is the `quality` the HEIF container's own AV1 items
+  default to, so one dial means one thing across the family. A gateway
+  consumer no longer has to pin a quality to get a lossy `.avif`.
+
 ### Added
 
 - **One-pass packed-RGB coding and the reader-side tile cap.** A lossy

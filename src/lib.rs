@@ -274,7 +274,8 @@ pub use decoder::{
 
 #[cfg(feature = "registry")]
 pub use encoder::{
-    make_encoder, quality_to_base_q_idx, AvifEncoder, AvifEncoderOptions, ENCODER_PIXEL_FORMATS,
+    make_encoder, quality_to_base_q_idx, AvifEncoder, AvifEncoderOptions, DEFAULT_QUALITY,
+    ENCODER_PIXEL_FORMATS,
 };
 
 #[cfg(feature = "registry")]
@@ -344,7 +345,8 @@ mod registry_glue {
     /// The capabilities declare what the encoder truly accepts
     /// ([`crate::encoder::ENCODER_PIXEL_FORMATS`] — the set a
     /// gateway's conversion ladder reads) and that it codes both
-    /// losslessly (`q` 0 / `quality` 100, the default) and lossily;
+    /// losslessly (`q` 0 / `quality` 100) and lossily (`quality` 60
+    /// when the caller sets nothing — [`crate::encoder::DEFAULT_QUALITY`]);
     /// the option schemas ([`crate::encoder::AvifEncoderOptions`],
     /// [`crate::decoder::AvifDecoderOptions`]) are attached so the
     /// framework's advisory `quality` and `threads` reach the codec.

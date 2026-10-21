@@ -259,9 +259,14 @@ fn quality_ladder_shrinks_bytes_and_psnr_on_yuv_and_rgb() {
         let q = |o: CodecOptions| encode(&ctx, &params(fmt, 16, 16, o), &f).0;
         let none = q(CodecOptions::new());
         let q100 = q(CodecOptions::new().set("quality", "100"));
+        let q60 = q(CodecOptions::new().set("quality", "60"));
         let q50 = q(CodecOptions::new().set("quality", "50"));
         let q10 = q(CodecOptions::new().set("quality", "10"));
-        assert_eq!(none, q100, "{fmt:?}: absent quality is lossless (100)");
+        assert_eq!(
+            none, q60,
+            "{fmt:?}: absent quality is the production default (60)"
+        );
+        assert_eq!(oxideav_avif::DEFAULT_QUALITY, 60);
         assert!(
             q100.len() > q50.len() && q50.len() > q10.len(),
             "{fmt:?}: bytes must shrink with quality: 100 → {} / 50 → {} / 10 → {}",
@@ -309,7 +314,7 @@ fn explicit_q_wins_over_quality_and_alpha_follows() {
     let fmt = PixelFormat::Yuv420P;
     let f = frame(fmt, 16, 16);
     let q = |o: CodecOptions| encode(&ctx, &params(fmt, 16, 16, o), &f).0;
-    let lossless = q(CodecOptions::new());
+    let lossless = q(CodecOptions::new().set("quality", "100"));
     // quality 10 with an explicit q = 0: the lossless bytes.
     assert_eq!(
         q(CodecOptions::new().set("quality", "10").set("q", "0")),
@@ -341,6 +346,19 @@ fn explicit_q_wins_over_quality_and_alpha_follows() {
     let (vf, label) = decode(&ctx, &dp, &alpha_exact);
     assert_eq!(label, PixelFormat::Yuva420P);
     assert_eq!(vf.planes[3].data, planes_of(&fa)[3].data, "alpha exact");
+    // With nothing given: colour at the production default, alpha
+    // lossless — the same bytes as saying so.
+    let defaults = qa(CodecOptions::new());
+    assert_eq!(
+        defaults,
+        qa(CodecOptions::new().set("quality", "60").set("alpha_q", "0"))
+    );
+    let (vf, _) = decode(&ctx, &dp, &defaults);
+    assert_eq!(
+        vf.planes[3].data,
+        planes_of(&fa)[3].data,
+        "default alpha exact"
+    );
 }
 
 #[test]
@@ -378,7 +396,10 @@ fn registry_encoder_refuses_unknown_or_out_of_range_options() {
         16,
         CodecOptions::new().set("qualty", "50").set("q", "999"),
     ));
-    assert_eq!(enc.encode_options().base_q_idx, 0);
+    assert_eq!(
+        enc.encode_options().base_q_idx,
+        oxideav_avif::quality_to_base_q_idx(oxideav_avif::DEFAULT_QUALITY)
+    );
 }
 
 // ───────────────────────────── layouts ──────────────────────────────
@@ -406,7 +427,7 @@ fn every_declared_layout_encodes_and_decodes_under_its_coded_label() {
     let ctx = registry();
     for &fmt in ENCODER_PIXEL_FORMATS {
         let f = frame(fmt, 16, 16);
-        let p = params(fmt, 16, 16, CodecOptions::new());
+        let p = params(fmt, 16, 16, CodecOptions::new().set("quality", "100"));
         let (bytes, out) = encode(&ctx, &p, &f);
         let expect = lossless_label(fmt);
         assert_eq!(
@@ -414,7 +435,8 @@ fn every_declared_layout_encodes_and_decodes_under_its_coded_label() {
             Some(expect),
             "{fmt:?}: output params carry the coded label"
         );
-        let (vf, label) = decode(&ctx, &p, &bytes);
+        let dp = params(fmt, 16, 16, CodecOptions::new());
+        let (vf, label) = decode(&ctx, &dp, &bytes);
         assert_eq!(label, expect, "{fmt:?}: decoded label");
         let src = planes_of(&f);
         match fmt {
@@ -479,7 +501,7 @@ fn lossy_packed_rgb_lands_on_ycbcr_lossless_keeps_identity() {
         encode(&ctx, &params(PixelFormat::Rgb24, w, h, o), f)
     };
     // Lossless: identity matrix, planar RGB label, exact.
-    let (lossless, out) = enc(CodecOptions::new(), 16, 16, &f);
+    let (lossless, out) = enc(CodecOptions::new().set("quality", "100"), 16, 16, &f);
     assert_eq!(out.pixel_format, Some(PixelFormat::Gbrp8));
     assert_eq!(rgb_of(&lossless), planes_of(&f)[0].data);
     assert_eq!(matrix_of(&lossless), Some(0));
