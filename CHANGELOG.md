@@ -2675,7 +2675,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `exif_item_id: Option<u32>`, `xmp_item_id: Option<u32>`, and
     `premultiplied_alpha: bool`. Helpers: `has_thumbnails()`,
     `has_descriptive_metadata()`. Exif detection accepts native
-    `item_type == 'Exif'` AND the libheif-style `mime` carrier with
+    `item_type == 'Exif'` AND the `mime`-item carrier some producers write, with
     `application/octet-stream` / `image/tiff` / `image/x-exif`
     content_type. XMP is detected via `mime` +
     `application/rdf+xml` (case-insensitive).
@@ -2942,8 +2942,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Grid `colr` / `pixi` / `pasp` resolution** (`build_info_grid`):
     every descriptive property now follows the same fallback chain —
     grid-item association first (canonical placement, describes the
-    reconstructed canvas), tile-0 association second (the libheif
-    writer pattern, OK because av1-avif §4.2 makes per-tile values
+    reconstructed canvas), tile-0 association second (a layout some
+    producers write, OK because av1-avif §4.2 makes per-tile values
     uniform). Previously only `colr` had the fallback; `pixi` looked
     only at tile 0 and `pasp` only at the grid item.
   - New tests: `composite_yuv420_odd_width_copies_full_chroma_edge`,
