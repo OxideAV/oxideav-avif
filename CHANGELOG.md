@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.16](https://github.com/OxideAV/oxideav-avif/compare/v0.0.15...v0.0.16) - 2026-10-21
+
+### Other
+
+- two 2026-05 entries describe producer file layouts without naming the producer
+- production default quality table, encode budget (1 / 4 / 8 workers, where the memory goes), interop matrix, blobs through the framework
+- interop gate over sips / magick / ffmpeg / heif-info / avifdec (21 shapes, 1 reader gap), registry_encoder_options fuzz target (odd-extent refusal + empty-blob items fixed), info() reports decoded extents, fuzz lock on core 0.1.40 / av1 0.1.21
+- quality 60 is the production default (alpha lossless unless quality is given); quality=100 / q=0 stays the lossless path
+- packed RGB converts straight into the coding planes (12 MP RGB 361 → 161 MiB on 8 workers); auto grids stay under the readers' 100-property ipco cap, alpha tiles counted
+- grid policy — 12 MP as 48 independent 512-pixel tiles coded on the execution budget (1.2 s / 162 MiB on 8 workers, was 2.2 s / 607 MiB); registry grid option, encode_budget example
+- ICC / Exif / XMP ride as core 0.1.40 blobs — the encoder writes the frame's blobs refined over the stream's, the decoder puts them back on its frames, Metadata ≡ blobs
+
 ### Fixed
 
 - **Odd extents on sub-sampled layouts are a typed refusal.** A
