@@ -14,7 +14,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_avif::{
-    decode_all_with, decode_with, encode, info, probe, DecodeOptions, EncodeOptions,
+    DecodeOptions, EncodeOptions, decode_all_with, decode_with, encode, info, probe,
 };
 
 /// Keep every decode inside a few megabytes of pixels.
@@ -66,7 +66,7 @@ fuzz_target!(|data: &[u8]| {
         let rgb = img.to_rgb8();
         assert_eq!(rgb.len(), n * 3);
         if !img.has_alpha() {
-            assert!(rgba.chunks_exact(4).all(|p| p[3] == 255));
+            assert!(rgba.as_chunks::<4>().0.iter().all(|p| p[3] == 255));
         }
         // A small picture re-encodes losslessly and decodes back the
         // same (sub-sampled layouts at odd extents are refused, which

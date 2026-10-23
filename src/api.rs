@@ -491,7 +491,7 @@ impl AvifImage {
         let mut g = Vec::with_capacity(n);
         let mut b = Vec::with_capacity(n);
         let mut r = Vec::with_capacity(n);
-        for px in data.chunks_exact(3) {
+        for px in data.as_chunks::<3>().0.iter() {
             r.push(px[0]);
             g.push(px[1]);
             b.push(px[2]);
@@ -520,7 +520,7 @@ impl AvifImage {
         let mut b = Vec::with_capacity(n);
         let mut r = Vec::with_capacity(n);
         let mut a = Vec::with_capacity(n);
-        for px in data.chunks_exact(4) {
+        for px in data.as_chunks::<4>().0.iter() {
             r.push(px[0]);
             g.push(px[1]);
             b.push(px[2]);
@@ -898,12 +898,12 @@ impl DecodeOptions {
     /// Check an input length against `max_bytes`
     /// ([`Error::LimitExceeded`] when over).
     pub fn check_bytes(&self, len: usize) -> Result<()> {
-        if let Some(max) = self.max_bytes {
-            if len as u64 > max {
-                return Err(Error::limit(format!(
-                    "avif: input is {len} bytes, more than the {max} allowed"
-                )));
-            }
+        if let Some(max) = self.max_bytes
+            && len as u64 > max
+        {
+            return Err(Error::limit(format!(
+                "avif: input is {len} bytes, more than the {max} allowed"
+            )));
         }
         Ok(())
     }
@@ -919,12 +919,12 @@ impl DecodeOptions {
             )));
         }
         let pixels = u64::from(width) * u64::from(height);
-        if let Some(max) = self.max_pixels {
-            if pixels > max {
-                return Err(Error::limit(format!(
-                    "avif: picture holds {pixels} pixels, more than the {max} allowed"
-                )));
-            }
+        if let Some(max) = self.max_pixels
+            && pixels > max
+        {
+            return Err(Error::limit(format!(
+                "avif: picture holds {pixels} pixels, more than the {max} allowed"
+            )));
         }
         Ok(())
     }
@@ -1190,7 +1190,11 @@ pub fn probe(bytes: &[u8]) -> bool {
     if is_avif(&bytes[major_at..major_at + 4]) {
         return true;
     }
-    bytes[brands_start..end].chunks_exact(4).any(is_avif)
+    bytes[brands_start..end]
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .any(|b| is_avif(b.as_slice()))
 }
 
 /// Header-only description of an AVIF file: extents, the layout a
@@ -1428,7 +1432,7 @@ mod tests {
         assert_eq!(img.to_rgb8(), rgb);
         let rgba = img.to_rgba8();
         assert_eq!(rgba.len(), 4 * 2 * 4);
-        assert!(rgba.chunks_exact(4).all(|p| p[3] == 255));
+        assert!(rgba.as_chunks::<4>().0.iter().all(|p| p[3] == 255));
         let with_alpha: Vec<u8> = (0..4 * 4 * 2).map(|i| (i * 13 % 256) as u8).collect();
         let img = AvifImage::from_rgba8(4, 2, with_alpha.clone()).unwrap();
         assert_eq!(img.format(), PixelFormat::Yuva444P);
@@ -1436,7 +1440,9 @@ mod tests {
         assert_eq!(
             img.to_rgb8(),
             with_alpha
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .flat_map(|p| p[..3].to_vec())
                 .collect::<Vec<_>>()
         );

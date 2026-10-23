@@ -15,7 +15,7 @@
 //! other kind does.
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_avif::{make_decoder, make_encoder, ENCODER_PIXEL_FORMATS};
+use oxideav_avif::{ENCODER_PIXEL_FORMATS, make_decoder, make_encoder};
 use oxideav_core::frame::{VideoFrame, VideoPlane};
 use oxideav_core::{
     BlobKind, CodecId, CodecOptions, CodecParameters, Frame, MetadataBlob, Packet, PixelFormat,
@@ -70,9 +70,17 @@ fn geometry(fmt: PixelFormat) -> (Vec<(u32, u32)>, usize, usize) {
 fn depth_of(fmt: PixelFormat) -> u32 {
     use PixelFormat as P;
     match fmt {
-        P::Yuv420P10Le | P::Yuv422P10Le | P::Yuv444P10Le | P::Gray10Le | P::Gbrp10Le
+        P::Yuv420P10Le
+        | P::Yuv422P10Le
+        | P::Yuv444P10Le
+        | P::Gray10Le
+        | P::Gbrp10Le
         | P::Gbrap10Le => 10,
-        P::Yuv420P12Le | P::Yuv422P12Le | P::Yuv444P12Le | P::Gray12Le | P::Gbrp12Le
+        P::Yuv420P12Le
+        | P::Yuv422P12Le
+        | P::Yuv444P12Le
+        | P::Gray12Le
+        | P::Gbrp12Le
         | P::Gbrap12Le => 12,
         _ => 8,
     }
@@ -140,7 +148,7 @@ fuzz_target!(|data: &[u8]| {
         opts = opts.set("speed", "fast");
     }
     let unknown = bytes.u8();
-    if unknown % 5 == 0 {
+    if unknown.is_multiple_of(5) {
         opts = opts.set("no-such-option", "1");
     }
 
@@ -195,7 +203,9 @@ fuzz_target!(|data: &[u8]| {
     if enc.send_frame(&Frame::Video(vf.clone())).is_err() {
         return;
     }
-    let pkt = enc.receive_packet().expect("a sent frame yields its packet");
+    let pkt = enc
+        .receive_packet()
+        .expect("a sent frame yields its packet");
     let label = enc
         .output_params()
         .pixel_format
@@ -212,9 +222,8 @@ fuzz_target!(|data: &[u8]| {
         other => panic!("not a video frame: {other:?}"),
     };
     assert_eq!(dec.output_pixel_format(), Some(label), "{fmt:?}");
-    assert_eq!(
+    assert!(
         decoded.planes[0].data.len() >= w as usize,
-        true,
         "{fmt:?}: luma covers the width"
     );
 
@@ -225,8 +234,10 @@ fuzz_target!(|data: &[u8]| {
     assert_eq!(got.icc, want.icc, "{fmt:?}: ICC");
     assert_eq!(got.exif, want.exif, "{fmt:?}: Exif");
     assert_eq!(got.xmp, want.xmp, "{fmt:?}: XMP");
-    assert!(decoded
-        .blobs()
-        .iter()
-        .all(|b| b.is(&BlobKind::ICC) || b.is(&BlobKind::EXIF) || b.is(&BlobKind::XMP)));
+    assert!(
+        decoded
+            .blobs()
+            .iter()
+            .all(|b| b.is(&BlobKind::ICC) || b.is(&BlobKind::EXIF) || b.is(&BlobKind::XMP))
+    );
 });

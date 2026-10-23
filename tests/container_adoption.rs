@@ -10,7 +10,7 @@
 #![cfg(feature = "registry")]
 
 use oxideav_avif::meta::Property;
-use oxideav_avif::{inspect, parse, parse_header, AvifDecoder};
+use oxideav_avif::{AvifDecoder, inspect, parse, parse_header};
 use oxideav_core::{CodecId, CodecParameters, Decoder, Frame, Packet, TimeBase};
 use oxideav_heif::boxes::FourCc;
 use oxideav_heif::props::{self as hprops, Property as HProp};
@@ -182,10 +182,11 @@ fn amendment_properties_parse_as_container_typed_not_errors() {
     assert_eq!(pixi.channels[0].label.as_deref(), Some("Y"));
     assert_eq!(pixi.channels[1].subsampling, Some((1, 0)));
     // None of them is essential, so nothing is reported as unsupported.
-    assert!(hdr
-        .meta
-        .unsupported_essential_properties(primary)
-        .is_empty());
+    assert!(
+        hdr.meta
+            .unsupported_essential_properties(primary)
+            .is_empty()
+    );
 }
 
 /// `inspect` / `parse` and the pixel decode of the same file are
@@ -371,7 +372,14 @@ fn identity_matrix_item_is_planar_rgb() {
     assert_eq!(sig, ColorSignal::srgb());
     assert_eq!(frame.image_plane_count(), 3, "G, B, R planes");
     let (w, h) = (24usize, 16usize);
-    let chan = |c: usize| -> Vec<u8> { IDENTITY_RGB_REF.chunks_exact(3).map(|p| p[c]).collect() };
+    let chan = |c: usize| -> Vec<u8> {
+        IDENTITY_RGB_REF
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|p| p[c])
+            .collect()
+    };
     let plane = |i: usize| -> Vec<u8> {
         let p = &frame.planes[i];
         (0..h)
@@ -441,10 +449,14 @@ fn encoder_writes_the_signalled_colr_and_range() {
         Some(ColorSignal::from_code_points(9, 16, 9, true))
     );
     // Lossless: the constant planes come back exactly.
-    assert!(out.planes[0]
-        .data
-        .chunks_exact(2)
-        .all(|c| u16::from_le_bytes([c[0], c[1]]) == 1000));
+    assert!(
+        out.planes[0]
+            .data
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .all(|c| u16::from_le_bytes([c[0], c[1]]) == 1000)
+    );
     // A limited-range signal writes full_range_flag = 0.
     params.color_signal = ColorSignal::bt709_limited();
     let mut enc = oxideav_avif::make_encoder(&params).expect("encoder");

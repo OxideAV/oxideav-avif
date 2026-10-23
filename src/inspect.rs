@@ -9,15 +9,15 @@
 use std::borrow::Cow;
 
 use crate::alpha::find_alpha_item_id;
-use crate::box_parser::{b, BoxType};
-use crate::cicp::{effective_cicp, CicpTriple};
+use crate::box_parser::{BoxType, b};
+use crate::cicp::{CicpTriple, effective_cicp};
 use crate::error::{AvifError as Error, Result};
 use crate::grid::ImageGrid;
 use crate::meta::{
-    Amve, Cclv, Clli, Colr, Ispe, Mdcv, Meta, Pasp, Pixi, Property, ITEM_TYPE_EXIF, ITEM_TYPE_MIME,
+    Amve, Cclv, Clli, Colr, ITEM_TYPE_EXIF, ITEM_TYPE_MIME, Ispe, Mdcv, Meta, Pasp, Pixi, Property,
 };
 use crate::parser::{
-    classify_brands, parse, parse_header, AvifFile, AvifHeader, BrandClass, ITEM_TYPE_GRID,
+    AvifFile, AvifHeader, BrandClass, ITEM_TYPE_GRID, classify_brands, parse, parse_header,
 };
 
 const AV1C: BoxType = b(b"av1C");
@@ -1354,7 +1354,7 @@ pub(crate) fn build_info_grid(
         _ => {
             return Err(Error::invalid(
                 "avif: first grid tile missing av1C property",
-            ))
+            ));
         }
     };
     // HEIF §6.5.6 (`pixi`) and §6.5.4 (`pasp`) are descriptive
@@ -1597,7 +1597,7 @@ pub(crate) fn build_info_derived(
         _ => {
             return Err(Error::invalid(
                 "avif: derived primary's coded leaf missing av1C property",
-            ))
+            ));
         }
     };
     let bits_per_channel = match hdr.meta.property_for(primary_id, b"pixi") {

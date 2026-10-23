@@ -200,8 +200,12 @@ fn dump_roundtrip_diagnostic(
             fuzz_input.len(),
             avif1.len(),
             avif2.len(),
-            p1.luma_stride, p1.u_stride, p1.v_stride,
-            p2.luma_stride, p2.u_stride, p2.v_stride,
+            p1.luma_stride,
+            p1.u_stride,
+            p1.v_stride,
+            p2.luma_stride,
+            p2.u_stride,
+            p2.v_stride,
         );
     }
 }

@@ -9,9 +9,9 @@
 #![cfg(feature = "registry")]
 
 use oxideav_avif::{
+    AvifDecoder, Colr, EncodeOptions, StillChroma, StillImage, StillProperties,
     audit_avif_profile_compliance, audit_mif1, audit_sequence_header_obu, classify_brands,
-    encode_still, encode_still_grid, inspect, parse, parse_header, AvifDecoder, Colr,
-    EncodeOptions, StillChroma, StillImage, StillProperties,
+    encode_still, encode_still_grid, inspect, parse, parse_header,
 };
 use oxideav_core::{CodecId, CodecParameters, Decoder, Frame, Packet, TimeBase};
 
@@ -96,7 +96,9 @@ fn decode_payload_av1(label: &str, avif: &[u8]) -> oxideav_core::frame::VideoFra
 
 /// Split a little-endian 2-byte-per-sample plane into `u16`s.
 fn le_u16(data: &[u8]) -> Vec<u16> {
-    data.chunks_exact(2)
+    data.as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect()
 }
@@ -638,7 +640,7 @@ fn pass_through_properties_round_trip() {
 /// the exact planes.
 #[test]
 fn grid_tiling_election_and_auto_encode() {
-    use oxideav_avif::{elect_grid_tiling, encode_still_auto, GRID_MIN_TILE_DIM};
+    use oxideav_avif::{GRID_MIN_TILE_DIM, elect_grid_tiling, encode_still_auto};
     assert_eq!(elect_grid_tiling(4096, 4096, 4096), Some((1, 1)));
     assert_eq!(elect_grid_tiling(4097, 100, 4096), Some((2, 1)));
     assert_eq!(elect_grid_tiling(9000, 5000, 4096), Some((3, 2)));
@@ -844,7 +846,7 @@ fn decode_sequence_own(label: &str, avif: &[u8]) -> Vec<oxideav_core::frame::Vid
 /// this crate's sequence decoder and the external AVIF decoder.
 #[test]
 fn avis_sequence_all_intra_round_trips_exact() {
-    use oxideav_avif::{encode_sequence, SequenceEncodeOptions};
+    use oxideav_avif::{SequenceEncodeOptions, encode_sequence};
     let (w, h) = (32u32, 24u32);
     let frames: Vec<StillImage> = (0..3)
         .map(|i| {
@@ -944,7 +946,7 @@ fn avis_sequence_all_intra_round_trips_exact() {
 /// frames.
 #[test]
 fn avis_sequence_gop_10bit_round_trips_exact() {
-    use oxideav_avif::{encode_sequence, SequenceEncodeOptions};
+    use oxideav_avif::{SequenceEncodeOptions, encode_sequence};
     let (w, h) = (32u32, 32u32);
     let frames: Vec<StillImage> = (0..6)
         .map(|i| {
@@ -1169,14 +1171,16 @@ fn grid_encode_with_alpha_round_trips_exact() {
             2,
             "{label}: colour + alpha grids"
         );
-        assert!(info
-            .grid_derivation_compliance
-            .iter()
-            .all(|a| a.is_compliant()));
-        assert!(info
-            .alpha_bit_depth_compliance
-            .iter()
-            .all(|a| a.is_compliant()));
+        assert!(
+            info.grid_derivation_compliance
+                .iter()
+                .all(|a| a.is_compliant())
+        );
+        assert!(
+            info.alpha_bit_depth_compliance
+                .iter()
+                .all(|a| a.is_compliant())
+        );
         let hdr = parse_header(&avif).expect("parse");
         let alpha_id =
             oxideav_avif::find_alpha_item_id(&hdr.meta, hdr.meta.primary_item_id.unwrap())

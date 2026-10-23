@@ -29,7 +29,7 @@
 //! enumerate AVIF/HEIF alternates without rebuilding the container
 //! traversal.
 
-use crate::box_parser::{b, iter_boxes, parse_full_box, read_u16, read_u32, type_str, BoxType};
+use crate::box_parser::{BoxType, b, iter_boxes, parse_full_box, read_u16, read_u32, type_str};
 use crate::error::{AvifError as Error, Result};
 
 /// One placed image inside an `iovl` overlay descriptor (HEIF §6.6.2.2).
@@ -753,12 +753,12 @@ impl SampleTransform {
         // Spec §4.2.3.4: `token shall be at most reference_count` when
         // 1 <= token <= 32.
         for (i, t) in st.tokens.iter().enumerate() {
-            if let Token::Sample(n) = *t {
-                if u32::from(n) > reference_count {
-                    return Err(Error::invalid(format!(
-                        "avif: sato token[{i}] sample index {n} > reference_count {reference_count}"
-                    )));
-                }
+            if let Token::Sample(n) = *t
+                && u32::from(n) > reference_count
+            {
+                return Err(Error::invalid(format!(
+                    "avif: sato token[{i}] sample index {n} > reference_count {reference_count}"
+                )));
             }
         }
         // Validate stack discipline without evaluating actual values.
@@ -1005,7 +1005,7 @@ fn read_sint_be(bytes: &[u8]) -> Result<i64> {
         n => {
             return Err(Error::invalid(format!(
                 "avif: sato constant width {n} not in {{1,2,4,8}}"
-            )))
+            )));
         }
     })
 }
@@ -1023,11 +1023,7 @@ fn pow_truncated(base: i64, exp: i64) -> i64 {
             1 => {
                 // 1^anything = 1; (-1)^anything alternates so just
                 // compute by parity.
-                if base == 1 || exp % 2 == 0 {
-                    1
-                } else {
-                    -1
-                }
+                if base == 1 || exp % 2 == 0 { 1 } else { -1 }
             }
             _ => 0,
         };
@@ -2313,10 +2309,10 @@ pub fn audit_pred_brand(meta: &crate::meta::Meta, brands: &[BoxType]) -> PredBra
     }
     out.missing_dependency_ids = missing;
 
-    if out.claims_mif1 {
-        if let Some(primary) = meta.primary_item_id {
-            out.primary_not_independent = !meta.iref_targets_of(&pred, primary).is_empty();
-        }
+    if out.claims_mif1
+        && let Some(primary) = meta.primary_item_id
+    {
+        out.primary_not_independent = !meta.iref_targets_of(&pred, primary).is_empty();
     }
 
     out
@@ -2453,10 +2449,10 @@ impl AlphaBitDepthAudit {
         } else if self.master_bit_depth.is_none() {
             out.push("master-item-av1C-truncated");
         }
-        if let (Some(a), Some(m)) = (self.alpha_bit_depth, self.master_bit_depth) {
-            if a != m {
-                out.push("alpha-master-bit-depth-mismatch");
-            }
+        if let (Some(a), Some(m)) = (self.alpha_bit_depth, self.master_bit_depth)
+            && a != m
+        {
+            out.push("alpha-master-bit-depth-mismatch");
         }
         out
     }
@@ -6395,7 +6391,7 @@ mod tests {
     fn audit_sequence_header_obu_size_field_zero_flagged() {
         let mut stream = Vec::new();
         stream.extend(obu_no_size(1)); // SH with no size
-                                       // Following bytes can't be framed — anything after.
+        // Following bytes can't be framed — anything after.
         stream.extend([0xff, 0xff, 0xff]);
         let (file, meta) = synth_av01_item(&stream);
         let rec = &audit_sequence_header_obu(&meta, &file)[0];
@@ -6573,7 +6569,7 @@ mod tests {
         buf.push(0x40); // is_multichannel=0, use_base_colour_space=1
         push_rational(&mut buf, 5, 2); // base_hdr_headroom
         push_rational(&mut buf, 8, 1); // alternate_hdr_headroom
-                                       // one GainMapChannel
+        // one GainMapChannel
         push_rational(&mut buf, -1, 4); // gain_map_min
         push_rational(&mut buf, 3, 4); // gain_map_max
         push_rational(&mut buf, 1, 1); // gamma
@@ -6636,8 +6632,8 @@ mod tests {
         buf.extend_from_slice(&1u16.to_be_bytes()); // writer_version
         buf.push(0x80); // is_multichannel=1, use_base_colour_space=0
         push_rational(&mut buf, 1, 1); // base_hdr_headroom
-                                       // alternate_hdr_headroom must differ from base_hdr_headroom
-                                       // (§5.2.7); 4/1 ≠ 1/1.
+        // alternate_hdr_headroom must differ from base_hdr_headroom
+        // (§5.2.7); 4/1 ≠ 1/1.
         push_rational(&mut buf, 4, 1); // alternate_hdr_headroom
         for ch in 0..3i32 {
             push_rational(&mut buf, ch, 1); // gain_map_min (R=0,G=1,B=2)
@@ -6792,7 +6788,7 @@ mod tests {
         approx(m.weight_factor(2.5), 0.0); // at H_baseline → not applied
         approx(m.weight_factor(8.0), 1.0); // at H_alternate → fully applied
         approx(m.weight_factor(5.25), 0.5); // midpoint → half
-                                            // Targets outside [H_baseline, H_alternate] clamp into [0, 1].
+        // Targets outside [H_baseline, H_alternate] clamp into [0, 1].
         approx(m.weight_factor(-100.0), 0.0);
         approx(m.weight_factor(100.0), 1.0);
     }
@@ -6824,7 +6820,7 @@ mod tests {
         approx(ch.unnormalize_log2_gain(1.0), 0.75); // → max(G)
         approx(ch.unnormalize_log2_gain(0.0), -0.25); // → min(G)
         approx(ch.unnormalize_log2_gain(0.5), 0.25); // span 1.0 × 0.5 − 0.25
-                                                     // Out-of-range stored sample saturates rather than producing NaN.
+        // Out-of-range stored sample saturates rather than producing NaN.
         approx(ch.unnormalize_log2_gain(2.0), 0.75);
         approx(ch.unnormalize_log2_gain(-1.0), -0.25);
     }

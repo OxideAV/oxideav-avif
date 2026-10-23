@@ -18,31 +18,31 @@
 //! [`crate::grid`] / [`crate::alpha`] / [`crate::transform`] working on
 //! [`crate::image::AvifFrame`]) is still the public surface.
 
-use oxideav_core::frame::{VideoFrame, VideoPlane};
 use oxideav_core::Decoder;
+use oxideav_core::frame::{VideoFrame, VideoPlane};
 use oxideav_core::{
     CodecId, CodecParameters, ColorSignal, Error, ExecutionContext, Frame, Packet, PixelFormat,
     Result, TimeBase,
 };
 
 use crate::api::DecodeOptions;
-use crate::av1_config::{parse_av1c, Av1CodecConfig};
+use crate::av1_config::{Av1CodecConfig, parse_av1c};
 
 use crate::alpha::find_alpha_item_id;
-use crate::box_parser::{b, BoxType};
+use crate::box_parser::{BoxType, b};
 use crate::cicp::effective_cicp;
 use crate::derived::{ImageOverlay, MAX_DERIVATION_DEPTH};
 use crate::frame_bridge::to_heif;
 use crate::grid::ImageGrid;
 use crate::image::{AvifFrame, AvifPixelFormat, AvifPlane};
 use crate::inspect::AvifInfo;
-use crate::meta::{Property, ITEM_TYPE_IDEN, ITEM_TYPE_IOVL, ITEM_TYPE_TMAP};
-use crate::parser::{classify_brands, AvifHeader, ITEM_TYPE_AV01, ITEM_TYPE_GRID};
+use crate::meta::{ITEM_TYPE_IDEN, ITEM_TYPE_IOVL, ITEM_TYPE_TMAP, Property};
+use crate::parser::{AvifHeader, ITEM_TYPE_AV01, ITEM_TYPE_GRID, classify_brands};
 use crate::signal::{color_signal_for, labelled_pixel_format};
 use crate::transform::{clap_extent, crop_top_left, rotation_keeps_layout};
 use oxideav_heif::compose;
 use oxideav_heif::gainmap::{
-    reconstruct_tone_map, GainMapMetadata, DEFAULT_HDR_REFERENCE_WHITE_NITS,
+    DEFAULT_HDR_REFERENCE_WHITE_NITS, GainMapMetadata, reconstruct_tone_map,
 };
 use oxideav_heif::props as hprops;
 use oxideav_heif::{Chroma, HeifFrame, HeifPixelFormat, Plane};
@@ -101,7 +101,7 @@ pub(crate) fn infer_av1_pixmap(
     let depth = cfg.bit_depth();
     let bps = if cfg.high_bitdepth { 2usize } else { 1 };
     let y = &frame.planes[0];
-    if y.stride == 0 || y.stride % bps != 0 {
+    if y.stride == 0 || !y.stride.is_multiple_of(bps) {
         return Err(Error::invalid(format!(
             "avif: AV1 frame Y plane stride {} incompatible with {depth}-bit storage",
             y.stride
@@ -160,7 +160,7 @@ pub(crate) fn infer_av1_pixmap(
         n => {
             return Err(Error::unsupported(format!(
                 "avif: AV1 frame has {n} planes, expected 1 or 3"
-            )))
+            )));
         }
     };
     Ok((format, width, height))
@@ -527,7 +527,7 @@ fn decode_av01_item(
                     Ok(other) => {
                         return Err(Error::unsupported(format!(
                             "avif: AV1 decoder returned non-video frame: {other:?}"
-                        )))
+                        )));
                     }
                     Err(Error::NeedMore) => break,
                     Err(e) => {
@@ -571,7 +571,7 @@ fn decode_av01_item(
 /// item is refused instead. Walks the item's OBUs up to the first
 /// Sequence Header; an item without one is left to the AV1 decoder.
 fn check_av1c_matches_stream(obu_bytes: &[u8], cfg: &Av1CodecConfig) -> Result<()> {
-    use oxideav_av1::{parse_obu, ObuType};
+    use oxideav_av1::{ObuType, parse_obu};
     let mut off = 0usize;
     while off < obu_bytes.len() {
         let Ok((desc, consumed)) = parse_obu(&obu_bytes[off..]) else {
@@ -629,7 +629,7 @@ fn decode_at_operating_point(
     ispe: Option<(u32, u32)>,
     op: u8,
 ) -> Result<Vec<VideoFrame>> {
-    use oxideav_av1::encoder::ivf::{build_file_header, build_frame_header, FOURCC_AV01};
+    use oxideav_av1::encoder::ivf::{FOURCC_AV01, build_file_header, build_frame_header};
     let (w, h) = ispe.unwrap_or((0, 0));
     let mut ivf = Vec::with_capacity(44 + obu_bytes.len());
     ivf.extend_from_slice(&build_file_header(
@@ -836,25 +836,23 @@ fn decode_item_output_inner(
             String::from_utf8_lossy(&item_type)
         )));
     };
-    if with_alpha {
-        if let Some(alpha_id) = find_alpha_item_id(&hdr.meta, item_id) {
-            if image.format.has_alpha {
-                return Err(Error::unsupported(format!(
-                    "avif: item {item_id} already carries alpha and has an alpha auxiliary {alpha_id}"
-                )));
-            }
-            let alpha = decode_item_output(hdr, alpha_id, depth + 1, ctx, false)?;
-            let alpha = alpha_as_gray(&alpha, image.width, image.height)?;
-            if alpha.format.bit_depth != image.format.bit_depth {
-                return Err(Error::invalid(format!(
-                    "avif alpha: alpha item {alpha_id} is {}-bit but master item {item_id} is \
+    if with_alpha && let Some(alpha_id) = find_alpha_item_id(&hdr.meta, item_id) {
+        if image.format.has_alpha {
+            return Err(Error::unsupported(format!(
+                "avif: item {item_id} already carries alpha and has an alpha auxiliary {alpha_id}"
+            )));
+        }
+        let alpha = decode_item_output(hdr, alpha_id, depth + 1, ctx, false)?;
+        let alpha = alpha_as_gray(&alpha, image.width, image.height)?;
+        if alpha.format.bit_depth != image.format.bit_depth {
+            return Err(Error::invalid(format!(
+                "avif alpha: alpha item {alpha_id} is {}-bit but master item {item_id} is \
                      {}-bit — the auxiliary shall be encoded at the master's bit depth \
                      (av1-avif §4.1)",
-                    alpha.format.bit_depth, image.format.bit_depth
-                )));
-            }
-            image = compose::attach_alpha(&image, &alpha).map_err(heif_err)?;
+                alpha.format.bit_depth, image.format.bit_depth
+            )));
         }
+        image = compose::attach_alpha(&image, &alpha).map_err(heif_err)?;
     }
     for prop in transforms_for(&hdr.meta, item_id) {
         image = match prop {
@@ -900,7 +898,7 @@ fn decode_coded_item(
         _ => {
             return Err(Error::invalid(format!(
                 "avif: item {item_id} missing av1C property"
-            )))
+            )));
         }
     };
     let ispe = match hdr.meta.property_for(item_id, &ISPE) {
@@ -922,12 +920,16 @@ fn decode_coded_item(
     let bit_depth = parse_av1c(&av1c)?.bit_depth();
     let mut frame = core_to_avif_frame(core_frame);
     let format = from_core_pix(fmt_core)?;
-    if let Some((iw, ih)) = ispe {
-        if iw > 0 && ih > 0 && iw <= w && ih <= h && (iw != w || ih != h) {
-            frame = crop_top_left(&frame, format, w, h, iw, ih).map_err(core_err)?;
-            w = iw;
-            h = ih;
-        }
+    if let Some((iw, ih)) = ispe
+        && iw > 0
+        && ih > 0
+        && iw <= w
+        && ih <= h
+        && (iw != w || ih != h)
+    {
+        frame = crop_top_left(&frame, format, w, h, iw, ih).map_err(core_err)?;
+        w = iw;
+        h = ih;
     }
     to_heif(&frame, format, bit_depth, w, h).map_err(core_err)
 }
@@ -1259,19 +1261,18 @@ fn decode_overlay_item(
     let mut inputs: Vec<(HeifFrame, bool)> = Vec::with_capacity(sources.len());
     for (i, &src) in sources.iter().enumerate() {
         let image = decode_item_output(hdr, src, depth + 1, ctx, true)?;
-        if let Some((first, _)) = inputs.first() {
-            if (first.format.chroma, first.format.bit_depth)
+        if let Some((first, _)) = inputs.first()
+            && (first.format.chroma, first.format.bit_depth)
                 != (image.format.chroma, image.format.bit_depth)
-            {
-                return Err(Error::unsupported(format!(
-                    "avif overlay: input {i} layout ({}-bit {:?}) differs from input 0 \
+        {
+            return Err(Error::unsupported(format!(
+                "avif overlay: input {i} layout ({}-bit {:?}) differs from input 0 \
                      ({}-bit {:?}) — mixed layouts are not composited",
-                    image.format.bit_depth,
-                    image.format.chroma,
-                    first.format.bit_depth,
-                    first.format.chroma
-                )));
-            }
+                image.format.bit_depth,
+                image.format.chroma,
+                first.format.bit_depth,
+                first.format.chroma
+            )));
         }
         inputs.push((image, is_premultiplied(hdr, src)));
     }

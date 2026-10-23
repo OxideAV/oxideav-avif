@@ -192,72 +192,71 @@ pub mod signal;
 #[cfg(feature = "registry")]
 pub mod still;
 
-pub use alpha::{composite_alpha, find_alpha_item_id, ALPHA_URN_PREFIX};
+pub use alpha::{ALPHA_URN_PREFIX, composite_alpha, find_alpha_item_id};
 pub use api::{
-    info, probe, AvifImage, ColorInfo, ColorRange, DecodeOptions, EncodeOptions, EncodeSpeed,
-    Frame, GridTiling, ImageInfo, Metadata, PixelFormat, Plane, RgbImage, RgbaImage, StillChroma,
+    AvifImage, ColorInfo, ColorRange, DecodeOptions, EncodeOptions, EncodeSpeed, Frame, GridTiling,
+    ImageInfo, Metadata, PixelFormat, Plane, RgbImage, RgbaImage, StillChroma, info, probe,
 };
 pub use avis::{
-    audit_avis_profile_compliance, audit_avis_sequence, audit_edit_list, inspect_avis, parse_avis,
-    parse_prft, parse_producer_reference_times, parse_ssix, parse_subsegment_indexes, sample_bytes,
     AvisInfo, AvisMeta, AvisProfileCompliance, AvisSequenceCompliance, EditListCompliance,
-    EditListEntry, ProducerReferenceTime, Sample, SubsegmentIndex, SubsegmentRange, HANDLER_PICT,
-    NTP_UNIX_EPOCH_OFFSET_SECONDS,
+    EditListEntry, HANDLER_PICT, NTP_UNIX_EPOCH_OFFSET_SECONDS, ProducerReferenceTime, Sample,
+    SubsegmentIndex, SubsegmentRange, audit_avis_profile_compliance, audit_avis_sequence,
+    audit_edit_list, inspect_avis, parse_avis, parse_prft, parse_producer_reference_times,
+    parse_ssix, parse_subsegment_indexes, sample_bytes,
 };
 pub use cicp::{
-    effective_cicp, is_matrix_reserved, is_primaries_reserved, is_transfer_reserved, matrix_name,
-    primaries_name, transfer_name, CicpTriple,
+    CicpTriple, effective_cicp, is_matrix_reserved, is_primaries_reserved, is_transfer_reserved,
+    matrix_name, primaries_name, transfer_name,
 };
 pub use derived::{
-    audit_alpha_bit_depth, audit_avif_profile_compliance, audit_iden_derivations, audit_pred_brand,
-    audit_sequence_header_obu, audit_tone_map, build_derivation_graph, normalize_full_range_plane,
-    output_dims_from_reconstructed, parse_grpl, reconstructed_dims, resolve_grids,
-    resolve_iden_derivations, resolve_overlays, resolve_tone_maps, transform_chain,
     AlphaBitDepthAudit, AvifProfile, AvifProfileCompliance, BracketingKind, DerivationGraph,
     DerivationKind, DerivationNode, DimTransform, EntityGroup, GainMapChannel, GainMapMetadata,
     GainMapRational, GridResolution, GridTilePlacement, IdenCompliance, IdenResolution,
-    ImageOverlay, Mif1Compliance, OverlayEntry, OverlayPlacement, OverlayResolution,
-    PredBrandCompliance, SampleTransform, SequenceHeaderObuAudit, Token, ToneMapCompliance,
-    ToneMapResolution, MAX_DERIVATION_DEPTH,
+    ImageOverlay, MAX_DERIVATION_DEPTH, Mif1Compliance, OverlayEntry, OverlayPlacement,
+    OverlayResolution, PredBrandCompliance, SampleTransform, SequenceHeaderObuAudit, Token,
+    ToneMapCompliance, ToneMapResolution, audit_alpha_bit_depth, audit_avif_profile_compliance,
+    audit_iden_derivations, audit_pred_brand, audit_sequence_header_obu, audit_tone_map,
+    build_derivation_graph, normalize_full_range_plane, output_dims_from_reconstructed, parse_grpl,
+    reconstructed_dims, resolve_grids, resolve_iden_derivations, resolve_overlays,
+    resolve_tone_maps, transform_chain,
 };
 pub use error::{AvifError, Result};
 /// The crate error under the contract's name.
 pub type Error = AvifError;
-pub use grid::{composite_grid, ImageGrid};
+pub use grid::{ImageGrid, composite_grid};
 pub use image::{AvifFrame, AvifPixelFormat, AvifPlane};
 pub use inspect::{
-    coded_item_dependencies, derivation_graph, entity_groups, gain_map_metadata, inspect,
-    is_font_item, item_payload_bytes, region_items, region_items_for, text_items, text_items_for,
-    transforms_for, AvifInfo, CodedItemDependencies, ResolvedRegionItem, ResolvedTextItem,
+    AvifInfo, CodedItemDependencies, ResolvedRegionItem, ResolvedTextItem, coded_item_dependencies,
+    derivation_graph, entity_groups, gain_map_metadata, inspect, is_font_item, item_payload_bytes,
+    region_items, region_items_for, text_items, text_items_for, transforms_for,
 };
 pub use meta::{
-    A1lx, A1op, Aebr, Afbr, Altt, AuxC, AuxKind, Cclv, Clap, Clli, Cmex, Cmin, Colr, Crtt, Dobr,
-    Elng, Fade, Fnch, Fobr, Imir, IrefEntry, Irot, Iscl, Ispe, ItemInfo, ItemLocation, Lsel, MaskC,
-    Mdcv, Mdft, Meta, Pano, PanoGrid, Pasp, Pixi, Prdi, Property, Rloc, Rref, Splt, Ssld, Sstr,
-    Stpe, Subs, SubsEntry, Tols, Txlo, Udes, Wbbr, Wipe, Zoom, AUX_URN_ALPHA_HEVC,
-    AUX_URN_ALPHA_MPEG, AUX_URN_DEPTH_HEVC, AUX_URN_DEPTH_MPEG, AUX_URN_HDR_GAINMAP,
-    ITEM_TYPE_EXIF, ITEM_TYPE_IDEN, ITEM_TYPE_IOVL, ITEM_TYPE_MIME, ITEM_TYPE_SATO, ITEM_TYPE_TMAP,
-    ITEM_TYPE_URI,
+    A1lx, A1op, AUX_URN_ALPHA_HEVC, AUX_URN_ALPHA_MPEG, AUX_URN_DEPTH_HEVC, AUX_URN_DEPTH_MPEG,
+    AUX_URN_HDR_GAINMAP, Aebr, Afbr, Altt, AuxC, AuxKind, Cclv, Clap, Clli, Cmex, Cmin, Colr, Crtt,
+    Dobr, Elng, Fade, Fnch, Fobr, ITEM_TYPE_EXIF, ITEM_TYPE_IDEN, ITEM_TYPE_IOVL, ITEM_TYPE_MIME,
+    ITEM_TYPE_SATO, ITEM_TYPE_TMAP, ITEM_TYPE_URI, Imir, IrefEntry, Irot, Iscl, Ispe, ItemInfo,
+    ItemLocation, Lsel, MaskC, Mdcv, Mdft, Meta, Pano, PanoGrid, Pasp, Pixi, Prdi, Property, Rloc,
+    Rref, Splt, Ssld, Sstr, Stpe, Subs, SubsEntry, Tols, Txlo, Udes, Wbbr, Wipe, Zoom,
 };
 pub use mux::{
-    encode_still_av1, AvifGridMuxer, AvifMuxer, AvifOverlayMuxer, BurstAlpha, BurstMember,
-    EntityGroupSpec, GridTile, IdentityDerivation, OverlayLayer, ToneMapItem,
+    AvifGridMuxer, AvifMuxer, AvifOverlayMuxer, BurstAlpha, BurstMember, EntityGroupSpec, GridTile,
+    IdentityDerivation, OverlayLayer, ToneMapItem, encode_still_av1,
 };
-pub use overlay::{composite_overlay, OverlayInput, MAX_OVERLAY_CANVAS_PIXELS};
+pub use overlay::{MAX_OVERLAY_CANVAS_PIXELS, OverlayInput, composite_overlay};
 pub use parser::{
-    audit_mif1, classify_brands, item_bytes, item_bytes_owned, item_bytes_owned_full,
-    item_bytes_owned_with_idat, item_bytes_with_idat, parse, parse_header, AvifFile, AvifHeader,
-    BrandClass, BRAND_AVIF, BRAND_AVIO, BRAND_AVIS, BRAND_MA1A, BRAND_MA1B, BRAND_MIAF, BRAND_MIF1,
-    BRAND_MSF1, ITEM_TYPE_AV01, ITEM_TYPE_GRID,
+    AvifFile, AvifHeader, BRAND_AVIF, BRAND_AVIO, BRAND_AVIS, BRAND_MA1A, BRAND_MA1B, BRAND_MIAF,
+    BRAND_MIF1, BRAND_MSF1, BrandClass, ITEM_TYPE_AV01, ITEM_TYPE_GRID, audit_mif1,
+    classify_brands, item_bytes, item_bytes_owned, item_bytes_owned_full,
+    item_bytes_owned_with_idat, item_bytes_with_idat, parse, parse_header,
 };
 pub use region::{
-    resolve_derived_region_items, DerivedRegionItem, RegionGeometry, RegionItem, ITEM_TYPE_MSKI,
-    ITEM_TYPE_RGAN, REF_TYPE_DRGN,
+    DerivedRegionItem, ITEM_TYPE_MSKI, ITEM_TYPE_RGAN, REF_TYPE_DRGN, RegionGeometry, RegionItem,
+    resolve_derived_region_items,
 };
 pub use sample_group::{
-    parse_csgp, parse_sample_group_descriptions, parse_sample_to_groups, parse_sbgp, parse_sgpd,
     BracketingEntry, SampleGroupDescription, SampleToGroup, SampleToGroupKind, SampleToGroupRun,
-    VisualEquivalenceEntry,
+    VisualEquivalenceEntry, parse_csgp, parse_sample_group_descriptions, parse_sample_to_groups,
+    parse_sbgp, parse_sgpd,
 };
 pub use transform::{apply_clap, apply_imir, apply_irot, crop_top_left};
 
@@ -269,17 +268,17 @@ pub use api_codec::{
 
 #[cfg(feature = "registry")]
 pub use decoder::{
-    make_decoder, AvifDecoder, AvifDecoderOptions, MAX_GRID_CANVAS_PIXELS, MAX_ITEM_DECODES,
+    AvifDecoder, AvifDecoderOptions, MAX_GRID_CANVAS_PIXELS, MAX_ITEM_DECODES, make_decoder,
 };
 
 #[cfg(feature = "registry")]
 pub use encoder::{
-    make_encoder, quality_to_base_q_idx, AvifEncoder, AvifEncoderOptions, DEFAULT_QUALITY,
-    ENCODER_PIXEL_FORMATS,
+    AvifEncoder, AvifEncoderOptions, DEFAULT_QUALITY, ENCODER_PIXEL_FORMATS, make_encoder,
+    quality_to_base_q_idx,
 };
 
 #[cfg(feature = "registry")]
-pub use sequence::{encode_sequence, SequenceEncodeOptions};
+pub use sequence::{SequenceEncodeOptions, encode_sequence};
 
 #[cfg(feature = "registry")]
 pub use signal::{color_signal_for, labelled_pixel_format, miaf_default_signal};
@@ -289,11 +288,11 @@ pub use signal::{color_signal_for, labelled_pixel_format, miaf_default_signal};
 pub use still::StillEncodeOptions;
 #[cfg(feature = "registry")]
 pub use still::{
-    elect_grid_for, elect_grid_tiling, encode_still, encode_still_auto, encode_still_burst,
-    encode_still_grid, encode_still_layered, encode_still_overlay, GainMapSpec, OverlayCanvas,
-    OverlayLayerImage, StillImage, StillProperties, AUTO_GRID_MAX_SINGLE_PIXELS,
-    AUTO_GRID_MAX_TILES, AUTO_GRID_TILE, GRID_MIN_TILE_DIM, STILL_MAX_CODED_DIM,
-    TILE_LAYOUT_THREADS,
+    AUTO_GRID_MAX_SINGLE_PIXELS, AUTO_GRID_MAX_TILES, AUTO_GRID_TILE, GRID_MIN_TILE_DIM,
+    GainMapSpec, OverlayCanvas, OverlayLayerImage, STILL_MAX_CODED_DIM, StillImage,
+    StillProperties, TILE_LAYOUT_THREADS, elect_grid_for, elect_grid_tiling, encode_still,
+    encode_still_auto, encode_still_burst, encode_still_grid, encode_still_layered,
+    encode_still_overlay,
 };
 
 #[cfg(feature = "registry")]
@@ -314,10 +313,10 @@ mod registry_glue {
         RuntimeContext,
     };
 
+    use crate::CODEC_ID_STR;
     use crate::decoder::make_decoder;
     use crate::encoder::make_encoder;
     use crate::error::AvifError;
-    use crate::CODEC_ID_STR;
 
     /// Bridge crate-local errors into the framework error type. Mirrors
     /// the conversion the decoder performs internally so external

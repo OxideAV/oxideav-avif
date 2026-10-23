@@ -11,14 +11,15 @@
 //! memory": every hostile shape must surface as an `Err`.
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_avif::{encode_still, parse, AvifDecoder, EncodeOptions, StillChroma, StillImage};
+use oxideav_avif::{AvifDecoder, EncodeOptions, StillChroma, StillImage, encode_still, parse};
 use oxideav_core::{CodecId, Decoder, Packet, TimeBase};
 use std::sync::OnceLock;
 
 /// `(colour payload, colour av1C, mono payload, mono av1C)` of one
 /// lossless 8×8 tile pair, encoded once.
 fn tiles() -> &'static (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
-    static TILES: OnceLock<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> = OnceLock::new();
+    type TileSet = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
+    static TILES: OnceLock<TileSet> = OnceLock::new();
     TILES.get_or_init(|| {
         let y: Vec<u16> = (0..64).map(|i| (i * 3) as u16).collect();
         let c: Vec<u16> = (0..16).map(|i| 100 + i as u16).collect();

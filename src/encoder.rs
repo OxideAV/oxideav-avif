@@ -129,14 +129,14 @@
 
 use oxideav_core::frame::VideoFrame;
 use oxideav_core::{
-    parse_options, CodecId, CodecOptionsStruct, CodecParameters, ColorRange, ColorSignal, Encoder,
-    Error, Frame, OptionField, OptionKind, OptionValue, Packet, PixelFormat, Result, TimeBase,
+    CodecId, CodecOptionsStruct, CodecParameters, ColorRange, ColorSignal, Encoder, Error, Frame,
+    OptionField, OptionKind, OptionValue, Packet, PixelFormat, Result, TimeBase, parse_options,
 };
 
-use crate::api::{exif_item_body, ColorInfo, EncodeOptions, EncodeSpeed, GridTiling, Metadata};
+use crate::api::{ColorInfo, EncodeOptions, EncodeSpeed, GridTiling, Metadata, exif_item_body};
 use crate::meta::Colr;
 use crate::still::{
-    encode_still_auto, identity_full_range_colr, StillChroma, StillImage, StillProperties,
+    StillChroma, StillImage, StillProperties, encode_still_auto, identity_full_range_colr,
 };
 
 /// Every input layout the encoder accepts (the module docs' list) —
@@ -294,10 +294,10 @@ impl AvifEncoderOptions {
         let mut out = Self::default();
         for (k, v) in params.options.iter() {
             let one = oxideav_core::CodecOptions::new().set(k, v);
-            if let Ok(parsed) = parse_options::<Self>(&one) {
-                if let Err(e) = parsed.apply_into(&mut out, k) {
-                    debug_assert!(false, "lenient option apply: {e}");
-                }
+            if let Ok(parsed) = parse_options::<Self>(&one)
+                && let Err(e) = parsed.apply_into(&mut out, k)
+            {
+                debug_assert!(false, "lenient option apply: {e}");
             }
         }
         out
@@ -445,7 +445,7 @@ impl CodecOptionsStruct for AvifEncoderOptions {
                     other => {
                         return Err(Error::invalid(format!(
                             "avif encode: chroma '{other}' is not 420 / 422 / 444"
-                        )))
+                        )));
                     }
                 }
             }
@@ -458,7 +458,7 @@ impl CodecOptionsStruct for AvifEncoderOptions {
                     other => {
                         return Err(Error::invalid(format!(
                             "avif encode: speed '{other}' is not fast / balanced / thorough"
-                        )))
+                        )));
                     }
                 }
             }
@@ -661,7 +661,7 @@ impl AvifEncoder {
                     "avif encode: pixel format {other:?} is not supported \
                      (planar YUV 8/10/12-bit, Gray, RGB(A)/BGR(A), Gbrp(a) 8/10/12-bit, \
                      Yuva420P, Ya8)"
-                )))
+                )));
             }
         };
         Ok(apply_color_signal(img, &self.params))
@@ -774,7 +774,9 @@ fn pack16le(plane: &oxideav_core::frame::VideoPlane, w: usize, h: usize) -> Resu
         let s = row * plane.stride;
         out.extend(
             plane.data[s..s + row_bytes]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| u16::from_le_bytes([c[0], c[1]])),
         );
     }
@@ -956,8 +958,8 @@ fn packed_rgb_to_ycbcr(
     chroma: StillChroma,
 ) -> StillImage {
     let chroma = match chroma {
-        StillChroma::Yuv420 if w % 2 != 0 || h % 2 != 0 => StillChroma::Yuv444,
-        StillChroma::Yuv422 if w % 2 != 0 => StillChroma::Yuv444,
+        StillChroma::Yuv420 if !w.is_multiple_of(2) || !h.is_multiple_of(2) => StillChroma::Yuv444,
+        StillChroma::Yuv422 if !w.is_multiple_of(2) => StillChroma::Yuv444,
         StillChroma::Monochrome => StillChroma::Yuv444,
         other => other,
     };
@@ -1105,7 +1107,7 @@ fn ya8(vf: &VideoFrame, width: u32, height: u32) -> Result<StillImage> {
     let mut a = Vec::with_capacity(w * h);
     for row in 0..h {
         let s = row * plane.stride;
-        for px in plane.data[s..s + row_bytes].chunks_exact(2) {
+        for px in plane.data[s..s + row_bytes].as_chunks::<2>().0.iter() {
             y.push(px[0] as u16);
             a.push(px[1] as u16);
         }
@@ -1137,7 +1139,7 @@ impl Encoder for AvifEncoder {
             other => {
                 return Err(Error::invalid(format!(
                     "avif encode: expected a video frame, got {other:?}"
-                )))
+                )));
             }
         };
         let img = self.frame_to_still(vf)?.with_props(self.metadata_props(vf));
@@ -1194,8 +1196,8 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxideav_core::frame::{VideoFrame, VideoPlane};
     use oxideav_core::Decoder;
+    use oxideav_core::frame::{VideoFrame, VideoPlane};
 
     /// The one-pass packed-RGB conversion is sample-identical to the
     /// contract path's (`still_of_rgb_in`: 4:4:4 then box filter) for

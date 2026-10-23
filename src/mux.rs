@@ -864,7 +864,7 @@ impl AvifMuxer {
                 _ => {
                     return Err(Error::invalid(
                         "avif mux: the gain map's colr must be nclx (HEIF Amd 1 §6.6.2.4.1)",
-                    ))
+                    ));
                 }
             };
             let mut gprops = vec![
@@ -1828,10 +1828,12 @@ mod tests {
             .build()
             .unwrap_err();
         assert!(matches!(err, Error::InvalidData(_)), "{err:?}");
-        assert!(AvifMuxer::new(16, 16, b"obu".to_vec(), synth_av1c())
-            .with_exif(b"\x00\x00".to_vec())
-            .build()
-            .is_err());
+        assert!(
+            AvifMuxer::new(16, 16, b"obu".to_vec(), synth_av1c())
+                .with_exif(b"\x00\x00".to_vec())
+                .build()
+                .is_err()
+        );
     }
 
     /// `infe` item name and a flagged `grpl` entity group through the
@@ -1899,9 +1901,11 @@ mod tests {
         assert!(img.compatible_brands.iter().any(|b| b == b"mif1"));
         assert!(img.compatible_brands.iter().any(|b| b == b"miaf"));
         // Still a conformant mif1 file.
-        assert!(crate::parser::audit_mif1(&bytes)
-            .expect("audit")
-            .is_compliant());
+        assert!(
+            crate::parser::audit_mif1(&bytes)
+                .expect("audit")
+                .is_compliant()
+        );
     }
 
     #[test]

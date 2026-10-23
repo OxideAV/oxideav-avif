@@ -7,7 +7,7 @@ use std::borrow::Cow;
 use crate::derived::Mif1Compliance;
 use crate::error::{AvifError as Error, Result};
 
-use crate::box_parser::{b, find_box, iter_boxes, parse_full_box, type_str, BoxType};
+use crate::box_parser::{BoxType, b, find_box, iter_boxes, parse_full_box, type_str};
 use crate::meta::{
     Amve, Cclv, Clli, Colr, IlocExtent, Ispe, ItemInfo, ItemLocation, Mdcv, Meta, Pasp, Pixi,
     Property,
@@ -468,12 +468,11 @@ fn primary_payload<'a>(
     heif: &HeifFileRef<'_>,
     item_id: u32,
 ) -> Result<Cow<'a, [u8]>> {
-    if let Ok(spans) = heif.item_file_spans(item_id) {
-        if let [(start, end)] = spans.as_slice() {
-            if let Some(slice) = file.get(*start..*end) {
-                return Ok(Cow::Borrowed(slice));
-            }
-        }
+    if let Ok(spans) = heif.item_file_spans(item_id)
+        && let [(start, end)] = spans.as_slice()
+        && let Some(slice) = file.get(*start..*end)
+    {
+        return Ok(Cow::Borrowed(slice));
     }
     Ok(Cow::Owned(heif.item_data_owned(item_id)?))
 }

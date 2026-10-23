@@ -454,7 +454,13 @@ fn every_declared_layout_encodes_and_decodes_under_its_coded_label() {
                     assert_eq!(vf.planes[pi].data, want, "{fmt:?} plane {pi}");
                 }
                 if bpp == 4 {
-                    let want: Vec<u8> = src[0].data.chunks_exact(4).map(|px| px[3]).collect();
+                    let want: Vec<u8> = src[0]
+                        .data
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|px| px[3])
+                        .collect();
                     assert_eq!(vf.planes[3].data, want, "{fmt:?} alpha");
                 }
             }
@@ -673,7 +679,7 @@ fn decoder_thread_budget_is_byte_identical_to_serial() {
 /// serial and on a budget — the budget is spent across the tiles.
 #[test]
 fn grid_tiles_decode_identically_under_a_budget() {
-    use oxideav_avif::{encode_still_grid, EncodeOptions, StillChroma, StillImage};
+    use oxideav_avif::{EncodeOptions, StillChroma, StillImage, encode_still_grid};
     let (w, h) = (128u32, 128u32);
     let plane = |c: usize, pw: u32, ph: u32| -> Vec<u16> {
         (0..pw as usize * ph as usize)
@@ -969,8 +975,8 @@ fn odd_extents_refuse_subsampled_layouts_by_type_and_short_planes_by_data() {
 #[test]
 fn grid_policy_elects_shapes_and_tiles_code_on_the_budget() {
     use oxideav_avif::{
-        elect_grid_for, GridTiling, AUTO_GRID_MAX_SINGLE_PIXELS, AUTO_GRID_MAX_TILES,
-        AUTO_GRID_TILE, STILL_MAX_CODED_DIM,
+        AUTO_GRID_MAX_SINGLE_PIXELS, AUTO_GRID_MAX_TILES, AUTO_GRID_TILE, GridTiling,
+        STILL_MAX_CODED_DIM, elect_grid_for,
     };
     // The election table.
     let elect = |w, h, a, g| elect_grid_for(w, h, a, g).unwrap();

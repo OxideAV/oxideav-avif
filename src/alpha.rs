@@ -34,7 +34,7 @@ use crate::frame_bridge::{from_heif, to_heif};
 use crate::image::AvifPlane as VideoPlane;
 use crate::image::{AvifFrame as VideoFrame, AvifPixelFormat as PixelFormat};
 
-use crate::box_parser::{b, BoxType};
+use crate::box_parser::{BoxType, b};
 use crate::meta::{Meta, Property};
 
 /// The codec-independent alpha `aux_type` URN prefix (HEIF §6.9.1).
@@ -47,10 +47,10 @@ const AUXC: BoxType = b(b"auxC");
 /// `auxC` names the alpha URN.
 pub fn find_alpha_item_id(meta: &Meta, primary_id: u32) -> Option<u32> {
     let candidate = meta.iref_source_of(&AUXL, primary_id)?;
-    if let Some(Property::AuxC(aux)) = meta.property_for(candidate, &AUXC) {
-        if aux.aux_type.starts_with(ALPHA_URN_PREFIX) {
-            return Some(candidate);
-        }
+    if let Some(Property::AuxC(aux)) = meta.property_for(candidate, &AUXC)
+        && aux.aux_type.starts_with(ALPHA_URN_PREFIX)
+    {
+        return Some(candidate);
     }
     None
 }
@@ -117,7 +117,7 @@ mod tests {
     }
 
     fn make_yuv420(w: u32, h: u32) -> VideoFrame {
-        assert!(w % 2 == 0 && h % 2 == 0);
+        assert!(w.is_multiple_of(2) && h.is_multiple_of(2));
         VideoFrame {
             pts: None,
             planes: vec![
@@ -292,7 +292,7 @@ mod tests {
         assert_eq!(out.planes.len(), 4);
         assert_eq!(out.planes[0].stride, 8);
         assert_eq!(out.planes[3].data.len(), 32);
-        for pair in out.planes[3].data.chunks_exact(2) {
+        for pair in out.planes[3].data.as_chunks::<2>().0.iter() {
             assert_eq!(u16::from_le_bytes([pair[0], pair[1]]), 1023);
         }
     }
@@ -317,7 +317,9 @@ mod tests {
         assert_eq!(out.planes[0].stride, 8);
         let words: Vec<u16> = out.planes[0]
             .data
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
         assert_eq!(words, vec![4000, 123, 4000, 123, 4000, 123, 4000, 123]);

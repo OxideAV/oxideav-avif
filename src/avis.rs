@@ -17,9 +17,9 @@
 
 use crate::error::{AvifError as Error, Result};
 
-use crate::box_parser::{b, find_box, iter_boxes, parse_full_box, read_u32, read_u64, BoxType};
+use crate::box_parser::{BoxType, b, find_box, iter_boxes, parse_full_box, read_u32, read_u64};
 use oxideav_heif::props as hprops;
-use oxideav_heif::{sequence, HeifFile, HeifFileRef};
+use oxideav_heif::{HeifFile, HeifFileRef, sequence};
 
 const MOOV: BoxType = b(b"moov");
 const TRAK: BoxType = b(b"trak");
@@ -2183,9 +2183,11 @@ mod tests {
         let audit = audit_avis_sequence(&meta, &[]);
         assert!(!audit.is_compliant());
         assert_eq!(audit.sample_description_count, 2);
-        assert!(audit
-            .missing()
-            .contains(&"avis-sample-description-not-single"));
+        assert!(
+            audit
+                .missing()
+                .contains(&"avis-sample-description-not-single")
+        );
         // Type-of-first still passes since first is av01.
         assert!(audit.sample_description_is_av01);
     }
@@ -2210,12 +2212,16 @@ mod tests {
         let audit = audit_avis_sequence(&meta, &[]);
         assert!(!audit.single_sample_description);
         assert!(!audit.sample_description_is_av01);
-        assert!(audit
-            .missing()
-            .contains(&"avis-sample-description-not-single"));
-        assert!(audit
-            .missing()
-            .contains(&"avis-sample-description-not-av01"));
+        assert!(
+            audit
+                .missing()
+                .contains(&"avis-sample-description-not-single")
+        );
+        assert!(
+            audit
+                .missing()
+                .contains(&"avis-sample-description-not-av01")
+        );
     }
 
     #[test]
@@ -2286,9 +2292,11 @@ mod tests {
         let audit = audit_avis_sequence(&meta, &file);
         assert_eq!(audit.sequence_header_obu_count, 2);
         assert!(!audit.sequence_headers_identical);
-        assert!(audit
-            .missing()
-            .contains(&"avis-sequence-header-obus-differ"));
+        assert!(
+            audit
+                .missing()
+                .contains(&"avis-sequence-header-obus-differ")
+        );
     }
 
     #[test]

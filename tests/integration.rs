@@ -20,7 +20,7 @@
 use oxideav_core::{CodecId, Error, Packet, TimeBase};
 
 use oxideav_avif::{
-    box_parser::b, inspect, parse, parse_avis, parse_header, AvifDecoder, ImageGrid,
+    AvifDecoder, ImageGrid, box_parser::b, inspect, parse, parse_avis, parse_header,
 };
 use oxideav_core::Decoder;
 
@@ -275,7 +275,7 @@ fn avis_sample_bytes_resolves_first_obu() {
 /// `sample_bytes` rejects out-of-range samples without panicking.
 #[test]
 fn avis_sample_bytes_rejects_out_of_range() {
-    use oxideav_avif::{sample_bytes, Sample};
+    use oxideav_avif::{Sample, sample_bytes};
     let bogus = Sample::new(u64::MAX - 10, 1024, 0, true);
     assert!(sample_bytes(ALPHA_VIDEO_AVIS, &bogus).is_err());
     let past_eof = Sample::new(ALPHA_VIDEO_AVIS.len() as u64 - 1, 100, 0, true);
@@ -304,7 +304,7 @@ fn avis_sample_duration_to_rational() {
 /// this is the end-to-end re-export path through `oxideav_avif::*`).
 #[test]
 fn alpha_video_avis_passes_section_3_compliance_audit() {
-    use oxideav_avif::{audit_avis_sequence, HANDLER_PICT};
+    use oxideav_avif::{HANDLER_PICT, audit_avis_sequence};
     let meta = parse_avis(ALPHA_VIDEO_AVIS).expect("parse_avis");
     let audit = audit_avis_sequence(&meta, ALPHA_VIDEO_AVIS);
     assert!(
@@ -329,7 +329,7 @@ fn alpha_video_avis_passes_section_3_compliance_audit() {
 #[test]
 fn alpha_video_avis_satisfies_section_8_2_baseline_profile_audit() {
     use oxideav_avif::{
-        audit_avis_profile_compliance, classify_brands, parse_avis, parse_header, AvifProfile,
+        AvifProfile, audit_avis_profile_compliance, classify_brands, parse_avis, parse_header,
     };
     let hdr = parse_header(ALPHA_VIDEO_AVIS).expect("parse_header");
     let brands = classify_brands(&hdr.major_brand, &hdr.compatible_brands).expect("brands");
@@ -362,7 +362,7 @@ fn alpha_video_avis_satisfies_section_8_2_baseline_profile_audit() {
 /// the aggregator entry point end-to-end on real container bytes.
 #[test]
 fn inspect_avis_aggregates_alpha_video_fixture_to_compliant() {
-    use oxideav_avif::{inspect_avis, AvifProfile, HANDLER_PICT};
+    use oxideav_avif::{AvifProfile, HANDLER_PICT, inspect_avis};
     let info = inspect_avis(ALPHA_VIDEO_AVIS).expect("inspect_avis");
 
     // Summary fields agree with the underlying parse_avis call.
@@ -591,7 +591,7 @@ fn build_synthetic_grid_avif() -> Vec<u8> {
     // ---- ipma: item 1 -> prop 1; items 2,3 -> props 2 + 3 (av1C) ----
     let mut ipma_body = Vec::new();
     ipma_body.extend_from_slice(&u32be(3)); // entry_count
-                                            // Item 1 (grid): only ispe(4x2)
+    // Item 1 (grid): only ispe(4x2)
     ipma_body.extend_from_slice(&1u16.to_be_bytes());
     ipma_body.push(1);
     ipma_body.push(1 & 0x7f);
@@ -651,7 +651,7 @@ fn build_synthetic_grid_avif() -> Vec<u8> {
     ] {
         iloc_inner.extend_from_slice(&id.to_be_bytes());
         iloc_inner.extend_from_slice(&u16be(0)); // data_reference_index
-                                                 // base_offset (size=0) emits zero bytes — skip.
+        // base_offset (size=0) emits zero bytes — skip.
         iloc_inner.extend_from_slice(&u16be(1)); // extent_count
         iloc_inner.extend_from_slice(&u32be(off));
         iloc_inner.extend_from_slice(&u32be(len));
@@ -1213,8 +1213,8 @@ fn synthetic_yuv444_frame(w: u32, h: u32) -> oxideav_avif::AvifFrame {
 /// `Irot` entry for it.
 #[test]
 fn transforms_for_surfaces_kimono_irot() {
-    use oxideav_avif::decoder::transforms_for;
     use oxideav_avif::Property;
+    use oxideav_avif::decoder::transforms_for;
 
     let hdr = parse_header(KIMONO_ROT90).expect("parse_header kimono");
     let primary = hdr.meta.primary_item_id.expect("pitm");
@@ -2375,7 +2375,7 @@ fn build_avif_with_idat_exif(exif_payload: &[u8]) -> Vec<u8> {
     iloc_inner.push(0x44); // offset_size=4, length_size=4
     iloc_inner.push(0x00); // base_offset_size=0, index_size=0
     iloc_inner.extend_from_slice(&u16be(2)); // item_count
-                                             // item 1 av01 cm=0
+    // item 1 av01 cm=0
     iloc_inner.extend_from_slice(&u16be(1));
     iloc_inner.extend_from_slice(&u16be(0)); // cm=0
     iloc_inner.extend_from_slice(&u16be(0)); // data_ref
@@ -2563,7 +2563,7 @@ fn build_avif_with_cm2_item(obu: &[u8], sub_offset: u32, sub_len: u32) -> Vec<u8
     iloc_inner.push(0x44); // offset_size=4, length_size=4
     iloc_inner.push(0x04); // base_offset_size=0, index_size=4
     iloc_inner.extend_from_slice(&u16be(2)); // item_count
-                                             // item 1 av01 cm=0
+    // item 1 av01 cm=0
     iloc_inner.extend_from_slice(&u16be(1));
     iloc_inner.extend_from_slice(&u16be(0)); // cm=0
     iloc_inner.extend_from_slice(&u16be(0)); // data_ref
@@ -2838,10 +2838,11 @@ fn essential_a1op_is_recognised_and_does_not_block() {
         !hdr.meta.has_unsupported_essential_property(primary),
         "recognised essential a1op must not block the item"
     );
-    assert!(hdr
-        .meta
-        .unsupported_essential_properties(primary)
-        .is_empty());
+    assert!(
+        hdr.meta
+            .unsupported_essential_properties(primary)
+            .is_empty()
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -3503,7 +3504,7 @@ fn build_synthetic_avif_with_sato() -> Vec<u8> {
 #[test]
 fn inspect_surfaces_sato_item_ids_and_descriptor_parses() {
     use oxideav_avif::derived::SampleTransform;
-    use oxideav_avif::{inspect, item_payload_bytes, Token};
+    use oxideav_avif::{Token, inspect, item_payload_bytes};
 
     let bytes = build_synthetic_avif_with_sato();
     let info = inspect(&bytes).expect("inspect");
@@ -4218,7 +4219,7 @@ fn encoder_muxes_black_box_av1_payload_round_trip() {
 /// / `iprp`) is present and the file claims the `mif1` brand.
 #[test]
 fn muxed_avif_is_mif1_compliant() {
-    use oxideav_avif::{audit_mif1, AvifMuxer};
+    use oxideav_avif::{AvifMuxer, audit_mif1};
     let file = AvifMuxer::new(16, 16, b"coded-av1".to_vec(), vec![0x81, 0x0c, 0x0c, 0x00])
         .with_pixi(vec![8, 8, 8])
         .build()
@@ -4237,7 +4238,7 @@ fn muxed_avif_is_mif1_compliant() {
 /// spec-conformant baseline file, not just something that re-parses.
 #[test]
 fn muxed_baseline_avif_passes_profile_compliance_audit() {
-    use oxideav_avif::{audit_avif_profile_compliance, classify_brands, AvifMuxer, AvifProfile};
+    use oxideav_avif::{AvifMuxer, AvifProfile, audit_avif_profile_compliance, classify_brands};
 
     let src = parse(MONO).expect("parse source");
     let payload = src.primary_item_data.to_vec();

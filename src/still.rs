@@ -56,11 +56,11 @@ use crate::mux::{
 
 use oxideav_av1::encoder::scalable_gop::encode_spatial_layered_gop_yuv_with_q;
 use oxideav_av1::encoder::still::{
-    auto_tile_layout, encode_key_frame_yuv_with_options, encode_still_yuv, StillOptions, StillSpeed,
+    StillOptions, StillSpeed, auto_tile_layout, encode_key_frame_yuv_with_options, encode_still_yuv,
 };
 use oxideav_av1::encoder::temporal_unit::encode_sequence_header_obu;
 use oxideav_av1::encoder::yuv_frame::{ChromaFormat, YuvFrame};
-use oxideav_av1::{parse_obu, ObuType, SequenceHeader};
+use oxideav_av1::{ObuType, SequenceHeader, parse_obu};
 
 pub use crate::api::{EncodeOptions, StillChroma};
 
@@ -476,7 +476,7 @@ impl StillImage {
         let mut y = Vec::with_capacity(n);
         let mut u = Vec::with_capacity(n);
         let mut v = Vec::with_capacity(n);
-        for px in rgb.chunks_exact(3) {
+        for px in rgb.as_chunks::<3>().0.iter() {
             v.push(px[0] as u16); // R → Cr
             y.push(px[1] as u16); // G → Y
             u.push(px[2] as u16); // B → Cb
@@ -501,7 +501,7 @@ impl StillImage {
         let mut u = Vec::with_capacity(n);
         let mut v = Vec::with_capacity(n);
         let mut a = Vec::with_capacity(n);
-        for px in rgba.chunks_exact(4) {
+        for px in rgba.as_chunks::<4>().0.iter() {
             v.push(px[0] as u16);
             y.push(px[1] as u16);
             u.push(px[2] as u16);
@@ -575,7 +575,8 @@ impl StillImage {
         }
         let (sx, sy) = self.chroma.subsampling();
         if self.chroma.has_chroma()
-            && ((sx == 1 && self.width % 2 != 0) || (sy == 1 && self.height % 2 != 0))
+            && ((sx == 1 && !self.width.is_multiple_of(2))
+                || (sy == 1 && !self.height.is_multiple_of(2)))
         {
             return Err(Error::invalid(format!(
                 "avif still: {:?} requires even subsampled extents, got {}x{}",
@@ -600,15 +601,15 @@ impl StillImage {
                 self.v.len()
             )));
         }
-        if let Some(a) = &self.alpha {
-            if a.len() != luma_len {
-                return Err(Error::invalid(format!(
-                    "avif still: alpha plane length {} != {}x{} (alpha is full resolution)",
-                    a.len(),
-                    self.width,
-                    self.height
-                )));
-            }
+        if let Some(a) = &self.alpha
+            && a.len() != luma_len
+        {
+            return Err(Error::invalid(format!(
+                "avif still: alpha plane length {} != {}x{} (alpha is full resolution)",
+                a.len(),
+                self.width,
+                self.height
+            )));
         }
         let ceil = 1u32 << self.bit_depth;
         let in_range = |p: &[u16]| p.iter().all(|&s| (s as u32) < ceil);
@@ -732,7 +733,7 @@ pub fn elect_grid_for(
                     Some((c, r))
                         if u32::from(c) * u32::from(r) * per_tile <= AUTO_GRID_MAX_TILES =>
                     {
-                        break
+                        break;
                     }
                     _ => edge = (edge * 2).min(STILL_MAX_CODED_DIM),
                 }
@@ -807,7 +808,7 @@ pub(crate) fn pad_plane(src: &[u16], w: usize, h: usize, pw: usize, ph: usize) -
         let base = sr * w;
         out.extend_from_slice(&src[base..base + w]);
         let edge = src[base + w - 1];
-        out.extend(std::iter::repeat(edge).take(pw - w));
+        out.extend(std::iter::repeat_n(edge, pw - w));
     }
     out
 }
@@ -835,7 +836,7 @@ fn extract_rect(
         out.extend_from_slice(&src[base + x0..base + x0 + copy]);
         if copy < tw {
             let edge = src[base + w - 1];
-            out.extend(std::iter::repeat(edge).take(tw - copy));
+            out.extend(std::iter::repeat_n(edge, tw - copy));
         }
     }
     out
@@ -1849,7 +1850,7 @@ pub fn encode_still_layered(
             return Err(Error::invalid(format!(
                 "avif still: render_layer {s} out of range for {} layers",
                 layers.len()
-            )))
+            )));
         }
         None => layers.len() - 1,
     };
@@ -1919,19 +1920,19 @@ pub fn encode_still_layered(
     if let Some(axis) = props.imir {
         mux = mux.with_imir(axis);
     }
-    if selected == layers.len() - 1 {
-        if let Some(alpha) = &top.alpha {
-            let coded_alpha =
-                encode_alpha(top, alpha, pw, ph, opts.alpha_q_idx, CodedTuning::of(opts))?;
-            max_profile = max_profile.max(coded_alpha.seq_profile);
-            mux = mux
-                .with_alpha(
-                    coded_alpha.payload,
-                    coded_alpha.av1c,
-                    opts.premultiplied_alpha,
-                )
-                .with_alpha_pixi(vec![top.bit_depth]);
-        }
+    if selected == layers.len() - 1
+        && let Some(alpha) = &top.alpha
+    {
+        let coded_alpha =
+            encode_alpha(top, alpha, pw, ph, opts.alpha_q_idx, CodedTuning::of(opts))?;
+        max_profile = max_profile.max(coded_alpha.seq_profile);
+        mux = mux
+            .with_alpha(
+                coded_alpha.payload,
+                coded_alpha.av1c,
+                opts.premultiplied_alpha,
+            )
+            .with_alpha_pixi(vec![top.bit_depth]);
     }
     mux = apply_profile_brand_mux(mux, max_profile);
     mux.build()

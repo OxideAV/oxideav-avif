@@ -15,7 +15,7 @@ use crate::error::{AvifError as Error, Result};
 
 #[cfg(test)]
 use crate::box_parser::iter_boxes;
-use crate::box_parser::{b, parse_full_box, read_cstr, read_u16, read_u32, type_str, BoxType};
+use crate::box_parser::{BoxType, b, parse_full_box, read_cstr, read_u16, read_u32, type_str};
 use oxideav_heif::boxes::FourCc;
 use oxideav_heif::meta as hmeta;
 use oxideav_heif::props as hprops;
@@ -1057,7 +1057,7 @@ fn div_ceil_u64(n: u64, d: u64) -> u64 {
     if d == 0 {
         return 0;
     }
-    n / d + u64::from(n % d != 0)
+    n / d + u64::from(!n.is_multiple_of(d))
 }
 
 /// Required Reference Types descriptive property (`rref`) —
@@ -2903,11 +2903,7 @@ impl Cmex {
     /// per §6.5.39.1 — the extra bits of fractional quaternion precision
     /// signalled by `rot_large_field_size`.
     pub fn orientation_precision(&self) -> u32 {
-        if self.rot_large_field_size() {
-            16
-        } else {
-            0
-        }
+        if self.rot_large_field_size() { 16 } else { 0 }
     }
 
     /// The camera position vector `(pos_x, pos_y, pos_z)` in µm
@@ -4181,7 +4177,7 @@ fn container_parse(box_type: &FourCc, body: &[u8]) -> Result<hprops::Property> {
 }
 
 macro_rules! container_typed_parser {
-    ($name:ident, $tag:expr, $variant:ident, $ty:ty, $conv:expr) => {
+    ($name:ident, $tag:expr_2021, $variant:ident, $ty:ty, $conv:expr_2021) => {
         #[cfg(test)]
         fn $name(body: &[u8]) -> Result<$ty> {
             match container_parse(&$tag, body)? {
@@ -5445,8 +5441,8 @@ mod tests {
         let mut p = Vec::new();
         p.push(1); // version
         p.extend_from_slice(&[0, 0, 0]); // flags
-                                         // offset_size=4, length_size=4 in byte 0; base_offset_size=0,
-                                         // index_size in byte 1.
+        // offset_size=4, length_size=4 in byte 0; base_offset_size=0,
+        // index_size in byte 1.
         p.push(0x44);
         // base_offset_size = 0 (high nibble), index_size in the low nibble.
         p.push(index_size & 0x0f);
@@ -5454,7 +5450,7 @@ mod tests {
         p.extend_from_slice(&7u16.to_be_bytes()); // item_ID = 7
         p.extend_from_slice(&[0x00, cm & 0x0f]); // reserved(12)+construction_method(4)
         p.extend_from_slice(&0u16.to_be_bytes()); // data_reference_index
-                                                  // base_offset_size == 0 → no base_offset bytes.
+        // base_offset_size == 0 → no base_offset bytes.
         p.extend_from_slice(&(extents.len() as u16).to_be_bytes());
         for (idx, off, len) in extents {
             match index_size {
@@ -5534,9 +5530,10 @@ mod tests {
         let mut buf = vec![0u8; 4]; // FullBox v=0 flags=0
         buf.extend_from_slice(b"urn:mpeg:mpegB:cicp:systems:auxiliary:alpha\0");
         let a = parse_auxc(&buf).unwrap();
-        assert!(a
-            .aux_type
-            .starts_with("urn:mpeg:mpegB:cicp:systems:auxiliary:alpha"));
+        assert!(
+            a.aux_type
+                .starts_with("urn:mpeg:mpegB:cicp:systems:auxiliary:alpha")
+        );
     }
 
     #[test]
@@ -5636,7 +5633,7 @@ mod tests {
         // FullBox(v=0, f=0) + one `auxl` child referencing from_id=2 to {1}.
         let mut body = Vec::new();
         body.extend_from_slice(&[0u8; 4]); // fullbox
-                                           // Child box header: size(4) + type(4)
+        // Child box header: size(4) + type(4)
         let child_payload: Vec<u8> = {
             let mut cp = Vec::new();
             cp.extend_from_slice(&2u16.to_be_bytes()); // from_id

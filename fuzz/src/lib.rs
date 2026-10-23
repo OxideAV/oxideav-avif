@@ -21,8 +21,8 @@
 #![allow(non_snake_case)]
 
 pub mod libavif {
-    use libloading::{Library, Symbol};
-    use std::ffi::CString;
+    use dlsym::Library;
+    use std::ffi::{CStr, CString};
     use std::os::raw::{c_char, c_int, c_void};
     use std::sync::OnceLock;
 
@@ -42,11 +42,11 @@ pub mod libavif {
         static LIB: OnceLock<Option<Library>> = OnceLock::new();
         LIB.get_or_init(|| {
             for name in CANDIDATES {
-                // SAFETY: `Library::new` is documented as unsafe because
+                // SAFETY: `Library::open` is documented as unsafe because
                 // the loaded library may run code at load time. We
                 // accept that risk for fuzz tooling — libavif is a
                 // well-behaved shared library.
-                if let Ok(l) = unsafe { Library::new(name) } {
+                if let Ok(l) = unsafe { Library::open(name) } {
                     return Some(l);
                 }
             }
@@ -173,10 +173,19 @@ pub mod libavif {
 
     type AvifRwDataFreeFn = unsafe extern "C" fn(*mut AvifRwData);
 
-    /// Helper: load a symbol or `None`. Keeps the call sites readable
-    /// when many functions need to be looked up at once.
-    unsafe fn sym<T>(l: &'static Library, name: &[u8]) -> Option<Symbol<'static, T>> {
-        l.get(name).ok()
+    /// Helper: resolve a symbol or `None`, detached from the
+    /// `Symbol` borrow. Keeps the call sites readable when many
+    /// functions need to be looked up at once.
+    ///
+    /// # Safety
+    ///
+    /// `T` must match the C signature of `name`. Detaching is sound
+    /// here because `l` comes from [`lib`]'s `OnceLock`, which lives
+    /// for the program lifetime, so the library is never unloaded.
+    unsafe fn sym<T: dlsym::SymbolType>(l: &'static Library, name: &CStr) -> Option<T> {
+        // SAFETY: forwarded to the caller (signature) + the 'static
+        // library above (lifetime).
+        unsafe { l.get::<T>(name).ok().map(|s| s.into_inner()) }
     }
 
     /// Encode an RGBA image losslessly via libavif. Uses
@@ -193,21 +202,19 @@ pub mod libavif {
     pub fn encode_lossless_rgba(rgba: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
         let l = lib()?;
         unsafe {
-            let enc_create: Symbol<AvifEncoderCreateFn> = sym(l, b"avifEncoderCreate")?;
-            let enc_destroy: Symbol<AvifEncoderDestroyFn> = sym(l, b"avifEncoderDestroy")?;
-            let enc_set_opt: Symbol<AvifEncoderSetCodecSpecificOptionFn> =
-                sym(l, b"avifEncoderSetCodecSpecificOption")?;
-            let enc_add: Symbol<AvifEncoderAddImageFn> = sym(l, b"avifEncoderAddImage")?;
-            let enc_finish: Symbol<AvifEncoderFinishFn> = sym(l, b"avifEncoderFinish")?;
-            let img_create: Symbol<AvifImageCreateFn> = sym(l, b"avifImageCreate")?;
-            let img_destroy: Symbol<AvifImageDestroyFn> = sym(l, b"avifImageDestroy")?;
-            let img_rgb_to_yuv: Symbol<AvifImageRGBToYUVFn> = sym(l, b"avifImageRGBToYUV")?;
-            let rgb_set_defaults: Symbol<AvifRGBImageSetDefaultsFn> =
-                sym(l, b"avifRGBImageSetDefaults")?;
-            let rgb_alloc: Symbol<AvifRGBImageAllocatePixelsFn> =
-                sym(l, b"avifRGBImageAllocatePixels")?;
-            let rgb_free: Symbol<AvifRGBImageFreePixelsFn> = sym(l, b"avifRGBImageFreePixels")?;
-            let rwd_free: Symbol<AvifRwDataFreeFn> = sym(l, b"avifRWDataFree")?;
+            let enc_create: AvifEncoderCreateFn = sym(l, c"avifEncoderCreate")?;
+            let enc_destroy: AvifEncoderDestroyFn = sym(l, c"avifEncoderDestroy")?;
+            let enc_set_opt: AvifEncoderSetCodecSpecificOptionFn =
+                sym(l, c"avifEncoderSetCodecSpecificOption")?;
+            let enc_add: AvifEncoderAddImageFn = sym(l, c"avifEncoderAddImage")?;
+            let enc_finish: AvifEncoderFinishFn = sym(l, c"avifEncoderFinish")?;
+            let img_create: AvifImageCreateFn = sym(l, c"avifImageCreate")?;
+            let img_destroy: AvifImageDestroyFn = sym(l, c"avifImageDestroy")?;
+            let img_rgb_to_yuv: AvifImageRGBToYUVFn = sym(l, c"avifImageRGBToYUV")?;
+            let rgb_set_defaults: AvifRGBImageSetDefaultsFn = sym(l, c"avifRGBImageSetDefaults")?;
+            let rgb_alloc: AvifRGBImageAllocatePixelsFn = sym(l, c"avifRGBImageAllocatePixels")?;
+            let rgb_free: AvifRGBImageFreePixelsFn = sym(l, c"avifRGBImageFreePixels")?;
+            let rwd_free: AvifRwDataFreeFn = sym(l, c"avifRWDataFree")?;
 
             let image = img_create(width, height, 8, AVIF_PIXEL_FORMAT_YUV444);
             if image.is_null() {
@@ -321,21 +328,19 @@ pub mod libavif {
     ) -> Option<Vec<u8>> {
         let l = lib()?;
         unsafe {
-            let enc_create: Symbol<AvifEncoderCreateFn> = sym(l, b"avifEncoderCreate")?;
-            let enc_destroy: Symbol<AvifEncoderDestroyFn> = sym(l, b"avifEncoderDestroy")?;
-            let enc_set_opt: Symbol<AvifEncoderSetCodecSpecificOptionFn> =
-                sym(l, b"avifEncoderSetCodecSpecificOption")?;
-            let enc_add: Symbol<AvifEncoderAddImageFn> = sym(l, b"avifEncoderAddImage")?;
-            let enc_finish: Symbol<AvifEncoderFinishFn> = sym(l, b"avifEncoderFinish")?;
-            let img_create: Symbol<AvifImageCreateFn> = sym(l, b"avifImageCreate")?;
-            let img_destroy: Symbol<AvifImageDestroyFn> = sym(l, b"avifImageDestroy")?;
-            let img_rgb_to_yuv: Symbol<AvifImageRGBToYUVFn> = sym(l, b"avifImageRGBToYUV")?;
-            let rgb_set_defaults: Symbol<AvifRGBImageSetDefaultsFn> =
-                sym(l, b"avifRGBImageSetDefaults")?;
-            let rgb_alloc: Symbol<AvifRGBImageAllocatePixelsFn> =
-                sym(l, b"avifRGBImageAllocatePixels")?;
-            let rgb_free: Symbol<AvifRGBImageFreePixelsFn> = sym(l, b"avifRGBImageFreePixels")?;
-            let rwd_free: Symbol<AvifRwDataFreeFn> = sym(l, b"avifRWDataFree")?;
+            let enc_create: AvifEncoderCreateFn = sym(l, c"avifEncoderCreate")?;
+            let enc_destroy: AvifEncoderDestroyFn = sym(l, c"avifEncoderDestroy")?;
+            let enc_set_opt: AvifEncoderSetCodecSpecificOptionFn =
+                sym(l, c"avifEncoderSetCodecSpecificOption")?;
+            let enc_add: AvifEncoderAddImageFn = sym(l, c"avifEncoderAddImage")?;
+            let enc_finish: AvifEncoderFinishFn = sym(l, c"avifEncoderFinish")?;
+            let img_create: AvifImageCreateFn = sym(l, c"avifImageCreate")?;
+            let img_destroy: AvifImageDestroyFn = sym(l, c"avifImageDestroy")?;
+            let img_rgb_to_yuv: AvifImageRGBToYUVFn = sym(l, c"avifImageRGBToYUV")?;
+            let rgb_set_defaults: AvifRGBImageSetDefaultsFn = sym(l, c"avifRGBImageSetDefaults")?;
+            let rgb_alloc: AvifRGBImageAllocatePixelsFn = sym(l, c"avifRGBImageAllocatePixels")?;
+            let rgb_free: AvifRGBImageFreePixelsFn = sym(l, c"avifRGBImageFreePixels")?;
+            let rwd_free: AvifRwDataFreeFn = sym(l, c"avifRWDataFree")?;
 
             let image = img_create(width, height, 8, AVIF_PIXEL_FORMAT_YUV420);
             if image.is_null() {
@@ -425,18 +430,16 @@ pub mod libavif {
     pub fn decode_to_rgba(data: &[u8]) -> Option<DecodedRgba> {
         let l = lib()?;
         unsafe {
-            let dec_create: Symbol<AvifDecoderCreateFn> = sym(l, b"avifDecoderCreate")?;
-            let dec_destroy: Symbol<AvifDecoderDestroyFn> = sym(l, b"avifDecoderDestroy")?;
-            let dec_set_io: Symbol<AvifDecoderSetIOMemoryFn> = sym(l, b"avifDecoderSetIOMemory")?;
-            let dec_read: Symbol<AvifDecoderReadFn> = sym(l, b"avifDecoderRead")?;
-            let img_create: Symbol<AvifImageCreateFn> = sym(l, b"avifImageCreate")?;
-            let img_destroy: Symbol<AvifImageDestroyFn> = sym(l, b"avifImageDestroy")?;
-            let img_yuv_to_rgb: Symbol<AvifImageYUVToRGBFn> = sym(l, b"avifImageYUVToRGB")?;
-            let rgb_set_defaults: Symbol<AvifRGBImageSetDefaultsFn> =
-                sym(l, b"avifRGBImageSetDefaults")?;
-            let rgb_alloc: Symbol<AvifRGBImageAllocatePixelsFn> =
-                sym(l, b"avifRGBImageAllocatePixels")?;
-            let rgb_free: Symbol<AvifRGBImageFreePixelsFn> = sym(l, b"avifRGBImageFreePixels")?;
+            let dec_create: AvifDecoderCreateFn = sym(l, c"avifDecoderCreate")?;
+            let dec_destroy: AvifDecoderDestroyFn = sym(l, c"avifDecoderDestroy")?;
+            let dec_set_io: AvifDecoderSetIOMemoryFn = sym(l, c"avifDecoderSetIOMemory")?;
+            let dec_read: AvifDecoderReadFn = sym(l, c"avifDecoderRead")?;
+            let img_create: AvifImageCreateFn = sym(l, c"avifImageCreate")?;
+            let img_destroy: AvifImageDestroyFn = sym(l, c"avifImageDestroy")?;
+            let img_yuv_to_rgb: AvifImageYUVToRGBFn = sym(l, c"avifImageYUVToRGB")?;
+            let rgb_set_defaults: AvifRGBImageSetDefaultsFn = sym(l, c"avifRGBImageSetDefaults")?;
+            let rgb_alloc: AvifRGBImageAllocatePixelsFn = sym(l, c"avifRGBImageAllocatePixels")?;
+            let rgb_free: AvifRGBImageFreePixelsFn = sym(l, c"avifRGBImageFreePixels")?;
 
             let decoder = dec_create();
             if decoder.is_null() {

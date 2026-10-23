@@ -15,7 +15,7 @@
 //! word mismatch.
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_avif::{encode_still, AvifDecoder, EncodeOptions, StillChroma, StillImage};
+use oxideav_avif::{AvifDecoder, EncodeOptions, StillChroma, StillImage, encode_still};
 use oxideav_core::{CodecId, Decoder, Frame, Packet, TimeBase};
 
 const MAX_WIDTH: usize = 40;
@@ -24,7 +24,9 @@ const MAX_PIXELS: usize = 2048;
 /// Reassemble a decoded plane (1 or 2 bytes per sample) into `u16`s.
 fn plane_words(data: &[u8], two_byte: bool) -> Vec<u16> {
     if two_byte {
-        data.chunks_exact(2)
+        data.as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect()
     } else {

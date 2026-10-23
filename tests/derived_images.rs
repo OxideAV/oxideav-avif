@@ -9,9 +9,9 @@
 #![cfg(feature = "registry")]
 
 use oxideav_avif::{
-    audit_iden_derivations, encode_still, encode_still_overlay, inspect, parse_header, AvifDecoder,
-    EncodeOptions, IdentityDerivation, OverlayCanvas, OverlayLayerImage, StillChroma, StillImage,
-    StillProperties, ITEM_TYPE_IDEN, ITEM_TYPE_IOVL,
+    AvifDecoder, EncodeOptions, ITEM_TYPE_IDEN, ITEM_TYPE_IOVL, IdentityDerivation, OverlayCanvas,
+    OverlayLayerImage, StillChroma, StillImage, StillProperties, audit_iden_derivations,
+    encode_still, encode_still_overlay, inspect, parse_header,
 };
 use oxideav_core::{CodecId, Decoder, Frame, Packet, TimeBase};
 
@@ -60,7 +60,9 @@ fn decode_own(label: &str, avif: &[u8]) -> oxideav_core::frame::VideoFrame {
 
 fn words(data: &[u8], two_byte: bool) -> Vec<u16> {
     if two_byte {
-        data.chunks_exact(2)
+        data.as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect()
     } else {
@@ -512,12 +514,14 @@ fn overlay_encode_guards() {
     .unwrap_err();
     assert!(err.to_string().contains("share one coded layout"), "{err}");
     assert!(encode_still_overlay(&canvas, &[], &EncodeOptions::default()).is_err());
-    assert!(encode_still_overlay(
-        &OverlayCanvas::new(0, 8),
-        &[OverlayLayerImage::new(&a, 0, 0)],
-        &EncodeOptions::default()
-    )
-    .is_err());
+    assert!(
+        encode_still_overlay(
+            &OverlayCanvas::new(0, 8),
+            &[OverlayLayerImage::new(&a, 0, 0)],
+            &EncodeOptions::default()
+        )
+        .is_err()
+    );
 }
 
 // ───────────────────────── identity ─────────────────────────

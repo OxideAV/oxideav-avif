@@ -29,7 +29,7 @@
 //! `grouping_type` + `default_group_description_index` header is
 //! surfaced by [`SampleGroupDescription`]).
 
-use crate::box_parser::{b, iter_boxes, parse_full_box, read_u16, read_u32, BoxType};
+use crate::box_parser::{BoxType, b, iter_boxes, parse_full_box, read_u16, read_u32};
 use crate::error::{AvifError as Error, Result};
 
 const SBGP: BoxType = b(b"sbgp");
@@ -934,7 +934,7 @@ mod tests {
         let mut body = Vec::new();
         body.extend_from_slice(b"roll"); // grouping_type (32, byte-aligned)
         body.extend_from_slice(&1u32.to_be_bytes()); // pattern_count (32)
-                                                     // pattern 0: pattern_length=2 (8b), sample_count=5 (8b)
+        // pattern 0: pattern_length=2 (8b), sample_count=5 (8b)
         body.push(2);
         body.push(5);
         // indices for pattern 0: [3, 4] (8b each)
@@ -969,7 +969,7 @@ mod tests {
         body.extend_from_slice(&1u32.to_be_bytes()); // pattern_count
         body.push(3); // pattern_length = 3 (8b)
         body.push(3); // sample_count = 3 (8b)
-                      // three 4-bit indices: 1, 2, 15 -> bytes 0x12, 0xF0 (last nibble padding)
+        // three 4-bit indices: 1, 2, 15 -> bytes 0x12, 0xF0 (last nibble padding)
         body.push(0x12);
         body.push(0xF0);
         let payload = full_box(0, flags, &body);
@@ -1147,11 +1147,10 @@ mod tests {
             BracketingEntry::parse(crate::derived::BracketingKind::AutoExposure, &[0x01]).is_err()
         );
         // A 2-byte slice cannot hold a 3-byte wbbr entry.
-        assert!(BracketingEntry::parse(
-            crate::derived::BracketingKind::WhiteBalance,
-            &[0x01, 0x02]
-        )
-        .is_err());
+        assert!(
+            BracketingEntry::parse(crate::derived::BracketingKind::WhiteBalance, &[0x01, 0x02])
+                .is_err()
+        );
     }
 
     #[test]

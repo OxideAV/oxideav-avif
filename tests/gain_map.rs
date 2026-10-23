@@ -11,15 +11,15 @@
 
 use oxideav_avif::meta::{Colr, Property};
 use oxideav_avif::{
-    encode_still, gain_map_metadata, inspect, parse_header, AvifDecoder, EncodeOptions,
-    GainMapSpec, StillChroma, StillImage, StillProperties,
+    AvifDecoder, EncodeOptions, GainMapSpec, StillChroma, StillImage, StillProperties,
+    encode_still, gain_map_metadata, inspect, parse_header,
 };
 use oxideav_core::{
     CodecId, CodecParameters, ColorSignal, Decoder, Frame, Packet, PixelFormat, TimeBase,
 };
 use oxideav_heif::gainmap::{GainMapChannel, GainMapMetadata, Rational};
 use oxideav_heif::props as hprops;
-use oxideav_heif::{to_rgb, Chroma, HeifFrame, HeifPixelFormat, Plane};
+use oxideav_heif::{Chroma, HeifFrame, HeifPixelFormat, Plane, to_rgb};
 
 /// `avifgainmaputil combine` of a 32×24 sRGB base gradient and a
 /// BT.2100 PQ alternate gradient (lossless, 8-bit 4:4:4, 4:4:4 8-bit
@@ -55,7 +55,9 @@ fn samples(frame: &oxideav_core::frame::VideoFrame, width: usize) -> Vec<Vec<u16
                 p.data.iter().map(|&b| u16::from(b)).collect()
             } else {
                 p.data
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|c| u16::from_le_bytes([c[0], c[1]]))
                     .collect()
             }

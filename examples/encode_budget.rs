@@ -168,7 +168,9 @@ fn psnr8(a: &[u8], b: &[u8]) -> f64 {
 /// BT.601 full-range luma of a packed RGB row set (what a lossy
 /// packed-RGB encode is converted with by default).
 fn luma_of_rgb(rgb: &[u8]) -> Vec<u8> {
-    rgb.chunks_exact(3)
+    rgb.as_chunks::<3>()
+        .0
+        .iter()
         .map(|p| {
             let (r, g, b) = (f64::from(p[0]), f64::from(p[1]), f64::from(p[2]));
             (0.299 * r + 0.587 * g + 0.114 * b)

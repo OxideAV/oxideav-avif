@@ -262,11 +262,7 @@ impl AvifPixelFormat {
             (false, 12, 0, 0) => Self::Yuv444P12Le,
             _ => return None,
         };
-        if alpha {
-            base.with_alpha()
-        } else {
-            Some(base)
-        }
+        if alpha { base.with_alpha() } else { Some(base) }
     }
 
     /// The alpha-less companion of any layout: `Yuva* → Yuv*`,

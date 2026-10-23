@@ -13,26 +13,26 @@ use oxideav_core::{
 };
 
 use crate::api::{
-    burst_members, exif_item_body, exif_tiff_bytes, has_moov, item_colrs, AvifImage, ColorInfo,
-    ColorRange, DecodeOptions, EncodeOptions, Frame, Metadata, RgbImage, RgbaImage, StillChroma,
+    AvifImage, ColorInfo, ColorRange, DecodeOptions, EncodeOptions, Frame, Metadata, RgbImage,
+    RgbaImage, StillChroma, burst_members, exif_item_body, exif_tiff_bytes, has_moov, item_colrs,
 };
-use crate::av1_config::{parse_av1c, Av1CodecConfig};
+use crate::av1_config::{Av1CodecConfig, parse_av1c};
 use crate::avis::{parse_avis, sample_bytes};
 use crate::decoder::{
-    core_to_avif_frame, decode_item_output, infer_av1_pixmap, tone_map_of, validate_av1_config,
-    DecodeCtx, MAX_AV1_ITEM_BYTES,
+    DecodeCtx, MAX_AV1_ITEM_BYTES, core_to_avif_frame, decode_item_output, infer_av1_pixmap,
+    tone_map_of, validate_av1_config,
 };
 use crate::error::{AvifError as Error, Result};
 use crate::frame_bridge::from_heif;
 use crate::image::{AvifPixelFormat, AvifPlane};
-use crate::inspect::{build_info, build_info_derived, build_info_grid, AvifInfo};
+use crate::inspect::{AvifInfo, build_info, build_info_derived, build_info_grid};
 use crate::meta::{Colr, ITEM_TYPE_IDEN, ITEM_TYPE_IOVL, ITEM_TYPE_TMAP};
 use crate::parser::{
-    audit_mif1, classify_brands, parse, parse_header, AvifHeader, BrandClass, ITEM_TYPE_AV01,
-    ITEM_TYPE_GRID,
+    AvifHeader, BrandClass, ITEM_TYPE_AV01, ITEM_TYPE_GRID, audit_mif1, classify_brands, parse,
+    parse_header,
 };
 use crate::signal::{color_signal_for, layout_of_record};
-use crate::still::{encode_still_auto, StillImage, StillProperties};
+use crate::still::{StillImage, StillProperties, encode_still_auto};
 use oxideav_heif::{Chroma, HeifFrame};
 
 /// Framework errors (the AV1 decoder's, the composition layer's) as
@@ -555,7 +555,7 @@ fn sequence_picture(
         other => {
             return Err(Error::unsupported(format!(
                 "avis: AV1 decoder returned a non-video frame: {other:?}"
-            )))
+            )));
         }
     };
     let (fmt_core, w, h) = infer_av1_pixmap(&vf, &seq.config).map_err(from_core_err)?;
@@ -681,7 +681,9 @@ fn plane_samples(
             out.extend(row.iter().map(|&b| u16::from(b)));
         } else {
             out.extend(
-                row.chunks_exact(2)
+                row.as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|w| u16::from_le_bytes([w[0], w[1]])),
             );
         }
@@ -729,7 +731,7 @@ fn still_of(image: &AvifImage, opts: &EncodeOptions) -> Result<StillImage> {
             _ => StillChroma::Yuv444,
         }
     };
-    if (sx == 1 && image.width % 2 != 0) || (sy == 1 && image.height % 2 != 0) {
+    if (sx == 1 && !image.width.is_multiple_of(2)) || (sy == 1 && !image.height.is_multiple_of(2)) {
         return Err(Error::unsupported(format!(
             "avif encode: {format:?} at {}x{} — this encoder codes sub-sampled chroma only at \
              even extents; use 4:4:4 (or `encode_rgb8`, which falls back to it)",
@@ -740,7 +742,7 @@ fn still_of(image: &AvifImage, opts: &EncodeOptions) -> Result<StillImage> {
         let packed = plane_samples(&image.planes[0], w * 2, h, bps, "packed YA")?;
         let mut y = Vec::with_capacity(w * h);
         let mut a = Vec::with_capacity(w * h);
-        for px in packed.chunks_exact(2) {
+        for px in packed.as_chunks::<2>().0.iter() {
             y.push(px[0]);
             a.push(px[1]);
         }
@@ -912,7 +914,7 @@ pub(crate) fn still_of_rgb_in(
     );
     let mut chroma = chroma;
     let (sx, sy) = chroma.subsampling();
-    if (sx == 1 && width % 2 != 0) || (sy == 1 && height % 2 != 0) {
+    if (sx == 1 && !width.is_multiple_of(2)) || (sy == 1 && !height.is_multiple_of(2)) {
         chroma = StillChroma::Yuv444;
     }
     let target = if chroma == StillChroma::Monochrome {
@@ -950,7 +952,12 @@ pub(crate) fn still_of_rgb_in(
     };
     let mut still = StillImage::yuv(width, height, 8, chroma, y, u, v)?;
     if channels == 4 {
-        let a: Vec<u16> = data.chunks_exact(4).map(|px| u16::from(px[3])).collect();
+        let a: Vec<u16> = data
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|px| u16::from(px[3]))
+            .collect();
         still = still.with_alpha(a)?;
     }
     Ok(still.with_colr(color.to_colr()))
@@ -1113,7 +1120,7 @@ mod tests {
         assert_eq!(rgb.data, expect);
         let rgba = decode_rgba8(&bytes).unwrap();
         assert_eq!(rgba.data.len(), expect.len() / 3 * 4);
-        assert!(rgba.data.chunks_exact(4).all(|p| p[3] == 255));
+        assert!(rgba.data.as_chunks::<4>().0.iter().all(|p| p[3] == 255));
         let from_reader = decode_from(std::io::Cursor::new(&bytes)).unwrap();
         assert_eq!(from_reader, img);
     }
@@ -1191,11 +1198,14 @@ mod tests {
         assert!(info.has_alpha);
         assert_eq!(info.format, PixelFormat::Yuva420P);
         let back = decode_rgba8(&bytes).unwrap();
-        assert!(back
-            .data
-            .chunks_exact(4)
-            .zip(rgba.chunks_exact(4))
-            .all(|(a, b)| a[3] == b[3]));
+        assert!(
+            back.data
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(rgba.as_chunks::<4>().0.iter())
+                .all(|(a, b)| a[3] == b[3])
+        );
         // Quality from the options changes the output.
         let lossy = encode_rgb8(16, 8, &rgb, &EncodeOptions::default().with_quality(50)).unwrap();
         assert_ne!(
@@ -1278,12 +1288,16 @@ mod tests {
         assert!(info.is_sequence);
         let frames = decode_all(&bytes).unwrap();
         assert_eq!(frames.len(), info.frames as usize);
-        assert!(frames
-            .iter()
-            .all(|f| f.delay.is_some_and(|d| d > Duration::ZERO)));
-        assert!(frames
-            .iter()
-            .all(|f| f.image.width == frames[0].image.width));
+        assert!(
+            frames
+                .iter()
+                .all(|f| f.delay.is_some_and(|d| d > Duration::ZERO))
+        );
+        assert!(
+            frames
+                .iter()
+                .all(|f| f.image.width == frames[0].image.width)
+        );
         let first = decode(&bytes).unwrap();
         assert_eq!(first, frames[0].image);
         let rgb = first.to_rgb8();

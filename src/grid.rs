@@ -878,7 +878,9 @@ mod tests {
         let out = composite_grid(&grid, &tiles, PixelFormat::Yuv420P10Le, 2, 2).unwrap();
         let words = |p: &VideoPlane| -> Vec<u16> {
             p.data
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect()
         };

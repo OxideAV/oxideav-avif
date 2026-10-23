@@ -275,7 +275,7 @@ mod tests {
     }
 
     fn make_yuv420(w: u32, h: u32) -> VideoFrame {
-        assert!(w % 2 == 0 && h % 2 == 0);
+        assert!(w.is_multiple_of(2) && h.is_multiple_of(2));
         let y: Vec<u8> = (0..w * h).map(|i| (i & 0xff) as u8).collect();
         let u: Vec<u8> = (0..(w / 2) * (h / 2))
             .map(|i| ((i + 40) & 0xff) as u8)
@@ -455,7 +455,9 @@ mod tests {
 
     fn words(p: &VideoPlane) -> Vec<u16> {
         p.data
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect()
     }

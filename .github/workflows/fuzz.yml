@@ -25,7 +25,7 @@ name: Fuzz
 #     decode_with / to_rgba8 / decode_all_with under tight
 #     DecodeOptions limits, lossless re-encode of small pictures.
 #
-# The libavif harnesses dlopen libavif at runtime via libloading; the
+# The libavif harnesses dlopen libavif at runtime via dlsym; the
 # CI runner needs `libavif-dev` so they actually validate instead of
 # silently skipping. The self-roundtrip harness never skips.
 

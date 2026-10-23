@@ -30,14 +30,14 @@
 use crate::api::EncodeSpeed;
 use crate::error::{AvifError as Error, Result};
 use crate::mux::{
-    prop_av1c, prop_clap, prop_colr, prop_ispe, prop_pixi, sequence_brands, ProfileBrand,
+    ProfileBrand, prop_av1c, prop_clap, prop_colr, prop_ispe, prop_pixi, sequence_brands,
 };
 use crate::still::{
-    av1_err, av1c_from_seq, coded_extent, colr_is_full_range, encode_coded_item,
-    full_range_temporal_unit, pad_plane, pixi_bits, top_left_clap, CodedTuning, StillImage,
-    STILL_MAX_CODED_DIM,
+    CodedTuning, STILL_MAX_CODED_DIM, StillImage, av1_err, av1c_from_seq, coded_extent,
+    colr_is_full_range, encode_coded_item, full_range_temporal_unit, pad_plane, pixi_bits,
+    top_left_clap,
 };
-use oxideav_av1::encoder::inter_frame::{encode_gop_yuv_with_q, GOP_MAX_FRAMES};
+use oxideav_av1::encoder::inter_frame::{GOP_MAX_FRAMES, encode_gop_yuv_with_q};
 use oxideav_av1::encoder::yuv_frame::YuvFrame;
 use oxideav_heif::{HeifWriter, SequenceWriter};
 
@@ -138,14 +138,14 @@ pub(crate) fn encode_sequence_timed(
     let first = frames
         .first()
         .ok_or_else(|| Error::invalid("avif sequence: no frames"))?;
-    if let Some(d) = durations {
-        if d.len() != frames.len() {
-            return Err(Error::invalid(format!(
-                "avif sequence: {} durations for {} frames",
-                d.len(),
-                frames.len()
-            )));
-        }
+    if let Some(d) = durations
+        && d.len() != frames.len()
+    {
+        return Err(Error::invalid(format!(
+            "avif sequence: {} durations for {} frames",
+            d.len(),
+            frames.len()
+        )));
     }
     if opts.timescale == 0 || opts.frame_duration == 0 {
         return Err(Error::invalid(
@@ -172,8 +172,14 @@ pub(crate) fn encode_sequence_timed(
         {
             return Err(Error::invalid(format!(
                 "avif sequence: frame {i} ({}x{} {}-bit {:?}) differs from frame 0 ({}x{} {}-bit {:?})",
-                f.width, f.height, f.bit_depth, f.chroma, first.width, first.height,
-                first.bit_depth, first.chroma
+                f.width,
+                f.height,
+                f.bit_depth,
+                f.chroma,
+                first.width,
+                first.height,
+                first.bit_depth,
+                first.chroma
             )));
         }
         if f.alpha.is_some() || f.depth_map.is_some() {
