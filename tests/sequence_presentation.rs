@@ -224,13 +224,11 @@ fn av1c_property(file: &[u8]) -> oxideav_heif::props::Property {
     oxideav_heif::props::Property::Av1C(oxideav_heif::Av1Config::parse(&raw).unwrap())
 }
 
-#[test]
-fn alpha_auxiliary_track_is_attached_to_the_time_parallel_sample() {
-    // Four 32 × 24 colour samples of one tick each; an alpha track
-    // (HEIF §7.5.3: `auxv`, `auxl` → master, `auxi` alpha URN) whose
-    // four samples last two ticks each (decode times 0, 2, 4, 6):
-    // pairing by time, not by index, master samples 0 and 1 show alpha
-    // sample 0, samples 2 and 3 alpha sample 1.
+/// Four 32 × 24 colour samples of one tick each plus an alpha track
+/// (HEIF §7.5.3: `auxv`, `auxl` → master, `auxi` alpha URN) whose four
+/// flat samples (40, 200, 90, 250) last two ticks each (decode times
+/// 0, 2, 4, 6).
+fn alpha_sequence_file() -> Vec<u8> {
     let (w, h) = (32u32, 24u32);
     let colour: Vec<StillImage> = (0..4u16)
         .map(|i| {
@@ -296,38 +294,83 @@ fn alpha_auxiliary_track_is_attached_to_the_time_parallel_sample() {
             .collect(),
         Vec::new(),
     ));
-    let file = writer.write_to_vec().unwrap();
+    writer.write_to_vec().unwrap()
+}
 
-    let i = info(&file).unwrap();
-    assert!(i.has_alpha);
-    let frames = decode_all(&file).unwrap();
-    assert_eq!(frames.len(), 4);
-    assert_eq!(i.frames, 4);
-    let expected_alpha = [40u8, 40, 200, 200];
-    for (k, f) in frames.iter().enumerate() {
-        assert_eq!(f.image.format, oxideav_avif::PixelFormat::Yuva420P, "{k}");
-        let a = &f.image.planes[3];
-        assert!(
-            a.data.iter().all(|&v| v == expected_alpha[k]),
-            "frame {k}: alpha {:?}",
-            &a.data[..4]
-        );
+/// Swap the first two `trak` boxes of the `moov` (their sizes and the
+/// absolute `stco` offsets into `mdat` are unchanged).
+fn swap_traks(file: &[u8]) -> Vec<u8> {
+    let be = |b: &[u8]| u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize;
+    let moov = file.windows(4).position(|w| w == b"moov").unwrap() - 4;
+    let moov_end = moov + be(&file[moov..]);
+    let mut at = moov + 8;
+    let mut traks = Vec::new();
+    while at < moov_end {
+        let size = be(&file[at..]);
+        if &file[at + 4..at + 8] == b"trak" {
+            traks.push((at, size));
+        }
+        at += size;
     }
-    // The registry decoder labels and describes the alpha layout.
-    let mut dec = AvifDecoder::new(CodecId::new("avif"));
-    dec.send_packet(&Packet::new(0, TimeBase::new(1, 1), file.clone()))
-        .unwrap();
-    let mut n = 0;
-    while let Ok(Frame::Video(vf)) = dec.receive_frame() {
-        assert_eq!(vf.image_plane_count(), 4);
-        n += 1;
+    let ((a, la), (b, lb)) = (traks[0], traks[1]);
+    assert_eq!(a + la, b, "adjacent traks");
+    let mut out = file[..a].to_vec();
+    out.extend_from_slice(&file[b..b + lb]);
+    out.extend_from_slice(&file[a..a + la]);
+    out.extend_from_slice(&file[b + lb..]);
+    out
+}
+
+#[test]
+fn alpha_auxiliary_track_is_attached_to_the_time_parallel_sample() {
+    // Pairing by time, not by index: master samples 0 and 1 show
+    // alpha sample 0, samples 2 and 3 alpha sample 1 — whichever
+    // order the tracks come in.
+    let in_order = alpha_sequence_file();
+    let swapped = swap_traks(&in_order);
+    let first_handler = |f: &[u8]| {
+        let heif = oxideav_heif::HeifFile::parse_borrowed(f).unwrap();
+        let movie = oxideav_heif::sequence::parse_movie(&heif).unwrap().unwrap();
+        movie.tracks[0].handler
+    };
+    assert_eq!(&first_handler(&in_order), b"pict");
+    assert_eq!(
+        &first_handler(&swapped),
+        b"auxv",
+        "the alpha track comes first"
+    );
+    for file in [in_order, swapped] {
+        let i = info(&file).unwrap();
+        assert!(i.has_alpha);
+        let frames = decode_all(&file).unwrap();
+        assert_eq!(frames.len(), 4);
+        assert_eq!(i.frames, 4);
+        let expected_alpha = [40u8, 40, 200, 200];
+        for (k, f) in frames.iter().enumerate() {
+            assert_eq!(f.image.format, oxideav_avif::PixelFormat::Yuva420P, "{k}");
+            let a = &f.image.planes[3];
+            assert!(
+                a.data.iter().all(|&v| v == expected_alpha[k]),
+                "frame {k}: alpha {:?}",
+                &a.data[..4]
+            );
+        }
+        // The registry decoder labels and describes the alpha layout.
+        let mut dec = AvifDecoder::new(CodecId::new("avif"));
+        dec.send_packet(&Packet::new(0, TimeBase::new(1, 1), file.clone()))
+            .unwrap();
+        let mut n = 0;
+        while let Ok(Frame::Video(vf)) = dec.receive_frame() {
+            assert_eq!(vf.image_plane_count(), 4);
+            n += 1;
+        }
+        assert_eq!(n, 4);
+        assert_eq!(dec.output_params_generation(), 0);
+        let p = dec.output_params().unwrap();
+        let predicted = stream_params(&file).unwrap();
+        assert_eq!(p.pixel_format, predicted.pixel_format);
+        assert_eq!(p.pixel_format.unwrap().plane_count(), 4);
     }
-    assert_eq!(n, 4);
-    assert_eq!(dec.output_params_generation(), 0);
-    let p = dec.output_params().unwrap();
-    let predicted = stream_params(&file).unwrap();
-    assert_eq!(p.pixel_format, predicted.pixel_format);
-    assert_eq!(p.pixel_format.unwrap().plane_count(), 4);
 }
 
 #[test]

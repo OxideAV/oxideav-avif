@@ -23,6 +23,7 @@ use oxideav_heif::{HeifFile, HeifFileRef, sequence};
 
 const MOOV: BoxType = b(b"moov");
 const TRAK: BoxType = b(b"trak");
+const TKHD: BoxType = b(b"tkhd");
 const STBL: BoxType = b(b"stbl");
 const AV01: BoxType = b(b"av01");
 const PRFT: BoxType = b(b"prft");
@@ -483,7 +484,7 @@ pub fn parse_subsegment_indexes(file: &[u8]) -> Vec<SubsegmentIndex> {
 pub struct AvisMeta {
     /// Movie timescale from `mvhd`. A duration of `timescale` == 1s.
     pub timescale: u32,
-    /// Media timescale from the first track's `mdia/mdhd`
+    /// Media timescale from the image sequence track's `mdia/mdhd`
     /// (ISO/IEC 14496-12 §8.4.2.2). Clock-ticks per second for the
     /// media timeline (the timeline `media_time` and sample
     /// `delta`s live on). `None` when `mdhd` is missing or
@@ -523,7 +524,7 @@ pub struct AvisMeta {
     /// list shall be `['av01']`. An empty list signals a missing or
     /// truncated `stsd`.
     pub sample_description_types: Vec<BoxType>,
-    /// Entries from the first track's `edts/elst` box in declaration
+    /// Entries from the image sequence track's `edts/elst` box in declaration
     /// order (ISO/IEC 14496-12 §8.6.6, `EditListBox`). Empty when the
     /// track carries no `edts` (the §8.6.5 implicit-identity case) or
     /// the `elst` body is truncated. v0 (32-bit `segment_duration` /
@@ -531,14 +532,14 @@ pub struct AvisMeta {
     /// widened to a single shape so callers stay version-agnostic;
     /// `audit_edit_list` consumes this field directly.
     pub edit_list: Vec<EditListEntry>,
-    /// Sample-to-group mappings decoded from the first track's `stbl`
+    /// Sample-to-group mappings decoded from the image sequence track's `stbl`
     /// (`sbgp` ISO/IEC 14496-12:2015 §8.9.2 and/or `csgp`
     /// :2020 §8.9.5). One entry per `grouping_type` present. Empty when
     /// the track carries no sample-grouping boxes. Each entry's
     /// per-sample group index is recovered via
     /// [`crate::sample_group::SampleToGroup::group_index_for_sample`].
     pub sample_to_groups: Vec<crate::sample_group::SampleToGroup>,
-    /// Sample-group description headers from the first track's `stbl`
+    /// Sample-group description headers from the image sequence track's `stbl`
     /// (`sgpd` §8.9.3). One entry per `grouping_type`; pair each with
     /// the matching [`Self::sample_to_groups`] entry by `grouping_type`.
     /// Only the generic header (grouping type, default index, entry
@@ -604,9 +605,10 @@ impl AvisMeta {
 /// contain the full file — sample offsets are absolute.
 ///
 /// The `moov` / `trak` / `stbl` walk is the container crate's
-/// ([`oxideav_heif::sequence::parse_movie`]): the first track's sample
-/// table (`stts` / `stsc` / `stsz` / `stco` + `co64` / `stss`, bounded
-/// expansion, every sample range checked against the file), its
+/// ([`oxideav_heif::sequence::parse_movie`]): the image sequence
+/// track's (the first `pict` track with an `av01` entry, else the
+/// first `pict` track, else the first track) sample table (`stts` /
+/// `stsc` / `stsz` / `stco` + `co64` / `stss`, bounded expansion, every sample range checked against the file), its
 /// `stsd` entries (`av01` + `av1C`), `tkhd` extents, `mdhd` timescale,
 /// `hdlr` and `elst` edit list. This crate adds what the container
 /// does not model: the sample-group boxes (`sbgp` / `csgp` / `sgpd`)
@@ -619,7 +621,7 @@ pub fn parse_avis(file: &[u8]) -> Result<AvisMeta> {
     parse_avis_presented(file).map(|(meta, _)| meta)
 }
 
-/// How the first track's decoded samples are presented (MIAF §6.6
+/// How the image sequence track's decoded samples are presented (MIAF §6.6
 /// step 2: "apply matrix of TrackHeaderBox and CleanApertureBox to the
 /// decoded pictures"; §7.4.4.1: the CleanApertureBox "shall be
 /// supported by the MIAF reader").
@@ -702,7 +704,7 @@ fn alpha_track_for(movie: &sequence::Movie, master_id: u32) -> Option<AlphaTrack
     })
 }
 
-/// [`parse_avis`] plus the first track's [`Presentation`].
+/// [`parse_avis`] plus the image sequence track's [`Presentation`].
 pub(crate) fn parse_avis_presented(file: &[u8]) -> Result<(AvisMeta, Presentation)> {
     if find_box(file, &MOOV)?.is_none() {
         return Err(Error::InvalidData("avis: missing moov".to_string()));
@@ -710,9 +712,7 @@ pub(crate) fn parse_avis_presented(file: &[u8]) -> Result<(AvisMeta, Presentatio
     let heif = HeifFile::parse_borrowed(file)?;
     let movie = sequence::parse_movie(&heif)?
         .ok_or_else(|| Error::InvalidData("avis: missing moov".to_string()))?;
-    let track = movie
-        .tracks
-        .first()
+    let track = master_track(&movie)
         .ok_or_else(|| Error::InvalidData("avis: missing trak/mdia/minf/stbl".to_string()))?;
     let samples = track
         .samples
@@ -752,13 +752,14 @@ pub(crate) fn parse_avis_presented(file: &[u8]) -> Result<(AvisMeta, Presentatio
             media_rate_fraction: (e.media_rate & 0xffff) as i16,
         })
         .collect();
-    let (sample_to_groups, sample_group_descriptions) = match first_track_stbl(&heif, file) {
-        Some(stbl) => (
-            crate::sample_group::parse_sample_to_groups(stbl),
-            crate::sample_group::parse_sample_group_descriptions(stbl),
-        ),
-        None => (Vec::new(), Vec::new()),
-    };
+    let (sample_to_groups, sample_group_descriptions) =
+        match track_stbl(&heif, file, track.track_id) {
+            Some(stbl) => (
+                crate::sample_group::parse_sample_to_groups(stbl),
+                crate::sample_group::parse_sample_group_descriptions(stbl),
+            ),
+            None => (Vec::new(), Vec::new()),
+        };
     let producer_reference_times = parse_producer_reference_times(file);
     let subsegment_indexes = parse_subsegment_indexes(file);
     let entry = track.sample_entries.iter().find(|e| e.entry_type == AV01);
@@ -788,27 +789,61 @@ pub(crate) fn parse_avis_presented(file: &[u8]) -> Result<(AvisMeta, Presentatio
     Ok((meta, presentation))
 }
 
-/// The raw `stbl` payload of the first track, located through the
-/// container's flattened box walk (`moov` → `trak` → `mdia` → `minf`
-/// → `stbl`), for the sample-group boxes this crate parses itself.
-fn first_track_stbl<'a>(heif: &HeifFileRef<'_>, file: &'a [u8]) -> Option<&'a [u8]> {
+/// The image sequence track a reader presents: the first track with
+/// the `pict` handler (HEIF §7.2.2, av1-avif §3) and an `av01` sample
+/// entry, else the first `pict` track, else the first track — so a
+/// file whose alpha (`auxv`) or metadata track comes first in the
+/// `moov` still decodes its pictures.
+fn master_track(movie: &sequence::Movie) -> Option<&sequence::Track> {
+    let pict = |t: &&sequence::Track| t.handler == HANDLER_PICT;
+    movie
+        .tracks
+        .iter()
+        .filter(pict)
+        .find(|t| t.sample_entries.iter().any(|e| e.entry_type == AV01))
+        .or_else(|| movie.tracks.iter().find(pict))
+        .or_else(|| movie.tracks.first())
+}
+
+/// The raw `stbl` payload of the track `track_id`, located through the
+/// container's flattened box walk (`moov` → `trak` → `tkhd` /
+/// `mdia` → `minf` → `stbl`), for the sample-group boxes this crate
+/// parses itself.
+fn track_stbl<'a>(heif: &HeifFileRef<'_>, file: &'a [u8], track_id: u32) -> Option<&'a [u8]> {
     let walk = heif.box_walk().ok()?;
-    let mut in_first_trak = false;
+    let mut in_trak = false;
+    let mut this_track = false;
+    let mut stbl = None;
     for entry in &walk {
         let t = &entry.header.box_type;
+        let h = &entry.header;
         if entry.depth == 1 && t == &TRAK {
-            if in_first_trak {
-                break;
+            if in_trak && this_track {
+                return stbl;
             }
-            in_first_trak = true;
+            in_trak = true;
+            this_track = false;
+            stbl = None;
             continue;
         }
-        if in_first_trak && t == &STBL {
-            let h = &entry.header;
-            return file.get(h.payload_start..h.end());
+        if !in_trak {
+            continue;
+        }
+        if t == &TKHD {
+            // ISO/IEC 14496-12 §8.3.2.2: version, flags, then the
+            // creation / modification times (32 or 64 bits each)
+            // before track_ID.
+            let body = file.get(h.payload_start..h.end())?;
+            let at = if body.first() == Some(&1) { 20 } else { 12 };
+            this_track = body
+                .get(at..at + 4)
+                .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]) == track_id)
+                .unwrap_or(false);
+        } else if t == &STBL && stbl.is_none() {
+            stbl = file.get(h.payload_start..h.end());
         }
     }
-    None
+    if in_trak && this_track { stbl } else { None }
 }
 
 /// Duration of one sample as a `(numerator, denominator)` pair of
@@ -1474,7 +1509,7 @@ pub struct AvisInfo {
     /// `mvhd::timescale` — clock-ticks per second for the movie
     /// timeline. ISO/IEC 14496-12 §8.2.2.
     pub timescale: u32,
-    /// `mdhd::timescale` from the first track's `mdia/mdhd`
+    /// `mdhd::timescale` from the image sequence track's `mdia/mdhd`
     /// (ISO/IEC 14496-12 §8.4.2.2) — clock-ticks per second for the
     /// media timeline. `None` when `mdhd` is missing or malformed.
     /// `EditListEntry::media_time` and every `stts` per-sample
@@ -3322,7 +3357,7 @@ mod tests {
     }
 
     /// `AvisInfo::media_timescale` carries forward the `AvisMeta`
-    /// field set by `parse_avis` from the first track's `mdia/mdhd`.
+    /// field set by `parse_avis` from the image sequence track's `mdia/mdhd`.
     #[test]
     fn build_avis_info_media_timescale_carries_forward() {
         let mut meta = avis_meta_with_av1c(Some(av1c_with(0, 8)));

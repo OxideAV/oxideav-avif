@@ -48,6 +48,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   decoded opaque `Yuv420P`; it is now `Yuva420P`, frame 0's alpha
   byte-identical to the external AVIF decoder's. `info()` /
   `stream_params()` report the alpha layout.
+- **The image sequence track is the `pict` one, not the first `trak`**
+  (HEIF §7.2.2, av1-avif §3): a file whose alpha (`auxv`) or metadata
+  track comes first in the `moov` decoded that track as the pictures;
+  the sample-group boxes are read from the same track (located by
+  `track_ID`).
 
 ### Changed
 
