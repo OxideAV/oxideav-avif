@@ -22,8 +22,9 @@ use oxideav_core::Decoder;
 use oxideav_core::frame::{VideoFrame, VideoPlane};
 use oxideav_core::{
     CodecId, CodecParameters, ColorSignal, Error, ExecutionContext, Frame, Packet, PixelFormat,
-    Result, TimeBase,
+    Rational, Result, TimeBase,
 };
+use std::collections::VecDeque;
 
 use crate::api::DecodeOptions;
 use crate::av1_config::{Av1CodecConfig, parse_av1c};
@@ -170,18 +171,62 @@ const AV1C: BoxType = b(b"av1C");
 const ISPE: BoxType = b(b"ispe");
 const DIMG: BoxType = b(b"dimg");
 
+/// The stream-level description of one emitted frame — what
+/// [`Decoder::output_params`] reports while that frame is the one most
+/// recently returned. Frames themselves carry no geometry or format;
+/// this record travels next to each queued frame so the description
+/// switches exactly at the frame boundary where the shape changes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct OutputShape {
+    width: u32,
+    height: u32,
+    pixel_format: PixelFormat,
+    color_signal: ColorSignal,
+    /// A sequence track's constant sample rate (`stts` deltas in the
+    /// `mdhd` timescale); `None` for a still and for a track whose
+    /// samples have differing durations.
+    frame_rate: Option<Rational>,
+}
+
+impl OutputShape {
+    fn to_params(self, codec_id: &CodecId) -> CodecParameters {
+        let mut p = CodecParameters::video(codec_id.clone());
+        p.width = Some(self.width);
+        p.height = Some(self.height);
+        p.pixel_format = Some(self.pixel_format);
+        p.frame_rate = self.frame_rate;
+        p.color_signal = self.color_signal;
+        p
+    }
+}
+
 /// `Decoder` trait impl registered under codec id `avif`.
+///
+/// **Stream parameters.** Every packet is a whole AVIF file and may
+/// decode to a picture of a different size, layout or colour than the
+/// one before it (a burst of stills, a grid next to a single coded
+/// item, an alpha-carrying file next to an opaque one, a tone-mapped
+/// reconstruction, an `avis` sequence whose samples change size at a
+/// key frame). [`Decoder::output_params`] describes the frame most
+/// recently returned by `receive_frame` (before the first one: the
+/// frame that will be returned next), and
+/// [`Decoder::output_params_generation`] is bumped exactly when
+/// `receive_frame` returns the first frame whose description differs
+/// from the previous frame's — never while it stays the same, and
+/// with the same rule across [`Decoder::reset`].
 pub struct AvifDecoder {
     codec_id: CodecId,
-    /// Frames ready to hand out via `receive_frame()`.
-    pending: Vec<Frame>,
+    /// Frames ready to hand out via `receive_frame()`, each with the
+    /// stream-level description it is emitted under.
+    pending: VecDeque<(Frame, OutputShape)>,
     /// The AvifInfo of the last decoded file, retained for `info()`.
     info: Option<AvifInfo>,
-    /// The colour signal of the last decoded file (still: the
-    /// primary's output image; sequence: the sample entry's `colr`).
-    color_signal: Option<ColorSignal>,
-    /// The framework label of the last decoded file's frames.
-    output_format: Option<PixelFormat>,
+    /// The description of the frame most recently returned by
+    /// `receive_frame` (kept across `reset`, so the first frame after
+    /// a seek is compared against what the consumer last saw).
+    shown: Option<OutputShape>,
+    /// The output-description change counter (wrapping).
+    generation: u64,
     /// The contract options the decode runs with (gain-map
     /// application, reference white, limits, strictness, layer,
     /// an explicit `threads`).
@@ -196,10 +241,10 @@ impl AvifDecoder {
     pub fn new(codec_id: CodecId) -> Self {
         Self {
             codec_id,
-            pending: Vec::new(),
+            pending: VecDeque::new(),
             info: None,
-            color_signal: None,
-            output_format: None,
+            shown: None,
+            generation: 0,
             options: DecodeOptions::default(),
             exec_threads: 1,
         }
@@ -301,26 +346,34 @@ impl AvifDecoder {
         Ok(())
     }
 
-    /// The colour signal (`oxideav-core` [`ColorSignal`]: range +
-    /// H.273 primaries / transfer / matrix) of the last decoded file —
-    /// the primary item's effective `colr` under MIAF §7.3.6.4 (its
-    /// `nclx`, else the MIAF default: full range, BT.709 / sRGB /
-    /// BT.601) for a still, the `av01` sample entry's `colr` for a
-    /// sequence. Every frame this decoder emits carries the same value
-    /// as its colour-signal side channel. `None` before the first
-    /// decode.
-    pub fn color_signal(&self) -> Option<ColorSignal> {
-        self.color_signal
+    /// The description the stream-level queries answer with: the
+    /// frame most recently returned by `receive_frame`, else (before
+    /// the first one) the frame that will be returned next.
+    fn current_shape(&self) -> Option<OutputShape> {
+        self.shown.or_else(|| self.pending.front().map(|(_, s)| *s))
     }
 
-    /// The framework pixel-format label of the frames of the last
-    /// decoded file: planar RGB (`Gbrp*` / `Gbrap*`, planes G B R [A])
-    /// for an identity-matrix 4:4:4 picture, `YuvJ*` for a full-range
-    /// 8-bit Y′CbCr still, the storage layout otherwise (see
-    /// [`crate::signal::labelled_pixel_format`]). `None` before the
-    /// first decode.
+    /// The colour signal (`oxideav-core` [`ColorSignal`]: range +
+    /// H.273 primaries / transfer / matrix) of the frame most recently
+    /// returned (before the first one: of the next frame) — the
+    /// primary item's effective `colr` under MIAF §7.3.6.4 (its
+    /// `nclx`, else the MIAF default: full range, BT.709 / sRGB /
+    /// BT.601) for a still, the `av01` sample entry's `colr` for a
+    /// sequence. `None` before anything was decoded. The same value
+    /// as [`Decoder::output_params`]'s `color_signal`.
+    pub fn color_signal(&self) -> Option<ColorSignal> {
+        self.current_shape().map(|s| s.color_signal)
+    }
+
+    /// The framework pixel-format label of the frame most recently
+    /// returned (before the first one: of the next frame): planar RGB
+    /// (`Gbrp*` / `Gbrap*`, planes G B R [A]) for an identity-matrix
+    /// 4:4:4 picture, `YuvJ*` for a full-range 8-bit Y′CbCr picture,
+    /// the storage layout otherwise (see
+    /// [`crate::signal::labelled_pixel_format`]). `None` before
+    /// anything was decoded.
     pub fn output_format(&self) -> Option<PixelFormat> {
-        self.output_format
+        self.current_shape().map(|s| s.pixel_format)
     }
 
     /// Parse an AVIF file and decode the primary item's **output
@@ -328,8 +381,9 @@ impl AvifDecoder {
     /// item or of a derived item (`grid` tile stitch, `iovl` overlay
     /// composition, `iden` identity — recursively over their inputs),
     /// with the alpha auxiliary composited and the item's
-    /// transformative properties applied in `ipma` order. Returns the
-    /// resolved `AvifInfo` on success.
+    /// transformative properties applied in `ipma` order. The frame is
+    /// queued for `receive_frame` with its description (size, label,
+    /// colour signal). Returns the resolved `AvifInfo` on success.
     pub fn decode_file(&mut self, file: &[u8]) -> Result<AvifInfo> {
         // The contract implementation does the work; this adapter only
         // re-labels the result for the framework.
@@ -337,10 +391,15 @@ impl AvifDecoder {
             crate::api_codec::decode_primary(file, &self.effective_options()).map_err(core_err)?;
         let format = decoded.image.format;
         let signal = color_signal_for(Some(&decoded.image.color.to_colr()));
+        let shape = OutputShape {
+            width: decoded.image.width,
+            height: decoded.image.height,
+            pixel_format: labelled_pixel_format(format, &signal),
+            color_signal: signal,
+            frame_rate: None,
+        };
         let out = VideoFrame::from(decoded.image);
-        self.color_signal = Some(signal);
-        self.output_format = Some(labelled_pixel_format(format, &signal));
-        self.pending.push(Frame::Video(out));
+        self.pending.push_back((Frame::Video(out), shape));
         self.info = Some(decoded.info.clone());
         Ok(decoded.info)
     }
@@ -374,24 +433,23 @@ impl AvifDecoder {
     pub fn decode_avis_file(&mut self, file: &[u8]) -> Result<usize> {
         let mut frames_queued = 0usize;
         let opts = self.effective_options();
-        let seq =
-            crate::api_codec::decode_sequence_with(file, &opts, None, |frame, seq, _duration| {
-                self.pending.push(with_signal(frame, seq.signal));
-                frames_queued += 1;
-                Ok(())
-            })
-            .map_err(core_err)?;
-        self.color_signal = Some(seq.signal);
-        self.output_format = seq.layout.map(|l| labelled_pixel_format(l, &seq.signal));
+        let pending = &mut self.pending;
+        crate::api_codec::decode_sequence_with(file, &opts, None, |picture, pts, seq, _| {
+            let shape = OutputShape {
+                width: picture.width,
+                height: picture.height,
+                pixel_format: labelled_pixel_format(picture.format, &seq.signal),
+                color_signal: seq.signal,
+                frame_rate: seq.frame_rate,
+            };
+            let mut vf = VideoFrame::from(picture);
+            vf.pts = pts;
+            pending.push_back((Frame::Video(vf), shape));
+            frames_queued += 1;
+            Ok(())
+        })
+        .map_err(core_err)?;
         Ok(frames_queued)
-    }
-}
-
-/// Attach the sequence's colour signal to a decoded sample frame.
-fn with_signal(frame: Frame, signal: ColorSignal) -> Frame {
-    match frame {
-        Frame::Video(v) => Frame::Video(v.with_color_signal(signal)),
-        other => other,
     }
 }
 
@@ -878,6 +936,39 @@ fn decode_item_output_inner(
             _ => continue,
         }
         .map_err(heif_err)?;
+    }
+    Ok(image)
+}
+
+/// Present one decoded sequence sample (MIAF §6.6 step 2): the sample
+/// entry's clean aperture first, then the track matrix's mirror and
+/// rotation (HEIF §7.2.1 NOTE 2: the CleanApertureBox clipping "takes
+/// place before applying the rotation specified by the matrix"), with
+/// the rules the item path applies to `clap` / `imir` / `irot`
+/// (a non-fitting aperture is treated as absent; a quarter turn of a
+/// 4:2:2 picture is refused).
+pub(crate) fn present_sample(
+    mut image: ItemImage,
+    presentation: &crate::avis::Presentation,
+) -> Result<ItemImage> {
+    if let Some(clap) = &presentation.clap
+        && clap_extent(clap, image.width, image.height).is_some()
+    {
+        image = compose::apply_clap(&image, &hprops::Clap::from(clap)).map_err(heif_err)?;
+    }
+    if let Some((mirror, turns)) = presentation
+        .matrix
+        .as_ref()
+        .and_then(crate::transform::matrix_orientation)
+    {
+        if mirror {
+            image = compose::apply_imir(&image, &hprops::Imir::new(1)).map_err(heif_err)?;
+        }
+        if turns != 0 {
+            let (sx, sy) = image.format.chroma.shift();
+            rotation_keeps_layout((sx as u8, sy as u8), turns).map_err(core_err)?;
+            image = compose::apply_irot(&image, &hprops::Irot::new(turns)).map_err(heif_err)?;
+        }
     }
     Ok(image)
 }
@@ -1375,21 +1466,28 @@ impl Decoder for AvifDecoder {
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        if self.pending.is_empty() {
-            return Err(Error::NeedMore);
+        let (frame, shape) = self.pending.pop_front().ok_or(Error::NeedMore)?;
+        // The bump becomes visible together with the first frame of
+        // the new shape; resolving the description at the very first
+        // frame is not a change.
+        if self.shown.is_some_and(|prev| prev != shape) {
+            self.generation = self.generation.wrapping_add(1);
         }
-        Ok(self.pending.remove(0))
+        self.shown = Some(shape);
+        Ok(frame)
     }
 
     fn flush(&mut self) -> Result<()> {
         Ok(())
     }
 
+    /// Drops the queued frames. The description of the frame last
+    /// returned (and the generation) stay: the first frame returned
+    /// after the reset bumps the generation only when its shape
+    /// differs from that one.
     fn reset(&mut self) -> Result<()> {
         self.pending.clear();
         self.info = None;
-        self.color_signal = None;
-        self.output_format = None;
         Ok(())
     }
 
@@ -1400,11 +1498,29 @@ impl Decoder for AvifDecoder {
         self.exec_threads = ctx.threads.max(1);
     }
 
-    /// The label of the frames of the last decoded file
-    /// ([`AvifDecoder::output_format`]); `None` before the first
-    /// decode.
+    /// The label of the frame most recently returned (before the
+    /// first one: of the next frame) — forwarded from
+    /// [`output_params`](Decoder::output_params).
     fn output_pixel_format(&self) -> Option<PixelFormat> {
-        self.output_format
+        self.output_params().and_then(|p| p.pixel_format)
+    }
+
+    /// The frame most recently returned by `receive_frame` (before the
+    /// first one: the next frame to be returned): its width / height
+    /// (after every transformative property — the emitted planes'
+    /// extents), framework pixel-format label, colour signal (the
+    /// item's or the sample entry's effective `colr`, MIAF §7.3.6.4)
+    /// and, for an `avis` track with uniform sample durations, its
+    /// frame rate. `None` before anything was decoded.
+    fn output_params(&self) -> Option<CodecParameters> {
+        self.current_shape().map(|s| s.to_params(&self.codec_id))
+    }
+
+    /// Bumped (wrapping) when `receive_frame` returns the first frame
+    /// whose description differs from the one before it — see
+    /// [`AvifDecoder`]'s stream-parameter notes.
+    fn output_params_generation(&self) -> u64 {
+        self.generation
     }
 }
 

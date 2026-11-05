@@ -616,6 +616,27 @@ impl AvisMeta {
 /// inconsistent (ISO/IEC 14496-12 makes `mvhd`, `tkhd`, `mdhd`, `hdlr`
 /// and `stts` mandatory). AVIS files lacking a `moov` produce an error.
 pub fn parse_avis(file: &[u8]) -> Result<AvisMeta> {
+    parse_avis_presented(file).map(|(meta, _)| meta)
+}
+
+/// How the first track's decoded samples are presented (MIAF §6.6
+/// step 2: "apply matrix of TrackHeaderBox and CleanApertureBox to the
+/// decoded pictures"; §7.4.4.1: the CleanApertureBox "shall be
+/// supported by the MIAF reader").
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Presentation {
+    /// The `av01` sample entry's `clap` (ISO/IEC 14496-12 §12.1.4).
+    pub clap: Option<crate::meta::Clap>,
+    /// The `tkhd` matrix `{a, b, u, c, d, v, x, y, w}` (§8.3.2, values
+    /// in 16.16 / 2.30 fixed point, §6.2.2).
+    pub matrix: Option<[i32; 9]>,
+    /// The `av01` sample entry's `width` / `height` — the coded
+    /// picture size the samples decode to.
+    pub entry_dims: Option<(u32, u32)>,
+}
+
+/// [`parse_avis`] plus the first track's [`Presentation`].
+pub(crate) fn parse_avis_presented(file: &[u8]) -> Result<(AvisMeta, Presentation)> {
     if find_box(file, &MOOV)?.is_none() {
         return Err(Error::InvalidData("avis: missing moov".to_string()));
     }
@@ -673,7 +694,15 @@ pub fn parse_avis(file: &[u8]) -> Result<AvisMeta> {
     };
     let producer_reference_times = parse_producer_reference_times(file);
     let subsegment_indexes = parse_subsegment_indexes(file);
-    Ok(AvisMeta {
+    let entry = track.sample_entries.iter().find(|e| e.entry_type == AV01);
+    let presentation = Presentation {
+        clap: entry.and_then(|e| e.clap).map(crate::meta::Clap::from),
+        matrix: Some(track.matrix),
+        entry_dims: entry
+            .filter(|e| e.width > 0 && e.height > 0)
+            .map(|e| (u32::from(e.width), u32::from(e.height))),
+    };
+    let meta = AvisMeta {
         timescale: movie.timescale,
         media_timescale: Some(track.timescale),
         display_dims: Some((track.width, track.height)),
@@ -687,7 +716,8 @@ pub fn parse_avis(file: &[u8]) -> Result<AvisMeta> {
         sample_group_descriptions,
         producer_reference_times,
         subsegment_indexes,
-    })
+    };
+    Ok((meta, presentation))
 }
 
 /// The raw `stbl` payload of the first track, located through the

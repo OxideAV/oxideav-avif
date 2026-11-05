@@ -81,19 +81,6 @@ pub fn labelled_pixel_format(format: AvifPixelFormat, signal: &ColorSignal) -> P
     }
 }
 
-/// The storage layout an AV1 stream decodes to, from its `av1C`
-/// record — for the sequence path, whose frames come straight from
-/// the AV1 decoder (no alpha composition).
-pub(crate) fn layout_of_record(cfg: &crate::av1_config::Av1CodecConfig) -> Option<AvifPixelFormat> {
-    AvifPixelFormat::from_layout(
-        cfg.bit_depth(),
-        u8::from(cfg.chroma_subsampling_x),
-        u8::from(cfg.chroma_subsampling_y),
-        cfg.monochrome,
-        false,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -254,6 +254,55 @@ pub fn apply_imir(
     })
 }
 
+/// The `tkhd` matrix as an image mirror followed by an anti-clockwise
+/// rotation — `(mirror_left_right, quarter_turns)` — when it is one of
+/// the eight HEIF §7.2.1 allows (`a`/`c` and `b`/`d` each one ±1.0, the
+/// other 0; ISO/IEC 14496-12 §6.2.2: `p' = a·p + c·q + x`,
+/// `q' = b·p + d·q + y`, origin top-left, `y` downwards; the
+/// translation is dropped, as §7.2.1 allows). Anything else — the
+/// identity, a scaling, a shear — is `None`: presented as decoded.
+pub(crate) fn matrix_orientation(matrix: &[i32; 9]) -> Option<(bool, u8)> {
+    const ONE: i32 = 0x0001_0000;
+    let unit = |v: i32| match v {
+        0 => Some(0i32),
+        ONE => Some(1),
+        _ if v == -ONE => Some(-1),
+        _ => None,
+    };
+    let (a, b, c, d) = (
+        unit(matrix[0])?,
+        unit(matrix[1])?,
+        unit(matrix[3])?,
+        unit(matrix[4])?,
+    );
+    // Column-vector form: (p', q') = [[a, c], [b, d]] · (p, q).
+    let m = [[a, c], [b, d]];
+    let mul = |x: [[i32; 2]; 2], y: [[i32; 2]; 2]| {
+        let mut o = [[0i32; 2]; 2];
+        for (r, row) in o.iter_mut().enumerate() {
+            for (k, cell) in row.iter_mut().enumerate() {
+                *cell = x[r][0] * y[0][k] + x[r][1] * y[1][k];
+            }
+        }
+        o
+    };
+    // One anti-clockwise quarter turn on a y-down raster: the right
+    // edge moves to the top, (p, q) → (q, −p).
+    let quarter = [[0, 1], [-1, 0]];
+    let left_right = [[-1, 0], [0, 1]];
+    for mirror in [false, true] {
+        let mut r = [[1, 0], [0, 1]];
+        for turns in 0..4u8 {
+            let f = if mirror { mul(r, left_right) } else { r };
+            if f == m {
+                return (mirror || turns != 0).then_some((mirror, turns));
+            }
+            r = mul(quarter, r);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

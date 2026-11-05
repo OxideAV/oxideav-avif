@@ -31,7 +31,7 @@ use crate::parser::{
     AvifHeader, BrandClass, ITEM_TYPE_AV01, ITEM_TYPE_GRID, audit_mif1, classify_brands, parse,
     parse_header,
 };
-use crate::signal::{color_signal_for, layout_of_record};
+use crate::signal::color_signal_for;
 use crate::still::{StillImage, StillProperties, encode_still_auto};
 use oxideav_heif::{Chroma, HeifFrame};
 
@@ -412,16 +412,21 @@ pub(crate) struct SequenceDecode {
     /// The `av01` sample entry's `colr` as a signal (MIAF default
     /// when absent).
     pub signal: ColorSignal,
-    /// The storage layout the samples decode to, from the `av1C`.
-    pub layout: Option<AvifPixelFormat>,
     /// The parsed `av1C` record.
     pub config: Av1CodecConfig,
+    /// The track's sample rate when every sample lasts the same
+    /// (`stts` delta in the `mdhd` timescale, ISO/IEC 14496-12
+    /// §8.6.1.2 / §8.4.2): `timescale / delta`, reduced.
+    pub frame_rate: Option<oxideav_core::Rational>,
 }
 
 /// Decode every sample of an `avis` image sequence (av1-avif §6.3 +
 /// ISO/IEC 14496-12 §8) through one shared AV1 decoder so inter-frame
-/// state is preserved, handing each decoded frame to `sink` with the
-/// duration of the sample that produced it. `limit` stops after that
+/// state is preserved, handing each presented picture (the sample
+/// entry's clean aperture and the track matrix applied, MIAF §6.6 —
+/// see [`sequence_picture`]) and its presentation time (in the `mdhd`
+/// timescale) to `sink` with the duration of the sample that produced
+/// it. `limit` stops after that
 /// many frames. The one implementation behind [`decode_all`] and
 /// [`crate::AvifDecoder::decode_avis_file`].
 pub(crate) fn decode_sequence_with<F>(
@@ -431,10 +436,10 @@ pub(crate) fn decode_sequence_with<F>(
     mut sink: F,
 ) -> Result<SequenceDecode>
 where
-    F: FnMut(oxideav_core::Frame, &SequenceDecode, Duration) -> Result<()>,
+    F: FnMut(AvifImage, Option<i64>, &SequenceDecode, Duration) -> Result<()>,
 {
     opts.check_bytes(file.len())?;
-    let meta = parse_avis(file)?;
+    let (meta, presentation) = crate::avis::parse_avis_presented(file)?;
     if meta.samples.is_empty() {
         return Err(Error::invalid("avis: track has zero samples"));
     }
@@ -463,8 +468,8 @@ where
     let media_timescale = meta.media_timescale.filter(|&t| t > 0).unwrap_or(timescale);
     let seq = SequenceDecode {
         signal: color_signal_for(meta.colr.as_ref()),
-        layout: layout_of_record(&cfg),
         config: cfg,
+        frame_rate: uniform_rate(&meta.samples, media_timescale),
     };
     let mut params = CodecParameters::video(CodecId::new("av1"));
     if let Some((w, h)) = meta.display_dims {
@@ -495,11 +500,15 @@ where
                 MAX_AV1_ITEM_BYTES
             )));
         }
-        // Build a packet on stream 0 with the movie timescale so
-        // the framework consumer recovers presentation order
-        // without an extra remapping step.
-        let pkt = Packet::new(0, TimeBase::new(1, timescale as i64), bytes.to_vec())
-            .with_pts(cumulative_pts as i64);
+        // Build a packet on stream 0 in the media timescale — the
+        // timeline the `stts` deltas accumulated into `pts` live on
+        // (ISO/IEC 14496-12 §8.4.2.3), not the `mvhd` one.
+        let pkt = Packet::new(
+            0,
+            TimeBase::new(1, i64::from(media_timescale)),
+            bytes.to_vec(),
+        )
+        .with_pts(cumulative_pts as i64);
         cumulative_pts = cumulative_pts.saturating_add(s.duration as u64);
         last_duration = Duration::from_secs_f64(f64::from(s.duration) / f64::from(media_timescale));
         av1.send_packet(&pkt).map_err(|e| {
@@ -515,7 +524,9 @@ where
         loop {
             match av1.receive_frame() {
                 Ok(frame) => {
-                    sink(frame, &seq, last_duration)?;
+                    let pts = frame.pts();
+                    let picture = sequence_picture(frame, &seq, opts, &presentation)?;
+                    sink(picture, pts, &seq, last_duration)?;
                     delivered += 1;
                     if done(delivered) {
                         break;
@@ -532,7 +543,9 @@ where
         // contract requires the call).
         let _ = av1.flush();
         while let Ok(frame) = av1.receive_frame() {
-            sink(frame, &seq, last_duration)?;
+            let pts = frame.pts();
+            let picture = sequence_picture(frame, &seq, opts, &presentation)?;
+            sink(picture, pts, &seq, last_duration)?;
             delivered += 1;
             if done(delivered) {
                 break;
@@ -542,13 +555,72 @@ where
     Ok(seq)
 }
 
+/// The stream parameters an AVIF file's container records state for
+/// its default decode ([`DecodeOptions::default`]: the primary item's
+/// output image, or the samples of an `avis` track) — what a reader
+/// can announce before decoding a payload, from the boxes alone:
+///
+/// * `width` / `height` — the primary's `ispe` (a derived item's
+///   canvas) after its `clap` and an odd `irot` quarter turn (HEIF
+///   §6.5.9 / §6.5.10); a sequence's coded sample size after the
+///   sample entry's `clap` and the `tkhd` matrix's rotation (MIAF §6.6);
+/// * `pixel_format` — the framework label of the layout the decode
+///   yields (`av1C` depth / chroma / monochrome, `+ alpha` when an
+///   alpha auxiliary is attached) under the item's colour (identity
+///   matrix → `Gbrp*`, full-range 8-bit → `YuvJ*`, see
+///   [`crate::signal::labelled_pixel_format`]);
+/// * `color_signal` — the effective `colr` (MIAF §7.3.6.4: its `nclx`,
+///   else the default 1 / 13 / 6 full range);
+/// * `frame_rate` — a sequence track's constant rate (`mdhd`
+///   timescale over a uniform `stts` delta), when every sample lasts
+///   the same.
+///
+/// [`crate::AvifDecoder`]'s `output_params()` reports the same fields
+/// from what it actually emits, and wins over this prediction under
+/// [`CodecParameters::merge_output_params`]; fields the boxes do not
+/// state stay unset.
+pub fn stream_params(bytes: &[u8]) -> Result<CodecParameters> {
+    let info = crate::api::info(bytes)?;
+    let signal = color_signal_for(Some(&info.color.to_colr()));
+    let mut p = CodecParameters::video(CodecId::new(crate::CODEC_ID_STR));
+    if info.width > 0 && info.height > 0 {
+        p.width = Some(info.width);
+        p.height = Some(info.height);
+    }
+    p.pixel_format = Some(crate::signal::labelled_pixel_format(info.format, &signal));
+    p.color_signal = signal;
+    if info.is_sequence {
+        let meta = parse_avis(bytes)?;
+        let timescale = meta
+            .media_timescale
+            .filter(|&t| t > 0)
+            .unwrap_or(meta.timescale);
+        p.frame_rate = uniform_rate(&meta.samples, timescale);
+    }
+    Ok(p)
+}
+
+/// The constant sample rate of a track: `timescale / delta` (reduced)
+/// when every sample has the same non-zero `stts` delta, else `None`.
+fn uniform_rate(samples: &[crate::avis::Sample], timescale: u32) -> Option<oxideav_core::Rational> {
+    let first = samples.first()?.duration;
+    if first == 0 || timescale == 0 || samples.iter().any(|s| s.duration != first) {
+        return None;
+    }
+    Some(oxideav_core::Rational::new(i64::from(timescale), i64::from(first)).reduced())
+}
+
 /// A sequence sample's decoded frame as a picture: geometry inferred
-/// from the plane layout at the record's depth, the sample entry's
+/// from the plane layout at the record's depth (a sample may carry a
+/// new sequence header at a key frame, so size and layout are read per
+/// sample), presented with the sample entry's clean aperture and the
+/// track matrix (MIAF §6.6 step 2, §7.4.4.1), in the sample entry's
 /// colour.
 fn sequence_picture(
     frame: oxideav_core::Frame,
     seq: &SequenceDecode,
     opts: &DecodeOptions,
+    presentation: &crate::avis::Presentation,
 ) -> Result<AvifImage> {
     let vf = match frame {
         oxideav_core::Frame::Video(v) => v,
@@ -559,9 +631,29 @@ fn sequence_picture(
         }
     };
     let (fmt_core, w, h) = infer_av1_pixmap(&vf, &seq.config).map_err(from_core_err)?;
-    opts.check_dims(w, h)?;
     let format = AvifPixelFormat::try_from(fmt_core)?;
     let planes = core_to_avif_frame(vf).planes;
+    let transformed = presentation.clap.is_some()
+        || presentation
+            .matrix
+            .as_ref()
+            .and_then(crate::transform::matrix_orientation)
+            .is_some();
+    let (w, h, format, planes) = if transformed {
+        let decoded = crate::frame_bridge::to_heif(
+            &crate::image::AvifFrame { pts: None, planes },
+            format,
+            seq.config.bit_depth(),
+            w,
+            h,
+        )?;
+        let shown = crate::decoder::present_sample(decoded, presentation).map_err(from_core_err)?;
+        let (frame, format) = from_heif(&shown)?;
+        (shown.width, shown.height, format, frame.planes)
+    } else {
+        (w, h, format, planes)
+    };
+    opts.check_dims(w, h)?;
     Ok(AvifImage::new(w, h, format, planes)?.with_color(ColorInfo::from(seq.signal)))
 }
 
@@ -578,8 +670,8 @@ pub fn decode_with(bytes: &[u8], opts: &DecodeOptions) -> Result<AvifImage> {
     opts.check_bytes(bytes.len())?;
     if is_sequence_file(bytes) {
         let mut first = None;
-        decode_sequence_with(bytes, opts, Some(1), |frame, seq, _| {
-            first = Some(sequence_picture(frame, seq, opts)?);
+        decode_sequence_with(bytes, opts, Some(1), |picture, _, _, _| {
+            first = Some(picture);
             Ok(())
         })?;
         return first.ok_or_else(|| Error::invalid("avis: the sequence decoded to no frame"));
@@ -614,8 +706,8 @@ pub fn decode_all_with(bytes: &[u8], opts: &DecodeOptions) -> Result<Vec<Frame>>
     opts.check_bytes(bytes.len())?;
     if is_sequence_file(bytes) {
         let mut frames = Vec::new();
-        decode_sequence_with(bytes, opts, None, |frame, seq, delay| {
-            frames.push(Frame::new(sequence_picture(frame, seq, opts)?, Some(delay)));
+        decode_sequence_with(bytes, opts, None, |picture, _, _, delay| {
+            frames.push(Frame::new(picture, Some(delay)));
             Ok(())
         })?;
         return Ok(frames);

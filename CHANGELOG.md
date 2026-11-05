@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Stream parameters under the core 0.1.42 contract.** The registry
+  decoder implements `Decoder::output_params()` — width / height,
+  pixel-format label, colour signal and (constant-rate `avis`) frame
+  rate of the frame most recently returned, before the first frame the
+  next one — and `output_params_generation()`, bumped exactly when
+  `receive_frame` returns the first frame of a new shape (burst of
+  differently sized / alpha / monochrome / tone-mapped stills, an
+  `avis` track switching size or layout at a key frame), never for a
+  constant stream, and with the same rule across `reset()`.
+  `output_pixel_format()`, `output_format()` and `color_signal()`
+  forward to the same description. Each queued frame carries its own
+  description, so a frame of an earlier packet still returned after a
+  later packet was decoded is still described as itself.
+- `stream_params(&bytes)`: the stream parameters the container states
+  for the default decode (size after `clap` / `irot` or the track's
+  presentation, label, colour signal, sequence frame rate); equal to
+  the decoded description on every fixture.
+
+### Fixed
+
+- **`avis` samples are presented with the sample entry's `clap` and the
+  `tkhd` matrix** (MIAF §6.6 step 2, §7.4.4.1; HEIF §7.2.1): an odd
+  31 × 17 track coded at 32 × 24 decoded as 32 × 24 (the black-box
+  readers show 31 × 17), and a rotated / mirrored track was emitted
+  unrotated. `decode` / `decode_all` / the registry decoder / `info()`
+  now agree on the presented extents; a rotated track is byte-identical
+  to `ffmpeg -f rawvideo` of the same file.
+- Sequence sample `pts` are in the `mdhd` media timescale they are
+  accumulated in (the packet time base was the `mvhd` one).
+
 ### Changed
 
 - edition 2024, MSRV 1.95; fuzz harness loads its libavif reference through dlsym instead of libloading.

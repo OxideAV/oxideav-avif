@@ -261,6 +261,40 @@ On this Mac (macOS 26.6):
 | 4032 × 3024 `auto` grid (8 × 6), single item, 10-bit grid, alpha grid | opens | opens | opens | opens | opens |
 | 4032 × 3024 `grid=256` (192 tiles) | opens | refused: `ipco` > 100 boxes | opens | refused: same | opens |
 
+### Stream parameters
+
+Frames carry no size or format; the registry decoder states them on
+the stream level (oxideav-core 0.1.42). `Decoder::output_params()`
+describes the frame most recently returned by `receive_frame` (before
+the first one, the frame that comes next): its width / height (after
+every transformative property), the framework pixel-format label
+(`Gbrp*` / `Gbrap*` for identity-matrix 4:4:4, `YuvJ*` for full-range
+8-bit Y′CbCr, the storage layout otherwise), the colour signal (the
+item's or sample entry's effective `colr`) and, for an `avis` track
+whose samples all last the same, the frame rate (`mdhd` timescale over
+the `stts` delta). Every packet is a whole file, so consecutive
+packets — a burst of stills, a grid next to a coded item, an
+alpha-carrying file next to an opaque one, a tone-mapped
+reconstruction, an `avis` track whose samples change size or layout at
+a key frame — can change shape: `output_params_generation()` is bumped
+exactly when `receive_frame` returns the first frame of a new shape,
+never otherwise (frames still queued from an earlier packet keep their
+own description), and `reset()` keeps the rule (the first frame after
+it is compared with the last one returned). `OutputParamsWatch` sees
+one change per switch (`tests/output_params.rs`).
+
+`stream_params(&bytes)` is the same description predicted from the
+boxes alone (`ispe` / `clap` / `irot`, `av1C` + `pixi` + alpha, `colr`,
+a sequence's sample entry, `clap`, `tkhd` matrix and `stts`) — every
+fixture's prediction equals what the decoder reports after decoding.
+
+`avis` samples are presented the way MIAF §6.6 asks: the sample
+entry's clean aperture first, then the `tkhd` matrix's mirror /
+quarter turns (the eight orientations HEIF §7.2.1 allows; any other
+matrix is presented as decoded) — a 31 × 17 track coded at 32 × 24
+decodes to 31 × 17, a rotated track byte-identical to
+`ffmpeg -f rawvideo` of the same file.
+
 ## Metadata and colour
 
 `AvifImage::color` is the item's `colr` `nclx` as `ColorInfo

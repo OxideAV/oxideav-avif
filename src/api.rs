@@ -726,8 +726,10 @@ impl Frame {
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImageInfo {
-    /// Output extents of the primary item (`ispe` / derived canvas; a
-    /// sequence's `tkhd` display size, else its track's sample entry).
+    /// Output extents of the primary item (`ispe` / derived canvas,
+    /// after `clap` and `irot`); a sequence's sample size (the `av01`
+    /// sample entry's, else `tkhd`'s) after the entry's `clap` and the
+    /// track matrix's rotation — the extents a decode yields.
     pub width: u32,
     pub height: u32,
     /// The layout a decode yields: depth and chroma from `av1C`, alpha
@@ -1333,7 +1335,7 @@ fn still_info(bytes: &[u8]) -> Result<ImageInfo> {
 }
 
 fn sequence_info(bytes: &[u8]) -> Result<ImageInfo> {
-    let meta = crate::avis::parse_avis(bytes)?;
+    let (meta, presentation) = crate::avis::parse_avis_presented(bytes)?;
     let av1c = meta.av1_codec_config.as_deref().ok_or_else(|| {
         Error::invalid("avis: track stsd → av01 → av1C is missing (av1-avif §2.2.1)")
     })?;
@@ -1345,7 +1347,26 @@ fn sequence_info(bytes: &[u8]) -> Result<ImageInfo> {
         Some((cfg.chroma_subsampling_x, cfg.chroma_subsampling_y)),
         false,
     )?;
-    let (width, height) = meta.display_dims.unwrap_or((0, 0));
+    // What a decode yields (MIAF §6.6 step 2): the coded sample size
+    // (the `av01` entry's, else the `tkhd` one), cut to the entry's
+    // clean aperture, axes swapped by an odd matrix quarter turn.
+    let (mut width, mut height) = presentation
+        .entry_dims
+        .or(meta.display_dims)
+        .unwrap_or((0, 0));
+    if let Some(clap) = &presentation.clap
+        && let Some((w, h)) = crate::transform::clap_extent(clap, width, height)
+    {
+        (width, height) = (w, h);
+    }
+    if let Some((_, turns)) = presentation
+        .matrix
+        .as_ref()
+        .and_then(crate::transform::matrix_orientation)
+        && turns & 1 == 1
+    {
+        std::mem::swap(&mut width, &mut height);
+    }
     let (has_exif, has_xmp, has_icc) = match crate::parser::parse_header(bytes) {
         Ok(hdr) => {
             // The cover still of the sequence (av1-avif §6.3) may carry
