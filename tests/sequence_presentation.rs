@@ -390,3 +390,38 @@ fn real_alpha_sequence_carries_its_alpha_track() {
     let clear = a0.iter().filter(|&&v| v == 0).count();
     assert_eq!((opaque, clear), (640 * 480 / 2, 640 * 480 / 2));
 }
+
+#[test]
+fn mutated_alpha_and_rotated_sequences_never_panic() {
+    // Byte mutations of a two-track (master + alpha) file and of a
+    // rotated, cropped one: every entry point returns, none panics.
+    let rotated = with_matrix(&mono_sequence(31, 17).0, [0, ONE, 0, -ONE, 0, 0, 0, 0, W]);
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for base in [alpha_sequence_file(), rotated] {
+        for _ in 0..150 {
+            let mut f = base.clone();
+            for _ in 0..1 + next() % 4 {
+                let at = (next() % f.len() as u64) as usize;
+                f[at] = next() as u8;
+            }
+            let _ = info(&f);
+            let _ = stream_params(&f);
+            let _ = decode_all(&f);
+            let mut dec = AvifDecoder::new(CodecId::new("avif"));
+            if dec
+                .send_packet(&Packet::new(0, TimeBase::new(1, 1), f))
+                .is_ok()
+            {
+                while dec.receive_frame().is_ok() {
+                    let _ = dec.output_params();
+                }
+            }
+        }
+    }
+}
