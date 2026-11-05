@@ -484,6 +484,10 @@ where
             opts.worker_count(),
         ));
     }
+    let mut alpha = match presentation.alpha.as_ref() {
+        Some(track) => Some(AlphaSequence::new(track, opts)?),
+        None => None,
+    };
     let mut delivered = 0usize;
     let done = |delivered: usize| limit.is_some_and(|n| delivered >= n);
     let mut cumulative_pts: u64 = 0;
@@ -525,7 +529,15 @@ where
             match av1.receive_frame() {
                 Ok(frame) => {
                     let pts = frame.pts();
-                    let picture = sequence_picture(frame, &seq, opts, &presentation)?;
+                    let picture = match alpha.as_mut() {
+                        Some(a) => {
+                            let dts = pts.unwrap_or(0).max(0) as u64;
+                            let alpha_frame = a.at(file, dts, media_timescale)?;
+                            let pair = Some((&alpha_frame, &a.config));
+                            sequence_picture(frame, &seq, opts, &presentation, pair)?
+                        }
+                        None => sequence_picture(frame, &seq, opts, &presentation, None)?,
+                    };
                     sink(picture, pts, &seq, last_duration)?;
                     delivered += 1;
                     if done(delivered) {
@@ -544,7 +556,15 @@ where
         let _ = av1.flush();
         while let Ok(frame) = av1.receive_frame() {
             let pts = frame.pts();
-            let picture = sequence_picture(frame, &seq, opts, &presentation)?;
+            let picture = match alpha.as_mut() {
+                Some(a) => {
+                    let dts = pts.unwrap_or(0).max(0) as u64;
+                    let alpha_frame = a.at(file, dts, media_timescale)?;
+                    let pair = Some((&alpha_frame, &a.config));
+                    sequence_picture(frame, &seq, opts, &presentation, pair)?
+                }
+                None => sequence_picture(frame, &seq, opts, &presentation, None)?,
+            };
             sink(picture, pts, &seq, last_duration)?;
             delivered += 1;
             if done(delivered) {
@@ -600,6 +620,86 @@ pub fn stream_params(bytes: &[u8]) -> Result<CodecParameters> {
     Ok(p)
 }
 
+/// The decoder of an alpha auxiliary sequence (HEIF §7.5.3, av1-avif
+/// §4.1), advanced lazily to the sample time-parallel with each master
+/// sample: samples are decoded in order (inter prediction), the last
+/// decoded one is kept while several master samples share it.
+struct AlphaSequence<'t> {
+    track: &'t crate::avis::AlphaTrack,
+    config: Av1CodecConfig,
+    decoder: Box<dyn oxideav_core::Decoder>,
+    /// Next alpha sample to feed.
+    next: usize,
+    /// The last decoded alpha picture.
+    current: Option<VideoFrame>,
+}
+
+impl<'t> AlphaSequence<'t> {
+    fn new(track: &'t crate::avis::AlphaTrack, opts: &DecodeOptions) -> Result<Self> {
+        let config = parse_av1c(&track.av1c).map_err(from_core_err)?;
+        validate_av1_config(&config).map_err(from_core_err)?;
+        let mut params = CodecParameters::video(CodecId::new("av1"));
+        params.extradata = track.av1c.clone();
+        let mut decoder = oxideav_av1::registry::make_decoder(&params).map_err(from_core_err)?;
+        if opts.worker_count() > 1 {
+            decoder.set_execution_context(&oxideav_core::ExecutionContext::with_threads(
+                opts.worker_count(),
+            ));
+        }
+        Ok(Self {
+            track,
+            config,
+            decoder,
+            next: 0,
+            current: None,
+        })
+    }
+
+    /// The alpha picture time-parallel with a master sample decoded at
+    /// `dts` (in `timescale` units): the last alpha sample whose decode
+    /// time is not after it (the first one for a master sample before
+    /// it).
+    fn at(&mut self, file: &[u8], dts: u64, timescale: u32) -> Result<VideoFrame> {
+        let ts_a = u128::from(self.track.timescale.max(1));
+        let ts_m = u128::from(timescale.max(1));
+        let target = self
+            .track
+            .dts
+            .iter()
+            .rposition(|&t| u128::from(t) * ts_m <= u128::from(dts) * ts_a)
+            .unwrap_or(0);
+        while self.next <= target {
+            let i = self.next;
+            let s = &self.track.samples[i];
+            let bytes = sample_bytes(file, s)?;
+            if bytes.len() > MAX_AV1_ITEM_BYTES {
+                return Err(Error::invalid(format!(
+                    "avis: alpha sample {i} payload {} bytes exceeds soft cap {} bytes",
+                    bytes.len(),
+                    MAX_AV1_ITEM_BYTES
+                )));
+            }
+            let pkt = Packet::new(0, TimeBase::new(1, ts_a as i64), bytes.to_vec())
+                .with_pts(self.track.dts[i] as i64);
+            self.decoder.send_packet(&pkt).map_err(|e| {
+                Error::invalid(format!("avis: av1 decoder rejected alpha sample {i}: {e}"))
+            })?;
+            loop {
+                match self.decoder.receive_frame() {
+                    Ok(oxideav_core::Frame::Video(v)) => self.current = Some(v),
+                    Ok(_) => {}
+                    Err(oxideav_core::Error::NeedMore) => break,
+                    Err(e) => return Err(from_core_err(e)),
+                }
+            }
+            self.next += 1;
+        }
+        self.current
+            .clone()
+            .ok_or_else(|| Error::invalid("avis: the alpha sequence decoded to no picture"))
+    }
+}
+
 /// The constant sample rate of a track: `timescale / delta` (reduced)
 /// when every sample has the same non-zero `stts` delta, else `None`.
 fn uniform_rate(samples: &[crate::avis::Sample], timescale: u32) -> Option<oxideav_core::Rational> {
@@ -613,7 +713,8 @@ fn uniform_rate(samples: &[crate::avis::Sample], timescale: u32) -> Option<oxide
 /// A sequence sample's decoded frame as a picture: geometry inferred
 /// from the plane layout at the record's depth (a sample may carry a
 /// new sequence header at a key frame, so size and layout are read per
-/// sample), presented with the sample entry's clean aperture and the
+/// sample), the time-parallel alpha auxiliary sample attached (HEIF
+/// §7.5.3), presented with the sample entry's clean aperture and the
 /// track matrix (MIAF §6.6 step 2, §7.4.4.1), in the sample entry's
 /// colour.
 fn sequence_picture(
@@ -621,6 +722,7 @@ fn sequence_picture(
     seq: &SequenceDecode,
     opts: &DecodeOptions,
     presentation: &crate::avis::Presentation,
+    alpha: Option<(&VideoFrame, &Av1CodecConfig)>,
 ) -> Result<AvifImage> {
     let vf = match frame {
         oxideav_core::Frame::Video(v) => v,
@@ -633,20 +735,25 @@ fn sequence_picture(
     let (fmt_core, w, h) = infer_av1_pixmap(&vf, &seq.config).map_err(from_core_err)?;
     let format = AvifPixelFormat::try_from(fmt_core)?;
     let planes = core_to_avif_frame(vf).planes;
-    let transformed = presentation.clap.is_some()
+    let transformed = alpha.is_some()
+        || presentation.clap.is_some()
         || presentation
             .matrix
             .as_ref()
             .and_then(crate::transform::matrix_orientation)
             .is_some();
     let (w, h, format, planes) = if transformed {
-        let decoded = crate::frame_bridge::to_heif(
+        let mut decoded = crate::frame_bridge::to_heif(
             &crate::image::AvifFrame { pts: None, planes },
             format,
             seq.config.bit_depth(),
             w,
             h,
         )?;
+        if let Some((alpha, config)) = alpha {
+            decoded = crate::decoder::attach_alpha_sample(decoded, alpha, config)
+                .map_err(from_core_err)?;
+        }
         let shown = crate::decoder::present_sample(decoded, presentation).map_err(from_core_err)?;
         let (frame, format) = from_heif(&shown)?;
         (shown.width, shown.height, format, frame.planes)

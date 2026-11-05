@@ -187,3 +187,163 @@ fn track_matrix_mirrors_and_rotates_every_sample() {
     assert_eq!((frames[0].image.width, frames[0].image.height), (w, h));
     assert_eq!(luma(&frames[0].image), pictures[0]);
 }
+
+/// A lossless `w × h` monochrome all-intra sequence whose sample `i`
+/// is flat at `values[i]` — the alpha planes of the tests below.
+fn flat_mono(w: u32, h: u32, values: &[u16]) -> Vec<Vec<u8>> {
+    let frames: Vec<StillImage> = values
+        .iter()
+        .map(|&v| {
+            StillImage::yuv(
+                w,
+                h,
+                8,
+                StillChroma::Monochrome,
+                vec![v; (w * h) as usize],
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap()
+        })
+        .collect();
+    let opts = SequenceEncodeOptions::default()
+        .with_all_intra(true)
+        .with_base_q_idx(0);
+    let file = encode_sequence(&frames, &opts).unwrap();
+    let meta = oxideav_avif::parse_avis(&file).unwrap();
+    meta.samples
+        .iter()
+        .map(|s| oxideav_avif::sample_bytes(&file, s).unwrap().to_vec())
+        .collect()
+}
+
+/// The `av1C` property of a sequence file's sample entry.
+fn av1c_property(file: &[u8]) -> oxideav_heif::props::Property {
+    let meta = oxideav_avif::parse_avis(file).unwrap();
+    let raw = meta.av1_codec_config.unwrap();
+    oxideav_heif::props::Property::Av1C(oxideav_heif::Av1Config::parse(&raw).unwrap())
+}
+
+#[test]
+fn alpha_auxiliary_track_is_attached_to_the_time_parallel_sample() {
+    // Four 32 × 24 colour samples of one tick each; an alpha track
+    // (HEIF §7.5.3: `auxv`, `auxl` → master, `auxi` alpha URN) whose
+    // four samples last two ticks each (decode times 0, 2, 4, 6):
+    // pairing by time, not by index, master samples 0 and 1 show alpha
+    // sample 0, samples 2 and 3 alpha sample 1.
+    let (w, h) = (32u32, 24u32);
+    let colour: Vec<StillImage> = (0..4u16)
+        .map(|i| {
+            let y: Vec<u16> = (0..w * h).map(|k| (k as u16 + i * 9) % 200 + 20).collect();
+            let c = vec![128u16; (w * h / 4) as usize];
+            StillImage::yuv(w, h, 8, StillChroma::Yuv420, y, c.clone(), c).unwrap()
+        })
+        .collect();
+    let colour_file = encode_sequence(
+        &colour,
+        &SequenceEncodeOptions::default()
+            .with_all_intra(true)
+            .with_base_q_idx(0),
+    )
+    .unwrap();
+    let colour_meta = oxideav_avif::parse_avis(&colour_file).unwrap();
+    let alpha_samples = flat_mono(w, h, &[40, 200, 90, 250]);
+    let alpha_file = {
+        let frames: Vec<StillImage> = [40u16]
+            .iter()
+            .map(|&v| {
+                StillImage::yuv(
+                    w,
+                    h,
+                    8,
+                    StillChroma::Monochrome,
+                    vec![v; (w * h) as usize],
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .unwrap()
+            })
+            .collect();
+        encode_sequence(
+            &frames,
+            &SequenceEncodeOptions::default()
+                .with_all_intra(true)
+                .with_base_q_idx(0),
+        )
+        .unwrap()
+    };
+    let mut writer =
+        oxideav_heif::SequenceWriter::new(*b"av01", av1c_property(&colour_file), 32, 24, 30)
+            .with_brands(*b"avis", vec![*b"avis", *b"msf1", *b"miaf", *b"mif1"]);
+    for s in &colour_meta.samples {
+        writer.push_sample(
+            oxideav_avif::sample_bytes(&colour_file, s)
+                .unwrap()
+                .to_vec(),
+            1,
+            true,
+        );
+    }
+    writer.alpha = Some(oxideav_heif::writer::SequenceAlphaTrack::new(
+        *b"av01",
+        av1c_property(&alpha_file),
+        32,
+        24,
+        oxideav_avif::AUX_URN_ALPHA_MPEG.to_string(),
+        alpha_samples
+            .into_iter()
+            .map(|d| oxideav_heif::writer::SequenceSample::new(d, 2, true))
+            .collect(),
+        Vec::new(),
+    ));
+    let file = writer.write_to_vec().unwrap();
+
+    let i = info(&file).unwrap();
+    assert!(i.has_alpha);
+    let frames = decode_all(&file).unwrap();
+    assert_eq!(frames.len(), 4);
+    assert_eq!(i.frames, 4);
+    let expected_alpha = [40u8, 40, 200, 200];
+    for (k, f) in frames.iter().enumerate() {
+        assert_eq!(f.image.format, oxideav_avif::PixelFormat::Yuva420P, "{k}");
+        let a = &f.image.planes[3];
+        assert!(
+            a.data.iter().all(|&v| v == expected_alpha[k]),
+            "frame {k}: alpha {:?}",
+            &a.data[..4]
+        );
+    }
+    // The registry decoder labels and describes the alpha layout.
+    let mut dec = AvifDecoder::new(CodecId::new("avif"));
+    dec.send_packet(&Packet::new(0, TimeBase::new(1, 1), file.clone()))
+        .unwrap();
+    let mut n = 0;
+    while let Ok(Frame::Video(vf)) = dec.receive_frame() {
+        assert_eq!(vf.image_plane_count(), 4);
+        n += 1;
+    }
+    assert_eq!(n, 4);
+    assert_eq!(dec.output_params_generation(), 0);
+    let p = dec.output_params().unwrap();
+    let predicted = stream_params(&file).unwrap();
+    assert_eq!(p.pixel_format, predicted.pixel_format);
+    assert_eq!(p.pixel_format.unwrap().plane_count(), 4);
+}
+
+#[test]
+fn real_alpha_sequence_carries_its_alpha_track() {
+    // 640 × 480, 48 samples, an `auxv` alpha track: frame 0's alpha is
+    // the two-level 0 / 255 mask the external AVIF decoder shows too.
+    let file = include_bytes!("fixtures/alpha_video.avif");
+    let i = info(file).unwrap();
+    assert!(i.has_alpha && i.is_sequence);
+    let frames = decode_all(file).unwrap();
+    assert_eq!(frames.len(), 48);
+    for f in &frames {
+        assert_eq!(f.image.format, oxideav_avif::PixelFormat::Yuva420P);
+    }
+    let a0 = &frames[0].image.planes[3].data;
+    let opaque = a0.iter().filter(|&&v| v == 255).count();
+    let clear = a0.iter().filter(|&&v| v == 0).count();
+    assert_eq!((opaque, clear), (640 * 480 / 2, 640 * 480 / 2));
+}

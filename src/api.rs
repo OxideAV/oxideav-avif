@@ -1341,11 +1341,14 @@ fn sequence_info(bytes: &[u8]) -> Result<ImageInfo> {
     })?;
     let cfg = oxideav_heif::Av1Config::parse(av1c)?;
     let bit_depth = cfg.bit_depth();
+    // An `av01` alpha auxiliary track (HEIF §7.5.3) is attached to
+    // every sample.
+    let has_alpha = presentation.alpha.is_some();
     let format = layout_of_info(
         bit_depth,
         cfg.monochrome,
         Some((cfg.chroma_subsampling_x, cfg.chroma_subsampling_y)),
-        false,
+        has_alpha,
     )?;
     // What a decode yields (MIAF §6.6 step 2): the coded sample size
     // (the `av01` entry's, else the `tkhd` one), cut to the entry's
@@ -1391,7 +1394,7 @@ fn sequence_info(bytes: &[u8]) -> Result<ImageInfo> {
         height,
         format,
         u32::try_from(meta.samples.len()).unwrap_or(u32::MAX),
-        false,
+        has_alpha,
         ColorInfo::from_colr(meta.colr.as_ref()),
         has_icc,
         has_exif,

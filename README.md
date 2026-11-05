@@ -293,7 +293,15 @@ entry's clean aperture first, then the `tkhd` matrix's mirror /
 quarter turns (the eight orientations HEIF §7.2.1 allows; any other
 matrix is presented as decoded) — a 31 × 17 track coded at 32 × 24
 decodes to 31 × 17, a rotated track byte-identical to
-`ffmpeg -f rawvideo` of the same file.
+`ffmpeg -f rawvideo` of the same file. An `av01` alpha auxiliary
+track (`auxv` handler, `auxl` reference to the master, alpha `auxi`
+URN — HEIF §7.5.3, av1-avif §4.1) is decoded alongside the master and
+each sample gets its time-parallel alpha sample (paired by decode
+time). Alpha samples are used as coded — value / maximum, HEIF §6.9.1
+(av1-avif §4.1 asks alpha sequences to be coded with
+`color_range = 1`); on `alpha_video.avif` the external AVIF decoder
+instead shows frames 10 and 47 through a limited-to-full expansion
+(106 → 105, 11 → 0), frame 0 (0 / 255) is identical.
 
 ## Metadata and colour
 

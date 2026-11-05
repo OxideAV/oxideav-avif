@@ -633,6 +633,73 @@ pub(crate) struct Presentation {
     /// The `av01` sample entry's `width` / `height` — the coded
     /// picture size the samples decode to.
     pub entry_dims: Option<(u32, u32)>,
+    /// The alpha auxiliary sequence of the track, when the file has
+    /// one this crate decodes (an `av01` one).
+    pub alpha: Option<AlphaTrack>,
+}
+
+/// An AV1 Alpha Image Sequence (av1-avif §4.1) linked to the master
+/// track: an `auxv` track (HEIF §7.5.3.1) whose `auxl` track
+/// reference names the master and whose `av01` sample entry's `auxi`
+/// announces the alpha URN. Its samples pair with the master's by
+/// decode time ("the time-parallel sample", §7.5.3.1).
+#[derive(Clone, Debug, Default)]
+// Read by the registry-gated sequence decode only.
+#[cfg_attr(not(feature = "registry"), allow(dead_code))]
+pub(crate) struct AlphaTrack {
+    /// The alpha sample entry's `av1C` record.
+    pub av1c: Vec<u8>,
+    /// The samples, in decode order.
+    pub samples: Vec<Sample>,
+    /// Each sample's decode time, in [`Self::timescale`] units.
+    pub dts: Vec<u64>,
+    /// The alpha track's `mdhd` timescale.
+    pub timescale: u32,
+}
+
+/// The `av01` alpha auxiliary track linked to `master_id` (HEIF
+/// §7.5.3: handler `auxv`, an `auxl` reference to the master, an
+/// `auxi` alpha URN in the sample entry — the MPEG-B URN av1-avif §4.1
+/// names, or the HEVC one HEIF Annex B uses), if any.
+fn alpha_track_for(movie: &sequence::Movie, master_id: u32) -> Option<AlphaTrack> {
+    movie.tracks.iter().find_map(|t| {
+        if t.track_id == master_id || t.handler != *b"auxv" {
+            return None;
+        }
+        let linked = t
+            .references
+            .iter()
+            .any(|(kind, ids)| kind == b"auxl" && ids.contains(&master_id));
+        if !linked {
+            return None;
+        }
+        let entry = t.sample_entries.iter().find(|e| {
+            e.entry_type == AV01
+                && matches!(
+                    e.aux_track_type.as_deref(),
+                    Some(crate::meta::AUX_URN_ALPHA_MPEG | crate::meta::AUX_URN_ALPHA_HEVC)
+                )
+        })?;
+        let av1c = entry.av1c.as_ref()?.raw.clone();
+        if t.samples.is_empty() {
+            return None;
+        }
+        Some(AlphaTrack {
+            av1c,
+            samples: t
+                .samples
+                .iter()
+                .map(|s| Sample {
+                    offset: s.offset,
+                    size: s.size,
+                    duration: s.duration,
+                    is_sync: s.is_sync,
+                })
+                .collect(),
+            dts: t.samples.iter().map(|s| s.dts).collect(),
+            timescale: t.timescale,
+        })
+    })
 }
 
 /// [`parse_avis`] plus the first track's [`Presentation`].
@@ -701,6 +768,7 @@ pub(crate) fn parse_avis_presented(file: &[u8]) -> Result<(AvisMeta, Presentatio
         entry_dims: entry
             .filter(|e| e.width > 0 && e.height > 0)
             .map(|e| (u32::from(e.width), u32::from(e.height))),
+        alpha: alpha_track_for(&movie, track.track_id),
     };
     let meta = AvisMeta {
         timescale: movie.timescale,

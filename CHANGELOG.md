@@ -38,6 +38,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to `ffmpeg -f rawvideo` of the same file.
 - Sequence sample `pts` are in the `mdhd` media timescale they are
   accumulated in (the packet time base was the `mvhd` one).
+- **`avis` alpha auxiliary tracks are decoded and attached** (HEIF
+  §7.5.3, av1-avif §4.1): an `auxv` track with an `auxl` reference to
+  the master and an alpha `auxi` URN in its `av01` sample entry is
+  decoded alongside the master (one AV1 decoder each, in order) and
+  each master sample gets the time-parallel alpha sample (paired by
+  decode time, not index; resized to the master's extents when they
+  differ; a depth mismatch is refused). The 48-frame `alpha_video.avif`
+  decoded opaque `Yuv420P`; it is now `Yuva420P`, frame 0's alpha
+  byte-identical to the external AVIF decoder's. `info()` /
+  `stream_params()` report the alpha layout.
 
 ### Changed
 

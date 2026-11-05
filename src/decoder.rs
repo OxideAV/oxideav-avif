@@ -940,6 +940,31 @@ fn decode_item_output_inner(
     Ok(image)
 }
 
+/// Attach a decoded alpha auxiliary sample to its master sample (HEIF
+/// §7.5.3, av1-avif §4.1): only the luma of the alpha picture is
+/// relevant, resized to the master's extents when they differ (the
+/// same nearest-neighbour reading as an alpha item), and it shall have
+/// the master's bit depth.
+pub(crate) fn attach_alpha_sample(
+    master: ItemImage,
+    alpha: &VideoFrame,
+    config: &Av1CodecConfig,
+) -> Result<ItemImage> {
+    let (fmt, w, h) = infer_av1_pixmap(alpha, config)?;
+    let layout = from_core_pix(fmt)?;
+    let frame = core_to_avif_frame(alpha.clone());
+    let alpha = to_heif(&frame, layout, config.bit_depth(), w, h).map_err(core_err)?;
+    let alpha = alpha_as_gray(&alpha, master.width, master.height)?;
+    if alpha.format.bit_depth != master.format.bit_depth {
+        return Err(Error::invalid(format!(
+            "avis alpha: the alpha sequence is {}-bit but the master is {}-bit — an \
+             AV1 Alpha Image Sequence shall have the master's bit depth (av1-avif §4.1)",
+            alpha.format.bit_depth, master.format.bit_depth
+        )));
+    }
+    compose::attach_alpha(&master, &alpha).map_err(heif_err)
+}
+
 /// Present one decoded sequence sample (MIAF §6.6 step 2): the sample
 /// entry's clean aperture first, then the track matrix's mirror and
 /// rotation (HEIF §7.2.1 NOTE 2: the CleanApertureBox clipping "takes
