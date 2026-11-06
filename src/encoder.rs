@@ -478,6 +478,11 @@ impl CodecOptionsStruct for AvifEncoderOptions {
 /// the option surface.
 pub struct AvifEncoder {
     params: CodecParameters,
+    /// The input frames' layout, from the construction parameters.
+    /// Kept apart from `params.pixel_format`, which moves to the coded
+    /// layout's label once a frame is coded (what the file decodes
+    /// back as) — the next input frame still has the input layout.
+    input_format: Option<PixelFormat>,
     opts: EncodeOptions,
     /// `threads` given explicitly (wins over the execution context).
     threads_option: Option<usize>,
@@ -517,6 +522,7 @@ impl AvifEncoder {
     /// options (the option bag on `params` is not read again).
     pub fn from_options(params: CodecParameters, opts: AvifEncoderOptions) -> Self {
         Self {
+            input_format: params.pixel_format,
             params,
             opts: opts.resolve(),
             threads_option: opts.threads,
@@ -583,8 +589,7 @@ impl AvifEncoder {
             .height
             .ok_or_else(|| Error::invalid("avif encode: CodecParameters.height required"))?;
         let fmt = self
-            .params
-            .pixel_format
+            .input_format
             .ok_or_else(|| Error::invalid("avif encode: CodecParameters.pixel_format required"))?;
 
         // Sub-sampled chroma needs even extents on the sub-sampled
@@ -1136,6 +1141,16 @@ impl Encoder for AvifEncoder {
     fn send_frame(&mut self, frame: &Frame) -> Result<()> {
         let vf = match frame {
             Frame::Video(v) => v,
+            // The input geometry and layout are the construction
+            // parameters' (`width` / `height` / `pixel_format`); a
+            // mid-stream input-shape change is not re-configured
+            // (`oxideav-core` 0.1.43 `Encoder::send_frame` contract).
+            Frame::StreamParams(_) => {
+                return Err(Error::unsupported(
+                    "avif encode: cannot re-configure for a mid-stream input-shape change \
+                     (Frame::StreamParams); build a new encoder for the new shape",
+                ));
+            }
             other => {
                 return Err(Error::invalid(format!(
                     "avif encode: expected a video frame, got {other:?}"
@@ -1289,6 +1304,29 @@ mod tests {
                 })
                 .collect(),
         })
+    }
+
+    /// A `Frame::StreamParams` event is refused with `Unsupported`
+    /// (no mid-stream re-configuration), and the encoder keeps working
+    /// on frames of its construction shape afterwards — including a
+    /// second packed-RGB frame after the output label moved to the
+    /// coded layout.
+    #[test]
+    fn stream_params_event_is_unsupported() {
+        let params = video_params(PixelFormat::Yuv420P, 16, 16);
+        let mut enc = make_encoder(&params).expect("encoder");
+        let ev = Frame::StreamParams(Box::new(video_params(PixelFormat::Yuv444P, 32, 32)));
+        assert!(matches!(enc.send_frame(&ev), Err(Error::Unsupported(_))));
+        enc.send_frame(&planar_frame(&[(16, 16), (8, 8), (8, 8)], 3))
+            .expect("frame after the refused event");
+        enc.receive_packet().expect("packet");
+        let rgb = video_params(PixelFormat::Rgb24, 16, 16);
+        let mut enc = make_encoder(&rgb).expect("encoder");
+        for seed in 0..2 {
+            enc.send_frame(&planar_frame(&[(48, 16)], seed))
+                .expect("packed RGB frame");
+            enc.receive_packet().expect("packet");
+        }
     }
 
     /// Trait-level end-to-end: send a Yuv420P frame at `quality=100`,

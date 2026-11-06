@@ -280,8 +280,25 @@ a key frame — can change shape: `output_params_generation()` is bumped
 exactly when `receive_frame` returns the first frame of a new shape,
 never otherwise (frames still queued from an earlier packet keep their
 own description), and `reset()` keeps the rule (the first frame after
-it is compared with the last one returned). `OutputParamsWatch` sees
-one change per switch (`tests/output_params.rs`).
+it is compared with the last one returned). Each switch is also
+announced in band (oxideav-core 0.1.43): `receive_frame` returns one
+`Frame::StreamParams` event carrying the new `output_params()`
+immediately before the first frame of the new shape — never for the
+first shape or a constant stream, one per generation bump.
+`OutputParamsWatch::observe` + `observe_frame` on one watch see each
+switch exactly once (`tests/output_params.rs`). A consumer that does
+not care skips the event (`Frame::is_stream_params()`).
+
+Internally every AV1 decode (coded items, `avis` samples, the alpha
+auxiliary track) skips the inner AV1 decoder's own `StreamParams`
+events — each picture's geometry is read from its planes — so the
+crate works unchanged with an AV1 decoder that emits them; every
+fixture decodes byte-identically with an event injected before every
+inner picture.
+
+The registry encoder refuses a `Frame::StreamParams` event with
+`Error::Unsupported`: its input geometry and layout are the
+construction parameters'.
 
 `stream_params(&bytes)` is the same description predicted from the
 boxes alone (`ispe` / `clap` / `irot`, `av1C` + `pixi` + alpha, `colr`,

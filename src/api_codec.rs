@@ -478,14 +478,10 @@ where
     }
     params.extradata = av1c;
 
-    let mut av1 = oxideav_av1::registry::make_decoder(&params).map_err(from_core_err)?;
-    if opts.worker_count() > 1 {
-        av1.set_execution_context(&oxideav_core::ExecutionContext::with_threads(
-            opts.worker_count(),
-        ));
-    }
+    let mut av1 =
+        crate::decoder::av1_decoder(&params, opts.worker_count()).map_err(from_core_err)?;
     let mut alpha = match presentation.alpha.as_ref() {
-        Some(track) => Some(AlphaSequence::new(track, opts)?),
+        Some(track) => Some(AlphaSequence::new(track)?),
         None => None,
     };
     let mut delivered = 0usize;
@@ -526,8 +522,8 @@ where
         // produce zero, and a single packet can occasionally yield
         // more than one display frame.
         loop {
-            match av1.receive_frame() {
-                Ok(frame) => {
+            match next_media_frame(&mut *av1) {
+                Ok(Some(frame)) => {
                     let pts = frame.pts();
                     let picture = match alpha.as_mut() {
                         Some(a) => {
@@ -544,7 +540,7 @@ where
                         break;
                     }
                 }
-                Err(oxideav_core::Error::NeedMore) => break,
+                Ok(None) => break,
                 Err(e) => return Err(from_core_err(e)),
             }
         }
@@ -554,7 +550,7 @@ where
         // (re-ordering in standard AV1 is rare for AVIS, but the trait
         // contract requires the call).
         let _ = av1.flush();
-        while let Ok(frame) = av1.receive_frame() {
+        while let Ok(Some(frame)) = next_media_frame(&mut *av1) {
             let pts = frame.pts();
             let picture = match alpha.as_mut() {
                 Some(a) => {
@@ -635,17 +631,18 @@ struct AlphaSequence<'t> {
 }
 
 impl<'t> AlphaSequence<'t> {
-    fn new(track: &'t crate::avis::AlphaTrack, opts: &DecodeOptions) -> Result<Self> {
+    fn new(track: &'t crate::avis::AlphaTrack) -> Result<Self> {
         let config = parse_av1c(&track.av1c).map_err(from_core_err)?;
         validate_av1_config(&config).map_err(from_core_err)?;
         let mut params = CodecParameters::video(CodecId::new("av1"));
         params.extradata = track.av1c.clone();
-        let mut decoder = oxideav_av1::registry::make_decoder(&params).map_err(from_core_err)?;
-        if opts.worker_count() > 1 {
-            decoder.set_execution_context(&oxideav_core::ExecutionContext::with_threads(
-                opts.worker_count(),
-            ));
-        }
+        // Serial on purpose: `at` pairs each master sample with the
+        // last alpha picture returned, so every alpha sample's picture
+        // must be out of the decoder before the next master sample is
+        // presented — a decoder on a thread budget may hold a picture
+        // back until its decode finished (then the pairing would depend
+        // on timing). The master track keeps the budget.
+        let decoder = crate::decoder::av1_decoder(&params, 1).map_err(from_core_err)?;
         Ok(Self {
             track,
             config,
@@ -685,10 +682,10 @@ impl<'t> AlphaSequence<'t> {
                 Error::invalid(format!("avis: av1 decoder rejected alpha sample {i}: {e}"))
             })?;
             loop {
-                match self.decoder.receive_frame() {
-                    Ok(oxideav_core::Frame::Video(v)) => self.current = Some(v),
-                    Ok(_) => {}
-                    Err(oxideav_core::Error::NeedMore) => break,
+                match next_media_frame(&mut *self.decoder) {
+                    Ok(Some(oxideav_core::Frame::Video(v))) => self.current = Some(v),
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
                     Err(e) => return Err(from_core_err(e)),
                 }
             }
@@ -697,6 +694,25 @@ impl<'t> AlphaSequence<'t> {
         self.current
             .clone()
             .ok_or_else(|| Error::invalid("avis: the alpha sequence decoded to no picture"))
+    }
+}
+
+/// The next media frame an AV1 sequence decoder returns: `Ok(None)`
+/// once it needs more data, every [`oxideav_core::Frame::StreamParams`]
+/// event (a mid-stream shape change announced in-band — a sample with
+/// a new sequence header) skipped, since each sample's geometry is
+/// read from its own planes and this crate's own decoder states the
+/// presented description itself.
+pub(crate) fn next_media_frame(
+    av1: &mut dyn oxideav_core::Decoder,
+) -> oxideav_core::Result<Option<oxideav_core::Frame>> {
+    loop {
+        match av1.receive_frame() {
+            Ok(f) if f.is_stream_params() => {}
+            Ok(f) => return Ok(Some(f)),
+            Err(oxideav_core::Error::NeedMore) => return Ok(None),
+            Err(e) => return Err(e),
+        }
     }
 }
 

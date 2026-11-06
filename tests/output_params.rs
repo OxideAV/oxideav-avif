@@ -4,7 +4,11 @@
 //! first one: the next frame), `Decoder::output_params_generation()`
 //! moves exactly at the frame boundary where that description changes
 //! and never otherwise (across `reset` too), and `OutputParamsWatch`
-//! sees one change per shape switch. Fixtures are built with this
+//! sees one change per shape switch. Each switch is announced in-band
+//! too (`oxideav-core` 0.1.43): one `Frame::StreamParams` right before
+//! the first frame of the new shape, payload == `output_params()`, in
+//! 1:1 agreement with the counter (`observe` + `observe_frame` on one
+//! watch report it once). Fixtures are built with this
 //! crate's own encoders (stills through the registry encoder, `avis`
 //! sequences through `encode_sequence`, spliced into one track with
 //! the container's sequence writer for the mid-stream size change).
@@ -125,10 +129,49 @@ fn assert_frame_matches(f: &Frame, p: &CodecParameters) {
     );
 }
 
+/// The next media frame, asserting the `Frame::StreamParams` rules on
+/// the way: at most one event before it, only when the generation
+/// moved (by exactly one), never before the first frame, its payload
+/// equal to `output_params()` at the moment it is returned. Returns
+/// the frame and whether an event preceded it.
+fn next_frame(dec: &mut dyn Decoder, last_gen: Option<u64>) -> Option<(Frame, Option<Frame>)> {
+    let mut event = None;
+    loop {
+        let f = dec.receive_frame().ok()?;
+        if let Some(p) = f.stream_params() {
+            assert!(event.is_none(), "two events for one change");
+            let prev = last_gen.expect("no event for the first shape");
+            assert_eq!(
+                dec.output_params_generation(),
+                prev.wrapping_add(1),
+                "the generation moved together with the event"
+            );
+            assert_eq!(
+                format!("{p:?}"),
+                format!("{:?}", dec.output_params().expect("described")),
+                "event payload == output_params()"
+            );
+            event = Some(f);
+            continue;
+        }
+        if let Some(prev) = last_gen {
+            assert_eq!(
+                event.is_some(),
+                dec.output_params_generation() != prev,
+                "one event per generation bump, none otherwise"
+            );
+        }
+        return Some((f, event));
+    }
+}
+
 /// Feed `files` either interleaved (send one, receive one) or all at
 /// once (every packet queued before the first `receive_frame`), and
 /// record after each returned frame: the generation, whether the
-/// watch saw a change, and the description.
+/// watch saw a change, and the description. One watch takes both
+/// signals — the in-band event (`observe_frame`) and the counter
+/// (`observe`) — and must report each change exactly once; the event
+/// count equals the final generation.
 fn run(
     dec: &mut dyn Decoder,
     files: &[Vec<u8>],
@@ -136,16 +179,37 @@ fn run(
 ) -> Vec<(u64, bool, (u32, u32, PixelFormat))> {
     let mut stream = CodecParameters::video(CodecId::new(AVIF));
     let mut watch = OutputParamsWatch::new();
+    // An event-only consumer: folds nothing but the events.
+    let mut event_stream: Option<CodecParameters> = None;
+    let mut events = 0u64;
+    let mut last_gen = None;
     let mut out = Vec::new();
     let mut pull = |dec: &mut dyn Decoder, out: &mut Vec<_>| {
-        while let Ok(f) = dec.receive_frame() {
-            let changed = watch.observe(dec, &mut stream);
+        while let Some((f, event)) = next_frame(dec, last_gen) {
+            let mut by_event = false;
+            if let Some(e) = &event {
+                events += 1;
+                let es = event_stream.as_mut().expect("first shape read");
+                assert!(watch.observe_frame(e, es), "the event is a change");
+                by_event = watch.observe_frame(e, &mut stream);
+                assert!(by_event, "the event changes the mixed stream");
+            }
+            let by_counter = watch.observe(dec, &mut stream);
+            assert!(!(by_event && by_counter), "change reported twice");
+            let changed = by_event || by_counter;
             let p = dec.output_params().expect("described after a frame");
             assert_frame_matches(&f, &p);
             // The watch's stream folded the same description.
             assert_eq!(shape(&stream), shape(&p));
             assert_eq!(stream.color_signal, p.color_signal);
-            out.push((dec.output_params_generation(), changed, shape(&p)));
+            // So did the event-only consumer (seeded from the first
+            // frame's description, as `output_params()` announces it).
+            let es = event_stream.get_or_insert_with(|| p.clone());
+            assert_eq!(shape(es), shape(&p));
+            assert_eq!(es.color_signal, p.color_signal);
+            let generation = dec.output_params_generation();
+            last_gen = Some(generation);
+            out.push((generation, changed, shape(&p)));
         }
     };
     if queued {
@@ -159,6 +223,8 @@ fn run(
             pull(dec, &mut out);
         }
     }
+    let final_gen = out.last().map_or(0, |r| r.0);
+    assert_eq!(events, final_gen, "events and generation bumps agree 1:1");
     out
 }
 
@@ -249,13 +315,39 @@ fn description_switches_at_the_frame_boundary_not_at_send_packet() {
     dec.send_packet(&packet(&b)).unwrap();
     assert_eq!(shape(&dec.output_params().unwrap()).0, 16);
     assert_eq!(dec.output_params_generation(), 0);
-    dec.receive_frame().unwrap();
+    // The change: the event first, the description and the counter
+    // already moved when it is returned …
+    let ev = dec.receive_frame().unwrap();
+    assert_eq!(shape(ev.stream_params().expect("an event")).0, 32);
     assert_eq!(dec.output_params_generation(), 1);
     assert_eq!(shape(&dec.output_params().unwrap()).0, 32);
-    dec.receive_frame().unwrap();
+    // … then the frame of the new shape, without a second bump.
+    assert!(matches!(dec.receive_frame().unwrap(), Frame::Video(_)));
+    assert_eq!(dec.output_params_generation(), 1);
+    assert_eq!(shape(&dec.output_params().unwrap()).0, 32);
+    assert!(matches!(dec.receive_frame().unwrap(), Frame::Video(_)));
     assert_eq!(dec.output_params_generation(), 1, "same shape, no bump");
     assert!(dec.receive_frame().is_err());
     assert_eq!(dec.output_params_generation(), 1);
+}
+
+/// The first shape is never announced in-band, a constant stream
+/// never sees an event, and `reset()` keeps the rule.
+#[test]
+fn events_only_for_mid_stream_changes() {
+    let ctx = registry();
+    let a = still(&ctx, PixelFormat::Yuv420P, 16, 16);
+    let mut dec = decoder(&ctx);
+    for _ in 0..3 {
+        dec.send_packet(&packet(&a)).unwrap();
+    }
+    for _ in 0..3 {
+        assert!(matches!(dec.receive_frame().unwrap(), Frame::Video(_)));
+    }
+    dec.reset().unwrap();
+    dec.send_packet(&packet(&a)).unwrap();
+    assert!(matches!(dec.receive_frame().unwrap(), Frame::Video(_)));
+    assert_eq!(dec.output_params_generation(), 0);
 }
 
 #[test]
@@ -280,16 +372,35 @@ fn reset_keeps_the_rule() {
     dec.receive_frame().unwrap();
     assert_eq!(dec.output_params_generation(), 0);
     assert!(!watch.observe(&*dec, &mut stream));
-    // A different shape after the reset: one bump, visible with its
-    // first frame.
+    // A different shape after the reset: one bump, announced by one
+    // event right before its first frame.
     dec.reset().unwrap();
     dec.send_packet(&packet(&b)).unwrap();
     assert_eq!(dec.output_params_generation(), 0);
-    dec.receive_frame().unwrap();
+    let ev = dec.receive_frame().unwrap();
+    assert!(ev.is_stream_params());
     assert_eq!(dec.output_params_generation(), 1);
-    assert!(watch.observe(&*dec, &mut stream));
+    assert!(watch.observe_frame(&ev, &mut stream));
+    assert!(matches!(dec.receive_frame().unwrap(), Frame::Video(_)));
+    assert_eq!(dec.output_params_generation(), 1);
+    assert!(
+        !watch.observe(&*dec, &mut stream),
+        "already seen via the event"
+    );
     assert_eq!(shape(&stream).0, 32);
     assert_eq!(stream.pixel_format.unwrap().plane_count(), 1);
+    // An event the consumer saw for a frame then dropped by a reset:
+    // the description already switched, so returning to the old
+    // shape is a change again — one more event, one more bump.
+    dec.send_packet(&packet(&a)).unwrap();
+    assert!(dec.receive_frame().unwrap().is_stream_params());
+    assert_eq!(dec.output_params_generation(), 2);
+    dec.reset().unwrap();
+    dec.send_packet(&packet(&b)).unwrap();
+    let ev = dec.receive_frame().unwrap();
+    assert_eq!(shape(ev.stream_params().unwrap()).0, 32);
+    assert_eq!(dec.output_params_generation(), 3);
+    assert!(matches!(dec.receive_frame().unwrap(), Frame::Video(_)));
 }
 
 #[test]
@@ -306,16 +417,23 @@ fn tone_mapping_switch_is_one_change() {
     let base = dec.output_params().unwrap();
     dec.set_tone_mapped(true);
     dec.send_packet(&packet(file)).unwrap();
-    dec.receive_frame().unwrap();
+    let ev = dec.receive_frame().unwrap();
+    assert!(ev.is_stream_params(), "the switch is announced in-band");
+    assert_eq!(dec.output_params_generation(), 1);
+    assert!(matches!(dec.receive_frame().unwrap(), Frame::Video(_)));
     assert_eq!(dec.output_params_generation(), 1);
     assert!(watch.observe(&dec, &mut stream));
     let applied = dec.output_params().unwrap();
+    assert_eq!(
+        format!("{:?}", ev.stream_params().unwrap()),
+        format!("{applied:?}")
+    );
     assert_ne!(
         (base.pixel_format, base.color_signal),
         (applied.pixel_format, applied.color_signal)
     );
     dec.send_packet(&packet(file)).unwrap();
-    dec.receive_frame().unwrap();
+    assert!(matches!(dec.receive_frame().unwrap(), Frame::Video(_)));
     assert_eq!(dec.output_params_generation(), 1);
     assert!(!watch.observe(&dec, &mut stream));
 }

@@ -213,7 +213,11 @@ impl OutputShape {
 /// [`Decoder::output_params_generation`] is bumped exactly when
 /// `receive_frame` returns the first frame whose description differs
 /// from the previous frame's — never while it stays the same, and
-/// with the same rule across [`Decoder::reset`].
+/// with the same rule across [`Decoder::reset`]. Each bump is
+/// announced in-band too: `receive_frame` returns one
+/// [`Frame::StreamParams`] event (payload == the new
+/// `output_params()`) immediately before that frame, so the counter
+/// and the events agree 1:1.
 pub struct AvifDecoder {
     codec_id: CodecId,
     /// Frames ready to hand out via `receive_frame()`, each with the
@@ -570,33 +574,15 @@ fn decode_av01_item(
                 params.height = Some(h);
             }
             params.extradata = av1c.to_vec();
-            let mut av1 = oxideav_av1::registry::make_decoder(&params)?;
-            if threads > 1 {
-                // The budget is advisory and the output is
-                // byte-identical at any value (oxideav-av1 0.1.21).
-                av1.set_execution_context(&ExecutionContext::with_threads(threads));
-            }
+            let mut av1 = av1_decoder(&params, threads)?;
             let pkt = Packet::new(0, TimeBase::new(1, 90_000), obu_bytes.to_vec());
             av1.send_packet(&pkt)?;
-            let mut out = Vec::new();
-            loop {
-                match av1.receive_frame() {
-                    Ok(Frame::Video(v)) => out.push(v),
-                    Ok(other) => {
-                        return Err(Error::unsupported(format!(
-                            "avif: AV1 decoder returned non-video frame: {other:?}"
-                        )));
-                    }
-                    Err(Error::NeedMore) => break,
-                    Err(e) => {
-                        if out.is_empty() {
-                            return Err(e);
-                        }
-                        break;
-                    }
-                }
-            }
-            out
+            // The item's temporal unit is the whole stream: end it, so
+            // a decoder that hands frames out only once their decode
+            // finished (frame-parallel work on a thread budget) returns
+            // every shown frame of the unit to the drain.
+            av1.flush()?;
+            drain_shown_frames(&mut *av1)?
         }
     };
     if frames.is_empty() {
@@ -618,6 +604,56 @@ fn decode_av01_item(
     };
     let (format, width, height) = infer_av1_pixmap(&frame, &cfg)?;
     Ok((frame, format, width, height))
+}
+
+/// The AV1 registry decoder every item, sequence and alpha-sequence
+/// decode of this crate runs, with `threads` workers (advisory: the
+/// output is byte-identical at any budget). The decoder may return
+/// [`Frame::StreamParams`] events between pictures (`oxideav-core`
+/// 0.1.43); every drain loop of this crate skips them
+/// ([`drain_shown_frames`], `api_codec::next_media_frame`). Under
+/// `cfg(test)` an event injector can wrap it (see
+/// `tests::inject_stream_params`) so the drain loops are exercised on
+/// real fixtures with an event before every picture.
+pub(crate) fn av1_decoder(params: &CodecParameters, threads: usize) -> Result<Box<dyn Decoder>> {
+    let mut av1 = oxideav_av1::registry::make_decoder(params)?;
+    if threads > 1 {
+        av1.set_execution_context(&ExecutionContext::with_threads(threads));
+    }
+    #[cfg(test)]
+    let av1 = tests::maybe_inject(av1);
+    Ok(av1)
+}
+
+/// Every shown frame an AV1 decoder returns for the temporal unit just
+/// sent, in decode order. A [`Frame::StreamParams`] event (a decoder
+/// announcing a mid-stream shape change — e.g. between the spatial
+/// layers of a layered item, av1-avif §2.3.1) carries no picture and
+/// is skipped: each picture's geometry is read from its own planes
+/// ([`infer_av1_pixmap`]). Any other non-video frame kind is refused.
+/// `NeedMore` / `Eof` end the drain; any other error after at least
+/// one frame ends the unit with what was decoded.
+pub(crate) fn drain_shown_frames(av1: &mut dyn Decoder) -> Result<Vec<VideoFrame>> {
+    let mut out = Vec::new();
+    loop {
+        match av1.receive_frame() {
+            Ok(Frame::Video(v)) => out.push(v),
+            Ok(f) if f.is_stream_params() => {}
+            Ok(other) => {
+                return Err(Error::unsupported(format!(
+                    "avif: AV1 decoder returned non-video frame: {other:?}"
+                )));
+            }
+            Err(Error::NeedMore | Error::Eof) => break,
+            Err(e) => {
+                if out.is_empty() {
+                    return Err(e);
+                }
+                break;
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// av1-avif §2.2.1: "The values of the fields in the
@@ -1490,15 +1526,36 @@ impl Decoder for AvifDecoder {
         }
     }
 
+    /// Returns the next queued frame — preceded, when its description
+    /// differs from the frame returned before it, by one
+    /// [`Frame::StreamParams`] event carrying the new description
+    /// (the `oxideav-core` 0.1.43 contract). When the event is
+    /// returned the generation has already moved and
+    /// [`output_params`](Decoder::output_params) already answers the
+    /// new shape; the frame itself follows on the next call. The first
+    /// shape is never announced in-band (that is what
+    /// `output_params()` answers up front), and the same rule holds
+    /// across [`reset`](Decoder::reset).
     fn receive_frame(&mut self) -> Result<Frame> {
-        let (frame, shape) = self.pending.pop_front().ok_or(Error::NeedMore)?;
-        // The bump becomes visible together with the first frame of
-        // the new shape; resolving the description at the very first
-        // frame is not a change.
+        let shape = self
+            .pending
+            .front()
+            .map(|(_, s)| *s)
+            .ok_or(Error::NeedMore)?;
         if self.shown.is_some_and(|prev| prev != shape) {
+            // A mid-stream change: bump, switch the description and
+            // announce it; the frame stays queued for the next call
+            // (which then sees `shown == shape` and returns it).
             self.generation = self.generation.wrapping_add(1);
+            self.shown = Some(shape);
+            return Ok(Frame::StreamParams(Box::new(
+                shape.to_params(&self.codec_id),
+            )));
         }
+        // Resolving the description at the very first frame is not a
+        // change.
         self.shown = Some(shape);
+        let (frame, _) = self.pending.pop_front().expect("front checked");
         Ok(frame)
     }
 
@@ -1819,5 +1876,240 @@ mod tests {
         let y = &vf.planes[0];
         assert_eq!(y.stride, 1280);
         assert_eq!(y.data.len() / y.stride, 720);
+    }
+
+    // ---- In-band `Frame::StreamParams` from the inner AV1 decoder ----
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// While non-zero, [`av1_decoder`] wraps every AV1 decoder in an
+    /// [`EventInjector`]. Global (not thread-local) so grid tiles
+    /// decoded on worker threads are covered too; concurrently running
+    /// tests see the injection as well, which is harmless by design —
+    /// the events must not change any decode.
+    static INJECT: AtomicUsize = AtomicUsize::new(0);
+    /// Events the injectors returned (proves the paths were exercised).
+    pub(super) static INJECTED: AtomicUsize = AtomicUsize::new(0);
+
+    pub(super) fn maybe_inject(inner: Box<dyn Decoder>) -> Box<dyn Decoder> {
+        if INJECT.load(Ordering::SeqCst) > 0 {
+            Box::new(EventInjector { inner, held: None })
+        } else {
+            inner
+        }
+    }
+
+    /// Run `f` with event injection on.
+    pub(crate) fn inject_stream_params<T>(f: impl FnOnce() -> T) -> T {
+        struct Guard;
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                INJECT.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        INJECT.fetch_add(1, Ordering::SeqCst);
+        let _g = Guard;
+        f()
+    }
+
+    /// A decoder wrapper that returns a `Frame::StreamParams` event
+    /// before every video frame of the inner decoder (the first one
+    /// included — harsher than the contract, which never announces the
+    /// first shape) and passes everything else through.
+    struct EventInjector {
+        inner: Box<dyn Decoder>,
+        held: Option<Frame>,
+    }
+
+    impl Decoder for EventInjector {
+        fn codec_id(&self) -> &CodecId {
+            self.inner.codec_id()
+        }
+        fn send_packet(&mut self, packet: &Packet) -> Result<()> {
+            self.inner.send_packet(packet)
+        }
+        fn receive_frame(&mut self) -> Result<Frame> {
+            if let Some(f) = self.held.take() {
+                return Ok(f);
+            }
+            let f = self.inner.receive_frame()?;
+            if matches!(f, Frame::Video(_)) {
+                self.held = Some(f);
+                INJECTED.fetch_add(1, Ordering::SeqCst);
+                let p = self
+                    .inner
+                    .output_params()
+                    .unwrap_or_else(|| CodecParameters::video(CodecId::new("av1")));
+                return Ok(Frame::StreamParams(Box::new(p)));
+            }
+            Ok(f)
+        }
+        fn flush(&mut self) -> Result<()> {
+            self.inner.flush()
+        }
+        fn reset(&mut self) -> Result<()> {
+            self.held = None;
+            self.inner.reset()
+        }
+        fn set_execution_context(&mut self, ctx: &ExecutionContext) {
+            self.inner.set_execution_context(ctx);
+        }
+    }
+
+    /// A scripted decoder: hands out `script` in order, then `NeedMore`.
+    struct Scripted(VecDeque<Result<Frame>>, CodecId);
+
+    impl Decoder for Scripted {
+        fn codec_id(&self) -> &CodecId {
+            &self.1
+        }
+        fn send_packet(&mut self, _: &Packet) -> Result<()> {
+            Ok(())
+        }
+        fn receive_frame(&mut self) -> Result<Frame> {
+            self.0.pop_front().unwrap_or(Err(Error::NeedMore))
+        }
+        fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn event(w: u32) -> Result<Frame> {
+        let mut p = CodecParameters::video(CodecId::new("av1"));
+        p.width = Some(w);
+        Ok(Frame::StreamParams(Box::new(p)))
+    }
+
+    fn picture(v: u8) -> Result<Frame> {
+        Ok(Frame::Video(VideoFrame {
+            pts: Some(i64::from(v)),
+            planes: vec![VideoPlane {
+                stride: 1,
+                data: vec![v],
+            }],
+        }))
+    }
+
+    #[test]
+    fn drain_skips_stream_params_events_anywhere() {
+        let script = [
+            event(1),
+            picture(1),
+            event(2),
+            event(3),
+            picture(2),
+            event(4),
+        ];
+        let mut d = Scripted(script.into_iter().collect(), CodecId::new("av1"));
+        let frames = drain_shown_frames(&mut d).unwrap();
+        let got: Vec<u8> = frames.iter().map(|f| f.planes[0].data[0]).collect();
+        assert_eq!(got, [1, 2]);
+        // Only events: no picture, no error from the drain itself.
+        let mut d = Scripted([event(1)].into_iter().collect(), CodecId::new("av1"));
+        assert!(drain_shown_frames(&mut d).unwrap().is_empty());
+    }
+
+    #[test]
+    fn sequence_pull_skips_events_and_keeps_end_of_stream() {
+        use crate::api_codec::next_media_frame;
+        let script = [event(1), picture(7), event(2), event(3)];
+        let mut d = Scripted(script.into_iter().collect(), CodecId::new("av1"));
+        let f = next_media_frame(&mut d).unwrap().expect("a picture");
+        assert_eq!(f.pts(), Some(7));
+        assert!(next_media_frame(&mut d).unwrap().is_none(), "NeedMore");
+        // After flush: events then end of stream — the drain stops
+        // with the error, never yields the event.
+        let script = [event(1), Err(Error::Eof)];
+        let mut d = Scripted(script.into_iter().collect(), CodecId::new("av1"));
+        assert!(matches!(next_media_frame(&mut d), Err(Error::Eof)));
+    }
+
+    #[test]
+    fn drain_still_refuses_other_frame_kinds() {
+        let audio = Frame::Audio(oxideav_core::AudioFrame {
+            samples: 0,
+            pts: None,
+            data: Vec::new(),
+        });
+        let mut d = Scripted(
+            [event(1), Ok(audio)].into_iter().collect(),
+            CodecId::new("av1"),
+        );
+        assert!(matches!(
+            drain_shown_frames(&mut d),
+            Err(Error::Unsupported(_))
+        ));
+    }
+
+    /// Every fixture (stills, grids, alpha, gain maps, `avis` with an
+    /// alpha track) decodes identically when the inner AV1 decoder
+    /// returns an event before every picture: the item drain, the
+    /// sequence drain (per packet and after `flush`) and the alpha
+    /// sequence drain all skip it.
+    #[test]
+    fn every_fixture_decodes_identically_with_injected_events() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let mut checked = 0;
+        let mut names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("avif"))
+            .collect();
+        names.sort();
+        for path in names {
+            let bytes = std::fs::read(&path).unwrap();
+            for tone_mapped in [false, true] {
+                let opts = DecodeOptions::default().with_tone_mapped(tone_mapped);
+                let plain = crate::decode_all_with(&bytes, &opts);
+                let before = INJECTED.load(Ordering::SeqCst);
+                let injected = inject_stream_params(|| crate::decode_all_with(&bytes, &opts));
+                assert!(
+                    INJECTED.load(Ordering::SeqCst) > before,
+                    "{path:?}: injector never fired"
+                );
+                match (plain, injected) {
+                    (Ok(a), Ok(b)) => assert!(a == b, "{path:?}: decode differs"),
+                    (a, b) => panic!("{path:?}: {:?} vs {:?}", a.err(), b.err()),
+                }
+            }
+            checked += 1;
+        }
+        assert!(checked >= 12, "{checked} fixtures");
+    }
+
+    /// The registry decoder over the same injection: frames and
+    /// descriptions as without it.
+    #[test]
+    fn registry_decoder_survives_injected_events() {
+        let bytes = include_bytes!("../tests/fixtures/alpha_video.avif");
+        let run = || {
+            let mut d = AvifDecoder::new(CodecId::new(crate::CODEC_ID_STR));
+            d.send_packet(&Packet::new(0, TimeBase::new(1, 1), bytes.to_vec()))
+                .unwrap();
+            let mut out = Vec::new();
+            while let Ok(f) = d.receive_frame() {
+                match f {
+                    Frame::Video(v) => out.push((
+                        v.pts,
+                        v.planes
+                            .into_iter()
+                            .map(|p| (p.stride, p.data))
+                            .collect::<Vec<_>>(),
+                        d.output_params(),
+                    )),
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+            out
+        };
+        let plain = run();
+        let injected = inject_stream_params(run);
+        assert!(!plain.is_empty());
+        assert_eq!(plain.len(), injected.len());
+        for (a, b) in plain.iter().zip(&injected) {
+            assert_eq!(a.0, b.0);
+            assert!(a.1 == b.1, "planes differ");
+            assert_eq!(format!("{:?}", a.2), format!("{:?}", b.2));
+        }
     }
 }

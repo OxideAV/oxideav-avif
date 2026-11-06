@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **In-band `Frame::StreamParams` events (core 0.1.43 contract).** The
+  registry decoder returns one `Frame::StreamParams` — payload equal to
+  `output_params()` — immediately before the first frame of every new
+  shape (burst of differently sized / alpha / monochrome stills, a
+  tone-mapping switch, an `avis` track changing size or layout at a key
+  frame); the generation has already moved when it is returned, so
+  events and bumps agree 1:1. None for the first shape or a constant
+  stream; the same rule after `reset()`. `tests/output_params.rs`
+  checks every change is seen exactly once by `observe` +
+  `observe_frame`.
+- Every internal AV1 decode loop (coded items, `avis` samples before
+  and after `flush`, the alpha auxiliary track) skips the inner AV1
+  decoder's `Frame::StreamParams` events instead of refusing them as an
+  unexpected frame kind. Unit tests drive the loops with a scripted
+  stub decoder and decode every fixture byte-identically with an event
+  injected before every inner picture.
+- The registry encoder refuses a `Frame::StreamParams` event with
+  `Error::Unsupported` (no mid-stream re-configuration).
 - **Stream parameters under the core 0.1.42 contract.** The registry
   decoder implements `Decoder::output_params()` — width / height,
   pixel-format label, colour signal and (constant-rate `avis`) frame
@@ -29,6 +47,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A coded AV1 item's temporal unit is ended with `flush()` before it is
+  drained, so an AV1 decoder that hands a frame out only once its
+  decode has finished (frame-parallel work under a thread budget)
+  still returns it — a still decoded under a budget could fail with
+  "decoded to no shown frame". The alpha auxiliary track of an `avis`
+  sequence is decoded serially so each master sample is paired with
+  its own alpha picture, never one still in flight.
+- The registry encoder kept reading the input layout from the output
+  parameters after the first frame relabelled them to the coded
+  layout: a second packed-RGB (`Rgb24` / `Rgba`) frame was refused
+  ("Yuv420 expects 3 planes"). The input layout is now kept apart.
 - **`avis` samples are presented with the sample entry's `clap` and the
   `tkhd` matrix** (MIAF §6.6 step 2, §7.4.4.1; HEIF §7.2.1): an odd
   31 × 17 track coded at 32 × 24 decoded as 32 × 24 (the black-box
