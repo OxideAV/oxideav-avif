@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.17](https://github.com/OxideAV/oxideav-avif/compare/v0.0.16...v0.0.17) - 2026-11-06
+
+### Other
+
+- Frame::StreamParams on both sides — the registry decoder announces every mid-stream shape change in band (1:1 with the generation), every inner AV1 drain loop skips the AV1 decoder's own events; items flushed before draining, alpha tracks decoded serially, encoder refuses the event and keeps its input layout
+- mutated two-track (master + alpha) and rotated / cropped sequences never panic through info / stream_params / decode_all / the registry decoder
+- the image sequence track is the pict one, not the first trak (HEIF §7.2.2, av1-avif §3); sample groups read from that track by track_ID
+- avis alpha auxiliary tracks decoded and attached — auxv / auxl / alpha auxi (HEIF §7.5.3, av1-avif §4.1), paired by decode time; alpha_video.avif now Yuva420P
+- stream parameters under the core 0.1.42 contract — output_params / output_params_generation per frame boundary, stream_params from the boxes; avis samples presented with the sample entry's clap and the tkhd matrix
+- edition 2024, MSRV 1.95
+
 ### Added
 
 - **In-band `Frame::StreamParams` events (core 0.1.43 contract).** The
