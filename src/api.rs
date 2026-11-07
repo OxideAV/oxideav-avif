@@ -970,6 +970,7 @@ impl StillChroma {
 /// Search effort of the AV1 still encoder behind every coded item
 /// ([`EncodeOptions::speed`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EncodeSpeed {
     /// The production point (default): the reduced search ladders —
     /// a 12 MP 8-bit still in seconds single-threaded, about a second

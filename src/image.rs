@@ -70,6 +70,7 @@ impl AvifFrame {
 /// formats declare. Plane `stride` / `data` stay byte-addressed, so an
 /// HBD plane's stride is `2 × plane_width`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AvifPixelFormat {
     /// 8-bit planar 4:2:0 — what AV1's intra path emits for a typical
     /// AVIF colour image.

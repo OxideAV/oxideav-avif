@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `#[non_exhaustive]` on `AvifPixelFormat` (the layout set has grown with the high-bit-depth and packed-alpha variants) and `EncodeSpeed`. `ColorRange` (full / limited) and `StillChroma` (AV1's four chroma layouts) stay exhaustive; `AvifFrame` / `AvifPlane` stay plain value records.
+
 ## [0.0.17](https://github.com/OxideAV/oxideav-avif/compare/v0.0.16...v0.0.17) - 2026-11-06
 
 ### Other
