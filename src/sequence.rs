@@ -34,8 +34,8 @@ use crate::mux::{
 };
 use crate::still::{
     CodedTuning, STILL_MAX_CODED_DIM, StillImage, av1_err, av1c_from_seq, coded_extent,
-    colr_is_full_range, encode_coded_item, full_range_temporal_unit, pad_plane, pixi_bits,
-    top_left_clap,
+    colr_is_full_range, encode_coded_item, pad_plane, pixi_bits, resignalled_temporal_unit,
+    stream_colour_description, top_left_clap,
 };
 use oxideav_av1::encoder::inter_frame::{GOP_MAX_FRAMES, encode_gop_yuv_with_q};
 use oxideav_av1::encoder::yuv_frame::YuvFrame;
@@ -211,6 +211,7 @@ pub(crate) fn encode_sequence_timed(
         });
     }
     let full_range = colr_is_full_range(first);
+    let colour = stream_colour_description(first);
 
     // Code the samples.
     let mut samples: Vec<(Vec<u8>, bool)> = Vec::with_capacity(frames.len());
@@ -228,6 +229,7 @@ pub(crate) fn encode_sequence_timed(
                 f.v.clone(),
                 opts.base_q_idx,
                 full_range,
+                colour,
                 CodedTuning::sequence(EncodeSpeed::Fast, 1),
                 "sequence frame",
             )?;
@@ -246,8 +248,8 @@ pub(crate) fn encode_sequence_timed(
                 seq_profile = gop.seq.seq_profile;
             }
             for (i, unit) in gop.temporal_units.into_iter().enumerate() {
-                let unit = if i == 0 && full_range {
-                    full_range_temporal_unit(&unit, &gop.seq)?
+                let unit = if i == 0 && (full_range || colour.is_some()) {
+                    resignalled_temporal_unit(&unit, &gop.seq, full_range, colour)?
                 } else {
                     unit
                 };

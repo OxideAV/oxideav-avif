@@ -181,6 +181,30 @@ fn add_xmp_item(w: &mut HeifWriter, image: u32, payload: &[u8]) -> u32 {
     w.add_xmp_bytes(image, payload.to_vec())
 }
 
+/// Append the master's transformative properties (`clap` → `irot` →
+/// `imir`, all essential) to an auxiliary item's property list: the
+/// auxiliary's samples are co-located with the master's (MIAF
+/// §7.3.5.2), so its output image goes through the same crop and
+/// orientation — a reader that builds each item's output image on its
+/// own would otherwise stretch a padded alpha plane over the cropped
+/// colour.
+fn push_transforms(
+    props: &mut Vec<Prop>,
+    clap: &Option<Clap>,
+    irot: &Option<Irot>,
+    imir: &Option<Imir>,
+) {
+    if let Some(clap) = clap {
+        props.push(prop_clap(clap));
+    }
+    if let Some(irot) = irot {
+        props.push(prop_irot(irot));
+    }
+    if let Some(imir) = imir {
+        props.push(prop_imir(imir));
+    }
+}
+
 /// Guard: the container assigns item ids in insertion order; the AVIF
 /// layout predicts them (a derived primary names its inputs before
 /// they exist). A mismatch is a bug, never silent.
@@ -825,6 +849,7 @@ impl AvifMuxer {
             if let Some(bits) = &alpha.pixi {
                 aprops.push(prop_pixi(bits));
             }
+            push_transforms(&mut aprops, &self.clap, &self.irot, &self.imir);
             let id = w.add_alpha(coded, *b"av01", alpha.payload, aprops, alpha.premultiplied);
             w.set_hidden(id, true);
         }
@@ -837,6 +862,7 @@ impl AvifMuxer {
             if let Some(bits) = &depth.pixi {
                 dprops.push(prop_pixi(bits));
             }
+            push_transforms(&mut dprops, &self.clap, &self.irot, &self.imir);
             let id = w.add_depth(coded, *b"av01", depth.payload, dprops);
             w.set_hidden(id, true);
         }
@@ -912,6 +938,7 @@ impl AvifMuxer {
                     if let Some(bits) = &a.pixi {
                         aprops.push(prop_pixi(bits));
                     }
+                    push_transforms(&mut aprops, &m.clap, &None, &None);
                     let aid = w.add_alpha(id, *b"av01", a.payload, aprops, a.premultiplied);
                     w.set_hidden(aid, true);
                 }
@@ -1215,15 +1242,28 @@ impl AvifGridMuxer {
         let tile_ids: Vec<u32> = (2..2 + n).collect();
         let grid_id = w.add_grid(desc, &tile_ids, grid_props)?;
         expect_id(grid_id, 1, "grid")?;
+        // MIAF §7.3.6.4 / §7.3.11.4.1: every coded item should carry
+        // its colour information and a grid's inputs carry the grid's
+        // own, so a reader that renders a tile on its own (or reads
+        // the colour from the coded items) sees the same `pixi` /
+        // `colr` as the canvas. The `ipco` holds each box once.
+        let mut tile_shared = Vec::new();
+        if let Some(bits) = &self.pixi {
+            tile_shared.push(prop_pixi(bits));
+        }
+        if let Some(colr) = &self.colr {
+            tile_shared.push(prop_colr(colr)?);
+        }
+        if let Some(icc) = &self.icc {
+            tile_shared.push(prop_colr(&Colr::Icc(icc.clone()))?);
+        }
         for (i, tile) in self.tiles.into_iter().enumerate() {
-            let id = w.add_coded_item(
-                *b"av01",
-                tile.payload,
-                vec![
-                    prop_av1c(&tile.av1c, "grid tile ")?,
-                    prop_ispe(tile.width, tile.height),
-                ],
-            );
+            let mut tprops = vec![
+                prop_av1c(&tile.av1c, "grid tile ")?,
+                prop_ispe(tile.width, tile.height),
+            ];
+            tprops.extend(tile_shared.iter().cloned());
+            let id = w.add_coded_item(*b"av01", tile.payload, tprops);
             expect_id(id, tile_ids[i], "grid tile")?;
             w.set_hidden(id, true);
         }
@@ -1237,18 +1277,19 @@ impl AvifGridMuxer {
             if let Some(bits) = &self.alpha_pixi {
                 aprops.push(prop_pixi(bits));
             }
+            push_transforms(&mut aprops, &None, &self.irot, &self.imir);
             let ag = w.add_grid(desc, &alpha_tile_ids, aprops)?;
             expect_id(ag, alpha_grid_id, "alpha grid")?;
             w.set_hidden(ag, true);
             for (i, tile) in self.alpha_tiles.into_iter().enumerate() {
-                let id = w.add_coded_item(
-                    *b"av01",
-                    tile.payload,
-                    vec![
-                        prop_av1c(&tile.av1c, &format!("alpha grid tile {i} "))?,
-                        prop_ispe(tile.width, tile.height),
-                    ],
-                );
+                let mut tprops = vec![
+                    prop_av1c(&tile.av1c, &format!("alpha grid tile {i} "))?,
+                    prop_ispe(tile.width, tile.height),
+                ];
+                if let Some(bits) = &self.alpha_pixi {
+                    tprops.push(prop_pixi(bits));
+                }
+                let id = w.add_coded_item(*b"av01", tile.payload, tprops);
                 expect_id(id, alpha_tile_ids[i], "alpha grid tile")?;
                 w.set_hidden(id, true);
             }

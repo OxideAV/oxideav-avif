@@ -124,8 +124,16 @@
 //!   of tiles at most that size. The decoded pixels are the same on
 //!   every shape.
 //!
+//! * `lossless` — `true` for a mathematically lossless file: the
+//!   colour planes and the alpha auxiliary are coded with the AV1
+//!   lossless arm whatever `quality` / `q` / `alpha_q` say, and RGB
+//!   input stays identity-matrix 4:4:4 RGB (`chroma` does not apply).
+//!   The decoded frame equals the input sample for sample.
+//!
 //! With neither `quality` nor `q` the colour planes code at
-//! [`DEFAULT_QUALITY`]; `quality=100` or `q=0` is the lossless path.
+//! [`DEFAULT_QUALITY`]; `lossless=true`, `quality=100` or `q=0` is the
+//! lossless path (`q=0` alone leaves the alpha auxiliary on
+//! `alpha_q` / `quality`).
 
 use oxideav_core::frame::VideoFrame;
 use oxideav_core::{
@@ -218,6 +226,11 @@ pub struct AvifEncoderOptions {
     pub threads: Option<usize>,
     /// How the picture splits into coded items (`grid`).
     pub grid: GridTiling,
+    /// Mathematically lossless coding (`lossless`): colour and alpha
+    /// coded with the AV1 lossless arm, packed / planar RGB kept as
+    /// identity-matrix 4:4:4; wins over `quality`, `q`, `alpha_q` and
+    /// `chroma`.
+    pub lossless: bool,
 }
 
 impl Default for AvifEncoderOptions {
@@ -231,6 +244,7 @@ impl Default for AvifEncoderOptions {
             speed: EncodeSpeed::Fast,
             threads: None,
             grid: GridTiling::Auto,
+            lossless: false,
         }
     }
 }
@@ -283,6 +297,12 @@ impl AvifEncoderOptions {
         self
     }
 
+    /// Setter: replace `lossless`.
+    pub fn with_lossless(mut self, lossless: bool) -> Self {
+        self.lossless = lossless;
+        self
+    }
+
     /// Strict parse of a parameter set's option bag.
     pub fn from_params(params: &CodecParameters) -> Result<Self> {
         parse_options::<Self>(&params.options)
@@ -314,6 +334,7 @@ impl AvifEncoderOptions {
             "speed" => into.speed = self.speed,
             "threads" => into.threads = self.threads,
             "grid" => into.grid = self.grid,
+            "lossless" => into.lossless = self.lossless,
             other => return Err(Error::invalid(format!("unknown option '{other}'"))),
         }
         Ok(())
@@ -325,7 +346,8 @@ impl AvifEncoderOptions {
     /// given, else lossless for the alpha auxiliary; `chroma` /
     /// `premultiplied` / `speed` / `grid` as given; `threads` as
     /// given, else `1` (the encoder fills the execution context's
-    /// budget in per frame).
+    /// budget in per frame); `lossless` as given (it then overrides
+    /// both quantisers — [`EncodeOptions::lossless`]).
     pub fn resolve(&self) -> EncodeOptions {
         let colour = self
             .quality
@@ -341,6 +363,7 @@ impl AvifEncoderOptions {
         .with_speed(self.speed)
         .with_threads(self.threads.unwrap_or(1))
         .with_grid(self.grid)
+        .with_lossless(self.lossless)
     }
 }
 
@@ -430,6 +453,12 @@ impl CodecOptionsStruct for AvifEncoderOptions {
             default: OptionValue::String(String::new()),
             help: "How the picture splits into coded items (default auto): auto (one item up to 1 MP, a grid of 512-pixel tiles above it), none (one item up to 4096 per axis), or a tile edge 64..=4096 in pixels; the pixels decode the same on every shape",
         },
+        OptionField {
+            name: "lossless",
+            kind: OptionKind::Bool,
+            default: OptionValue::Bool(false),
+            help: "Mathematically lossless: colour and alpha coded with the AV1 lossless arm, RGB input kept as identity-matrix 4:4:4 RGB (matrix_coefficients = 0, full range) so the decoded picture equals the source; wins over quality / q / alpha_q / chroma",
+        },
     ];
 
     fn apply(&mut self, key: &str, value: &OptionValue) -> Result<()> {
@@ -467,6 +496,7 @@ impl CodecOptionsStruct for AvifEncoderOptions {
                 self.threads = (n > 0).then_some(n as usize);
             }
             "grid" => self.grid = parse_grid_option(value)?,
+            "lossless" => self.lossless = value.as_bool()?,
             other => return Err(Error::invalid(format!("unknown option '{other}'"))),
         }
         Ok(())
@@ -574,7 +604,7 @@ impl AvifEncoder {
     /// at a lossy colour quality (the lossless identity-matrix coding
     /// is byte-exact and stays).
     fn lossy_rgb(&self) -> Option<(ColorInfo, StillChroma)> {
-        (self.opts.base_q_idx > 0).then(|| (self.lossy_rgb_color(), self.opts.chroma))
+        (!self.opts.is_colour_lossless()).then(|| (self.lossy_rgb_color(), self.opts.chroma))
     }
 
     /// Convert one framework video frame into a [`StillImage`] per the

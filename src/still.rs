@@ -926,9 +926,26 @@ pub(crate) struct CodedItem {
 /// * a full-range `colr` `nclx` on the colour item (e.g. the identity
 ///   RGB path) — MIAF gives the container property precedence, but a
 ///   matching in-stream flag keeps both signals consistent.
-pub(crate) fn full_range_temporal_unit(unit: &[u8], seq: &SequenceHeader) -> Result<Vec<u8>> {
+///
+/// `colour` re-signals the §5.5.2 colour description the same way
+/// (see [`stream_colour_description`]) — display metadata as well.
+pub(crate) fn resignalled_temporal_unit(
+    unit: &[u8],
+    seq: &SequenceHeader,
+    full_range: bool,
+    colour: Option<(u8, u8, u8)>,
+) -> Result<Vec<u8>> {
     let mut seq_full = seq.clone();
-    seq_full.color_config.color_range = true;
+    if full_range {
+        seq_full.color_config.color_range = true;
+    }
+    if let Some((primaries, transfer, matrix)) = colour {
+        let cc = &mut seq_full.color_config;
+        cc.color_description_present_flag = true;
+        cc.color_primaries = primaries;
+        cc.transfer_characteristics = transfer;
+        cc.matrix_coefficients = matrix;
+    }
     let new_sh = encode_sequence_header_obu(&seq_full);
     let mut out = Vec::with_capacity(unit.len());
     let mut off = 0usize;
@@ -1016,6 +1033,7 @@ pub(crate) fn encode_coded_item(
     v: Vec<u16>,
     q: u8,
     full_range: bool,
+    colour: Option<(u8, u8, u8)>,
     tuning: CodedTuning,
     stage: &str,
 ) -> Result<CodedItem> {
@@ -1031,6 +1049,7 @@ pub(crate) fn encode_coded_item(
     let mut so = StillOptions::new(q);
     so.speed = still_speed(tuning.speed);
     so.full_range = full_range;
+    so.color_description = colour;
     so.reduced_header = true;
     let (cols, rows) = auto_tile_layout(pw, ph, TILE_LAYOUT_THREADS);
     so.tile_cols_log2 = cols;
@@ -1068,6 +1087,49 @@ pub(crate) fn colr_is_full_range(img: &StillImage) -> bool {
     )
 }
 
+/// The §5.5.2 colour description `(color_primaries,
+/// transfer_characteristics, matrix_coefficients)` the coded stream of
+/// `img` signals: the `colr` `nclx` triple, so the Sequence Header OBU
+/// and the container agree (MIAF §7.3.6.4 gives the property
+/// precedence, but a reader that takes the colour of a coded item — a
+/// grid tile above all — from the bitstream must not see "unspecified"
+/// next to identity-matrix planes and convert G, B, R as Y′CbCr).
+///
+/// `None` (the unspecified triple, `color_description_present_flag =
+/// 0`) when there is no `nclx`, when it is unspecified itself, and for
+/// the two descriptions the bitstream cannot state: the identity
+/// matrix over sub-sampled chroma (§6.4.2 requires 4:4:4) and
+/// BT.709 / sRGB / identity at limited range (§5.5.2 codes that triple
+/// without a `color_range` bit — it is full range by definition).
+pub(crate) fn stream_colour_description(img: &StillImage) -> Option<(u8, u8, u8)> {
+    let Some(Colr::Nclx {
+        colour_primaries,
+        transfer_characteristics,
+        matrix_coefficients,
+        full_range,
+    }) = &img.colr
+    else {
+        return None;
+    };
+    let triple = (
+        u8::try_from(*colour_primaries).ok()?,
+        u8::try_from(*transfer_characteristics).ok()?,
+        u8::try_from(*matrix_coefficients).ok()?,
+    );
+    if triple == (2, 2, 2) {
+        return None;
+    }
+    if triple.2 == 0 {
+        if img.chroma != StillChroma::Yuv444 && img.chroma != StillChroma::Monochrome {
+            return None;
+        }
+        if triple == (1, 13, 0) && !*full_range && img.chroma != StillChroma::Monochrome {
+            return None;
+        }
+    }
+    Some(triple)
+}
+
 /// Pad the image's planes to the coded extents and encode the primary
 /// coded item.
 fn encode_primary(
@@ -1100,6 +1162,7 @@ fn encode_primary(
         v,
         q,
         colr_is_full_range(img),
+        stream_colour_description(img),
         tuning,
         "primary",
     )
@@ -1131,6 +1194,7 @@ fn encode_alpha(
         Vec::new(),
         q,
         true,
+        None,
         tuning,
         "alpha",
     )
@@ -1175,7 +1239,7 @@ pub fn encode_still_burst(images: &[StillImage], opts: &EncodeOptions) -> Result
                  {STILL_MAX_CODED_DIM}",
             )));
         }
-        let coded = encode_primary(img, pw, ph, opts.base_q_idx, CodedTuning::of(opts))?;
+        let coded = encode_primary(img, pw, ph, opts.colour_q_idx(), CodedTuning::of(opts))?;
         max_profile = max_profile.max(coded.seq_profile);
         let mut member = crate::mux::BurstMember::new(pw, ph, coded.payload, coded.av1c);
         member.pixi = Some(pixi_bits(img));
@@ -1185,8 +1249,14 @@ pub fn encode_still_burst(images: &[StillImage], opts: &EncodeOptions) -> Result
             member.clap = Some(top_left_clap(img.width, img.height, pw, ph));
         }
         if let Some(alpha) = &img.alpha {
-            let coded_alpha =
-                encode_alpha(img, alpha, pw, ph, opts.alpha_q_idx, CodedTuning::of(opts))?;
+            let coded_alpha = encode_alpha(
+                img,
+                alpha,
+                pw,
+                ph,
+                opts.alpha_plane_q_idx(),
+                CodedTuning::of(opts),
+            )?;
             max_profile = max_profile.max(coded_alpha.seq_profile);
             member.alpha = Some(crate::mux::BurstAlpha::new(
                 coded_alpha.payload,
@@ -1212,7 +1282,7 @@ fn still_muxer(img: &StillImage, opts: &EncodeOptions) -> Result<(AvifMuxer, u8)
              {STILL_MAX_CODED_DIM}; use encode_still_grid",
         )));
     }
-    let primary = encode_primary(img, pw, ph, opts.base_q_idx, CodedTuning::of(opts))?;
+    let primary = encode_primary(img, pw, ph, opts.colour_q_idx(), CodedTuning::of(opts))?;
     let mut max_profile = primary.seq_profile;
 
     // ispe documents the coded extents (av1-avif §2.2.2); clap crops
@@ -1292,8 +1362,14 @@ fn still_muxer(img: &StillImage, opts: &EncodeOptions) -> Result<(AvifMuxer, u8)
         });
     }
     if let Some(alpha) = &img.alpha {
-        let coded_alpha =
-            encode_alpha(img, alpha, pw, ph, opts.alpha_q_idx, CodedTuning::of(opts))?;
+        let coded_alpha = encode_alpha(
+            img,
+            alpha,
+            pw,
+            ph,
+            opts.alpha_plane_q_idx(),
+            CodedTuning::of(opts),
+        )?;
         max_profile = max_profile.max(coded_alpha.seq_profile);
         mux = mux
             .with_alpha(
@@ -1304,8 +1380,14 @@ fn still_muxer(img: &StillImage, opts: &EncodeOptions) -> Result<(AvifMuxer, u8)
             .with_alpha_pixi(vec![img.bit_depth]);
     }
     if let Some(depth) = &img.depth_map {
-        let coded_depth =
-            encode_alpha(img, depth, pw, ph, opts.alpha_q_idx, CodedTuning::of(opts))?;
+        let coded_depth = encode_alpha(
+            img,
+            depth,
+            pw,
+            ph,
+            opts.alpha_plane_q_idx(),
+            CodedTuning::of(opts),
+        )?;
         max_profile = max_profile.max(coded_depth.seq_profile);
         mux = mux.with_depth(coded_depth.payload, coded_depth.av1c);
     }
@@ -1448,8 +1530,9 @@ pub fn encode_still_grid(
             ty,
             tu,
             tv,
-            opts.base_q_idx,
+            opts.colour_q_idx(),
             colr_is_full_range(img),
+            stream_colour_description(img),
             per_tile,
             "grid tile",
         )?;
@@ -1466,8 +1549,9 @@ pub fn encode_still_grid(
                     ta,
                     Vec::new(),
                     Vec::new(),
-                    opts.alpha_q_idx,
+                    opts.alpha_plane_q_idx(),
                     true,
+                    None,
                     per_tile,
                     "grid alpha tile",
                 )?)
@@ -1714,14 +1798,20 @@ pub fn encode_still_overlay(
                 "avif still: overlay layer {i} coded extents {pw}x{ph} exceed {STILL_MAX_CODED_DIM}"
             )));
         }
-        let coded = encode_primary(img, pw, ph, opts.base_q_idx, CodedTuning::of(opts))?;
+        let coded = encode_primary(img, pw, ph, opts.colour_q_idx(), CodedTuning::of(opts))?;
         max_profile = max_profile.max(coded.seq_profile);
         let clap = ((pw, ph) != (img.width, img.height))
             .then(|| top_left_clap(img.width, img.height, pw, ph));
         let alpha = match &img.alpha {
             Some(a) => {
-                let coded_alpha =
-                    encode_alpha(img, a, pw, ph, opts.alpha_q_idx, CodedTuning::of(opts))?;
+                let coded_alpha = encode_alpha(
+                    img,
+                    a,
+                    pw,
+                    ph,
+                    opts.alpha_plane_q_idx(),
+                    CodedTuning::of(opts),
+                )?;
                 max_profile = max_profile.max(coded_alpha.seq_profile);
                 Some((coded_alpha.payload, coded_alpha.av1c))
             }
@@ -1854,14 +1944,15 @@ pub fn encode_still_layered(
         }
         None => layers.len() - 1,
     };
-    let coded = encode_spatial_layered_gop_yuv_with_q(&frames, opts.base_q_idx)
+    let coded = encode_spatial_layered_gop_yuv_with_q(&frames, opts.colour_q_idx())
         .map_err(|e| av1_err("layered", e))?;
     let unit =
         coded.temporal_units.into_iter().next().ok_or_else(|| {
             Error::invalid("avif still: layered encode produced no temporal unit")
         })?;
-    let payload = if colr_is_full_range(top) {
-        full_range_temporal_unit(&unit, &coded.seq)?
+    let colour = stream_colour_description(top);
+    let payload = if colr_is_full_range(top) || colour.is_some() {
+        resignalled_temporal_unit(&unit, &coded.seq, colr_is_full_range(top), colour)?
     } else {
         unit
     };
@@ -1923,8 +2014,14 @@ pub fn encode_still_layered(
     if selected == layers.len() - 1
         && let Some(alpha) = &top.alpha
     {
-        let coded_alpha =
-            encode_alpha(top, alpha, pw, ph, opts.alpha_q_idx, CodedTuning::of(opts))?;
+        let coded_alpha = encode_alpha(
+            top,
+            alpha,
+            pw,
+            ph,
+            opts.alpha_plane_q_idx(),
+            CodedTuning::of(opts),
+        )?;
         max_profile = max_profile.max(coded_alpha.seq_profile);
         mux = mux
             .with_alpha(

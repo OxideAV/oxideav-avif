@@ -937,6 +937,18 @@ fn decode_item_output_inner(
             )));
         }
         let alpha = decode_item_output(hdr, alpha_id, depth + 1, ctx, false)?;
+        // The alpha plane's samples are co-located with the master's
+        // (MIAF §7.3.5.2), and each item's output image is its
+        // reconstructed image after its own transformative properties
+        // (HEIF §6.3). An auxiliary that carries transforms of its own
+        // is therefore attached to the master's *output* image; one
+        // that carries none is co-located with the master's
+        // reconstructed samples and goes through the master's
+        // transforms with it.
+        let alpha_transformed = !transforms_for(&hdr.meta, alpha_id).is_empty();
+        if alpha_transformed {
+            image = apply_item_transforms(hdr, item_id, image)?;
+        }
         let alpha = alpha_as_gray(&alpha, image.width, image.height)?;
         if alpha.format.bit_depth != image.format.bit_depth {
             return Err(Error::invalid(format!(
@@ -947,7 +959,20 @@ fn decode_item_output_inner(
             )));
         }
         image = compose::attach_alpha(&image, &alpha).map_err(heif_err)?;
+        if alpha_transformed {
+            return Ok(image);
+        }
     }
+    apply_item_transforms(hdr, item_id, image)
+}
+
+/// `image` (the reconstructed image of `item_id`) after the item's
+/// transformative properties in `ipma` order (HEIF §6.3).
+fn apply_item_transforms(
+    hdr: &AvifHeader<'_>,
+    item_id: u32,
+    mut image: ItemImage,
+) -> Result<ItemImage> {
     for prop in transforms_for(&hdr.meta, item_id) {
         image = match prop {
             Property::Clap(clap) => {

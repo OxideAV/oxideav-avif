@@ -4,15 +4,18 @@
 //! the bytes pick one of the declared input layouts, a small geometry
 //! (odd extents included, so the sub-sampled layouts' typed refusal is
 //! exercised), every codec option (`quality` / `q` / `alpha_q` /
-//! `chroma` / `premultiplied` / `speed` / `threads` / `grid`, in and
-//! out of range, malformed), stream- and frame-level metadata blobs
+//! `chroma` / `premultiplied` / `speed` / `threads` / `grid` /
+//! `lossless`, in and out of range, malformed), stream- and
+//! frame-level metadata blobs
 //! (well-known and custom kinds, empty and sized payloads) and the
 //! picture's samples. The invariant: construction and encoding never
 //! panic (a bad option or geometry is a typed `Err`), a produced file
 //! decodes through the registry decoder to the encoder's announced
 //! label and geometry, and the ICC / Exif / XMP the frame carried
 //! (refined over the stream's) come back as the frame's blobs — no
-//! other kind does.
+//! other kind does; and under `lossless=true` — whatever the quality
+//! options next to it say — packed RGB(A) / BGR(A) input decodes back
+//! to exactly the source bytes.
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_avif::{ENCODER_PIXEL_FORMATS, make_decoder, make_encoder};
@@ -151,6 +154,16 @@ fuzz_target!(|data: &[u8]| {
     if unknown.is_multiple_of(5) {
         opts = opts.set("no-such-option", "1");
     }
+    let lossless_word = match unknown % 4 {
+        0 => None,
+        1 => Some("true"),
+        2 => Some("false"),
+        _ => Some(word(bytes.u8())),
+    };
+    if let Some(w) = lossless_word {
+        opts = opts.set("lossless", w);
+    }
+    let lossless = lossless_word == Some("true");
 
     let mut params = CodecParameters::video(CodecId::new(oxideav_avif::CODEC_ID_STR));
     params.width = Some(w);
@@ -215,6 +228,43 @@ fuzz_target!(|data: &[u8]| {
         oxideav_avif::CODEC_ID_STR,
     )))
     .expect("decoder");
+    if lossless {
+        // The exact round trip of the packed layouts, alpha included.
+        let source = &vf.planes[0].data;
+        match fmt {
+            PixelFormat::Rgb24 | PixelFormat::Bgr24 => {
+                let back = oxideav_avif::decode_rgb8(&pkt.data).expect("decode_rgb8");
+                let want: Vec<u8> = if fmt == PixelFormat::Rgb24 {
+                    source.clone()
+                } else {
+                    source
+                        .chunks_exact(3)
+                        .flat_map(|p| [p[2], p[1], p[0]])
+                        .collect()
+                };
+                assert!(
+                    back.as_bytes() == want.as_slice(),
+                    "{fmt:?} {w}x{h}: lossless"
+                );
+            }
+            PixelFormat::Rgba | PixelFormat::Bgra => {
+                let back = oxideav_avif::decode_rgba8(&pkt.data).expect("decode_rgba8");
+                let want: Vec<u8> = if fmt == PixelFormat::Rgba {
+                    source.clone()
+                } else {
+                    source
+                        .chunks_exact(4)
+                        .flat_map(|p| [p[2], p[1], p[0], p[3]])
+                        .collect()
+                };
+                assert!(
+                    back.as_bytes() == want.as_slice(),
+                    "{fmt:?} {w}x{h}: lossless"
+                );
+            }
+            _ => {}
+        }
+    }
     dec.send_packet(&Packet::new(0, TimeBase::new(1, 1), pkt.data))
         .expect("the encoder's file decodes");
     let decoded = match dec.receive_frame().expect("one frame") {

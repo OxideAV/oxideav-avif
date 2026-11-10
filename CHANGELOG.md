@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Explicit lossless option.** `EncodeOptions::lossless` /
+  `with_lossless(true)` and the registry's typed `lossless` option:
+  the colour planes and the alpha auxiliary are coded with the AV1
+  lossless arm whatever `base_q_idx` / `alpha_q_idx` / `quality` / `q`
+  / `alpha_q` / `chroma` say, and RGB input is kept as RGB — H.273
+  identity matrix (`matrix_coefficients = 0`), 4:4:4, full range — so
+  the decoded picture equals the source sample for sample.
+  `EncodeOptions::colour_q_idx()` / `alpha_plane_q_idx()` /
+  `is_colour_lossless()` report what an option set resolves to.
+- `tests/lossless_roundtrip.rs` (exact round trip over extents incl.
+  odd, RGB / RGBA, 8 / 10 / 12-bit, gray, gray + alpha, grids,
+  orientation, the registry option; container + sequence-header
+  signalling asserted) and `tests/lossless_interop.rs` (the installed
+  black-box readers reproduce 16 lossless files sample for sample;
+  lossless identity-matrix files from a black-box producer decode
+  exactly).
+
+### Fixed
+
+- **`encode_rgb8` / `encode_rgba8` at quality 100 were not an exact
+  round trip.** A lossless request (`with_quality(100)`, the default
+  `base_q_idx = 0`, `with_lossless(true)`) converted the RGB bytes to
+  Y′CbCr (4:2:0, or 4:4:4 at odd extents) before the lossless AV1
+  coding, so the decoded RGB differed from the source. These paths now
+  code identity-matrix 4:4:4 RGB when the colour planes are lossless.
+  Every lossy quality keeps its Y′CbCr coding.
+- **The AV1 sequence header now carries the colour description of the
+  `colr` `nclx`** (`color_description_present_flag = 1`, the same
+  primaries / transfer / matrix) on every coded item — still items,
+  grid tiles, burst members, layered items, sequence samples. It was
+  left "unspecified", so a reader that takes a coded item's colour
+  from the bitstream decoded the G, B, R planes of an identity-matrix
+  grid as Y′CbCr (two of the four black-box readers did on a lossless
+  1200 × 900 RGB grid). Decoded samples are unchanged; lossy files
+  with an `nclx` differ from earlier ones by the sequence header's
+  colour-description bits only.
+- **Grid tiles carry the grid's `pixi` and `colr`** (nclx and ICC;
+  MIAF §7.3.6.4, §7.3.11.4.1), alpha grid tiles their `pixi`. The
+  `ipco` holds each box once.
+- **The alpha (and depth) auxiliary item carries the colour item's
+  `clap`, `irot` and `imir`** (burst members: `clap`; an alpha grid:
+  the grid's `irot` / `imir`). A padded picture (extents not a multiple
+  of 8) was written with a cropped colour item and an un-cropped alpha
+  item, which readers that build each item's output image on its own
+  stretched over the colour (three of the four black-box readers
+  returned a rescaled alpha plane at 17 × 13).
+- **Decoder: an alpha auxiliary with transformative properties of its
+  own** is attached to the colour item's *output* image (HEIF §6.3),
+  not resized onto its reconstructed image and transformed a second
+  time. An auxiliary without any keeps going through the colour
+  item's transforms with it (`tests/fixtures/alpha_aux_without_clap.avif`).
+
 ### Changed
 
 - `#[non_exhaustive]` on `AvifPixelFormat` (the layout set has grown with the high-bit-depth and packed-alpha variants) and `EncodeSpeed`. `ColorRange` (full / limited) and `StillChroma` (AV1's four chroma layouts) stay exhaustive; `AvifFrame` / `AvifPlane` stay plain value records.

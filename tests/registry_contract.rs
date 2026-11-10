@@ -234,7 +234,8 @@ fn capabilities_declare_layouts_flags_and_quality() {
             "premultiplied",
             "speed",
             "threads",
-            "grid"
+            "grid",
+            "lossless"
         ]
     );
     let schema = ctx

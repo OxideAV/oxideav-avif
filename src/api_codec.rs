@@ -1052,7 +1052,7 @@ pub fn encode_all(frames: &[Frame], opts: &EncodeOptions) -> Result<Vec<u8>> {
         .collect();
     let seq_opts = crate::sequence::SequenceEncodeOptions::default()
         .with_timescale(1000)
-        .with_base_q_idx(opts.base_q_idx);
+        .with_base_q_idx(opts.colour_q_idx());
     crate::sequence::encode_sequence_timed(&stills, &seq_opts, Some(&durations))
 }
 
@@ -1198,15 +1198,26 @@ fn box_filter(plane: &[u16], w: usize, h: usize, sx: u32, sy: u32) -> Vec<u16> {
     out
 }
 
-/// Encode tightly packed 8-bit RGB as an AVIF at the MIAF default
-/// colour signalling (BT.709 / sRGB / BT.601, full range) in
-/// `opts.chroma` — 4:2:0 by default, 4:4:4 at odd extents (see
-/// [`EncodeOptions::chroma`]); `opts.base_q_idx` / [`EncodeOptions::with_quality`]
-/// set the quality. For byte-exact RGB use
-/// `encode(&AvifImage::from_rgb8(..).unwrap(), ..)`, which codes the identity
-/// matrix in 4:4:4.
+/// Encode tightly packed 8-bit RGB as an AVIF.
+///
+/// * **Lossless** — [`EncodeOptions::with_lossless`], quality 100, or
+///   `base_q_idx = 0` (the [`EncodeOptions`] default): the bytes are
+///   kept as RGB — H.273 identity matrix (`matrix_coefficients = 0`),
+///   4:4:4, full range, BT.709 primaries / sRGB transfer, in the
+///   `colr` `nclx` and the AV1 sequence header — and coded with the
+///   AV1 lossless arm, so [`crate::decode_rgb8`] returns exactly the
+///   input. `opts.chroma` does not apply.
+/// * **Lossy** — any other quality: converted to Y′CbCr at the MIAF
+///   default colour signalling (BT.709 / sRGB / BT.601, full range) in
+///   `opts.chroma` — 4:2:0 by default, 4:4:4 at odd extents (see
+///   [`EncodeOptions::chroma`]); `opts.base_q_idx` /
+///   [`EncodeOptions::with_quality`] set the quality.
 pub fn encode_rgb8(width: u32, height: u32, rgb: &[u8], opts: &EncodeOptions) -> Result<Vec<u8>> {
-    let still = still_of_rgb(width, height, rgb, 3, opts)?;
+    let still = if opts.is_colour_lossless() {
+        StillImage::rgb8(width, height, rgb)?
+    } else {
+        still_of_rgb(width, height, rgb, 3, opts)?
+    };
     encode_still_auto(&still, opts)
 }
 
@@ -1215,7 +1226,11 @@ pub fn encode_rgb8(width: u32, height: u32, rgb: &[u8], opts: &EncodeOptions) ->
 /// at `opts.alpha_q_idx`, `prem` signalled per
 /// `opts.premultiplied_alpha`).
 pub fn encode_rgba8(width: u32, height: u32, rgba: &[u8], opts: &EncodeOptions) -> Result<Vec<u8>> {
-    let still = still_of_rgb(width, height, rgba, 4, opts)?;
+    let still = if opts.is_colour_lossless() {
+        StillImage::rgba8(width, height, rgba)?
+    } else {
+        still_of_rgb(width, height, rgba, 4, opts)?
+    };
     encode_still_auto(&still, opts)
 }
 
@@ -1383,15 +1398,16 @@ mod tests {
     }
 
     #[test]
-    fn rgb_one_call_paths_code_420_by_default() {
+    fn rgb_one_call_paths_code_420_when_lossy_and_exact_rgb_when_lossless() {
         let rgb: Vec<u8> = (0..16 * 8 * 3).map(|i| (i * 7 % 256) as u8).collect();
-        let bytes = encode_rgb8(16, 8, &rgb, &EncodeOptions::default()).unwrap();
+        let lossy_opts = EncodeOptions::default().with_quality(95);
+        let bytes = encode_rgb8(16, 8, &rgb, &lossy_opts).unwrap();
         let info = crate::info(&bytes).unwrap();
         assert_eq!(info.format, PixelFormat::Yuv420P);
         assert_eq!(info.color, ColorInfo::miaf_default());
         let back = decode_rgb8(&bytes).unwrap();
         assert_eq!((back.width, back.height), (16, 8));
-        // Lossless luma, box-filtered chroma: close, not exact.
+        // Near-lossless luma, box-filtered chroma: close, not exact.
         let err: u32 = back
             .data
             .iter()
@@ -1399,16 +1415,15 @@ mod tests {
             .map(|(a, b)| u32::from(a.abs_diff(*b)))
             .sum();
         assert!(err / (16 * 8 * 3) < 24, "mean error {}", err / (16 * 8 * 3));
-        // Odd extents fall back to 4:4:4, and 4:4:4 at q 0 is lossless
-        // up to the forward/inverse matrix rounding.
+        // Odd extents fall back to 4:4:4.
         let odd: Vec<u8> = (0..5 * 3 * 3).map(|i| (i * 11 % 256) as u8).collect();
-        let bytes = encode_rgb8(5, 3, &odd, &EncodeOptions::default()).unwrap();
+        let bytes = encode_rgb8(5, 3, &odd, &lossy_opts).unwrap();
         assert_eq!(crate::info(&bytes).unwrap().format, PixelFormat::Yuv444P);
-        let back = decode_rgb8(&bytes).unwrap();
-        assert!(back.data.iter().zip(&odd).all(|(a, b)| a.abs_diff(*b) <= 2));
-        // RGBA: alpha as the auxiliary, exact.
+        assert_eq!(crate::info(&bytes).unwrap().color.matrix, 6);
+        // RGBA: alpha as the auxiliary, exact at the default alpha
+        // quantiser.
         let rgba: Vec<u8> = (0..8 * 8 * 4).map(|i| (i * 13 % 256) as u8).collect();
-        let bytes = encode_rgba8(8, 8, &rgba, &EncodeOptions::default()).unwrap();
+        let bytes = encode_rgba8(8, 8, &rgba, &lossy_opts).unwrap();
         let info = crate::info(&bytes).unwrap();
         assert!(info.has_alpha);
         assert_eq!(info.format, PixelFormat::Yuva420P);
@@ -1421,6 +1436,24 @@ mod tests {
                 .zip(rgba.as_chunks::<4>().0.iter())
                 .all(|(a, b)| a[3] == b[3])
         );
+        // Lossless — the default, quality 100, the explicit switch —
+        // keeps the bytes as identity-matrix 4:4:4 RGB: exact.
+        for opts in [
+            EncodeOptions::default(),
+            EncodeOptions::default().with_quality(100),
+            EncodeOptions::default()
+                .with_quality(40)
+                .with_lossless(true),
+        ] {
+            let bytes = encode_rgb8(16, 8, &rgb, &opts).unwrap();
+            let info = crate::info(&bytes).unwrap();
+            assert_eq!(info.format, PixelFormat::Yuv444P);
+            assert_eq!(info.color, ColorInfo::identity_full_range());
+            assert_eq!(decode_rgb8(&bytes).unwrap().data, rgb);
+            let bytes = encode_rgba8(8, 8, &rgba, &opts).unwrap();
+            assert_eq!(crate::info(&bytes).unwrap().format, PixelFormat::Yuva444P);
+            assert_eq!(decode_rgba8(&bytes).unwrap().data, rgba);
+        }
         // Quality from the options changes the output.
         let lossy = encode_rgb8(16, 8, &rgb, &EncodeOptions::default().with_quality(50)).unwrap();
         assert_ne!(

@@ -1060,6 +1060,17 @@ pub struct EncodeOptions {
     /// [`crate::still::encode_still`] / [`crate::still::encode_still_grid`]
     /// are the explicit shapes and ignore it.
     pub grid: GridTiling,
+    /// Mathematically lossless coding (default `false`): the colour
+    /// planes **and** the alpha auxiliary are coded with the AV1
+    /// lossless arm (`base_q_idx = 0`, no quantiser deltas) whatever
+    /// `base_q_idx` / `alpha_q_idx` say, and the RGB one-call paths
+    /// ([`crate::encode_rgb8`] / [`crate::encode_rgba8`]) keep the
+    /// samples as RGB — the H.273 identity matrix
+    /// (`matrix_coefficients = 0`) in 4:4:4 at full range, signalled in
+    /// the `colr` `nclx` and the AV1 sequence header — instead of
+    /// converting to Y′CbCr, so the decoded picture equals the source
+    /// sample for sample. See [`Self::with_lossless`].
+    pub lossless: bool,
 }
 
 impl Default for EncodeOptions {
@@ -1075,6 +1086,7 @@ impl Default for EncodeOptions {
             speed: EncodeSpeed::Fast,
             threads: 1,
             grid: GridTiling::Auto,
+            lossless: false,
         }
     }
 }
@@ -1142,10 +1154,43 @@ impl EncodeOptions {
         self
     }
 
+    /// Setter: replace `lossless`. `true` is the explicit request for
+    /// an exact round trip — colour and alpha coded losslessly, RGB
+    /// input kept as identity-matrix 4:4:4 RGB — and wins over
+    /// `base_q_idx`, `alpha_q_idx`, [`Self::with_quality`] and `chroma`
+    /// in whichever order they are set.
+    pub fn with_lossless(mut self, lossless: bool) -> Self {
+        self.lossless = lossless;
+        self
+    }
+
+    /// The `base_q_idx` the colour planes are coded with: `0` when
+    /// [`Self::lossless`] is set, else the `base_q_idx` field.
+    pub fn colour_q_idx(&self) -> u8 {
+        if self.lossless { 0 } else { self.base_q_idx }
+    }
+
+    /// The `base_q_idx` the alpha auxiliary is coded with: `0` when
+    /// [`Self::lossless`] is set, else the `alpha_q_idx` field.
+    pub fn alpha_plane_q_idx(&self) -> u8 {
+        if self.lossless { 0 } else { self.alpha_q_idx }
+    }
+
+    /// `true` when the colour planes are coded losslessly
+    /// ([`Self::colour_q_idx`] is `0`) — the condition under which the
+    /// RGB one-call paths code identity-matrix RGB instead of Y′CbCr.
+    pub fn is_colour_lossless(&self) -> bool {
+        self.colour_q_idx() == 0
+    }
+
     /// Colour quality on a 0–100 scale (100 = lossless): sets
     /// `base_q_idx = ((100 − quality) × 255 + 50) / 100`, so 100 → 0,
     /// 90 → 26, 75 → 64, 50 → 128, 0 → 255. Values above 100 clamp to
-    /// 100. Alpha stays at its own `alpha_q_idx`.
+    /// 100. Alpha stays at its own `alpha_q_idx` (lossless by
+    /// default). At 100 the colour planes are coded losslessly, which
+    /// on the RGB one-call paths means exact RGB (the identity
+    /// matrix in 4:4:4 — see [`Self::lossless`]); every other quality
+    /// codes the same bytes as before.
     pub fn with_quality(mut self, quality: u8) -> Self {
         let q = u32::from(quality.min(100));
         self.base_q_idx = (((100 - q) * 255 + 50) / 100) as u8;

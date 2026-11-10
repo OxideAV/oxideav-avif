@@ -114,8 +114,9 @@ by name. Decode yields the storage layout; `color.matrix == 0`
 | Encode | Layout written |
 |---|---|
 | `encode(&AvifImage)` | the image's own layout and depth; alpha as the AV1-coded alpha auxiliary item; `Error::Unsupported` for sub-sampled chroma at odd extents (never a silent conversion) |
-| `encode_rgb8` / `encode_rgba8` | 8-bit 4:2:0 (`EncodeOptions::chroma`; 4:4:4 at odd extents), MIAF default colour (BT.709 / sRGB / BT.601, full range), alpha as the auxiliary |
-| `encode(&AvifImage::from_rgb8(..)?)` | identity-matrix 4:4:4 — byte-exact RGB at the default lossless quality |
+| `encode_rgb8` / `encode_rgba8`, lossless (`with_lossless(true)`, `with_quality(100)`, the default `base_q_idx = 0`) | the bytes as RGB: identity matrix (`matrix_coefficients = 0`), 4:4:4, full range, AV1 lossless — `decode_rgb8` / `decode_rgba8` return exactly the input, alpha included |
+| `encode_rgb8` / `encode_rgba8`, any other quality | 8-bit Y′CbCr 4:2:0 (`EncodeOptions::chroma`; 4:4:4 at odd extents), MIAF default colour (BT.709 / sRGB / BT.601, full range), alpha as the auxiliary |
+| `encode(&AvifImage::from_rgb8(..)?)` | identity-matrix 4:4:4 at every quality — byte-exact RGB when lossless |
 | canvases past 4096 coded pixels per axis | `grid` tiling (`encode_still_auto`) |
 | `encode_all(&[Frame], &EncodeOptions)` | the mirror of `decode_all`: delay-less frames → the primary plus a `brst` image burst (`encode_still_burst`; per-member colour / ICC / alpha / `clap`, Exif / XMP on the primary), timed frames → an `avis` image sequence (`encode_sequence` at timescale 1000, each frame's delay in ms; no alpha — `Unsupported`); all frames share frame 0's geometry, depth and layout; `decode_all(encode_all(f)) == f` at the lossless default |
 
@@ -125,12 +126,79 @@ the primary alone. `AvifImage::new` / `from_rgb8` / `from_rgba8` are
 `Result`s that refuse a zero dimension or a buffer that does not match
 the geometry with `InvalidData`.
 
+## Lossless
+
+A lossless request is an exact round trip: the decoded picture equals
+the source sample for sample.
+
+```rust
+# #[cfg(feature = "registry")] fn main() -> Result<(), oxideav_avif::Error> {
+# let (w, h) = (17u32, 13u32);
+# let rgba: Vec<u8> = (0..w * h * 4).map(|i| (i * 37 % 251) as u8).collect();
+let opts = oxideav_avif::EncodeOptions::default().with_lossless(true);
+let file = oxideav_avif::encode_rgba8(w, h, &rgba, &opts)?;
+assert_eq!(oxideav_avif::decode_rgba8(&file)?.into_raw(), rgba);
+# Ok(())
+# }
+# #[cfg(not(feature = "registry"))] fn main() {}
+```
+
+| Request | Meaning |
+|---|---|
+| `EncodeOptions::with_lossless(true)` / registry `lossless=true` | colour **and** alpha coded with the AV1 lossless arm (`base_q_idx = 0`, no quantiser deltas), whatever `base_q_idx` / `alpha_q_idx` / `quality` / `q` / `alpha_q` / `chroma` say |
+| `with_quality(100)` / registry `quality=100` | the same for the colour planes (`base_q_idx = 0`); the alpha auxiliary keeps its own quantiser on the contract path (lossless by default) and follows `quality` on the registry |
+| `base_q_idx = 0` (the `EncodeOptions` default) / registry `q=0` | the colour planes lossless |
+
+RGB input — `encode_rgb8` / `encode_rgba8`, `AvifImage::from_rgb8` /
+`from_rgba8`, the registry's `Rgb24` / `Rgba` / `Bgr24` / `Bgra` /
+`Gbrp*` / `Gbrap*` — is then coded **as RGB**, never through a Y′CbCr
+conversion (which is not invertible in integers): the H.273 identity
+matrix in 4:4:4 at full range, planes G, B, R. Y′CbCr and monochrome
+pictures (`encode(&AvifImage)`, the registry's planar layouts) are
+coded as they are, at 8, 10 or 12 bits. A lossless file says what it
+holds in both places a reader looks:
+
+| Where | Lossless RGB(A) |
+|---|---|
+| `colr` `nclx` on the colour item, on a grid and on each of its tiles | primaries 1, transfer 13, `matrix_coefficients` 0, `full_range_flag` 1 (or the caller's primaries / transfer) |
+| `pixi` | 8, 8, 8 (10s / 12s at depth); 8 on the alpha auxiliary |
+| `av1C` | High profile (Professional at 12 bits), `monochrome` 0, `chroma_subsampling_x` / `_y` 0 / 0 — mirrored from the sequence header (av1-avif §2.2.1) |
+| AV1 Sequence Header OBU | `color_description_present_flag` 1 with the same triple, `color_range` 1, 4:4:4 (AV1 §5.5.2 / §6.4.2) — every coded item, tiles included |
+| alpha auxiliary | monochrome, `color_range` 1 (av1-avif §4.1), lossless, the colour item's `clap` / `irot` / `imir` |
+
+The in-stream colour description mirrors the `nclx` at every quality
+(MIAF §7.3.6.4 gives the property precedence; a reader that takes a
+coded item's colour from the bitstream now sees the same thing).
+
+**Proof.** `tests/lossless_roundtrip.rs`: 180 one-call cells (9 extents
+from 1 × 1 to 100 × 37, odd ones included × RGB / RGBA × noise and
+structured content × five ways of asking), 73 `encode(&AvifImage)`
+cells (identity RGB with and without alpha at 8 / 10 / 12 bits, gray
+8 / 10 / 12, gray + alpha, 4:2:0 / 4:2:2 / 4:4:4 Y′CbCr), the registry
+option over packed and planar layouts, grids, orientation — all
+bit-exact through this crate's decoder. `tests/lossless_interop.rs`
+hands 16 lossless files to the readers installed on the host, each an
+opaque process, and compares the pixels they output with the source:
+
+| file | `avifdec` | `ffmpeg` | `magick` | `sips` |
+|---|---|---|---|---|
+| RGB / RGBA 8-bit at 16 × 16, 17 × 13, 64 × 48, 301 × 203 | exact | exact (colour; it reads the colour item) | exact | exact |
+| RGB / RGBA 1200 × 900 (3 × 2 grid, alpha grid) | exact | exact | exact | exact |
+| RGBA 21 × 10 with `irot` / `imir` (padded, alpha) | exact | exact | exact | exact (un-oriented: its converter leaves orientation to presentation) |
+| RGB 10-bit, 12-bit 33 × 17 | exact | exact | exact | — |
+| gray 8-bit 33 × 17 | exact | exact | exact | — |
+
+and the other way round, lossless identity-matrix files a black-box
+producer writes from PNGs (RGB and RGBA, three extents) decode to
+exactly the PNG's samples.
+
 ## Options
 
 `EncodeOptions` (`Default` = lossless): `base_q_idx` (AV1 quantizer,
 0 = lossless) or `with_quality(0..=100)` (`base_q_idx = ((100 − q) ×
-255 + 50) / 100`), `alpha_q_idx`, `premultiplied_alpha` (`prem`
-signalling), `chroma` for the RGB one-call paths, `embed_exif` /
+255 + 50) / 100`), `alpha_q_idx`, `lossless` (`with_lossless(true)`:
+colour and alpha exact, see "Lossless"), `premultiplied_alpha` (`prem`
+signalling), `chroma` for the lossy RGB one-call paths, `embed_exif` /
 `embed_xmp` / `embed_icc`, `speed` (`EncodeSpeed::Fast` default /
 `Balanced` / `Thorough` — the AV1 search effort; `Thorough` is the
 exhaustive search, minutes per 12 MP), `threads` (AV1 tile-search
@@ -161,7 +229,9 @@ alpha auxiliary follows `quality` when `alpha_q` is absent and
 `alpha_q` (explicit `base_q_idx`, win over `quality`), `chroma` (`420`
 default / `422` / `444`: the Y′CbCr layout a packed RGB(A) frame is
 coded in at a lossy quality; odd extents 4:4:4; lossless RGB keeps the
-byte-exact identity coding), `premultiplied`, `speed` (`fast` default
+byte-exact identity coding), `lossless` (`true`: colour and alpha
+lossless whatever `quality` / `q` / `alpha_q` say, RGB kept as
+identity-matrix RGB — see "Lossless"), `premultiplied`, `speed` (`fast` default
 / `balanced` / `thorough`: the AV1 search effort), `threads` (AV1
 tile-search workers and the grid's tile workers; `0` = the execution
 context's budget; the bytes never depend on it), `grid` (`auto`
@@ -255,6 +325,7 @@ On this Mac (macOS 26.6):
 | `Yuv420P10Le`, `Yuv444P12Le`, `Gray12Le` lossless | opens | opens | opens | opens | opens |
 | `Rgb24` lossy 4:2:0 / `chroma=444`, `Bgr24` lossless (identity), `Gbrp8`, `Gbrap10Le` | opens | opens | opens | opens | opens |
 | `Rgba` (alpha auxiliary), `Yuva420P` lossless, `Ya8` | opens | opens | opens | opens | opens |
+| lossless RGB / RGBA / 10-bit / 12-bit / gray, pixels compared (see "Lossless") | exact | exact | exact | — | exact |
 | `Bgra` with `premultiplied=true` (`prem` reference, HEIF §6.9.1) | no picture (reader gap) | opens | opens | opens | opens |
 | ICC + Exif + XMP items | opens | opens | opens | opens | opens |
 | 1200 × 900 `auto` grid (3 × 2), with alpha (3 × 2 + alpha), `grid=256` (5 × 4) | opens | opens | opens | opens | opens |
