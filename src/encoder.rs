@@ -931,18 +931,29 @@ fn packed_rgb(
         // Straight from the packed rows into the coding planes: no
         // packed copy, no 4:4:4 intermediate (the conversion is the
         // same arithmetic as the contract path's, pinned in the tests).
-        Some((color, chroma)) => packed_rgb_to_ycbcr(plane, w, h, bpp, rgb_at, color, chroma),
+        Some((color, chroma)) => {
+            packed_rgb_to_ycbcr(&plane.data, plane.stride, w, h, bpp, rgb_at, color, chroma)
+        }
+        // Identity matrix: the coding planes are the channels
+        // themselves (Y = G, Cb = B, Cr = R), filled straight from the
+        // packed rows.
         None => {
-            let mut rgb = Vec::with_capacity(w * h * 3);
+            let n = w * h;
+            let (mut y, mut u, mut v) = (
+                Vec::with_capacity(n),
+                Vec::with_capacity(n),
+                Vec::with_capacity(n),
+            );
             for row in 0..h {
                 let s = row * plane.stride;
                 for px in plane.data[s..s + row_bytes].chunks_exact(bpp) {
-                    rgb.push(px[rgb_at[0]]);
-                    rgb.push(px[rgb_at[1]]);
-                    rgb.push(px[rgb_at[2]]);
+                    v.push(u16::from(px[rgb_at[0]]));
+                    y.push(u16::from(px[rgb_at[1]]));
+                    u.push(u16::from(px[rgb_at[2]]));
                 }
             }
-            StillImage::rgb8(width, height, &rgb)?
+            StillImage::yuv(width, height, 8, StillChroma::Yuv444, y, u, v)?
+                .with_colr(identity_full_range_colr())
         }
     };
     if bpp == 4 {
@@ -983,8 +994,10 @@ fn ycbcr_scales(color: &ColorInfo) -> (f64, f64, f64, f64) {
 /// to 4:4:4. The same numbers as the contract path's conversion
 /// ([`crate::api_codec`]'s `still_of_rgb_in`) without its packed /
 /// 4:4:4 intermediates: the working set is the output planes.
-fn packed_rgb_to_ycbcr(
-    plane: &oxideav_core::frame::VideoPlane,
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn packed_rgb_to_ycbcr(
+    data: &[u8],
+    stride: usize,
     w: usize,
     h: usize,
     bpp: usize,
@@ -1015,9 +1028,9 @@ fn packed_rgb_to_ycbcr(
     let mut acc_u = vec![0u32; cw];
     let mut acc_v = vec![0u32; cw];
     for row in 0..h {
-        let s = row * plane.stride;
+        let s = row * stride;
         let cy = row >> sy;
-        for (x, px) in plane.data[s..s + w * bpp].chunks_exact(bpp).enumerate() {
+        for (x, px) in data[s..s + w * bpp].chunks_exact(bpp).enumerate() {
             let r = f64::from(px[rgb_at[0]]) / 255.0;
             let g = f64::from(px[rgb_at[1]]) / 255.0;
             let b = f64::from(px[rgb_at[2]]) / 255.0;
@@ -1245,7 +1258,7 @@ mod tests {
     use oxideav_core::frame::{VideoFrame, VideoPlane};
 
     /// The one-pass packed-RGB conversion is sample-identical to the
-    /// contract path's (`still_of_rgb_in`: 4:4:4 then box filter) for
+    /// general one (`still_of_rgb_general`: 4:4:4 then box filter) for
     /// every matrix the converter has a kernel for, both ranges, the
     /// three layouts, odd extents, BGR order and a padded stride.
     #[test]
@@ -1278,7 +1291,16 @@ mod tests {
                                 }
                             }
                             let plane = oxideav_core::frame::VideoPlane { stride, data };
-                            let fast = packed_rgb_to_ycbcr(&plane, w, h, bpp, order, color, chroma);
+                            let fast = packed_rgb_to_ycbcr(
+                                &plane.data,
+                                plane.stride,
+                                w,
+                                h,
+                                bpp,
+                                order,
+                                color,
+                                chroma,
+                            );
                             let mut rgb = Vec::with_capacity(w * h * 3);
                             for row in 0..h {
                                 for px in plane.data[row * stride..row * stride + w * bpp]
@@ -1291,7 +1313,7 @@ mod tests {
                                     ]);
                                 }
                             }
-                            let slow = crate::api_codec::still_of_rgb_in(
+                            let slow = crate::api_codec::still_of_rgb_general(
                                 w as u32, h as u32, &rgb, 3, color, chroma,
                             )
                             .expect("contract conversion");

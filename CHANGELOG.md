@@ -90,6 +90,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   time. An auxiliary without any keeps going through the colour
   item's transforms with it (`tests/fixtures/alpha_aux_without_clap.avif`).
 
+### Performance
+
+Byte-identical files; 12 MP (3024 × 4032), peak RSS of one operation
+per process (`examples/path_bench`, `/usr/bin/time -l`):
+
+- `encode_rgb8` / `encode_rgba8` at a lossy quality convert in one
+  pass from the caller's bytes into the coding planes (the registry's
+  converter; the general converter stays as the pinned reference and
+  the monochrome path): quality 60 on 1 worker 256 → 93 MiB (RGB),
+  308 → 133 MiB (RGBA).
+- Decode: a decoded item's planes move through the composition layer
+  (`to_heif_owned` / `from_heif_owned`), and an item whose output image
+  is consumed once is not memoised — registry decode of a 4:2:0 grid
+  99 → 65 MiB on 1 worker, 117 → 88 MiB on 8; lossless RGB 213 →
+  145 MiB.
+- `to_rgb8` / `to_rgba8`: identity-matrix 4:4:4 pictures are
+  interleaved directly, everything else is converted 64 rows at a time
+  (equal to the whole-picture conversion on an 840-cell matrix of
+  layouts, depths, ranges, kernels and band sizes): contract decode +
+  `to_rgba8` 214 → 111 MiB (lossy RGB), 330 → 190 MiB and 0.39 →
+  0.33 s on 8 workers (lossless RGB).
+- The registry's lossless packed-RGB path fills the coding planes
+  straight from the frame's rows (no packed copy).
+
 ### Changed
 
 - **Coded items are written at the picture's own extents.** A picture

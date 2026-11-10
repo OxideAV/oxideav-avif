@@ -318,6 +318,59 @@ layout box-filtered from the rounded 4:4:4 values — sample-identical
 to the contract path's conversion, pinned in the tests); the r477
 path kept a packed copy, a 16-bit RGB copy and a 4:4:4 intermediate.
 
+### Both paths, encode and decode
+
+`examples/path_bench` runs one encode or one decode per process
+through the contract API (`encode_rgb8` / `encode_rgba8` / `encode`,
+`decode_with` + `to_rgba8`) or the registry path, so the wall clock it
+prints and the process peak (`/usr/bin/time -l`) belong to that one
+operation. Same 12 MP picture (3024 × 4032 after orientation), `fast`
+(the default and fastest effort), quality 60 or lossless, 1 and 8
+workers; "before" is this crate at the start of the round (r486), the
+files are **byte-identical** before and after:
+
+| operation (12 MP) | peak RSS before → after, 1 worker | 8 workers | wall, 8 workers (min of 5, interleaved) |
+|---|---|---|---|
+| contract `encode_rgb8`, quality 60 | 256 → **93 MiB** | 307 → 140 MiB | 1.86 → 1.73 s |
+| contract `encode_rgba8`, quality 60 | 308 → **133 MiB** | 354 → 177 MiB | — |
+| contract decode + `to_rgba8`, lossy RGB file | 214 → **111 MiB** | 232 → 135 MiB | 0.176 → 0.167 s |
+| contract decode + `to_rgba8`, lossy RGBA file | 319 → **185 MiB** | 339 → 208 MiB | 0.223 → 0.209 s |
+| contract decode + `to_rgba8`, lossless RGB file | 330 → **190 MiB** | 360 → 231 MiB | 0.390 → 0.326 s |
+| contract decode + `to_rgba8`, lossless RGBA file | 401 → **264 MiB** | 430 → 304 MiB | — |
+| registry decode, 4:2:0 quality 60 | 99 → **65 MiB** | 117 → 88 MiB | 0.092 → 0.085 s |
+| registry decode, lossy RGBA file | 178 → 140 MiB | 202 → 161 MiB | — |
+| registry decode, lossless RGB file | 213 → 145 MiB | 238 → 187 MiB | 0.496 → 0.446 s (RGBA) |
+| registry encode, lossless `Rgb24` | 187 → 174 MiB | 260 → 243 MiB | 0.97 → 0.97 s |
+| registry encode, quality 60 (`Yuv420P` / `Rgb24` / `Rgba`) | 87 / 91 / 128 MiB, unchanged | 139 / 141 / 185 MiB | 1.31 → 1.38 s (noise) |
+
+What changed: `encode_rgb8` / `encode_rgba8` convert the caller's bytes
+to the coding planes in one pass (the registry's converter — no 16-bit
+RGB copy, no 4:4:4 intermediate); a decoded item's planes move through
+the composition layer instead of being cloned at each hand-over, and an
+item used once in the graph is no longer memoised (a 48-tile grid kept
+every tile twice, and the canvas twice); `to_rgb8` / `to_rgba8`
+interleave an identity-matrix picture directly and convert everything
+else 64 rows at a time (a whole-picture 16-bit RGBA intermediate
+before); lossless packed RGB goes straight into the coding planes.
+1 MP (1200 × 900): `encode_rgb8` quality 60 37 → 24 MiB, lossless
+decode + `to_rgba8` 40 → 23 MiB and 0.219 → 0.210 s.
+
+Where the time is (1 worker, `sample` profiles of the same runs): the
+AV1 codec holds 89–93 % of every encode and decode — lossless decode
+2.1 s: symbol decoding 49 % (`read_symbol` 36 %, `renormalize` 13 %)
+and coefficient reading 23 %; lossless encode 6.6 s: `write_symbol`
+44 %, CDF update 13 %; quality-60 encode 6.7–7.8 s: CDEF filtering
+13 %, forward DCT 10 %, loop-restoration search 14 %. On the contract
+decode of a lossy file the container crate's Y′CbCr → RGB converter is
+8 % and this crate's packing 6 %. For scale at 8 workers: quality-60
+encode 1.3–1.7 s, lossless encode 1.0–1.1 s, decode 0.085 s (lossy,
+planes) / 0.17 s (lossy, to RGBA) / 0.33–0.45 s (lossless); 1 MP:
+encode 0.23 s / 0.13 s (lossless), decode 0.025 s / 0.05 s (lossless).
+What is left on this side is the `StillImage` the encoders build from
+the caller's buffer (`u16` samples: 36 MiB for 12 MP 4:2:0, 73 MiB for
+RGB) — cutting grid tiles straight from the caller's rows would remove
+it.
+
 ## Interop
 
 `tests/interop.rs` hands every shape the registry encoder writes to

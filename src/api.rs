@@ -650,15 +650,48 @@ impl AvifImage {
         }
     }
 
-    /// The container crate's planar frame for this picture (the shape
-    /// its composition and colour layers work on).
-    pub(crate) fn to_heif_frame(&self) -> Result<oxideav_heif::HeifFrame> {
+    /// The whole-picture conversion [`Self::rgb_bytes`] is checked
+    /// against: the container crate's converter over one frame holding
+    /// every plane.
+    #[cfg(test)]
+    fn rgb_bytes_whole(&self, channels: usize, color: ColorInfo) -> Result<Vec<u8>> {
         let frame = AvifFrame::new(None, self.planes.clone());
-        crate::frame_bridge::to_heif(&frame, self.format, self.bit_depth, self.width, self.height)
+        let frame = crate::frame_bridge::to_heif(
+            &frame,
+            self.format,
+            self.bit_depth,
+            self.width,
+            self.height,
+        )?;
+        let rgb = oxideav_heif::rgb::to_rgb(&frame, Some(&color.to_heif_colr()))?;
+        let n = self.width as usize * self.height as usize;
+        let depth = rgb.bit_depth;
+        let max = (1u32 << depth) - 1;
+        let to8 = |v: u16| -> u8 {
+            if depth == 8 {
+                v as u8
+            } else {
+                ((u32::from(v).min(max) * 255 + max / 2) / max) as u8
+            }
+        };
+        let mut out = Vec::with_capacity(n * channels);
+        for px in rgb.data.chunks_exact(rgb.channels).take(n) {
+            out.extend_from_slice(&[to8(px[0]), to8(px[1]), to8(px[2])]);
+            if channels == 4 {
+                out.push(if rgb.channels >= 4 { to8(px[3]) } else { 255 });
+            }
+        }
+        Ok(out)
     }
 
     /// `channels` = 3 (RGB) or 4 (RGBA), 8 bits per channel, converted
     /// with `color`.
+    ///
+    /// Identity-matrix 4:4:4 pictures at full range (the planes are
+    /// G, B, R) are interleaved directly; everything else goes through
+    /// the container crate's converter a band of rows at a time, so
+    /// the working set is the output plus one band — never a second
+    /// (16-bit) copy of the whole picture.
     fn rgb_bytes(&self, channels: usize, color: ColorInfo) -> Result<Vec<u8>> {
         if !matches!(self.bit_depth, 8 | 10 | 12) {
             return Err(Error::invalid(format!(
@@ -666,37 +699,202 @@ impl AvifImage {
                 self.bit_depth
             )));
         }
-        let frame = self.to_heif_frame()?;
-        let colr = color.to_heif_colr();
-        let rgb = oxideav_heif::rgb::to_rgb(&frame, Some(&colr))?;
-        let n = self.width as usize * self.height as usize;
-        if rgb.channels < 3 || rgb.data.len() < n * rgb.channels {
-            return Err(Error::invalid(
-                "avif: RGB conversion returned fewer samples than the picture holds",
-            ));
+        if let Some(out) = self.identity_rgb_bytes(channels, color)? {
+            return Ok(out);
         }
-        let depth = rgb.bit_depth;
-        let max = (1u32 << depth) - 1;
-        let half = max / 2;
-        let to8 = |v: u16| -> u8 {
-            if depth == 8 {
-                v as u8
-            } else {
-                ((u32::from(v).min(max) * 255 + half) / max) as u8
+        self.banded_rgb_bytes(channels, color, RGB_BAND_ROWS)
+    }
+
+    /// The direct path of [`Self::rgb_bytes`]: `Some` for a planar
+    /// 4:4:4 picture under the H.273 identity matrix at full range —
+    /// `R = Cr`, `G = Y`, `B = Cb` sample for sample (§8.3), deeper
+    /// samples brought to 8 bits as `round(v × 255 / (2^d − 1))`.
+    fn identity_rgb_bytes(&self, channels: usize, color: ColorInfo) -> Result<Option<Vec<u8>>> {
+        let format = self.format;
+        let planar_444 = !format.is_packed_ya()
+            && format.plane_count() >= 3
+            && format.chroma_subsampling() == (0, 0);
+        if !planar_444
+            || color.matrix != 0
+            || !color.range.is_full()
+            || self.planes.len() != format.plane_count()
+            || format.bit_depth() != self.bit_depth
+        {
+            return Ok(None);
+        }
+        let (w, h) = (self.width as usize, self.height as usize);
+        if w == 0 || h == 0 {
+            return Err(Error::invalid("avif: zero-sized frame"));
+        }
+        let bps = format.bytes_per_sample();
+        let row_bytes = w * bps;
+        for plane in &self.planes {
+            if plane.stride < row_bytes || plane.data.len() < plane.stride * (h - 1) + row_bytes {
+                return Err(Error::invalid(format!(
+                    "avif: colour plane too short ({} bytes, stride {}, need {h} rows of {row_bytes})",
+                    plane.data.len(),
+                    plane.stride
+                )));
             }
+        }
+        let alpha = format.has_alpha().then(|| &self.planes[3]);
+        let (g, b, r) = (&self.planes[0], &self.planes[1], &self.planes[2]);
+        let mut out = vec![255u8; w * h * channels];
+        fn row(p: &Plane, y: usize, row_bytes: usize) -> &[u8] {
+            let s = y * p.stride;
+            &p.data[s..s + row_bytes]
+        }
+        let row_of = |p, y| row(p, y, row_bytes);
+        if bps == 1 {
+            for (y, dst) in out.chunks_exact_mut(w * channels).enumerate() {
+                let (rr, gr, br) = (row_of(r, y), row_of(g, y), row_of(b, y));
+                match (channels, alpha) {
+                    (4, Some(a)) => {
+                        let ar = row_of(a, y);
+                        for (x, px) in dst.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                            px[0] = rr[x];
+                            px[1] = gr[x];
+                            px[2] = br[x];
+                            px[3] = ar[x];
+                        }
+                    }
+                    _ => {
+                        for (x, px) in dst.chunks_exact_mut(channels).enumerate() {
+                            px[0] = rr[x];
+                            px[1] = gr[x];
+                            px[2] = br[x];
+                        }
+                    }
+                }
+            }
+        } else {
+            let max = (1u32 << self.bit_depth) - 1;
+            let half = max / 2;
+            let to8 = |row: &[u8], x: usize| -> u8 {
+                let v = u32::from(u16::from_le_bytes([row[2 * x], row[2 * x + 1]]));
+                ((v.min(max) * 255 + half) / max) as u8
+            };
+            for (y, dst) in out.chunks_exact_mut(w * channels).enumerate() {
+                let (rr, gr, br) = (row_of(r, y), row_of(g, y), row_of(b, y));
+                let ar = alpha.map(|a| row_of(a, y));
+                for (x, px) in dst.chunks_exact_mut(channels).enumerate() {
+                    px[0] = to8(rr, x);
+                    px[1] = to8(gr, x);
+                    px[2] = to8(br, x);
+                    if channels == 4
+                        && let Some(ar) = ar
+                    {
+                        px[3] = to8(ar, x);
+                    }
+                }
+            }
+        }
+        Ok(Some(out))
+    }
+
+    /// The general path of [`Self::rgb_bytes`]: the container crate's
+    /// conversion applied to bands of `band_rows` luma rows (an even
+    /// count, so a band starts on a chroma row of every sub-sampled
+    /// layout; chroma is replicated to its co-sited luma samples, so
+    /// the bands convert exactly as the whole picture would).
+    fn banded_rgb_bytes(
+        &self,
+        channels: usize,
+        color: ColorInfo,
+        band_rows: usize,
+    ) -> Result<Vec<u8>> {
+        let format = self.format;
+        let (w, h) = (self.width as usize, self.height as usize);
+        if w == 0 || h == 0 {
+            return Err(Error::invalid("avif: zero-sized frame"));
+        }
+        if self.planes.len() != format.plane_count() {
+            return Err(Error::invalid(format!(
+                "avif: {format:?} frame carries {} planes, expected {}",
+                self.planes.len(),
+                format.plane_count()
+            )));
+        }
+        let colr = color.to_heif_colr();
+        let bps = format.bytes_per_sample();
+        let (sx, sy) = format.chroma_subsampling();
+        let colour_planes = if format.plane_count() == 1 || format.is_packed_ya() {
+            1
+        } else {
+            3
         };
-        let mut out = Vec::with_capacity(n * channels);
-        for px in rgb.data.chunks_exact(rgb.channels).take(n) {
-            out.push(to8(px[0]));
-            out.push(to8(px[1]));
-            out.push(to8(px[2]));
-            if channels == 4 {
-                out.push(if rgb.channels >= 4 { to8(px[3]) } else { 255 });
+        let band_rows = band_rows.max(2) & !1;
+        let mut out = Vec::with_capacity(w * h * channels);
+        let mut row = 0usize;
+        while row < h {
+            let rows = band_rows.min(h - row);
+            let mut planes = Vec::with_capacity(self.planes.len());
+            for (i, plane) in self.planes.iter().enumerate() {
+                let chroma = (1..colour_planes).contains(&i);
+                let (first, count, cols) = if chroma {
+                    (row >> sy, rows.div_ceil(1 << sy), w.div_ceil(1 << sx))
+                } else if format.is_packed_ya() {
+                    (row, rows, w * 2)
+                } else {
+                    (row, rows, w)
+                };
+                let row_bytes = cols * bps;
+                let mut data = Vec::with_capacity(row_bytes * count);
+                for r in first..first + count {
+                    let s = r * plane.stride;
+                    let src = plane.data.get(s..s + row_bytes).ok_or_else(|| {
+                        Error::invalid(format!(
+                            "avif: plane {i} too short ({} bytes, stride {}) for row {r} of \
+                             {row_bytes} bytes",
+                            plane.data.len(),
+                            plane.stride
+                        ))
+                    })?;
+                    data.extend_from_slice(src);
+                }
+                planes.push(Plane::new(row_bytes, data));
             }
+            let band = crate::frame_bridge::to_heif_owned(
+                AvifFrame::new(None, planes),
+                format,
+                self.bit_depth,
+                self.width,
+                rows as u32,
+            )?;
+            let rgb = oxideav_heif::rgb::to_rgb(&band, Some(&colr))?;
+            let n = w * rows;
+            if rgb.channels < 3 || rgb.data.len() < n * rgb.channels {
+                return Err(Error::invalid(
+                    "avif: RGB conversion returned fewer samples than the picture holds",
+                ));
+            }
+            let depth = rgb.bit_depth;
+            let max = (1u32 << depth) - 1;
+            let half = max / 2;
+            let to8 = |v: u16| -> u8 {
+                if depth == 8 {
+                    v as u8
+                } else {
+                    ((u32::from(v).min(max) * 255 + half) / max) as u8
+                }
+            };
+            for px in rgb.data.chunks_exact(rgb.channels).take(n) {
+                out.push(to8(px[0]));
+                out.push(to8(px[1]));
+                out.push(to8(px[2]));
+                if channels == 4 {
+                    out.push(if rgb.channels >= 4 { to8(px[3]) } else { 255 });
+                }
+            }
+            row += rows;
         }
         Ok(out)
     }
 }
+
+/// Luma rows per band of the RGB conversion: 64 rows of a 12 MP
+/// picture are a few hundred kilobytes of intermediates.
+const RGB_BAND_ROWS: usize = 64;
 
 // ---------------------------------------------------------------------
 // Frames, header info, options
@@ -1453,6 +1651,143 @@ fn sequence_info(bytes: &[u8]) -> Result<ImageInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn lcg(n: usize, seed: u32) -> Vec<u8> {
+        let mut s = seed;
+        (0..n)
+            .map(|_| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (s >> 24) as u8
+            })
+            .collect()
+    }
+
+    /// Noise planes for `format` at `depth` bits (padded strides when
+    /// `pad` is set, so the stride-aware row walks are exercised).
+    fn noise_picture(
+        w: u32,
+        h: u32,
+        format: PixelFormat,
+        depth: u8,
+        pad: usize,
+        seed: u32,
+    ) -> AvifImage {
+        let (sx, sy) = format.chroma_subsampling();
+        let ya = format.is_packed_ya();
+        let colour = if format.plane_count() == 1 || ya {
+            1
+        } else {
+            3
+        };
+        let bps = format.bytes_per_sample();
+        let planes = (0..format.plane_count())
+            .map(|p| {
+                let chroma = (1..colour).contains(&p);
+                let (pw, ph) = if chroma {
+                    (
+                        (w as usize).div_ceil(1 << sx),
+                        (h as usize).div_ceil(1 << sy),
+                    )
+                } else {
+                    (w as usize * if ya { 2 } else { 1 }, h as usize)
+                };
+                let stride = pw * bps + pad;
+                let raw = lcg(pw * ph * 2, seed + p as u32 * 17);
+                let mut data = vec![0u8; stride * ph];
+                for y in 0..ph {
+                    for x in 0..pw {
+                        let v =
+                            u16::from_le_bytes([raw[2 * (y * pw + x)], raw[2 * (y * pw + x) + 1]])
+                                & ((1u16 << depth) - 1);
+                        if bps == 1 {
+                            data[y * stride + x] = v as u8;
+                        } else {
+                            data[y * stride + 2 * x..y * stride + 2 * x + 2]
+                                .copy_from_slice(&v.to_le_bytes());
+                        }
+                    }
+                }
+                Plane::new(stride, data)
+            })
+            .collect();
+        AvifImage::new(w, h, format, planes)
+            .unwrap()
+            .with_bit_depth(depth)
+    }
+
+    /// The direct identity path and the banded general path give the
+    /// bytes of the whole-picture conversion — every layout, depth,
+    /// range and kernel, heights that end mid-band and on an odd row,
+    /// bands of 2 rows up, padded strides.
+    #[test]
+    fn rgb_conversion_paths_equal_the_whole_picture_conversion() {
+        use PixelFormat as F;
+        let layouts = [
+            (F::Yuv420P, 8),
+            (F::Yuv422P, 8),
+            (F::Yuv444P, 8),
+            (F::Gray8, 8),
+            (F::Yuva420P, 8),
+            (F::Yuva422P, 8),
+            (F::Yuva444P, 8),
+            (F::Ya8, 8),
+            (F::Yuv420P10Le, 10),
+            (F::Yuv444P10Le, 10),
+            (F::Yuva444P12Le, 12),
+            (F::Yuv422P12Le, 12),
+            (F::Gray12Le, 12),
+            (F::Ya16Le, 10),
+        ];
+        let colours = [
+            ColorInfo::miaf_default(),
+            ColorInfo::miaf_default().with_range(ColorRange::Limited),
+            ColorInfo::new(ColorRange::Limited, 1, 1, 1),
+            ColorInfo::new(ColorRange::Full, 9, 16, 9),
+            ColorInfo::identity_full_range(),
+            ColorInfo::identity_full_range().with_range(ColorRange::Limited),
+        ];
+        let mut cells = 0;
+        for (format, depth) in layouts {
+            for &(w, h) in &[(1u32, 1u32), (7, 5), (16, 2), (33, 67), (64, 130)] {
+                for (c, colour) in colours.iter().enumerate() {
+                    let pad = if (w + h) % 2 == 0 { 0 } else { 6 };
+                    let img = noise_picture(w, h, format, depth, pad, w * 3 + h + c as u32)
+                        .with_color(*colour);
+                    for channels in [3usize, 4] {
+                        let want = img.rgb_bytes_whole(channels, *colour).unwrap();
+                        let label = format!("{format:?} {w}x{h} colour {c} x{channels}");
+                        assert!(img.rgb_bytes(channels, *colour).unwrap() == want, "{label}");
+                        for band in [2usize, 6, 64] {
+                            assert!(
+                                img.banded_rgb_bytes(channels, *colour, band).unwrap() == want,
+                                "{label} band {band}"
+                            );
+                        }
+                        cells += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(cells, 14 * 5 * 6 * 2);
+        // The identity path is taken where it applies, and only there.
+        let rgb = noise_picture(9, 4, F::Yuva444P, 8, 3, 1);
+        assert!(
+            rgb.identity_rgb_bytes(4, ColorInfo::identity_full_range())
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            rgb.identity_rgb_bytes(4, ColorInfo::miaf_default())
+                .unwrap()
+                .is_none()
+        );
+        // A plane that does not cover the picture is an error on both.
+        let mut short = noise_picture(8, 8, F::Yuv444P, 8, 0, 2);
+        short.planes[2].data.truncate(40);
+        assert!(short.try_to_rgb8().is_err());
+        short.color = ColorInfo::identity_full_range();
+        assert!(short.try_to_rgb8().is_err());
+    }
 
     fn ftyp(major: &[u8; 4], compat: &[&[u8; 4]]) -> Vec<u8> {
         let mut v = Vec::new();

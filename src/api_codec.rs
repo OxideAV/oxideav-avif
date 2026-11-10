@@ -350,7 +350,9 @@ fn picture_of(
         decode_item_output(hdr, target, 0, &mut ctx, true).map_err(from_core_err)?;
     opts.check_dims(composed.width, composed.height)?;
     let bit_depth = composed.format.bit_depth;
-    let (frame, format) = from_heif(&composed)?;
+    let (width, height) = (composed.width, composed.height);
+    // The composed planes move into the picture (no copy).
+    let (frame, format) = crate::frame_bridge::from_heif_owned(composed)?;
     // The output image's colour: the item's own `nclx` `colr` (a
     // reconstructed `tmap` carries the `tmap` item's — the alternate
     // colorimetry, HEIF Amd 1 §6.6.2.4.1), else what the container
@@ -375,8 +377,8 @@ fn picture_of(
         .and_then(|id| hdr.item_data(id).ok())
         .map(|b| b.into_owned());
     Ok(AvifImage {
-        width: composed.width,
-        height: composed.height,
+        width,
+        height,
         format,
         planes: frame.planes,
         color: ColorInfo::from_colr(colour.as_ref()),
@@ -1136,6 +1138,47 @@ pub(crate) fn still_of_rgb_in(
             data.len()
         )));
     }
+    if chroma != StillChroma::Monochrome {
+        // One pass from the caller's bytes into the coding planes (the
+        // registry encoder's converter): no 16-bit RGB copy, no 4:4:4
+        // intermediate. Sample-identical to the general path below,
+        // which stays for the monochrome target.
+        let mut still = crate::encoder::packed_rgb_to_ycbcr(
+            data,
+            width as usize * channels,
+            width as usize,
+            height as usize,
+            channels,
+            [0, 1, 2],
+            color,
+            chroma,
+        );
+        if channels == 4 {
+            let a: Vec<u16> = data
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|px| u16::from(px[3]))
+                .collect();
+            still = still.with_alpha(a)?;
+        }
+        return Ok(still);
+    }
+    still_of_rgb_general(width, height, data, channels, color, chroma)
+}
+
+/// The general RGB → coding-planes conversion (the container crate's
+/// converter to 4:4:4, then the box filter): the reference the
+/// one-pass converter is pinned against, and the path of the
+/// monochrome target. Geometry is checked by the caller.
+pub(crate) fn still_of_rgb_general(
+    width: u32,
+    height: u32,
+    data: &[u8],
+    channels: usize,
+    color: ColorInfo,
+    chroma: StillChroma,
+) -> Result<StillImage> {
     let colr = oxideav_heif::props::Colr::from(&color.to_colr());
     let rgb = oxideav_heif::rgb::RgbImage16::new(
         width,

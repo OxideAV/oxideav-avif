@@ -818,6 +818,11 @@ pub(crate) struct DecodeCtx {
     layer: Option<u16>,
     /// Worker budget handed to every AV1 item decode (`≥ 1`).
     threads: usize,
+    /// How many times each item's output image is asked for by the
+    /// graph (see [`item_uses`]); built on the first decode. An item
+    /// used once is never memoised — its image moves to its one
+    /// consumer instead of being cloned into the cache.
+    uses: Option<std::sync::Arc<std::collections::HashMap<u32, u32>>>,
 }
 
 impl DecodeCtx {
@@ -831,8 +836,36 @@ impl DecodeCtx {
             max_pixels: opts.max_pixels.unwrap_or(u64::MAX),
             layer: opts.layer,
             threads: opts.worker_count(),
+            uses: None,
         }
     }
+
+    /// `true` when more than one consumer asks for `item_id`'s output
+    /// image, so it is worth keeping after its first decode.
+    fn is_shared(&mut self, meta: &crate::meta::Meta, item_id: u32) -> bool {
+        let uses = self
+            .uses
+            .get_or_insert_with(|| std::sync::Arc::new(item_uses(meta)));
+        uses.get(&item_id).copied().unwrap_or(0) > 1
+    }
+}
+
+/// How often each item's output image is consumed by the item graph:
+/// once per item reference naming it as a target (a `dimg` input
+/// listed twice counts twice; any reference type counts, which only
+/// errs towards memoising), and once per master an auxiliary points at
+/// with `auxl` (the master's decode asks for the auxiliary).
+fn item_uses(meta: &crate::meta::Meta) -> std::collections::HashMap<u32, u32> {
+    let mut uses = std::collections::HashMap::new();
+    for e in &meta.irefs {
+        for &to in &e.to_ids {
+            *uses.entry(to).or_insert(0u32) += 1;
+        }
+        if &e.reference_type == b"auxl" {
+            *uses.entry(e.from_id).or_insert(0u32) += e.to_ids.len() as u32;
+        }
+    }
+    uses
 }
 
 /// An image item's output image (HEIF §6.3) — the container crate's
@@ -882,8 +915,15 @@ pub(crate) fn decode_item_output(
             "avif: derivation cycle through item {item_id}"
         )));
     }
-    if let Some(cached) = ctx.cache.get(&(item_id, with_alpha)) {
-        return Ok(cached.clone());
+    let shared = ctx.is_shared(&hdr.meta, item_id);
+    let memoised = if shared {
+        ctx.cache.get(&(item_id, with_alpha)).cloned()
+    } else {
+        // The one consumer takes the image a parallel pre-decode left.
+        ctx.cache.remove(&(item_id, with_alpha))
+    };
+    if let Some(cached) = memoised {
+        return Ok(cached);
     }
     if ctx.decodes >= MAX_ITEM_DECODES {
         return Err(Error::invalid(format!(
@@ -894,7 +934,9 @@ pub(crate) fn decode_item_output(
     ctx.stack.push(item_id);
     let result = decode_item_output_inner(hdr, item_id, depth, ctx, with_alpha);
     ctx.stack.pop();
-    if let Ok(image) = &result {
+    if let Ok(image) = &result
+        && shared
+    {
         ctx.cache.insert((item_id, with_alpha), image.clone());
     }
     result
@@ -1122,7 +1164,7 @@ fn decode_coded_item(
         w = iw;
         h = ih;
     }
-    to_heif(&frame, format, bit_depth, w, h).map_err(core_err)
+    crate::frame_bridge::to_heif_owned(frame, format, bit_depth, w, h).map_err(core_err)
 }
 
 /// Decode a `grid` derived item: decode each `dimg` input (its output
@@ -1233,6 +1275,7 @@ fn decode_tiles_parallel(
         max_pixels: ctx.max_pixels,
         layer: None,
         threads: per_tile,
+        uses: ctx.uses.clone(),
     };
     // (tile index, tile id, output, decodes spent)
     type TileOut = (usize, u32, Result<ItemImage>, u32);
@@ -1247,6 +1290,7 @@ fn decode_tiles_parallel(
                         let mut child = DecodeCtx {
                             stack: seed.stack.clone(),
                             cache: std::collections::HashMap::new(),
+                            uses: seed.uses.clone(),
                             ..*seed
                         };
                         let r = decode_item_output(hdr, tid, depth, &mut child, false);

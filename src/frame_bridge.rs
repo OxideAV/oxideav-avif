@@ -60,6 +60,62 @@ fn tight_plane(plane: &AvifPlane, row_bytes: usize, rows: usize, label: &str) ->
     Ok(out)
 }
 
+/// [`tight_plane`] of an owned plane: the buffer itself when it is
+/// already tight (the common case — no copy), a packed copy otherwise.
+fn tight_plane_owned(
+    plane: AvifPlane,
+    row_bytes: usize,
+    rows: usize,
+    label: &str,
+) -> Result<Vec<u8>> {
+    if rows > 0
+        && row_bytes > 0
+        && plane.stride == row_bytes
+        && plane.data.len() == row_bytes * rows
+    {
+        return Ok(plane.data);
+    }
+    tight_plane(&plane, row_bytes, rows, label)
+}
+
+/// [`to_heif`] consuming the frame: planes that are already tightly
+/// packed move into the container frame instead of being copied.
+pub(crate) fn to_heif_owned(
+    frame: AvifFrame,
+    format: AvifPixelFormat,
+    bit_depth: u8,
+    width: u32,
+    height: u32,
+) -> Result<HeifFrame> {
+    if format.is_packed_ya() || frame.planes.len() != format.plane_count() {
+        return to_heif(&frame, format, bit_depth, width, height);
+    }
+    if width == 0 || height == 0 {
+        return Err(Error::invalid("avif: zero-sized frame"));
+    }
+    let depth = depth_of(format, bit_depth);
+    let bps = format.bytes_per_sample();
+    let hf = HeifPixelFormat::new(chroma_of(format), depth, format.has_alpha())?;
+    let mut planes = Vec::with_capacity(hf.plane_count());
+    for (p, src) in frame.planes.into_iter().enumerate() {
+        let (pw, ph) = hf.plane_dims(p, width, height);
+        let row_bytes = pw as usize * bps;
+        let data = tight_plane_owned(src, row_bytes, ph as usize, "colour")?;
+        planes.push(Plane {
+            stride: row_bytes,
+            data,
+        });
+    }
+    let out = HeifFrame {
+        width,
+        height,
+        format: hf,
+        planes,
+    };
+    out.validate()?;
+    Ok(out)
+}
+
 /// Re-layout a crate-local frame as the container's planar frame.
 /// `bit_depth` is only consulted for [`AvifPixelFormat::Ya16Le`].
 pub(crate) fn to_heif(
@@ -164,6 +220,40 @@ pub(crate) fn from_heif(frame: &HeifFrame) -> Result<(AvifFrame, AvifPixelFormat
             })
             .collect()
     };
+    Ok((AvifFrame { pts: None, planes }, format))
+}
+
+/// [`from_heif`] consuming the frame: planes that are already tightly
+/// packed move into the crate-local frame instead of being copied.
+#[cfg_attr(not(feature = "registry"), allow(dead_code))]
+pub(crate) fn from_heif_owned(frame: HeifFrame) -> Result<(AvifFrame, AvifPixelFormat)> {
+    let hf = frame.format;
+    let gray = hf.chroma == Chroma::Mono;
+    let bps = hf.bytes_per_sample();
+    let already_tight = (0..frame.planes.len()).all(|i| {
+        let (w, h) = hf.plane_dims(i, frame.width, frame.height);
+        let row = w as usize * bps;
+        frame.planes[i].stride == row && frame.planes[i].data.len() == row * h as usize
+    });
+    if (gray && hf.has_alpha) || !already_tight {
+        return from_heif(&frame);
+    }
+    let (sx, sy) = hf.chroma.shift();
+    let format = AvifPixelFormat::from_layout(hf.bit_depth, sx as u8, sy as u8, gray, hf.has_alpha)
+        .ok_or_else(|| {
+            Error::unsupported(format!(
+                "avif: no pixel layout for {:?} {}-bit alpha={}",
+                hf.chroma, hf.bit_depth, hf.has_alpha
+            ))
+        })?;
+    let planes = frame
+        .planes
+        .into_iter()
+        .map(|p| AvifPlane {
+            stride: p.stride,
+            data: p.data,
+        })
+        .collect();
     Ok((AvifFrame { pts: None, planes }, format))
 }
 
