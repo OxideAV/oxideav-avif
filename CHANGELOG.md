@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.18](https://github.com/OxideAV/oxideav-avif/compare/v0.0.17...v0.0.18) - 2026-11-10
+
+### Other
+
+- README / tests: the lossless proof table and the grid paragraph describe the black-box readers by role
+- perf — one-pass RGB conversion on the contract encode, decoded planes moved (not cloned) through composition, single-use items not memoised, direct / banded to_rgba8; byte-identical files, 12 MP peak RSS 256 -> 93 MiB (encode_rgb8), 214 -> 111 MiB (decode + to_rgba8), 99 -> 65 MiB (registry decode)
+- image sequences with an alpha auxiliary track (+ loop count, ICC / Exif / XMP, threaded all-intra), coded items at the picture's own extents (no pad + clap), automatic grid freed from the 100-box ipco cap, 1-pixel sub-sampled layouts decoded by the av1C record
+- true lossless — explicit lossless option (contract + registry), encode_rgb8 / encode_rgba8 exact at quality 100 (identity-matrix 4:4:4 RGB), colour description in the AV1 sequence header, colr / pixi on grid tiles, clap / irot / imir on the alpha auxiliary, decoder attaches a transformed alpha to the output image
+- API hygiene: #[non_exhaustive] on AvifPixelFormat and EncodeSpeed
+
 ### Added
 
 - **Explicit lossless option.** `EncodeOptions::lossless` /
