@@ -381,9 +381,9 @@ fn cases() -> Vec<Case> {
 /// Bring what a reader produced to the source's scale and compare.
 /// `None` = identical; `Some(description)` otherwise.
 fn mismatch(reader: &str, case: &Case, seen: &[u8]) -> Option<String> {
-    // `sips` converts the stored picture and leaves `irot` / `imir` to
-    // whoever presents it: it must reproduce the un-oriented source
-    // (colour and alpha alike).
+    // The OS image tool converts the stored picture and leaves `irot`
+    // / `imir` to whoever presents it: it must reproduce the
+    // un-oriented source (colour and alpha alike).
     let source = match (&case.unoriented, reader) {
         (Some(plain), "sips") => plain,
         _ => &case.expect,

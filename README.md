@@ -177,14 +177,15 @@ cells (identity RGB with and without alpha at 8 / 10 / 12 bits, gray
 8 / 10 / 12, gray + alpha, 4:2:0 / 4:2:2 / 4:4:4 Y′CbCr), the registry
 option over packed and planar layouts, grids, orientation — all
 bit-exact through this crate's decoder. `tests/lossless_interop.rs`
-hands 16 lossless files to the readers installed on the host, each an
-opaque process, and compares the pixels they output with the source:
+hands 16 lossless files to the readers installed on the host (the four
+pixel-producing ones of the "Interop" table below), each an opaque
+process, and compares the pixels they output with the source:
 
-| file | `avifdec` | `ffmpeg` | `magick` | `sips` |
+| file | AVIF decoder CLI | media framework CLI | image toolkit CLI | OS image tool |
 |---|---|---|---|---|
 | RGB / RGBA 8-bit at 16 × 16, 17 × 13, 64 × 48, 301 × 203 | exact | exact (colour; it reads the colour item) | exact | exact |
 | RGB / RGBA 1200 × 900 (3 × 2 grid, alpha grid) | exact | exact | exact | exact |
-| RGBA 21 × 10 with `irot` / `imir` (padded, alpha) | exact | exact | exact | exact (un-oriented: its converter leaves orientation to presentation) |
+| RGBA 21 × 10 with `irot` / `imir` (alpha) | exact | exact | exact | exact (un-oriented: its converter leaves orientation to presentation) |
 | RGB 10-bit, 12-bit 33 × 17 | exact | exact | exact | — |
 | gray 8-bit 33 × 17 | exact | exact | exact | — |
 
@@ -284,9 +285,9 @@ those readers' 1 000-item ceiling: `auto` keeps colour + alpha tiles
 under `AUTO_GRID_MAX_TILES` (900) by doubling the tile edge
 (16384 × 16384 → 16 × 16 tiles of 1024); an explicit `grid=<edge>` is
 honoured as given (`grid=256` on 12 MP is 192 tiles and opens
-everywhere; `grid=128` with alpha is 1 538 items, which
-`magick identify` / `heif-info` / `ffmpeg` refuse). `elect_grid_for`
-is the election table.
+everywhere; `grid=128` with alpha is 1 538 items, which three of the
+five installed readers refuse). `elect_grid_for` is the election
+table.
 
 Same picture as above at `quality` 60, `/usr/bin/time -l` around
 `examples/encode_budget` (the process holds the source frame and
@@ -355,7 +356,7 @@ before); lossless packed RGB goes straight into the coding planes.
 1 MP (1200 × 900): `encode_rgb8` quality 60 37 → 24 MiB, lossless
 decode + `to_rgba8` 40 → 23 MiB and 0.219 → 0.210 s.
 
-Where the time is (1 worker, `sample` profiles of the same runs): the
+Where the time is (1 worker, sampling profiles of the same runs): the
 AV1 codec holds 89–93 % of every encode and decode — lossless decode
 2.1 s: symbol decoding 49 % (`read_symbol` 36 %, `renormalize` 13 %)
 and coefficient reading 23 %; lossless encode 6.6 s: `write_symbol`
