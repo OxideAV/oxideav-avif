@@ -995,20 +995,25 @@ fn grid_policy_elects_shapes_and_tiles_code_on_the_budget() {
     assert_eq!(elect(500, 500, false, GridTiling::MaxTile(8)), Some((8, 8)));
     assert_eq!(elect(0, 10, false, GridTiling::Auto), None);
     assert!(elect_grid_for(5000, 0, false, GridTiling::Single).is_err());
-    // The reader-side ipco cap: colour + alpha tiles stay under
-    // AUTO_GRID_MAX_TILES by doubling the tile edge (12 MP with alpha
-    // = 2 × 12 tiles of 1024; 48 MP = 48 tiles of 1024, 96 with alpha
-    // would exceed it so 2048: 4 × 3); an explicit edge is honoured.
-    assert_eq!(elect(4032, 3024, true, GridTiling::Auto), Some((4, 3)));
-    assert_eq!(elect(8000, 6000, false, GridTiling::Auto), Some((8, 6)));
-    assert_eq!(elect(8000, 6000, true, GridTiling::Auto), Some((4, 3)));
+    // The tiles of a grid share their properties, so alpha no longer
+    // coarsens the tiling: 12 MP with alpha is 2 × 48 tiles of 512.
+    // What bounds an automatic grid is the readers' item ceiling —
+    // colour + alpha tiles stay under AUTO_GRID_MAX_TILES by doubling
+    // the tile edge (16384 × 16384 would be 1024 tiles of 512: 256 of
+    // 1024 instead; with alpha 2 × 256); an explicit edge is honoured.
+    assert_eq!(elect(4032, 3024, true, GridTiling::Auto), Some((8, 6)));
+    assert_eq!(elect(8000, 6000, false, GridTiling::Auto), Some((16, 12)));
+    assert_eq!(elect(8000, 6000, true, GridTiling::Auto), Some((16, 12)));
+    assert_eq!(elect(16384, 16384, false, GridTiling::Auto), Some((16, 16)));
+    assert_eq!(elect(16384, 16384, true, GridTiling::Auto), Some((16, 16)));
+    assert_eq!(elect(16384, 8192, true, GridTiling::Auto), Some((16, 8)));
     assert_eq!(
         elect(4032, 3024, true, GridTiling::MaxTile(256)),
         Some((16, 12))
     );
     assert_eq!(AUTO_GRID_TILE, 512);
     assert_eq!(AUTO_GRID_MAX_SINGLE_PIXELS, 1 << 20);
-    assert_eq!(AUTO_GRID_MAX_TILES, 90);
+    assert_eq!(AUTO_GRID_MAX_TILES, 900);
     assert_eq!(STILL_MAX_CODED_DIM, 4096);
 
     let ctx = registry();

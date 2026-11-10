@@ -777,7 +777,14 @@ fn sequence_picture(
         (w, h, format, planes)
     };
     opts.check_dims(w, h)?;
-    Ok(AvifImage::new(w, h, format, planes)?.with_color(ColorInfo::from(seq.signal)))
+    Ok(AvifImage::new(w, h, format, planes)?
+        .with_color(ColorInfo::from(seq.signal))
+        .with_metadata(Metadata::new(
+            presentation.icc.clone(),
+            presentation.exif.clone(),
+            presentation.xmp.clone(),
+            None,
+        )))
 }
 
 /// Decode the primary picture with [`DecodeOptions::default`] — a
@@ -1007,11 +1014,12 @@ fn still_of(image: &AvifImage, opts: &EncodeOptions) -> Result<StillImage> {
 /// colour, ICC, alpha auxiliary and `clap`, Exif / XMP on the primary).
 /// Frames with a `delay` become the samples of an `avis` image
 /// sequence ([`crate::encode_sequence`] at timescale 1000 with each
-/// frame's delay in milliseconds, `opts.base_q_idx` as the quality);
-/// every frame must then carry a delay, since an `avis` file holds
-/// samples only, and the sequence encoder carries no alpha
-/// (`Error::Unsupported`). All frames share frame 0's geometry, depth
-/// and chroma layout.
+/// frame's delay in milliseconds, the options' colour and alpha
+/// quantisers, speed and threads); every frame must then carry a
+/// delay, since an `avis` file holds samples only. Alpha rides as the
+/// alpha auxiliary track (all frames carry it, or none), frame 0's
+/// Exif / XMP describe the sequence. All frames share frame 0's
+/// geometry, depth and chroma layout.
 ///
 /// `decode_all(encode_all(frames)) == frames` holds for planes and
 /// colour at the lossless default (`base_q_idx = 0`); burst members
@@ -1050,9 +1058,18 @@ pub fn encode_all(frames: &[Frame], opts: &EncodeOptions) -> Result<Vec<u8>> {
                 .unwrap_or(0)
         })
         .collect();
+    // Pictures off the 8-pixel grid are coded all-intra at their own
+    // extents: the KEY + P coder would pad them and rely on the sample
+    // entry's `clap`, which not every player applies to a track.
+    let first = &frames[0].image;
+    let off_grid = !first.width.is_multiple_of(8) || !first.height.is_multiple_of(8);
     let seq_opts = crate::sequence::SequenceEncodeOptions::default()
+        .with_all_intra(off_grid)
         .with_timescale(1000)
-        .with_base_q_idx(opts.colour_q_idx());
+        .with_base_q_idx(opts.colour_q_idx())
+        .with_alpha_q_idx(opts.alpha_plane_q_idx())
+        .with_speed(opts.speed)
+        .with_threads(opts.threads);
     crate::sequence::encode_sequence_timed(&stills, &seq_opts, Some(&durations))
 }
 
@@ -1311,7 +1328,8 @@ mod tests {
             assert_eq!(got.image.color, want.image.color, "sample {i} colour");
         }
 
-        // Rejections: nothing; mixed timed / untimed; alpha in a sequence.
+        // Rejections: nothing; mixed timed / untimed. Alpha in a
+        // sequence rides the alpha auxiliary track and comes back.
         assert!(matches!(encode_all(&[], &opts), Err(Error::InvalidData(_))));
         let mixed = [seq[0].clone(), burst[0].clone()];
         assert!(matches!(
@@ -1322,10 +1340,12 @@ mod tests {
             Frame::new(pic(1, true), Some(Duration::from_millis(10))),
             Frame::new(pic(2, true), Some(Duration::from_millis(10))),
         ];
-        assert!(matches!(
-            encode_all(&timed_alpha, &opts),
-            Err(Error::Unsupported(_))
-        ));
+        let back = decode_all(&encode_all(&timed_alpha, &opts).unwrap()).unwrap();
+        assert_eq!(back.len(), 2);
+        for (got, want) in back.iter().zip(&timed_alpha) {
+            assert_eq!(got.image.planes, want.image.planes);
+            assert_eq!(got.delay, want.delay);
+        }
         // Fallible constructors.
         assert!(matches!(
             AvifImage::from_rgb8(2, 2, vec![0; 11]),

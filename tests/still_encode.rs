@@ -238,40 +238,42 @@ fn depth_format_matrix_round_trips_exact() {
     }
 }
 
-/// Arbitrary (non-multiple-of-8) extents: the coded frame pads with
-/// edge replication, `ispe` documents the coded extents (av1-avif
-/// §2.2.2 `shall`), and the emitted top-left-anchored `clap`
-/// (av1-avif §2.2.3) crops the decode back to the requested pixels
-/// exactly.
+/// Arbitrary (non-multiple-of-8) extents are coded as they are: the
+/// AV1 frame has the picture's size, `ispe` documents it (av1-avif
+/// §2.2.2 `shall`), there is nothing to crop (no `clap`), and the
+/// decode is the requested pixels exactly.
 #[test]
-fn odd_dimensions_pad_and_clap_back_exact() {
+fn odd_dimensions_code_at_their_own_extents_exact() {
     // 4:4:4 (odd × odd), monochrome (odd), 4:2:0 (even but not
     // multiple of 8).
     let cases = [
         (17u32, 11u32, StillChroma::Yuv444),
         (9, 9, StillChroma::Monochrome),
         (18, 10, StillChroma::Yuv420),
+        (1, 1, StillChroma::Yuv444),
+        (3, 250, StillChroma::Monochrome),
     ];
     for (w, h, chroma) in cases {
         let label = format!("{w}x{h} {chroma:?}");
         let img = build_image(w, h, 8, chroma);
         let avif = encode_still(&img, &EncodeOptions::default())
             .unwrap_or_else(|e| panic!("{label}: encode failed: {e}"));
-        // ispe documents the padded coded extents; clap carries the
-        // display crop.
         let info = inspect(&avif).expect("inspect");
-        assert_eq!(info.width % 8, 0, "{label}: coded width padded");
-        assert_eq!(info.height % 8, 0, "{label}: coded height padded");
+        assert_eq!((info.width, info.height), (w, h), "{label}: ispe");
+        let parsed = parse(&avif).expect("parse");
+        assert!(
+            !parsed
+                .meta
+                .properties_for(parsed.primary_item_id)
+                .iter()
+                .any(|p| matches!(p, oxideav_avif::meta::Property::Clap(_))),
+            "{label}: no clap"
+        );
         assert!(audit_mif1(&avif).expect("audit").is_compliant());
 
         let vf = decode_own(&label, &avif);
-        // The decoder applies clap — the output is the requested rect.
-        assert_eq!(vf.planes[0].stride as u32, w, "{label}: cropped width");
-        assert_eq!(
-            vf.planes[0].data.len(),
-            (w * h) as usize,
-            "{label}: cropped size"
-        );
+        assert_eq!(vf.planes[0].stride as u32, w, "{label}: width");
+        assert_eq!(vf.planes[0].data.len(), (w * h) as usize, "{label}: size");
         assert_eq!(vf.planes[0].data, narrow(&img.y), "{label}: Y exact");
     }
 }

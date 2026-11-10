@@ -19,6 +19,22 @@
 //!   `stco` and — when not every sample is a sync sample — `stss`
 //!   (14496-12 §8.6.2: absence means every sample is sync).
 //! * `mdat` — the AV1 temporal units, one per sample (binding §2.4).
+//! * Frames with an alpha plane add an **alpha auxiliary track** (HEIF
+//!   §7.5.3, av1-avif §4.1): a second `av01` track with the `auxv`
+//!   handler, an `auxl` track reference to the picture track and the
+//!   alpha URN in its sample entry's `auxi`; its samples are
+//!   monochrome, full-range KEY frames at the picture's depth, one per
+//!   picture sample with the same duration (the time-parallel sample
+//!   is the picture's alpha).
+//! * [`SequenceEncodeOptions::loop_count`] writes the edit list MIAF
+//!   reads the repetition count from; Exif / XMP of the first frame
+//!   ride as items of the picture track's `meta`.
+//!
+//! All-intra samples are coded at the picture's own extents; KEY + P
+//! groups at the extents rounded up to a multiple of 8 with a `clap`
+//! in the sample entry cropping back (some players scale the decoded
+//! frame to the `tkhd` size instead of applying that `clap`, so
+//! [`crate::encode_all`] codes off-grid pictures all-intra).
 //!
 //! Frames are coded either all-intra (every sample a KEY frame, one
 //! Sequence Header per sample — §3 requires repeated headers to be
@@ -33,9 +49,9 @@ use crate::mux::{
     ProfileBrand, prop_av1c, prop_clap, prop_colr, prop_ispe, prop_pixi, sequence_brands,
 };
 use crate::still::{
-    CodedTuning, STILL_MAX_CODED_DIM, StillImage, av1_err, av1c_from_seq, coded_extent,
-    colr_is_full_range, encode_coded_item, pad_plane, pixi_bits, resignalled_temporal_unit,
-    stream_colour_description, top_left_clap,
+    CodedTuning, STILL_MAX_CODED_DIM, StillImage, av1_err, av1c_from_seq, code_in_parallel,
+    coded_extent, colr_is_full_range, encode_coded_item, item_extent, pad_plane, pixi_bits,
+    resignalled_temporal_unit, stream_colour_description, top_left_clap,
 };
 use oxideav_av1::encoder::inter_frame::{GOP_MAX_FRAMES, encode_gop_yuv_with_q};
 use oxideav_av1::encoder::yuv_frame::YuvFrame;
@@ -57,6 +73,22 @@ pub struct SequenceEncodeOptions {
     /// Frames per KEY + P group, 1..=`GOP_MAX_FRAMES` (64). Ignored
     /// when `all_intra`.
     pub gop_length: usize,
+    /// AV1 `base_q_idx` of the alpha auxiliary track's samples; `0` =
+    /// lossless (the default).
+    pub alpha_q_idx: u8,
+    /// How often the sequence plays: `None` (default) writes no edit
+    /// list, which players read as "indefinitely"; `Some(0)` states
+    /// "indefinitely" explicitly; `Some(n)` plays it `n` times (MIAF
+    /// Annex A.2: an `elst` over the media with the repeat flag and the
+    /// track duration multiplied).
+    pub loop_count: Option<u32>,
+    /// Worker threads: all-intra samples (and the alpha track's) are
+    /// independent pictures and are coded on up to this many workers;
+    /// the bytes never depend on it. Default `1`.
+    pub threads: usize,
+    /// AV1 search effort of the all-intra and alpha samples (default
+    /// [`EncodeSpeed::Fast`]).
+    pub speed: EncodeSpeed,
 }
 
 impl SequenceEncodeOptions {
@@ -78,6 +110,7 @@ impl SequenceEncodeOptions {
             base_q_idx,
             all_intra,
             gop_length,
+            ..Self::default()
         }
     }
     /// Setter: replace `timescale`.
@@ -105,6 +138,26 @@ impl SequenceEncodeOptions {
         self.gop_length = gop_length;
         self
     }
+    /// Setter: replace `alpha_q_idx`.
+    pub fn with_alpha_q_idx(mut self, alpha_q_idx: u8) -> Self {
+        self.alpha_q_idx = alpha_q_idx;
+        self
+    }
+    /// Setter: replace `loop_count`.
+    pub fn with_loop_count(mut self, loop_count: Option<u32>) -> Self {
+        self.loop_count = loop_count;
+        self
+    }
+    /// Setter: replace `threads` (clamped to at least 1).
+    pub fn with_threads(mut self, threads: usize) -> Self {
+        self.threads = threads.max(1);
+        self
+    }
+    /// Setter: replace `speed`.
+    pub fn with_speed(mut self, speed: EncodeSpeed) -> Self {
+        self.speed = speed;
+        self
+    }
 }
 
 impl Default for SequenceEncodeOptions {
@@ -115,14 +168,20 @@ impl Default for SequenceEncodeOptions {
             base_q_idx: 0,
             all_intra: false,
             gop_length: GOP_MAX_FRAMES,
+            alpha_q_idx: 0,
+            loop_count: None,
+            threads: 1,
+            speed: EncodeSpeed::Fast,
         }
     }
 }
 
 /// Encode `frames` as an `avis` image sequence. Every frame must share
-/// one width, height, bit depth and chroma layout; alpha / depth
-/// auxiliaries are not carried (an auxiliary image sequence track is
-/// out of scope here).
+/// one width, height, bit depth and chroma layout. When the frames
+/// carry an alpha plane (all of them, or none) it is written as the
+/// alpha auxiliary track; depth maps are not carried. The first
+/// frame's Exif / XMP ([`crate::StillProperties`]) describe the whole
+/// sequence.
 pub fn encode_sequence(frames: &[StillImage], opts: &SequenceEncodeOptions) -> Result<Vec<u8>> {
     encode_sequence_timed(frames, opts, None)
 }
@@ -158,7 +217,15 @@ pub(crate) fn encode_sequence_timed(
             opts.gop_length
         )));
     }
-    let (pw, ph) = (coded_extent(first.width), coded_extent(first.height));
+    // KEY frames are coded at the picture's own extents; the KEY + P
+    // group coder works on the 8 × 8 mode-info grid, so off-grid
+    // pictures are edge-padded there and cropped back by the sample
+    // entry's `clap`.
+    let (pw, ph) = if opts.all_intra {
+        (item_extent(first.width), item_extent(first.height))
+    } else {
+        (coded_extent(first.width), coded_extent(first.height))
+    };
     if pw > STILL_MAX_CODED_DIM || ph > STILL_MAX_CODED_DIM {
         return Err(Error::unsupported(format!(
             "avif sequence: coded extents {pw}x{ph} exceed {STILL_MAX_CODED_DIM}"
@@ -182,10 +249,22 @@ pub(crate) fn encode_sequence_timed(
                 first.chroma
             )));
         }
-        if f.alpha.is_some() || f.depth_map.is_some() {
+        if f.depth_map.is_some() {
             return Err(Error::unsupported(
-                "avif sequence: auxiliary (alpha / depth) image sequences are not supported",
+                "avif sequence: depth-map auxiliary sequences are not supported",
             ));
+        }
+        if f.alpha.is_some() != first.alpha.is_some() {
+            return Err(Error::invalid(format!(
+                "avif sequence: frame {i} {} an alpha plane but frame 0 {} — the alpha \
+                 auxiliary track needs one sample per picture",
+                if f.alpha.is_some() { "has" } else { "lacks" },
+                if first.alpha.is_some() {
+                    "has one"
+                } else {
+                    "has none"
+                },
+            )));
         }
         let (w, h) = (f.width as usize, f.height as usize);
         let y = pad_plane(&f.y, w, h, pw as usize, ph as usize);
@@ -217,9 +296,15 @@ pub(crate) fn encode_sequence_timed(
     let mut samples: Vec<(Vec<u8>, bool)> = Vec::with_capacity(frames.len());
     let mut av1c: Option<Vec<u8>> = None;
     let mut seq_profile = 0u8;
+    let threads = opts.threads.max(1);
+    let workers =
+        oxideav_core::ExecutionContext::with_threads(threads).effective_workers(frames.len());
+    let tuning = CodedTuning::sequence(opts.speed, (threads / workers).max(1));
     if opts.all_intra {
-        for f in &yuv {
-            let coded = encode_coded_item(
+        // Independent KEY frames: coded on the workers, in sample order.
+        let coded = code_in_parallel(yuv.len(), workers, &|i| {
+            let f = &yuv[i];
+            encode_coded_item(
                 pw,
                 ph,
                 f.bit_depth,
@@ -230,9 +315,11 @@ pub(crate) fn encode_sequence_timed(
                 opts.base_q_idx,
                 full_range,
                 colour,
-                CodedTuning::sequence(EncodeSpeed::Fast, 1),
+                tuning,
                 "sequence frame",
-            )?;
+            )
+        })?;
+        for coded in coded {
             if av1c.is_none() {
                 av1c = Some(coded.av1c);
                 seq_profile = coded.seq_profile;
@@ -298,6 +385,11 @@ pub(crate) fn encode_sequence_timed(
         entry_properties.push(colr.clone());
         props.push((colr, false));
     }
+    if let Some(icc) = first.props.icc.as_ref().filter(|p| !p.is_empty()) {
+        let (colr, _) = prop_colr(&crate::meta::Colr::Icc(icc.clone()))?;
+        entry_properties.push(colr.clone());
+        props.push((colr, false));
+    }
     if let Some(c) = clap.as_ref() {
         let (clap, essential) = prop_clap(c);
         entry_properties.push(clap.clone());
@@ -324,11 +416,83 @@ pub(crate) fn encode_sequence_timed(
     still.set_primary(cover);
     writer.still = Some(still);
     writer.cover_sample = Some(0);
-    for (i, (data, sync)) in samples.into_iter().enumerate() {
-        let duration = durations
+    let duration_of = |i: usize| {
+        durations
             .and_then(|d| d.get(i).copied())
-            .unwrap_or(opts.frame_duration);
-        writer.push_sample(data, duration, sync);
+            .unwrap_or(opts.frame_duration)
+    };
+    for (i, (data, sync)) in samples.into_iter().enumerate() {
+        writer.push_sample(data, duration_of(i), sync);
+    }
+    if first.alpha.is_some() {
+        // The alpha auxiliary track: one monochrome, full-range KEY
+        // frame per picture sample at the picture's depth and coded
+        // extents (av1-avif §4.1), time-parallel by construction (the
+        // same durations).
+        let (w, h) = (first.width as usize, first.height as usize);
+        let coded = code_in_parallel(frames.len(), workers, &|i| {
+            let alpha = frames[i]
+                .alpha
+                .as_ref()
+                .ok_or_else(|| Error::invalid("avif sequence: alpha plane vanished"))?;
+            encode_coded_item(
+                pw,
+                ph,
+                first.bit_depth,
+                oxideav_av1::encoder::yuv_frame::ChromaFormat::Monochrome,
+                pad_plane(alpha, w, h, pw as usize, ph as usize),
+                Vec::new(),
+                Vec::new(),
+                opts.alpha_q_idx,
+                true,
+                None,
+                tuning,
+                "sequence alpha frame",
+            )
+        })?;
+        let mut alpha_config = None;
+        let mut alpha_samples = Vec::with_capacity(coded.len());
+        for (i, item) in coded.into_iter().enumerate() {
+            if alpha_config.is_none() {
+                alpha_config = Some(prop_av1c(&item.av1c, "sequence alpha ")?.0);
+            }
+            alpha_samples.push(oxideav_heif::writer::SequenceSample::new(
+                item.payload,
+                duration_of(i),
+                true,
+            ));
+        }
+        let mut alpha_entry = Vec::new();
+        if let Some(c) = clap.as_ref() {
+            alpha_entry.push(prop_clap(c).0);
+        }
+        writer.alpha = Some(oxideav_heif::writer::SequenceAlphaTrack::new(
+            *b"av01",
+            alpha_config.expect("at least one alpha sample"),
+            pw as u16,
+            ph as u16,
+            crate::alpha::ALPHA_URN_PREFIX.to_string(),
+            alpha_samples,
+            alpha_entry,
+        ));
+    }
+    if let Some(count) = opts.loop_count {
+        writer = writer.with_looping(match count {
+            0 => oxideav_heif::sequence::LoopBehaviour::Forever,
+            n => oxideav_heif::sequence::LoopBehaviour::Times(u64::from(n)),
+        });
+    }
+    // Exif (the item body carries the 4-byte offset word; the track
+    // `meta` takes the payload from the TIFF header on) and XMP of the
+    // first frame describe the whole sequence (HEIF §8.3).
+    if let Some(body) = first.props.exif.as_ref().filter(|b| b.len() > 4) {
+        let offset = u32::from_be_bytes([body[0], body[1], body[2], body[3]]) as usize;
+        if let Some(tiff) = body.get(4 + offset..).filter(|t| !t.is_empty()) {
+            writer = writer.with_exif(Some(tiff.to_vec()));
+        }
+    }
+    if let Some(xmp) = first.props.xmp.as_ref().filter(|x| !x.is_empty()) {
+        writer = writer.with_xmp(Some(xmp.clone()));
     }
     Ok(writer.write_to_vec()?)
 }

@@ -66,6 +66,11 @@ fn installed(program: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The readers that only write PNG need one of the raw converters.
+fn raw_converter_installed() -> bool {
+    installed("magick") || installed("ffmpeg")
+}
+
 /// A PNG written by a reader, as tightly packed samples in `layout`
 /// (8-bit RGBA / gray, or 16-bit little-endian RGB words) — converted
 /// by whichever raw converter is installed.
@@ -203,6 +208,9 @@ fn read_with(reader: &str, file: &Path, dir: &Path, layout: Layout) -> Seen {
             })
         }
         "avifdec" => {
+            if !raw_converter_installed() {
+                return Seen::Skipped;
+            }
             let mut args = Vec::new();
             if deep {
                 args.extend(["-d".into(), "16".into()]);
@@ -211,7 +219,7 @@ fn read_with(reader: &str, file: &Path, dir: &Path, layout: Layout) -> Seen {
             run("avifdec", &args).map(|ok| ok.then(|| png_to_raw(&png, &raw, layout)).flatten())
         }
         "sips" => {
-            if layout != Layout::Rgba8 {
+            if layout != Layout::Rgba8 || !raw_converter_installed() {
                 return Seen::Skipped;
             }
             run(
@@ -535,4 +543,107 @@ fn identity_matrix_files_from_a_black_box_producer_decode_exactly() {
     }
     println!("{checked} black-box lossless files decoded exactly");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A lossless RGBA image sequence (picture track + alpha auxiliary
+/// track, padded odd extents): every frame the black-box readers
+/// output equals the source — colour and alpha through the reader
+/// that composes the alpha track, colour through the one that reads
+/// the picture track.
+#[test]
+fn installed_readers_reproduce_a_lossless_rgba_sequence() {
+    let (w, h, count) = (17u32, 13u32, 4u32);
+    let frames: Vec<Vec<u8>> = (0..count)
+        .map(|t| noise(w as usize * h as usize * 4, 500 + t))
+        .collect();
+    let timed: Vec<oxideav_avif::Frame> = frames
+        .iter()
+        .map(|rgba| {
+            oxideav_avif::Frame::new(
+                AvifImage::from_rgba8(w, h, rgba.clone()).unwrap(),
+                Some(std::time::Duration::from_millis(100)),
+            )
+        })
+        .collect();
+    let file =
+        oxideav_avif::encode_all(&timed, &EncodeOptions::default().with_lossless(true)).unwrap();
+    let dir: PathBuf =
+        std::env::temp_dir().join(format!("oxideav-avif-lossless-seq-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("tmp dir");
+    let path = dir.join("rgba_sequence.avif");
+    std::fs::write(&path, &file).unwrap();
+    let mut failures = Vec::new();
+    let mut seen = Vec::new();
+
+    // Frame by frame, alpha composed from the auxiliary track.
+    for (i, want) in frames.iter().enumerate() {
+        if !raw_converter_installed() {
+            break;
+        }
+        let png = dir.join(format!("frame{i}.png"));
+        let raw = dir.join(format!("frame{i}.raw"));
+        match run(
+            "avifdec",
+            &["--index".into(), i.to_string(), s(&path), s(&png)],
+        ) {
+            None => break,
+            Some(false) => failures.push(format!("avifdec refused frame {i}")),
+            Some(true) => match png_to_raw(&png, &raw, Layout::Rgba8) {
+                None => break,
+                Some(got) => {
+                    if &got != want {
+                        failures.push(format!("avifdec frame {i} differs"));
+                    }
+                    if i == 0 {
+                        seen.push("avifdec");
+                    }
+                }
+            },
+        }
+    }
+    // Every picture-track sample in one pass (colour only).
+    let raw = dir.join("all.raw");
+    match run(
+        "ffmpeg",
+        &[
+            "-v".into(),
+            "error".into(),
+            "-y".into(),
+            "-i".into(),
+            s(&path),
+            // Stream 0 is the cover image item; 1 the picture track.
+            "-map".into(),
+            "0:1".into(),
+            "-f".into(),
+            "rawvideo".into(),
+            "-pix_fmt".into(),
+            "rgb24".into(),
+            s(&raw),
+        ],
+    ) {
+        None => {}
+        Some(false) => failures.push("ffmpeg refused the sequence".into()),
+        Some(true) => {
+            let got = std::fs::read(&raw).unwrap();
+            let want: Vec<u8> = frames
+                .iter()
+                .flat_map(|f| f.as_chunks::<4>().0.iter().flat_map(|p| [p[0], p[1], p[2]]))
+                .collect();
+            if got != want {
+                failures.push(format!(
+                    "ffmpeg: {} bytes of colour, {} expected, or different samples",
+                    got.len(),
+                    want.len()
+                ));
+            }
+            seen.push("ffmpeg");
+        }
+    }
+    println!("lossless RGBA sequence reproduced exactly by: {seen:?}");
+    if failures.is_empty() {
+        let _ = std::fs::remove_dir_all(&dir);
+    } else {
+        println!("files kept under {}", dir.display());
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

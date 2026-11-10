@@ -638,6 +638,18 @@ pub(crate) struct Presentation {
     /// The alpha auxiliary sequence of the track, when the file has
     /// one this crate decodes (an `av01` one).
     pub alpha: Option<AlphaTrack>,
+    /// The metadata true for the whole sequence (HEIF §8.3, Annex
+    /// A.2.2 / A.3): the Exif payload (from the TIFF header on) and
+    /// the XMP packet of the picture track's `meta`, and the ICC
+    /// profile of the sample entry's `colr`.
+    #[cfg_attr(not(feature = "registry"), allow(dead_code))]
+    pub exif: Option<Vec<u8>>,
+    /// See [`Self::exif`].
+    #[cfg_attr(not(feature = "registry"), allow(dead_code))]
+    pub xmp: Option<Vec<u8>>,
+    /// See [`Self::exif`].
+    #[cfg_attr(not(feature = "registry"), allow(dead_code))]
+    pub icc: Option<Vec<u8>>,
 }
 
 /// An AV1 Alpha Image Sequence (av1-avif §4.1) linked to the master
@@ -763,7 +775,17 @@ pub(crate) fn parse_avis_presented(file: &[u8]) -> Result<(AvisMeta, Presentatio
     let producer_reference_times = parse_producer_reference_times(file);
     let subsegment_indexes = parse_subsegment_indexes(file);
     let entry = track.sample_entries.iter().find(|e| e.entry_type == AV01);
+    let (exif, xmp) = track.sequence_metadata(&heif);
+    let icc = entry.and_then(|e| {
+        e.colr.iter().find_map(|c| match c {
+            hprops::Colr::Icc { profile, .. } if !profile.is_empty() => Some(profile.clone()),
+            _ => None,
+        })
+    });
     let presentation = Presentation {
+        exif: exif.filter(|e| !e.is_empty()),
+        xmp: xmp.filter(|x| !x.is_empty()),
+        icc,
         clap: entry.and_then(|e| e.clap).map(crate::meta::Clap::from),
         matrix: Some(track.matrix),
         entry_dims: entry

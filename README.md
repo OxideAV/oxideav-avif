@@ -118,7 +118,7 @@ by name. Decode yields the storage layout; `color.matrix == 0`
 | `encode_rgb8` / `encode_rgba8`, any other quality | 8-bit Y′CbCr 4:2:0 (`EncodeOptions::chroma`; 4:4:4 at odd extents), MIAF default colour (BT.709 / sRGB / BT.601, full range), alpha as the auxiliary |
 | `encode(&AvifImage::from_rgb8(..)?)` | identity-matrix 4:4:4 at every quality — byte-exact RGB when lossless |
 | canvases past 4096 coded pixels per axis | `grid` tiling (`encode_still_auto`) |
-| `encode_all(&[Frame], &EncodeOptions)` | the mirror of `decode_all`: delay-less frames → the primary plus a `brst` image burst (`encode_still_burst`; per-member colour / ICC / alpha / `clap`, Exif / XMP on the primary), timed frames → an `avis` image sequence (`encode_sequence` at timescale 1000, each frame's delay in ms; no alpha — `Unsupported`); all frames share frame 0's geometry, depth and layout; `decode_all(encode_all(f)) == f` at the lossless default |
+| `encode_all(&[Frame], &EncodeOptions)` | the mirror of `decode_all`: delay-less frames → the primary plus a `brst` image burst (`encode_still_burst`; per-member colour / ICC / alpha / `clap`, Exif / XMP on the primary), timed frames → an `avis` image sequence (`encode_sequence` at timescale 1000, each frame's delay in ms; alpha as the alpha auxiliary track, frame 0's ICC / Exif / XMP as the sequence's; pictures off the 8-pixel grid all-intra at their own extents); all frames share frame 0's geometry, depth and layout; `decode_all(encode_all(f)) == f` at the lossless default |
 
 `decode_all` returns every sample of an `avis` image sequence (with
 its `delay`), the entities of the primary's `brst` burst group, else
@@ -172,7 +172,7 @@ coded item's colour from the bitstream now sees the same thing).
 
 **Proof.** `tests/lossless_roundtrip.rs`: 180 one-call cells (9 extents
 from 1 × 1 to 100 × 37, odd ones included × RGB / RGBA × noise and
-structured content × five ways of asking), 73 `encode(&AvifImage)`
+structured content × five ways of asking), 100 `encode(&AvifImage)`
 cells (identity RGB with and without alpha at 8 / 10 / 12 bits, gray
 8 / 10 / 12, gray + alpha, 4:2:0 / 4:2:2 / 4:4:4 Y′CbCr), the registry
 option over packed and planar layouts, grids, orientation — all
@@ -273,14 +273,20 @@ clock of a large picture: `auto` codes one item up to
 `AUTO_GRID_TILE` (512-pixel) tiles above it, the tiles cut straight
 from the picture and coded on up to `threads` workers
 (`ExecutionContext::effective_workers`, each tile with a share of the
-budget; the bytes never depend on the worker count). Every coded item
-carries its own `av1C` in the `ipco` (the container writer never
-shares decoder configurations) and readers in the wild cap the `ipco`
-at 100 child boxes, so `auto` keeps colour + alpha tiles under
-`AUTO_GRID_MAX_TILES` (90) by doubling the tile edge (12 MP with alpha
-→ 4 × 3 tiles of 1024); an explicit `grid=<edge>` is honoured as
-given (`grid=256` on 12 MP is 192 tiles, which `magick identify` /
-`heif-info` refuse). `elect_grid_for` is the election table.
+budget; the bytes never depend on the worker count). The container
+writer keeps the `ipco` a pool (oxideav-heif ≥ 0.0.13): the tiles of a
+grid share one `av1C`, `ispe`, `pixi` and `colr`, so a grid of any
+size carries a handful of property boxes and alpha no longer coarsens
+the tiling (12 MP with alpha is 8 × 6 colour + 8 × 6 alpha tiles of
+512; it was 4 × 3 of 1024 while every tile brought its own `av1C` and
+readers refuse an `ipco` past 100 boxes). What bounds a grid now is
+those readers' 1 000-item ceiling: `auto` keeps colour + alpha tiles
+under `AUTO_GRID_MAX_TILES` (900) by doubling the tile edge
+(16384 × 16384 → 16 × 16 tiles of 1024); an explicit `grid=<edge>` is
+honoured as given (`grid=256` on 12 MP is 192 tiles and opens
+everywhere; `grid=128` with alpha is 1 538 items, which
+`magick identify` / `heif-info` / `ffmpeg` refuse). `elect_grid_for`
+is the election table.
 
 Same picture as above at `quality` 60, `/usr/bin/time -l` around
 `examples/encode_budget` (the process holds the source frame and
@@ -297,7 +303,7 @@ registry wrote before this round:
 | packed `Rgb24` | 512 grid, r477 conversion | 7.37 s / 288 MiB | — | 1.26 s / 361 MiB | 1 958 495 | — |
 | packed `Rgb24` | **512 grid, one-pass conversion** | 7.37 s / 91 MiB | — | **1.24 s / 161 MiB** | 1 958 495 | — |
 | 10-bit 4:2:0 | 512 grid (`auto`) | 7.57 s / 101 MiB | 2.22 s / 136 MiB | 1.27 s / 165 MiB | 2 072 085 | — |
-| packed `Rgba` (alpha) | 1024 grid, 4 × 3 + alpha (`auto`, the tile cap) | 8.59 s / 149 MiB | 2.38 s / 262 MiB | 1.74 s / 330 MiB | 1 940 633 | — |
+| packed `Rgba` (alpha) | 1024 grid, 4 × 3 + alpha (`auto` under the former 90-tile cap) | 8.59 s / 149 MiB | 2.38 s / 262 MiB | 1.74 s / 330 MiB | 1 940 633 | — |
 
 Where the memory goes (12 MP 8-bit 4:2:0, 512 grid): the source frame
 18 MiB; the `StillImage` the registry builds from it 36 MiB (`u16`
@@ -330,7 +336,8 @@ On this Mac (macOS 26.6):
 | ICC + Exif + XMP items | opens | opens | opens | opens | opens |
 | 1200 × 900 `auto` grid (3 × 2), with alpha (3 × 2 + alpha), `grid=256` (5 × 4) | opens | opens | opens | opens | opens |
 | 4032 × 3024 `auto` grid (8 × 6), single item, 10-bit grid, alpha grid | opens | opens | opens | opens | opens |
-| 4032 × 3024 `grid=256` (192 tiles) | opens | refused: `ipco` > 100 boxes | opens | refused: same | opens |
+| 4032 × 3024 `grid=256` (192 tiles sharing one `av1C`), `Rgba` `auto` (8 × 6 + alpha 8 × 6) | opens | opens | opens | opens | opens |
+| 4032 × 3024 `Rgba` `grid=128` (1 538 items) | opens | refused: > 1 000 items | refused: > 1 000 streams | refused: same | opens |
 
 ### Stream parameters
 
@@ -483,8 +490,9 @@ encoder across the full (bit depth × chroma format) matrix — 8/10/12
 bit × 4:2:0 / 4:2:2 / 4:4:4 / monochrome — plus RGB(A) via the H.273
 identity matrix in 4:4:4 (byte-exact lossless round-trips), alpha as
 a same-depth monochrome auxiliary (av1-avif §4.1, full-range
-signalled in-stream), arbitrary extents (edge-replicated pad to the
-coded 8-grid + top-left `clap`, `ispe` = coded extents per §2.2.2),
+signalled in-stream), arbitrary extents (the AV1 frame is the
+picture's own size from 1 × 1 — no padding, no `clap`; `ispe` = coded
+extents per §2.2.2),
 grid tiling with right/bottom trim (64-pixel tile floor + tiling
 election, alpha as a hidden alpha grid, pass-through properties on
 the grid item), `iovl` overlays (`encode_still_overlay`), `iden`
@@ -532,7 +540,7 @@ passes `audit_mif1`. At this layer the AV1 bitstream is taken
 | AV1 layered properties | `a1op` operating-point selector + `a1lx` layered-image index (av1-avif §2.3.2) |
 | Auxiliary classification | `auxC` URN routed to `Alpha` / `DepthMap` / `HdrGainMap` / `Other` |
 | Container encoder / muxer (`mux`) | `AvifMuxer` / `AvifGridMuxer` / `AvifOverlayMuxer` / `encode_still_av1` decide the AVIF layout — brands (profile tri-state `MA1B` default / `MA1A` / general-brands-only per av1-avif §8.1), item order (primary = item 1, a `grid` / `iovl` before its inputs), per-item property sets with their essential flags (`av1C` / `clap` / `irot` / `imir` / `lsel` / `a1op` essential), `auxC` URNs, the grid / overlay descriptors — and `oxideav-heif`'s `HeifWriter` serialises `meta` (`iloc` v1, derived bodies in `idat`, de-duplicated `ipco`, `prem` master → alpha) + `mdat`. Round-trips through `parse` byte-for-byte; passes `audit_mif1`; opens in `heif-info` / ImageMagick / ffmpeg (and `avifdec` for coded / grid primaries) |
-| Pixel → AVIF still encoder (`still`) | `StillImage` + `encode_still` / `encode_still_grid` drive oxideav-av1's still encoder (`still_picture = 1`, reduced header; `Fast` effort by default, `EncodeSpeed`; tile layout from the picture size, searched on `EncodeOptions::threads`): 8/10/12-bit × 4:2:0/4:2:2/4:4:4/monochrome; RGB(A) via the H.273 identity matrix in 4:4:4 (byte-exact lossless); alpha as a same-depth monochrome auxiliary with in-stream full-range signalling (the §5.5.2 `color_range` bit — av1-avif §4.1 readers ignore `colr` on alpha); arbitrary extents via edge-replicated pad + top-left `clap` (§2.2.3) with `ispe` = coded extents (§2.2.2 `shall`); grid tiling (HEIF §6.6.2) with right/bottom trim; `ftyp` profile brand elected from `seq_profile` (§8). Lossless round-trips sample-exact through the crate's own decoder; lossy PSNR-gated; black-box-accepted by an external AVIF decoder binary |
+| Pixel → AVIF still encoder (`still`) | `StillImage` + `encode_still` / `encode_still_grid` drive oxideav-av1's still encoder (`still_picture = 1`, reduced header; `Fast` effort by default, `EncodeSpeed`; tile layout from the picture size, searched on `EncodeOptions::threads`): 8/10/12-bit × 4:2:0/4:2:2/4:4:4/monochrome; RGB(A) via the H.273 identity matrix in 4:4:4 (byte-exact lossless); alpha as a same-depth monochrome auxiliary with in-stream full-range signalling (the §5.5.2 `color_range` bit — av1-avif §4.1 readers ignore `colr` on alpha); arbitrary extents coded as they are (the AV1 frame has the picture's size; `ispe` = coded extents, §2.2.2 `shall`; no `clap`); grid tiling (HEIF §6.6.2) with right/bottom trim; `ftyp` profile brand elected from `seq_profile` (§8). Lossless round-trips sample-exact through the crate's own decoder; lossy PSNR-gated; black-box-accepted by an external AVIF decoder binary |
 | Registry `Encoder` | one video frame → one complete AVIF file packet; 27 declared input layouts (`ENCODER_PIXEL_FORMATS`, the registry's `accepted_pixel_formats`): planar YUV 8-bit (+ `YuvJ*` full-range), 10/12-bit LE planar, `Gray8/10/12`, packed `Rgb24`/`Rgba`/`Bgr24`/`Bgra` (identity 4:4:4 when lossless, Y′CbCr in the `chroma` layout when lossy; alpha auxiliary), planar `Gbrp(a)` 8/10/12, `Yuva420P`, `Ya8`; codec options `quality` (0..=100 → `base_q_idx`, 100 = lossless, absent = 60) / `q` / `alpha_q` / `chroma` / `premultiplied` / `speed` / `threads` / `grid`, declared as a schema; `lossy` + `lossless` capability flags; ICC / Exif / XMP blobs written frame-over-stream and put back on decoded frames; 12 MP in 1.2 s / 162 MiB on 8 workers as a 512-pixel grid |
 | Registry `Decoder` threads | `set_execution_context` / the `threads` option hand the worker budget to the AV1 decoder of every coded item and sequence sample (tile / band / wave / stripe parallel, byte-identical at any budget); the distinct tiles of a `grid` primary decode round-robin on the same workers; 12 MP tiled still 0.34 s serial → 0.07 s on 8 workers (4.8×), the same picture as a 4 × 3 grid 0.31 s → 0.07 s (4.7×) (`examples/decode_threads`) |
 | Derived images | `iovl` overlay + `iden` identity + `tmap` tone-map derivations resolved end-to-end (HEIF §6.3 / §6.6.2, av1-avif §4.2.2) via a box-graph geometry resolver — no AV1 decode: `transform_chain` / `output_dims_from_reconstructed` apply `irot`/`imir`/`clap`/`iscl` in `ipma` order (§6.3); `reconstructed_dims` resolves grid/iovl descriptor dims + recursive `iden` inputs + `tmap` base-input extents + `sato` own/`ispe`-or-input extents + coded `ispe` (cycle-guarded, depth 16; descriptor bytes resolve through `iloc` construction methods 0/1/**2**); `resolve_overlays` clips each `OverlayPlacement` against the canvas (§6.6.2.2.3); `resolve_iden_derivations` folds the iden's own transforms over its source; `resolve_tone_maps` resolves each `tmap`'s base/gain-map input ids + rendered (base) extents + per-gain-map coded extents, flagging gain-map up-sampling. Surfaced on `AvifInfo::{overlay_resolutions, iden_resolutions, tone_map_resolutions}`; `inspect()` accepts `iovl`/`iden`/`tmap`/`sato` derived primaries. **Pixel composition** (`oxideav-heif`'s `compose`, through `overlay::composite_overlay` and the decoder's recursive output-image path): `iovl` canvases painted in `dimg` order with the §6.9.1 alpha rendering (straight / `prem`), canvas opacity seeded from the RGBA fill (converted with the output's H.273 matrix at every `colr`), inputs clipped at the canvas edge, an input at an odd offset on a subsampled axis or carrying alpha promotes the canvas to 4:4:4, monochrome inputs stay monochrome, `MAX_OVERLAY_CANVAS_PIXELS` bound; `iden` = its input's output image (alpha inherited) plus the iden's own transforms; both writable via `AvifOverlayMuxer` / `encode_still_overlay` and `AvifMuxer::with_identity_derivation`. **`tmap` pixel reconstruction** (HEIF Amd 1:2025 §6.6.2.4 + ISO 21496-1, av1-avif §4.2.2): base by default, opt-in applied decode (`AvifDecoder::set_tone_mapped` / `gain_map=apply`) through the container's normative reconstruction in the `tmap` item's `colr` at its `pixi` depth, matching `avifgainmaputil tonemap` within 1 code both ways; authored via `StillProperties::gain_map` / `AvifMuxer::with_tone_map`. `sato` remains geometry-only (no container counterpart) |
@@ -553,7 +561,7 @@ passes `audit_mif1`. At this layer the AV1 bitstream is taken
 | Alpha auxiliary | `auxl` + `auxC` detection + attachment at every depth (`Gray8→Ya8`, `Gray10/12→Ya16Le`, `Yuv→YuvA` incl. `*10Le`/`*12Le`) + av1-avif §4.1 same-bit-depth `shall` enforced before attachment and audited at the container layer |
 | Post-transforms | `clap` → `irot` → `imir` in `ipma` order (HEIF §6.3), at 8/10/12-bit and on the packed `Ya8`/`Ya16Le` layouts; an odd clean aperture on subsampled chroma promotes to 4:4:4 (MIAF §7.3.6.7); the standalone `apply_*` entry points refuse a layout change their `(frame, width, height)` result cannot carry |
 | Layered image items | `a1lx` / `lsel` / `a1op` written by `AvifMuxer::{with_layered_index, with_layer_selector, with_operating_point}` and `encode_still_layered` (2..=4 AV1 spatial layers in one temporal unit, per-layer byte sizes from an OBU walk, `ispe`/`clap` of the selected layer — av1-avif §2.2.2 / §2.3); the decoder drains every shown frame, renders the `lsel` layer (or the top one) and decodes non-default `a1op` operating points |
-| AVIS image sequences | **encode** (`encode_sequence` over the container's `SequenceWriter`: `ftyp` `avis`/`msf1`/`av01` (+`avio`), cover still whose primary aliases sample 0, `moov`/`trak` with `pict` handler, `av01` sample entry + `av1C`/`colr`/`clap` + `ccst`, `stts`/`stss`/`stsc`/`stsz`/`stco`; all-intra or KEY + P groups; lossless sequences decode exact through this crate, the external AVIF decoder and ffmpeg) + sample-table walk by the container (`parse_avis` over `oxideav_heif::sequence::parse_movie`; ISO/IEC 14496-12's mandatory `mvhd` / `tkhd` / `mdhd` / `hdlr` / `stts` enforced) + `inspect_avis` aggregator + §3 / §8.2 / §8.3 audits + `edts/elst` edit list (ISO/IEC 14496-12 §8.6.6) + `mdhd` media-timescale plumb + `prft` ProducerReferenceTimeBox (§8.16.5, v0/v1 NTP→Unix, top-level walk) on `AvisMeta::producer_reference_times` + `ssix` SubsegmentIndexBox (§8.16.4, v0; per-subsegment `(level: u8, range_size: u24)` leva-level byte-range partitions for partial-subsegment access, top-level walk) on `AvisMeta::subsegment_indexes` |
+| AVIS image sequences | **encode** (`encode_sequence` over the container's `SequenceWriter`: `ftyp` `avis`/`msf1`/`av01` (+`avio`), cover still whose primary aliases sample 0, `moov`/`trak` with `pict` handler, `av01` sample entry + `av1C`/`colr`/`clap` + `ccst`, `stts`/`stss`/`stsc`/`stsz`/`stco`; all-intra (at the picture's own extents, samples coded on `SequenceEncodeOptions::threads` workers with identical bytes) or KEY + P groups (8-grid + `clap`); **alpha as an alpha auxiliary track** — `auxv` handler, `auxl` reference, alpha `auxi`, monochrome full-range KEY frames time-parallel to the pictures, `alpha_q_idx` (lossless by default); `loop_count` as the MIAF Annex A.2 edit list; frame 0's ICC (`colr` in the sample entry) / Exif / XMP (items of the track's `meta`) written and put back on every decoded frame; lossless sequences — RGBA included — decode exact through this crate, the external AVIF decoder and ffmpeg) + sample-table walk by the container (`parse_avis` over `oxideav_heif::sequence::parse_movie`; ISO/IEC 14496-12's mandatory `mvhd` / `tkhd` / `mdhd` / `hdlr` / `stts` enforced) + `inspect_avis` aggregator + §3 / §8.2 / §8.3 audits + `edts/elst` edit list (ISO/IEC 14496-12 §8.6.6) + `mdhd` media-timescale plumb + `prft` ProducerReferenceTimeBox (§8.16.5, v0/v1 NTP→Unix, top-level walk) on `AvisMeta::producer_reference_times` + `ssix` SubsegmentIndexBox (§8.16.4, v0; per-subsegment `(level: u8, range_size: u24)` leva-level byte-range partitions for partial-subsegment access, top-level walk) on `AvisMeta::subsegment_indexes` |
 | Sample grouping | `sbgp` (SampleToGroupBox, ISO/IEC 14496-12:2015 §8.9.2, v0/v1) + `csgp` (CompactSampleToGroupBox, :2020 §8.9.5 — 4/8/16/32-bit packed field widths, pattern expansion, `traf` fragment-local msb) + `sgpd` (§8.9.3, v0/v1/v2 default index) which now also **retains + slices per-entry `VisualSampleGroupEntry` payloads** (v1 `default_length` fixed-size or self-describing `description_length`) into `SampleGroupDescription::entries`; typed decoders for the HEIF §6.8.6 bracketing entries (`BracketingEntry`: `aebr` auto-exposure / `wbbr` white-balance / `fobr` focus incl. infinity / `afbr` flash-exposure / `dobr` depth-of-field via `bracketing_entries()`) and the §6.8.1.2.2 `eqiv` `VisualEquivalenceEntry` (`time_offset` + 8.8 `timescale_multiplier`, `equivalence_entries()`); per-sample group-index lookup via `SampleToGroup::group_index_for_sample`, surfaced on `AvisMeta::{sample_to_groups, sample_group_descriptions}` |
 
 ## Constructing the crate's types

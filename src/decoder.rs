@@ -132,7 +132,21 @@ pub(crate) fn infer_av1_pixmap(
             // mismatch as an InvalidData error.
             let u_stride_doubled = u.stride.saturating_mul(2);
             let chroma_h_doubled = chroma_h.saturating_mul(2);
-            let sub = if u_stride_doubled == y.stride && chroma_h_doubled >= height as usize {
+            // The record's own sub-sampling wins whenever the planes
+            // fit it: a 1-pixel-wide or 1-pixel-tall picture has the
+            // same plane shapes under several layouts (`ceil(1 / 2)`
+            // is 1), which the geometry alone cannot tell apart.
+            let (cx, cy) = (
+                u32::from(cfg.chroma_subsampling_x),
+                u32::from(cfg.chroma_subsampling_y),
+            );
+            let declared_fits = !cfg.monochrome
+                && (cx, cy) != (0, 1)
+                && u.stride == (width as usize).div_ceil(1 << cx) * bps
+                && chroma_h == (height as usize).div_ceil(1 << cy);
+            let sub = if declared_fits {
+                (cx as u8, cy as u8)
+            } else if u_stride_doubled == y.stride && chroma_h_doubled >= height as usize {
                 if chroma_h as u32 == height.div_ceil(2) {
                     (1u8, 1u8)
                 } else {

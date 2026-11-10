@@ -24,12 +24,14 @@
 //!   (av1-avif §4.1): same bit depth as the master (the §4.1 `shall`),
 //!   no `colr` (the §4.1 `should`), hidden item + `auxC` alpha URN +
 //!   `auxl` iref, `prem` iref when premultiplied.
-//! * **Arbitrary dimensions.** The AV1 encoder codes multiples of 8
-//!   per axis (min 8); other extents are edge-replicated up to the
-//!   next multiple and cropped back with an essential `clap` property
-//!   anchored top-left (av1-avif §2.2.3). `ispe` always documents the
-//!   coded frame extents per the §2.2.2 `shall` (`image_width` /
-//!   `image_height` equal `UpscaledWidth` / `FrameHeight`).
+//! * **Arbitrary dimensions.** A coded item is the AV1 frame of the
+//!   picture's own extents (any size from 1 × 1): `ispe` documents
+//!   them per the §2.2.2 `shall` (`image_width` / `image_height` equal
+//!   `UpscaledWidth` / `FrameHeight`) and there is nothing to crop.
+//!   Only the spatially layered encode, whose coder works on the
+//!   8 × 8 grid, still edge-replicates up to the next multiple of 8
+//!   and crops back with an essential top-left `clap` (§2.2.3) — as
+//!   do grid tiles, trimmed by the grid's output extents.
 //! * **Grid encode** ([`encode_still_grid`]) for canvases beyond the
 //!   single-item limit: the canvas splits into equal coded tiles
 //!   (HEIF §6.6.2 `grid` derived item, `dimg` irefs), the declared
@@ -685,15 +687,16 @@ pub const AUTO_GRID_TILE: u32 = 512;
 pub const AUTO_GRID_MAX_SINGLE_PIXELS: u64 = 1_048_576;
 
 /// The most coded tiles (colour and alpha together) an automatic grid
-/// holds: every coded item carries its own `av1C` in the `ipco`
-/// (decoder configurations are never shared between items in the
-/// container writer's layout), and readers in the wild cap the `ipco`
-/// at 100 child boxes. [`GridTiling::Auto`] doubles the tile edge
-/// from [`AUTO_GRID_TILE`] until the tiles fit under this bound; an
-/// explicit [`GridTiling::MaxTile`] is honoured as given (a
-/// 4032 × 3024 picture at `grid=256` is 192 tiles, which such readers
-/// refuse).
-pub const AUTO_GRID_MAX_TILES: u32 = 90;
+/// holds. The container writer keeps the `ipco` a pool — the tiles of
+/// a grid share one `av1C`, `ispe`, `pixi` and `colr` — so the
+/// property count no longer bounds a grid (a 192-tile file used to
+/// carry 196 `ipco` boxes, past the 100 that readers in the wild
+/// accept; it now carries a handful). What remains is those readers'
+/// item ceiling (1 000 `iloc` entries): [`GridTiling::Auto`] doubles
+/// the tile edge from [`AUTO_GRID_TILE`] until the tiles fit under
+/// this bound, which leaves room for the grid items and the metadata
+/// items; an explicit [`GridTiling::MaxTile`] is honoured as given.
+pub const AUTO_GRID_MAX_TILES: u32 = 900;
 
 /// The `(columns, rows)` tiling `grid` asks for on a `width × height`
 /// picture (`alpha` when it carries an alpha plane — its tiles count
@@ -789,6 +792,14 @@ pub(crate) fn identity_full_range_colr() -> Colr {
         matrix_coefficients: 0,
         full_range: true,
     }
+}
+
+/// The coded extent of a single coded item along one axis: the
+/// picture's own (AV1 codes any frame size; the padding to its 8 × 8
+/// mode-info grid is the codec's business, §7.x of the bitstream, and
+/// decoders output the frame size).
+pub(crate) fn item_extent(v: u32) -> u32 {
+    v
 }
 
 /// Round `v` up to the coded-extent grid (multiple of 8, min 8).
@@ -1232,7 +1243,7 @@ pub fn encode_still_burst(images: &[StillImage], opts: &EncodeOptions) -> Result
     let (mut mux, mut max_profile) = still_muxer(first, opts)?;
     for (i, img) in images.iter().enumerate().skip(1) {
         img.validate()?;
-        let (pw, ph) = (coded_extent(img.width), coded_extent(img.height));
+        let (pw, ph) = (item_extent(img.width), item_extent(img.height));
         if pw > STILL_MAX_CODED_DIM || ph > STILL_MAX_CODED_DIM {
             return Err(Error::unsupported(format!(
                 "avif burst: image {i} coded extents {pw}x{ph} exceed the single-item bound \
@@ -1275,7 +1286,7 @@ pub fn encode_still_burst(images: &[StillImage], opts: &EncodeOptions) -> Result
 /// sequence profile coded (for the profile brand).
 fn still_muxer(img: &StillImage, opts: &EncodeOptions) -> Result<(AvifMuxer, u8)> {
     img.validate()?;
-    let (pw, ph) = (coded_extent(img.width), coded_extent(img.height));
+    let (pw, ph) = (item_extent(img.width), item_extent(img.height));
     if pw > STILL_MAX_CODED_DIM || ph > STILL_MAX_CODED_DIM {
         return Err(Error::unsupported(format!(
             "avif still: coded extents {pw}x{ph} exceed the single-item bound \
@@ -1285,8 +1296,8 @@ fn still_muxer(img: &StillImage, opts: &EncodeOptions) -> Result<(AvifMuxer, u8)
     let primary = encode_primary(img, pw, ph, opts.colour_q_idx(), CodedTuning::of(opts))?;
     let mut max_profile = primary.seq_profile;
 
-    // ispe documents the coded extents (av1-avif §2.2.2); clap crops
-    // back to the requested extents when padding was needed.
+    // ispe documents the coded extents (av1-avif §2.2.2) — the
+    // picture's own; a clap would only crop a padded coding back.
     let mut mux = AvifMuxer::new(pw, ph, primary.payload, primary.av1c).with_pixi(pixi_bits(img));
     if (pw, ph) != (img.width, img.height) {
         mux = mux.with_clap(top_left_clap(img.width, img.height, pw, ph));
@@ -1327,14 +1338,7 @@ fn still_muxer(img: &StillImage, opts: &EncodeOptions) -> Result<(AvifMuxer, u8)
     }
     if let Some(gm) = &props.gain_map {
         gm.map.validate()?;
-        let (gw, gh) = (coded_extent(gm.map.width), coded_extent(gm.map.height));
-        if (gw, gh) != (gm.map.width, gm.map.height) {
-            return Err(Error::unsupported(format!(
-                "avif still: gain map extents {}x{} are not on the coded 8-grid (a padded gain \
-                 map would need its own clap, which the tmap derivation does not carry)",
-                gm.map.width, gm.map.height
-            )));
-        }
+        let (gw, gh) = (item_extent(gm.map.width), item_extent(gm.map.height));
         let coded_map = encode_primary(&gm.map, gw, gh, gm.q, CodedTuning::of(opts))?;
         max_profile = max_profile.max(coded_map.seq_profile);
         let channels = if gm.map.chroma == StillChroma::Monochrome {
@@ -1597,7 +1601,7 @@ pub fn encode_still_grid(
 /// over the job order, one job in flight per worker) and return the
 /// outputs in job order; the first failing job in job order is the
 /// error. `workers == 1` runs inline on the caller's thread.
-fn code_in_parallel<T, F>(count: usize, workers: usize, job: &F) -> Result<Vec<T>>
+pub(crate) fn code_in_parallel<T, F>(count: usize, workers: usize, job: &F) -> Result<Vec<T>>
 where
     T: Send,
     F: Fn(usize) -> Result<T> + Sync,
@@ -1751,8 +1755,8 @@ impl<'a> OverlayLayerImage<'a> {
 /// Encode `layers` (bottom-most first) as an **overlay-derived** AVIF:
 /// the primary is an `iovl` item (HEIF §6.6.2.2) whose hidden `av01`
 /// inputs are the layers, each coded exactly like an [`encode_still`]
-/// primary (edge-replicated pad to the coded 8-grid + top-left `clap`,
-/// same-depth monochrome alpha auxiliary with `auxl` / `prem`). Every
+/// primary (its own extents, same-depth monochrome alpha auxiliary
+/// with `auxl` / `prem`). Every
 /// layer must share one bit depth and chroma layout so a reader can
 /// composite them without colour conversion.
 pub fn encode_still_overlay(
@@ -1792,7 +1796,7 @@ pub fn encode_still_overlay(
                 img.bit_depth, img.chroma, first.bit_depth, first.chroma
             )));
         }
-        let (pw, ph) = (coded_extent(img.width), coded_extent(img.height));
+        let (pw, ph) = (item_extent(img.width), item_extent(img.height));
         if pw > STILL_MAX_CODED_DIM || ph > STILL_MAX_CODED_DIM {
             return Err(Error::unsupported(format!(
                 "avif still: overlay layer {i} coded extents {pw}x{ph} exceed {STILL_MAX_CODED_DIM}"

@@ -206,7 +206,15 @@ fn every_depth_and_layout_round_trips_exactly_under_lossless() {
     let mut cells = 0;
     for &(format, depth, identity) in layouts {
         let (sx, sy) = format.chroma_subsampling();
-        for &(w, h) in &[(1u32, 1u32), (8, 8), (17, 13), (40, 24), (33, 65)] {
+        for &(w, h) in &[
+            (1u32, 1u32),
+            (2, 1),
+            (1, 3),
+            (8, 8),
+            (17, 13),
+            (40, 24),
+            (33, 65),
+        ] {
             if (sx == 1 && w % 2 == 1) || (sy == 1 && h % 2 == 1) {
                 continue; // sub-sampled chroma is coded at even extents only
             }
@@ -229,7 +237,7 @@ fn every_depth_and_layout_round_trips_exactly_under_lossless() {
             cells += 1;
         }
     }
-    assert!(cells >= 70, "matrix shrank: {cells}");
+    assert_eq!(cells, 100, "the layout matrix");
 }
 
 /// The Sequence Header OBU of an AV1 Image Item Data payload.
@@ -276,9 +284,9 @@ fn has_clap(props: &[&Property]) -> bool {
 /// What a lossless RGB(A) file must say about itself: `colr` `nclx`
 /// 1 / 13 / 0 full range and `pixi` 8, 8, 8 on the colour item, `av1C`
 /// 4:4:4 non-monochrome mirroring a sequence header that carries the
-/// same colour description (H.273 identity, full range), and — at
-/// padded extents — the same `clap` on the colour item and on its
-/// alpha auxiliary (whose stream is monochrome, full range).
+/// same colour description (H.273 identity, full range) and the
+/// picture's own extents (odd ones included: no padding, no `clap`),
+/// next to an alpha auxiliary whose stream is monochrome, full range.
 #[test]
 fn lossless_rgb_is_signalled_in_the_container_and_the_sequence_header() {
     for &(w, h) in &[(16u32, 16u32), (17, 13)] {
@@ -320,12 +328,23 @@ fn lossless_rgb_is_signalled_in_the_container_and_the_sequence_header() {
         let alpha = find_alpha_item_id(&hdr.meta, primary).expect("alpha auxiliary");
         let aprops = hdr.meta.properties_for(alpha);
         assert_eq!(pixi_of(&aprops), Some(vec![8]));
-        let padded = (w % 8, h % 8) != (0, 0);
-        assert_eq!(has_clap(&props), padded, "{w}x{h}: colour clap");
+        // Coded at the picture's own extents: `ispe` is the picture,
+        // nothing to crop on either item.
+        for (what, list) in [("colour", &props), ("alpha", &aprops)] {
+            let ispe = list.iter().find_map(|p| match p {
+                Property::Ispe(i) => Some((i.width, i.height)),
+                _ => None,
+            });
+            assert_eq!(ispe, Some((w, h)), "{w}x{h}: {what} ispe");
+            assert!(!has_clap(list), "{w}x{h}: {what} needs no clap");
+        }
         assert_eq!(
-            has_clap(&aprops),
-            padded,
-            "{w}x{h}: the alpha auxiliary carries the colour item's clap"
+            (
+                seq.max_frame_width_minus_1 + 1,
+                seq.max_frame_height_minus_1 + 1
+            ),
+            (w, h),
+            "{w}x{h}: the coded frame size"
         );
         let aseq = sequence_header(&hdr.item_data(alpha).unwrap());
         assert!(aseq.color_config.mono_chrome);
@@ -438,6 +457,76 @@ fn alpha_stays_co_located_through_clap_and_orientation() {
         sorted_out.sort_unstable();
         assert!(sorted_in == sorted_out, "the same pixels, re-arranged");
     }
+}
+
+/// A cropped colour item whose alpha auxiliary shares the crop (the
+/// muxer hands the colour item's `clap` to the auxiliary): both items
+/// carry it and the decode is the cropped picture, alpha co-located.
+#[test]
+fn muxer_gives_the_alpha_auxiliary_the_colour_items_clap() {
+    use oxideav_avif::meta::Clap;
+    use oxideav_avif::{AvifMuxer, StillImage, encode_still};
+    let (cw, ch, w, h) = (24u32, 16u32, 17u32, 13u32);
+    let full = textured(cw, ch, 4, 41);
+    let coded = encode_still(
+        &StillImage::rgba8(cw, ch, &full).unwrap(),
+        &EncodeOptions::default().with_lossless(true),
+    )
+    .unwrap();
+    let hdr = parse_header(&coded).unwrap();
+    let primary = hdr.meta.primary_item_id.unwrap();
+    let alpha = find_alpha_item_id(&hdr.meta, primary).unwrap();
+    let av1c = |id: u32| {
+        hdr.meta
+            .properties_for(id)
+            .iter()
+            .find_map(|p| match p {
+                Property::Av1C(raw) => Some(raw.clone()),
+                _ => None,
+            })
+            .unwrap()
+    };
+    // Top-left anchored crop to 17 x 13 (HEIF 6.5.11 centre geometry).
+    let clap = Clap::new(
+        w as i32,
+        1,
+        h as i32,
+        1,
+        w as i32 - cw as i32,
+        2,
+        h as i32 - ch as i32,
+        2,
+    );
+    let file = AvifMuxer::new(
+        cw,
+        ch,
+        hdr.item_data(primary).unwrap().into_owned(),
+        av1c(primary),
+    )
+    .with_pixi(vec![8, 8, 8])
+    .with_colr(ColorInfo::identity_full_range().to_colr())
+    .with_clap(clap)
+    .with_alpha(
+        hdr.item_data(alpha).unwrap().into_owned(),
+        av1c(alpha),
+        false,
+    )
+    .advanced_profile()
+    .build()
+    .unwrap();
+    let cropped = parse_header(&file).unwrap();
+    let p = cropped.meta.primary_item_id.unwrap();
+    let a = find_alpha_item_id(&cropped.meta, p).unwrap();
+    assert!(has_clap(&cropped.meta.properties_for(p)));
+    assert!(has_clap(&cropped.meta.properties_for(a)));
+    let back = decode_rgba8(&file).unwrap();
+    assert_eq!((back.width, back.height), (w, h));
+    let mut want = Vec::new();
+    for row in 0..h as usize {
+        let at = row * cw as usize * 4;
+        want.extend_from_slice(&full[at..at + w as usize * 4]);
+    }
+    assert!(back.as_bytes() == want.as_slice());
 }
 
 /// A file whose alpha auxiliary carries no `clap` next to a cropped

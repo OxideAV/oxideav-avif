@@ -26,6 +26,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lossless identity-matrix files from a black-box producer decode
   exactly).
 
+- **Image sequences with alpha.** `encode_sequence` / `encode_all`
+  write frames that carry an alpha plane as a picture track plus an
+  **alpha auxiliary track** (HEIF §7.5.3, av1-avif §4.1: `auxv`
+  handler, `auxl` track reference, alpha URN in the sample entry's
+  `auxi`; monochrome, full-range KEY frames at the picture's depth,
+  one per picture sample with the same duration). Timed RGBA / Y′CbCr
+  + alpha / gray + alpha frames were `Unsupported`; they now round
+  trip — exactly at the lossless setting, and the black-box readers
+  reproduce a lossless RGBA sequence frame for frame. Every frame
+  carries alpha or none does (`InvalidData` for a mix).
+- `SequenceEncodeOptions`: `alpha_q_idx` (lossless by default),
+  `loop_count` (`None` = no edit list, `Some(0)` = indefinitely,
+  `Some(n)` = `n` plays — the MIAF Annex A.2 edit list), `threads`
+  (all-intra and alpha samples are coded on the workers; the bytes do
+  not depend on the count), `speed`. `encode_all` passes the options'
+  alpha quantiser, speed and threads.
+- **Sequence metadata.** The first frame's ICC profile (a `prof`
+  `colr` in the sample entry and on the cover item), Exif and XMP
+  (items of the picture track's `meta`, HEIF §8.3) are written, and
+  the decoder puts a sequence's ICC / Exif / XMP on every frame it
+  returns.
+
 ### Fixed
 
 - **`encode_rgb8` / `encode_rgba8` at quality 100 were not an exact
@@ -55,6 +77,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   item, which readers that build each item's output image on its own
   stretched over the colour (three of the four black-box readers
   returned a rescaled alpha plane at 17 × 13).
+- **Decoder: 1-pixel-wide / 1-pixel-tall sub-sampled pictures.** The
+  layout of a decoded AV1 frame was inferred from its plane shapes
+  alone, which coincide for such pictures (`ceil(1 / 2) = 1`): a
+  2 × 1 4:2:2 picture was labelled 4:2:0, a 1 × N 4:2:0 one 4:4:4. The
+  `av1C` record's sub-sampling now decides whenever the planes fit it
+  (found by the `registry_encoder_options` fuzz target once items were
+  coded at their own extents).
 - **Decoder: an alpha auxiliary with transformative properties of its
   own** is attached to the colour item's *output* image (HEIF §6.3),
   not resized onto its reconstructed image and transformed a second
@@ -63,6 +92,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Coded items are written at the picture's own extents.** A picture
+  whose width or height is not a multiple of 8 was edge-padded to the
+  next multiple and cropped back with a `clap`; the AV1 still encoder
+  codes any frame size, so the item is now the picture itself — `ispe`
+  is the picture's size, no `clap`, a smaller payload (17 × 13 lossless
+  RGBA 2 242 → 2 200 B), and nothing for a reader to get wrong (see the
+  alpha `clap` fix below, which older files needed). Applies to single
+  items, burst members, overlay layers, gain maps (an off-grid gain map
+  was `Unsupported`) and all-intra sequence samples; KEY + P sequence
+  groups and spatially layered items keep the padded 8-grid + `clap`
+  (their coder needs it), which is why `encode_all` codes off-grid
+  timed frames all-intra.
+- **The automatic grid no longer coarsens for the readers' 100-box
+  `ipco` limit.** The container writer (oxideav-heif ≥ 0.0.13, now the
+  minimum) interns each distinct property once, so a grid's tiles
+  share one `av1C` / `ispe` / `pixi` / `colr`. `AUTO_GRID_MAX_TILES`
+  goes from 90 to 900 (the readers' 1 000-item ceiling, measured: a
+  1 538-item file is refused by three of five): 12 MP with alpha is
+  coded as 8 × 6 + 8 × 6 tiles of 512 instead of 4 × 3 + 4 × 3 of
+  1024, and an explicit `grid=256` on 12 MP (192 tiles) opens in every
+  installed reader.
+- `EncodeOptions::default()` on `encode_rgb8` / `encode_rgba8` (the
+  default is `base_q_idx = 0`) now writes identity-matrix 4:4:4 RGB
+  instead of a 4:2:0 Y′CbCr picture with lossless AV1 coding — larger,
+  and exact. Ask for a lossy quality (`with_quality(..)`) to get the
+  Y′CbCr coding.
 - `#[non_exhaustive]` on `AvifPixelFormat` (the layout set has grown with the high-bit-depth and packed-alpha variants) and `EncodeSpeed`. `ColorRange` (full / limited) and `StillChroma` (AV1's four chroma layouts) stay exhaustive; `AvifFrame` / `AvifPlane` stay plain value records.
 
 ## [0.0.17](https://github.com/OxideAV/oxideav-avif/compare/v0.0.16...v0.0.17) - 2026-11-06
