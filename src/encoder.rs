@@ -622,27 +622,6 @@ impl AvifEncoder {
             .input_format
             .ok_or_else(|| Error::invalid("avif encode: CodecParameters.pixel_format required"))?;
 
-        // Sub-sampled chroma needs even extents on the sub-sampled
-        // axis (the contract path's rule): a typed refusal, never a
-        // zero-height chroma plane.
-        let (sx, sy) = match fmt {
-            PixelFormat::Yuv420P
-            | PixelFormat::YuvJ420P
-            | PixelFormat::Yuv420P10Le
-            | PixelFormat::Yuv420P12Le
-            | PixelFormat::Yuva420P => (1, 1),
-            PixelFormat::Yuv422P
-            | PixelFormat::YuvJ422P
-            | PixelFormat::Yuv422P10Le
-            | PixelFormat::Yuv422P12Le => (1, 0),
-            _ => (0, 0),
-        };
-        if (sx == 1 && width % 2 != 0) || (sy == 1 && height % 2 != 0) {
-            return Err(Error::unsupported(format!(
-                "avif encode: {fmt:?} at {width}x{height} — this encoder codes sub-sampled \
-                 chroma only at even extents; hand it a 4:4:4 or packed layout"
-            )));
-        }
         if width == 0 || height == 0 {
             return Err(Error::invalid(
                 "avif encode: dimensions must be at least 1x1",
@@ -847,7 +826,10 @@ fn planar8(
     let (sx, sy) = chroma_shift(chroma);
     let y = pack8(&vf.planes[0], width as usize, height as usize)?;
     let (u, v) = if planes_needed == 3 {
-        let (cw, ch) = ((width >> sx) as usize, (height >> sy) as usize);
+        let (cw, ch) = (
+            ((width + sx) >> sx) as usize,
+            ((height + sy) >> sy) as usize,
+        );
         (pack8(&vf.planes[1], cw, ch)?, pack8(&vf.planes[2], cw, ch)?)
     } else {
         (Vec::new(), Vec::new())
@@ -888,7 +870,10 @@ fn planar16(
     let (sx, sy) = chroma_shift(chroma);
     let y = pack16le(&vf.planes[0], width as usize, height as usize)?;
     let (u, v) = if planes_needed == 3 {
-        let (cw, ch) = ((width >> sx) as usize, (height >> sy) as usize);
+        let (cw, ch) = (
+            ((width + sx) >> sx) as usize,
+            ((height + sy) >> sy) as usize,
+        );
         (
             pack16le(&vf.planes[1], cw, ch)?,
             pack16le(&vf.planes[2], cw, ch)?,
@@ -902,8 +887,8 @@ fn planar16(
 /// Packed RGB(A)/BGR(A): `rgb_at` gives the byte offsets of R, G, B
 /// within each `bpp`-byte pixel; a 4th byte (when `bpp == 4`) is the
 /// alpha channel. `lossy` = `Some((colour, chroma))` converts the
-/// picture to Y′CbCr in `colour` and codes it in `chroma` (odd extents
-/// 4:4:4); `None` keeps the byte-exact identity-matrix 4:4:4 coding.
+/// picture to Y′CbCr in `colour` and codes it in `chroma` (at every
+/// extent); `None` keeps the byte-exact identity-matrix 4:4:4 coding.
 fn packed_rgb(
     vf: &VideoFrame,
     width: u32,
@@ -990,8 +975,10 @@ fn ycbcr_scales(color: &ColorInfo) -> (f64, f64, f64, f64) {
 /// for an unspecified one — rounded to nearest at the signalled
 /// range), the chroma of a sub-sampled layout box-filtered from the
 /// rounded 4:4:4 values (`(a + b + c + d + 2) >> 2` per 2×2 for
-/// 4:2:0, `(a + b + 1) >> 1` per pair for 4:2:2); odd extents promote
-/// to 4:4:4. The same numbers as the contract path's conversion
+/// 4:2:0, `(a + b + 1) >> 1` per pair for 4:2:2; at an odd extent the
+/// last chroma column / row averages the samples the picture has —
+/// the chroma plane is `(extent + 1) >> 1` wide / tall). The same
+/// numbers as the contract path's conversion
 /// ([`crate::api_codec`]'s `still_of_rgb_in`) without its packed /
 /// 4:4:4 intermediates: the working set is the output planes.
 #[allow(clippy::too_many_arguments)]
@@ -1006,8 +993,6 @@ pub(crate) fn packed_rgb_to_ycbcr(
     chroma: StillChroma,
 ) -> StillImage {
     let chroma = match chroma {
-        StillChroma::Yuv420 if !w.is_multiple_of(2) || !h.is_multiple_of(2) => StillChroma::Yuv444,
-        StillChroma::Yuv422 if !w.is_multiple_of(2) => StillChroma::Yuv444,
         StillChroma::Monochrome => StillChroma::Yuv444,
         other => other,
     };
@@ -1016,11 +1001,14 @@ pub(crate) fn packed_rgb_to_ycbcr(
     let kg = 1.0 - kr - kb;
     let (y_off, y_scale, mid, c_scale) = ycbcr_scales(&color);
     let (sx, sy) = chroma_shift(chroma);
-    let (cw, ch) = (w >> sx, h >> sy);
+    let (cw, ch) = ((w + sx as usize) >> sx, (h + sy as usize) >> sy);
     let mut y_plane = Vec::with_capacity(w * h);
     let mut u_plane = vec![0u16; cw * ch];
     let mut v_plane = vec![0u16; cw * ch];
-    let count = 1u32 << (sx + sy);
+    // Luma samples under one chroma sample: `1 << (sx + sy)` inside
+    // the picture, fewer in the last column / row of an odd extent.
+    let cols_in = |cx: usize| ((cx + 1) << sx).min(w) - (cx << sx);
+    let rows_in = |cy: usize| ((cy + 1) << sy).min(h) - (cy << sy);
     let round = |v: f64| v.round().clamp(0.0, 255.0) as u16;
     // Rows go in pairs for 4:2:0 so the 2×2 sum closes per row pair
     // without a full-resolution chroma plane: `acc` holds the running
@@ -1046,11 +1034,19 @@ pub(crate) fn packed_rgb_to_ycbcr(
         // The last luma row of this chroma row: close the sums.
         if (row >> sy) != ((row + 1) >> sy) || row + 1 == h {
             let base = cy * cw;
-            for i in 0..cw {
-                u_plane[base + i] = ((acc_u[i] + count / 2) / count) as u16;
-                v_plane[base + i] = ((acc_v[i] + count / 2) / count) as u16;
-                acc_u[i] = 0;
-                acc_v[i] = 0;
+            let rows = rows_in(cy);
+            let cells = u_plane[base..base + cw]
+                .iter_mut()
+                .zip(&mut v_plane[base..base + cw]);
+            for (cx, ((u, v), (su, sv))) in cells
+                .zip(acc_u.iter_mut().zip(acc_v.iter_mut()))
+                .enumerate()
+            {
+                let count = (cols_in(cx) * rows) as u32;
+                *u = ((*su + count / 2) / count) as u16;
+                *v = ((*sv + count / 2) / count) as u16;
+                *su = 0;
+                *sv = 0;
             }
         }
     }

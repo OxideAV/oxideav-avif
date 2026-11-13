@@ -14,8 +14,8 @@
 //!   sequence still has at least an image item; the first sample is a
 //!   sync sample, i.e. valid AV1 Image Item Data per §2.1).
 //! * `moov` / `trak` — `'pict'` handler (§3), one `av01` sample entry
-//!   (§3: exactly one) carrying `av1C` (+ `colr`, + `clap` when the
-//!   coded extents pad the requested ones), `stts` / `stsc` / `stsz` /
+//!   (§3: exactly one) carrying `av1C` (+ `colr`) at the pictures' own
+//!   size (no `clap`), `stts` / `stsc` / `stsz` /
 //!   `stco` and — when not every sample is a sync sample — `stss`
 //!   (14496-12 §8.6.2: absence means every sample is sync).
 //! * `mdat` — the AV1 temporal units, one per sample (binding §2.4).
@@ -30,11 +30,13 @@
 //!   reads the repetition count from; Exif / XMP of the first frame
 //!   ride as items of the picture track's `meta`.
 //!
-//! All-intra samples are coded at the picture's own extents; KEY + P
-//! groups at the extents rounded up to a multiple of 8 with a `clap`
-//! in the sample entry cropping back (some players scale the decoded
-//! frame to the `tkhd` size instead of applying that `clap`, so
-//! [`crate::encode_all`] codes off-grid pictures all-intra).
+//! Every sample — KEY frames and the P frames of a group alike — is
+//! coded at the picture's own extents, whatever they are (odd, not a
+//! multiple of 8, sub-sampled chroma at an odd size): the sample
+//! entry, the `tkhd` and the decoded frame state one size and there
+//! is no clean aperture for a player to apply (ISO/IEC 14496-12
+//! §8.5.2: the entry documents the cropped frame dimensions; block
+//! padding is the codec's own business).
 //!
 //! Frames are coded either all-intra (every sample a KEY frame, one
 //! Sequence Header per sample — §3 requires repeated headers to be
@@ -45,13 +47,11 @@
 
 use crate::api::EncodeSpeed;
 use crate::error::{AvifError as Error, Result};
-use crate::mux::{
-    ProfileBrand, prop_av1c, prop_clap, prop_colr, prop_ispe, prop_pixi, sequence_brands,
-};
+use crate::mux::{ProfileBrand, prop_av1c, prop_colr, prop_ispe, prop_pixi, sequence_brands};
 use crate::still::{
     CodedTuning, STILL_MAX_CODED_DIM, StillImage, av1_err, av1c_from_seq, code_in_parallel,
-    coded_extent, colr_is_full_range, encode_coded_item, item_extent, pad_plane, pixi_bits,
-    resignalled_temporal_unit, stream_colour_description, top_left_clap,
+    colr_is_full_range, encode_coded_item, item_extent, pixi_bits, resignalled_temporal_unit,
+    stream_colour_description,
 };
 use oxideav_av1::encoder::inter_frame::{GOP_MAX_FRAMES, encode_gop_yuv_with_q};
 use oxideav_av1::encoder::yuv_frame::YuvFrame;
@@ -217,15 +217,10 @@ pub(crate) fn encode_sequence_timed(
             opts.gop_length
         )));
     }
-    // KEY frames are coded at the picture's own extents; the KEY + P
-    // group coder works on the 8 × 8 mode-info grid, so off-grid
-    // pictures are edge-padded there and cropped back by the sample
-    // entry's `clap`.
-    let (pw, ph) = if opts.all_intra {
-        (item_extent(first.width), item_extent(first.height))
-    } else {
-        (coded_extent(first.width), coded_extent(first.height))
-    };
+    // Every sample is coded at the picture's own extents (KEY frames
+    // and KEY + P groups alike: the AV1 coder pads to its mode-info
+    // grid internally and codes the true frame size).
+    let (pw, ph) = (item_extent(first.width), item_extent(first.height));
     if pw > STILL_MAX_CODED_DIM || ph > STILL_MAX_CODED_DIM {
         return Err(Error::unsupported(format!(
             "avif sequence: coded extents {pw}x{ph} exceed {STILL_MAX_CODED_DIM}"
@@ -266,27 +261,14 @@ pub(crate) fn encode_sequence_timed(
                 },
             )));
         }
-        let (w, h) = (f.width as usize, f.height as usize);
-        let y = pad_plane(&f.y, w, h, pw as usize, ph as usize);
-        let (u, v) = if f.chroma.has_chroma() {
-            let (sx, sy) = f.chroma.subsampling();
-            let (cw, ch) = f.chroma_dims();
-            let (pcw, pch) = ((pw >> sx) as usize, (ph >> sy) as usize);
-            (
-                pad_plane(&f.u, cw as usize, ch as usize, pcw, pch),
-                pad_plane(&f.v, cw as usize, ch as usize, pcw, pch),
-            )
-        } else {
-            (Vec::new(), Vec::new())
-        };
         yuv.push(YuvFrame {
             width: pw,
             height: ph,
             bit_depth: f.bit_depth,
             format: f.chroma.to_av1(),
-            y,
-            u,
-            v,
+            y: f.y.clone(),
+            u: f.u.clone(),
+            v: f.v.clone(),
         });
     }
     let full_range = colr_is_full_range(first);
@@ -357,8 +339,6 @@ pub(crate) fn encode_sequence_timed(
         1 => ProfileBrand::Advanced,
         _ => ProfileBrand::Bare,
     };
-    let clap = ((pw, ph) != (first.width, first.height))
-        .then(|| top_left_clap(first.width, first.height, pw, ph));
     let all_sync = samples.iter().all(|(_, s)| *s);
     if pw > u32::from(u16::MAX) || ph > u32::from(u16::MAX) {
         return Err(Error::unsupported(
@@ -370,7 +350,7 @@ pub(crate) fn encode_sequence_timed(
     // track's properties, its `iloc` aliasing sample 0 in the track
     // `mdat` — HEIF §7.1 recommends the cover, av1-avif §6.3 NOTE
     // requires the item), `moov` / `trak` with the `pict` handler,
-    // the `av01` sample entry carrying `av1C` (+ `colr`, + `clap`)
+    // the `av01` sample entry carrying `av1C` (+ `colr`)
     // and the mandatory `ccst` (HEIF §7.2.3.1), `stts` / `stsc` /
     // `stsz` / `stco`, `stss` only when a sample is not sync.
     let pixi = pixi_bits(first);
@@ -389,11 +369,6 @@ pub(crate) fn encode_sequence_timed(
         let (colr, _) = prop_colr(&crate::meta::Colr::Icc(icc.clone()))?;
         entry_properties.push(colr.clone());
         props.push((colr, false));
-    }
-    if let Some(c) = clap.as_ref() {
-        let (clap, essential) = prop_clap(c);
-        entry_properties.push(clap.clone());
-        props.push((clap, essential));
     }
     let (av1c_prop, _) = prop_av1c(&av1c, "sequence ")?;
     let (major, compat) = sequence_brands(profile_brand, all_sync);
@@ -429,7 +404,6 @@ pub(crate) fn encode_sequence_timed(
         // frame per picture sample at the picture's depth and coded
         // extents (av1-avif §4.1), time-parallel by construction (the
         // same durations).
-        let (w, h) = (first.width as usize, first.height as usize);
         let coded = code_in_parallel(frames.len(), workers, &|i| {
             let alpha = frames[i]
                 .alpha
@@ -440,7 +414,7 @@ pub(crate) fn encode_sequence_timed(
                 ph,
                 first.bit_depth,
                 oxideav_av1::encoder::yuv_frame::ChromaFormat::Monochrome,
-                pad_plane(alpha, w, h, pw as usize, ph as usize),
+                alpha.clone(),
                 Vec::new(),
                 Vec::new(),
                 opts.alpha_q_idx,
@@ -456,24 +430,20 @@ pub(crate) fn encode_sequence_timed(
             if alpha_config.is_none() {
                 alpha_config = Some(prop_av1c(&item.av1c, "sequence alpha ")?.0);
             }
-            alpha_samples.push(oxideav_heif::writer::SequenceSample::new(
+            alpha_samples.push(oxideav_heif::SequenceSample::new(
                 item.payload,
                 duration_of(i),
                 true,
             ));
         }
-        let mut alpha_entry = Vec::new();
-        if let Some(c) = clap.as_ref() {
-            alpha_entry.push(prop_clap(c).0);
-        }
-        writer.alpha = Some(oxideav_heif::writer::SequenceAlphaTrack::new(
+        writer.alpha = Some(oxideav_heif::SequenceAlphaTrack::new(
             *b"av01",
             alpha_config.expect("at least one alpha sample"),
             pw as u16,
             ph as u16,
             crate::alpha::ALPHA_URN_PREFIX.to_string(),
             alpha_samples,
-            alpha_entry,
+            Vec::new(),
         ));
     }
     if let Some(count) = opts.loop_count {

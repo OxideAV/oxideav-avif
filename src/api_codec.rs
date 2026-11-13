@@ -955,13 +955,6 @@ fn still_of(image: &AvifImage, opts: &EncodeOptions) -> Result<StillImage> {
             _ => StillChroma::Yuv444,
         }
     };
-    if (sx == 1 && !image.width.is_multiple_of(2)) || (sy == 1 && !image.height.is_multiple_of(2)) {
-        return Err(Error::unsupported(format!(
-            "avif encode: {format:?} at {}x{} — this encoder codes sub-sampled chroma only at \
-             even extents; use 4:4:4 (or `encode_rgb8`, which falls back to it)",
-            image.width, image.height
-        )));
-    }
     let (y, u, v, alpha) = if format.is_packed_ya() {
         let packed = plane_samples(&image.planes[0], w * 2, h, bps, "packed YA")?;
         let mut y = Vec::with_capacity(w * h);
@@ -1060,13 +1053,9 @@ pub fn encode_all(frames: &[Frame], opts: &EncodeOptions) -> Result<Vec<u8>> {
                 .unwrap_or(0)
         })
         .collect();
-    // Pictures off the 8-pixel grid are coded all-intra at their own
-    // extents: the KEY + P coder would pad them and rely on the sample
-    // entry's `clap`, which not every player applies to a track.
-    let first = &frames[0].image;
-    let off_grid = !first.width.is_multiple_of(8) || !first.height.is_multiple_of(8);
+    // KEY + P groups at every picture size (the samples are coded at
+    // the pictures' own extents, so the sample entry needs no `clap`).
     let seq_opts = crate::sequence::SequenceEncodeOptions::default()
-        .with_all_intra(off_grid)
         .with_timescale(1000)
         .with_base_q_idx(opts.colour_q_idx())
         .with_alpha_q_idx(opts.alpha_plane_q_idx())
@@ -1187,11 +1176,6 @@ pub(crate) fn still_of_rgb_general(
         8,
         data.iter().map(|&b| u16::from(b)).collect(),
     );
-    let mut chroma = chroma;
-    let (sx, sy) = chroma.subsampling();
-    if (sx == 1 && !width.is_multiple_of(2)) || (sy == 1 && !height.is_multiple_of(2)) {
-        chroma = StillChroma::Yuv444;
-    }
     let target = if chroma == StillChroma::Monochrome {
         Chroma::Mono
     } else {
@@ -1239,19 +1223,26 @@ pub(crate) fn still_of_rgb_general(
 }
 
 /// Average a full-resolution plane down by `2^sx × 2^sy` with
-/// round-half-up; extents must be even on each sub-sampled axis.
+/// round-half-up into the `((w + sx) >> sx) × ((h + sy) >> sy)` chroma
+/// plane; the last column / row of an odd extent averages the samples
+/// the picture has.
 fn box_filter(plane: &[u16], w: usize, h: usize, sx: u32, sy: u32) -> Vec<u16> {
-    let (cw, ch) = (w >> sx, h >> sy);
-    let count = 1u32 << (sx + sy);
+    let (cw, ch) = ((w + sx as usize) >> sx, (h + sy as usize) >> sy);
     let mut out = Vec::with_capacity(cw * ch);
     for cy in 0..ch {
+        let rows = (cy << sy)..((cy + 1) << sy).min(h);
         for cx in 0..cw {
-            let mut sum = 0u32;
-            for dy in 0..(1usize << sy) {
-                for dx in 0..(1usize << sx) {
-                    sum += u32::from(plane[(cy * (1 << sy) + dy) * w + cx * (1 << sx) + dx]);
-                }
-            }
+            let cols = (cx << sx)..((cx + 1) << sx).min(w);
+            let count = (rows.len() * cols.len()) as u32;
+            let sum: u32 = rows
+                .clone()
+                .map(|y| {
+                    plane[y * w + cols.start..y * w + cols.end]
+                        .iter()
+                        .map(|&s| u32::from(s))
+                        .sum::<u32>()
+                })
+                .sum();
             out.push(((sum + count / 2) / count) as u16);
         }
     }
@@ -1478,11 +1469,16 @@ mod tests {
             .map(|(a, b)| u32::from(a.abs_diff(*b)))
             .sum();
         assert!(err / (16 * 8 * 3) < 24, "mean error {}", err / (16 * 8 * 3));
-        // Odd extents fall back to 4:4:4.
+        // Odd extents keep the requested layout (chroma planes
+        // rounded up: 3 × 2 for 5 × 3).
         let odd: Vec<u8> = (0..5 * 3 * 3).map(|i| (i * 11 % 256) as u8).collect();
         let bytes = encode_rgb8(5, 3, &odd, &lossy_opts).unwrap();
-        assert_eq!(crate::info(&bytes).unwrap().format, PixelFormat::Yuv444P);
+        assert_eq!(crate::info(&bytes).unwrap().format, PixelFormat::Yuv420P);
         assert_eq!(crate::info(&bytes).unwrap().color.matrix, 6);
+        let img = decode(&bytes).unwrap();
+        assert_eq!((img.width, img.height), (5, 3));
+        assert_eq!(img.planes[1].data.len(), 3 * 2);
+        assert_eq!(decode_rgb8(&bytes).unwrap().data.len(), 5 * 3 * 3);
         // RGBA: alpha as the auxiliary, exact at the default alpha
         // quantiser.
         let rgba: Vec<u8> = (0..8 * 8 * 4).map(|i| (i * 13 % 256) as u8).collect();
@@ -1533,22 +1529,22 @@ mod tests {
 
     #[test]
     fn encode_refuses_unsupported_layouts_without_converting() {
-        // Odd 4:2:0 extents: AV1 could, this encoder does not.
+        // Odd 4:2:0 extents are coded as they are (2 × 2 chroma for a
+        // 3 × 3 picture) and come back exactly at the lossless default.
         let img = AvifImage::new(
             3,
             3,
             PixelFormat::Yuv420P,
             vec![
-                Plane::new(3, vec![0; 9]),
-                Plane::new(2, vec![0; 4]),
-                Plane::new(2, vec![0; 4]),
+                Plane::new(3, (0..9).map(|i| i * 20).collect()),
+                Plane::new(2, vec![90, 100, 110, 120]),
+                Plane::new(2, vec![200, 190, 180, 170]),
             ],
         )
         .unwrap();
-        assert!(matches!(
-            encode(&img, &EncodeOptions::default()),
-            Err(Error::Unsupported(_))
-        ));
+        let back = decode(&encode(&img, &EncodeOptions::default()).unwrap()).unwrap();
+        assert_eq!(back.format, PixelFormat::Yuv420P);
+        assert_eq!(back.planes, img.planes);
         // Plane count mismatch (fields assigned after construction).
         let mut img =
             AvifImage::new(4, 4, PixelFormat::Gray8, vec![Plane::new(4, vec![0; 16])]).unwrap();

@@ -27,11 +27,12 @@
 //! * **Arbitrary dimensions.** A coded item is the AV1 frame of the
 //!   picture's own extents (any size from 1 × 1): `ispe` documents
 //!   them per the §2.2.2 `shall` (`image_width` / `image_height` equal
-//!   `UpscaledWidth` / `FrameHeight`) and there is nothing to crop.
-//!   Only the spatially layered encode, whose coder works on the
-//!   8 × 8 grid, still edge-replicates up to the next multiple of 8
-//!   and crops back with an essential top-left `clap` (§2.2.3) — as
-//!   do grid tiles, trimmed by the grid's output extents.
+//!   `UpscaledWidth` / `FrameHeight`) and there is nothing to crop —
+//!   single items, burst members, the layers of a spatially layered
+//!   item and image-sequence samples alike. Sub-sampled chroma at an
+//!   odd extent has the rounded-up plane size `(extent + 1) >> 1`,
+//!   the chroma plane AV1 gives a frame of that size. Only grid tiles are edge-replicated
+//!   to a common tile size, trimmed by the grid's output extents.
 //! * **Grid encode** ([`encode_still_grid`]) for canvases beyond the
 //!   single-item limit: the canvas splits into equal coded tiles
 //!   (HEIF §6.6.2 `grid` derived item, `dimg` irefs), the declared
@@ -559,7 +560,7 @@ impl StillImage {
             return (0, 0);
         }
         let (sx, sy) = self.chroma.subsampling();
-        (self.width >> sx, self.height >> sy)
+        ((self.width + sx) >> sx, (self.height + sy) >> sy)
     }
 
     /// Shape / depth / range validation.
@@ -573,16 +574,6 @@ impl StillImage {
             return Err(Error::invalid(format!(
                 "avif still: bit_depth must be 8, 10 or 12, got {}",
                 self.bit_depth
-            )));
-        }
-        let (sx, sy) = self.chroma.subsampling();
-        if self.chroma.has_chroma()
-            && ((sx == 1 && !self.width.is_multiple_of(2))
-                || (sy == 1 && !self.height.is_multiple_of(2)))
-        {
-            return Err(Error::invalid(format!(
-                "avif still: {:?} requires even subsampled extents, got {}x{}",
-                self.chroma, self.width, self.height
             )));
         }
         let luma_len = (self.width as usize) * (self.height as usize);
@@ -1155,7 +1146,7 @@ fn encode_primary(
     let (u, v) = if img.chroma.has_chroma() {
         let (sx, sy) = img.chroma.subsampling();
         let (cw, ch) = img.chroma_dims();
-        let (pcw, pch) = ((pw >> sx) as usize, (ph >> sy) as usize);
+        let (pcw, pch) = (((pw + sx) >> sx) as usize, ((ph + sy) >> sy) as usize);
         (
             pad_plane(&img.u, cw as usize, ch as usize, pcw, pch),
             pad_plane(&img.v, cw as usize, ch as usize, pcw, pch),
@@ -1873,9 +1864,11 @@ pub fn layer_byte_sizes(payload: &[u8]) -> Result<Vec<u32>> {
 /// carries `a1lx` (per-layer byte sizes, §2.3.2.3) and `lsel`
 /// (HEIF §6.5.11): `render_layer = None` writes `0xFFFF`, allowing a
 /// reader to render every layer progressively and finish on the top
-/// one; `Some(s)` pins layer `s`. `ispe` / `clap` describe the
-/// selected layer (§2.2.2: the last frame decoded at operating point 0
-/// when unpinned).
+/// one; `Some(s)` pins layer `s`. `ispe` describes the selected layer
+/// (§2.2.2: the last frame decoded at operating point 0 when
+/// unpinned). Every layer is coded at its own extents — any size,
+/// sub-sampled layouts at odd extents included — so no `clap` is
+/// written.
 ///
 /// Alpha (of the top layer only) rides as the usual single-layer
 /// auxiliary. Pass-through properties come from the top layer.
@@ -1908,33 +1901,23 @@ pub fn encode_still_layered(
                 layer.width, layer.height, top.width, top.height
             )));
         }
-        let (pw, ph) = (coded_extent(layer.width), coded_extent(layer.height));
+        // Every layer is coded at its own extents (the AV1 frame size
+        // of that spatial layer; chroma at the rounded-up sub-sampled
+        // extent).
+        let (pw, ph) = (item_extent(layer.width), item_extent(layer.height));
         if pw > STILL_MAX_CODED_DIM || ph > STILL_MAX_CODED_DIM {
             return Err(Error::unsupported(format!(
                 "avif still: layer {i} coded extents {pw}x{ph} exceed {STILL_MAX_CODED_DIM}"
             )));
         }
-        let (w, h) = (layer.width as usize, layer.height as usize);
-        let y = pad_plane(&layer.y, w, h, pw as usize, ph as usize);
-        let (u, v) = if layer.chroma.has_chroma() {
-            let (sx, sy) = layer.chroma.subsampling();
-            let (cw, ch) = layer.chroma_dims();
-            let (pcw, pch) = ((pw >> sx) as usize, (ph >> sy) as usize);
-            (
-                pad_plane(&layer.u, cw as usize, ch as usize, pcw, pch),
-                pad_plane(&layer.v, cw as usize, ch as usize, pcw, pch),
-            )
-        } else {
-            (Vec::new(), Vec::new())
-        };
         frames.push(vec![YuvFrame {
             width: pw,
             height: ph,
             bit_depth: layer.bit_depth,
             format: layer.chroma.to_av1(),
-            y,
-            u,
-            v,
+            y: layer.y.clone(),
+            u: layer.u.clone(),
+            v: layer.v.clone(),
         }]);
         coded_dims.push((pw, ph));
     }
@@ -1976,14 +1959,10 @@ pub fn encode_still_layered(
     let mut max_profile = coded.seq.seq_profile;
 
     let (pw, ph) = coded_dims[selected];
-    let sel_img = layers[selected];
     let mut mux = AvifMuxer::new(pw, ph, payload, av1c)
         .with_pixi(pixi_bits(top))
         .with_layered_index(a1lx)
         .with_layer_selector(render_layer.map_or(0xFFFF, u16::from));
-    if (pw, ph) != (sel_img.width, sel_img.height) {
-        mux = mux.with_clap(top_left_clap(sel_img.width, sel_img.height, pw, ph));
-    }
     if let Some(colr) = &top.colr {
         mux = mux.with_colr(colr.clone());
     }

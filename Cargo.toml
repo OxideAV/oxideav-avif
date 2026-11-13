@@ -23,14 +23,19 @@ exclude = ["/tests", "/fuzz"]
 # the framework or the AV1 codec.
 # See `src/lib.rs` for the standalone-vs-registry split.
 oxideav-core = { version = "0.1", optional = true }
-oxideav-av1 = { version = "0.1", optional = true }
+# 0.1.24: the KEY + P group and spatial-layer encoders code any
+# picture extent (image sequences and layered items off the 8-sample
+# grid).
+oxideav-av1 = { version = "0.1.24", optional = true }
 # The ISOBMFF / HEIF container layer (box reader, `meta` item model,
 # item payload resolution, derived-image graph, composition, sequence
 # tables, writer). Always on: the standalone build talks to it too.
 # `0.0.x` requirements are exact under caret semantics; the range keeps
 # avif on the latest heif 0.0 line (0.0.13 made the `ipco` a pool — one
-# `av1C` shared by a grid's tiles — which the automatic grid relies on).
-oxideav-heif = { version = ">=0.0.13, <0.1", default-features = false }
+# `av1C` shared by a grid's tiles — which the automatic grid relies on;
+# 0.0.15 exports `SequenceSample` and reads the alpha information
+# property).
+oxideav-heif = { version = ">=0.0.15, <0.1", default-features = false }
 
 [features]
 default = ["registry"]

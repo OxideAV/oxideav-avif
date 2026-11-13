@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Every picture size on every encode path** (oxideav-av1 ≥ 0.1.24,
+  whose KEY + P group and spatial-layer coders take any extent):
+  - *Image sequences use inter prediction at any size.* `encode_all`
+    coded timed frames whose width or height was not a multiple of 8
+    all-intra (the group coder padded to the 8-sample grid and relied
+    on a `clap` not every player applies to a track). KEY + P groups
+    are now coded at the pictures' own extents — the sample entry, the
+    `tkhd` and the decoded frame state one size, and no sequence
+    carries a `clap` any more. `encode_sequence` does the same.
+  - *Sub-sampled chroma at odd extents.* `encode(&AvifImage)`, the
+    registry encoder (`Yuv420P*` / `Yuv422P*` / `YuvJ*` / `Yuva420P`),
+    `StillImage::yuv` and every path built on them refused a 4:2:0 /
+    4:2:2 picture with an odd sub-sampled extent (`Unsupported`); it is
+    coded as it is, the chroma planes at the rounded-up size
+    `(extent + 1) >> 1` — the layout the decoder already returned for
+    such files.
+  - *Layered / progressive items at any size.* `encode_still_layered`
+    codes every spatial layer at its own extents (it padded each layer
+    to the 8-sample grid and cropped the selected one with a `clap`).
+- `tests/any_extent.rs`: 10 extents (1 × 1, odd, ×2, ×4, ×8, one axis
+  off the grid, past one superblock) × 4:2:0 / 4:2:2 / 4:4:4 /
+  monochrome × 8 / 10 bits × with / without alpha — 140 stills and 70
+  four-frame sequences exact through this crate's decoder (samples 1..
+  inter-predicted, no `clap`), six layered items exact layer by layer,
+  45 stills reproduced sample for sample by the black-box AVIF decoder
+  and sized correctly by three more readers, 15 off-grid sequences
+  presented at their size with square pixels and decoded exactly by
+  the black-box media framework.
+
+### Changed
+
+- **Lossy `encode_rgb8` / `encode_rgba8` and the registry's packed
+  RGB(A) path keep the requested `chroma` at odd extents** (4:2:0 by
+  default; they promoted to 4:4:4). The last chroma column / row
+  averages the samples the picture has. Files of even-sized pictures
+  are unchanged.
+- Dependency floors: `oxideav-av1` 0.1.24, `oxideav-heif` 0.0.15
+  (`SequenceSample` / `SequenceAlphaTrack` taken from the crate root).
+
 ## [0.0.18](https://github.com/OxideAV/oxideav-avif/compare/v0.0.17...v0.0.18) - 2026-11-10
 
 ### Other

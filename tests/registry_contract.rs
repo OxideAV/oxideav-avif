@@ -84,7 +84,7 @@ fn frame(fmt: PixelFormat, w: u32, h: u32) -> Frame {
     let depth = depth_of(fmt);
     let mut out = Vec::new();
     for (pi, (sx, sy)) in planes.iter().enumerate() {
-        let (pw, ph) = ((w >> sx) as usize, (h >> sy) as usize);
+        let (pw, ph) = (((w + sx) >> sx) as usize, ((h + sy) >> sy) as usize);
         let stride = pw * channels * bps;
         let mut data = Vec::with_capacity(stride * ph);
         for y in 0..ph {
@@ -523,7 +523,8 @@ fn lossy_packed_rgb_lands_on_ycbcr_lossless_keeps_identity() {
     let dp = params(PixelFormat::Rgb24, 16, 16, CodecOptions::new());
     assert_eq!(decode(&ctx, &dp, &lossy).1, PixelFormat::YuvJ420P);
 
-    // `chroma=444` keeps full chroma; odd extents promote to 4:4:4.
+    // `chroma=444` keeps full chroma; odd extents keep the requested
+    // layout (4:2:0 by default, chroma planes rounded up).
     let (c444, out) = enc(
         CodecOptions::new()
             .set("quality", "60")
@@ -536,16 +537,16 @@ fn lossy_packed_rgb_lands_on_ycbcr_lossless_keeps_identity() {
     assert_eq!(decode(&ctx, &dp, &c444).1, PixelFormat::YuvJ444P);
     let f15 = frame(PixelFormat::Rgb24, 15, 15);
     let (odd, out) = enc(CodecOptions::new().set("quality", "60"), 15, 15, &f15);
-    assert_eq!(out.pixel_format, Some(PixelFormat::YuvJ444P));
-    assert_eq!(
-        decode(
-            &ctx,
-            &params(PixelFormat::Rgb24, 15, 15, CodecOptions::new()),
-            &odd
-        )
-        .1,
-        PixelFormat::YuvJ444P
+    assert_eq!(out.pixel_format, Some(PixelFormat::YuvJ420P));
+    let (vf15, label) = decode(
+        &ctx,
+        &params(PixelFormat::Rgb24, 15, 15, CodecOptions::new()),
+        &odd,
     );
+    assert_eq!(label, PixelFormat::YuvJ420P);
+    assert_eq!(vf15.planes[1].data.len(), 8 * 8);
+    let db = psnr8(&rgb_of(&odd), &planes_of(&f15)[0].data);
+    assert!(db > 25.0, "quality 60 RGB 15x15 round trip {db:.2} dB");
 
     // RGBA keeps its alpha as the auxiliary on the lossy path too.
     let fa = frame(PixelFormat::Rgba, 16, 16);
@@ -911,12 +912,14 @@ fn blobs_ride_the_registry_frame_over_stream() {
     assert!(plain.len() < bytes.len());
 }
 
-/// Sub-sampled layouts at odd extents are refused by type (never a
-/// zero-height chroma plane: a 2 × 1 `Yuv420P12Le` frame panicked in
-/// the fuzz harness), packed / 4:4:4 layouts take odd extents, and a
-/// short plane is `InvalidData`.
+/// Sub-sampled layouts at odd extents are coded as they are — the
+/// chroma planes rounded up, `(extent + 1) >> 1` (never a zero-height
+/// chroma plane: a 2 × 1 `Yuv420P12Le` frame panicked in the fuzz
+/// harness once) — and decode back exactly at the lossless setting;
+/// packed / 4:4:4 layouts take odd extents, and a short plane is
+/// `InvalidData`.
 #[test]
-fn odd_extents_refuse_subsampled_layouts_by_type_and_short_planes_by_data() {
+fn odd_extents_code_subsampled_layouts_and_short_planes_are_refused_by_data() {
     let ctx = registry();
     for (fmt, w, h) in [
         (PixelFormat::Yuv420P12Le, 2, 1),
@@ -924,21 +927,42 @@ fn odd_extents_refuse_subsampled_layouts_by_type_and_short_planes_by_data() {
         (PixelFormat::YuvJ420P, 2, 3),
         (PixelFormat::Yuv422P10Le, 1, 2),
         (PixelFormat::Yuva420P, 2, 1),
+        (PixelFormat::Yuv420P, 1, 1),
+        (PixelFormat::Yuv420P, 17, 13),
+        (PixelFormat::Yuv422P, 33, 9),
+        (PixelFormat::Yuv420P10Le, 67, 35),
+        (PixelFormat::Yuva420P, 21, 11),
     ] {
-        let mut enc = ctx
-            .codecs
-            .first_encoder(&params(fmt, w, h, CodecOptions::new()))
-            .expect("encoder");
-        let mut f = frame(fmt, w.max(2), h.max(2));
-        if let Frame::Video(v) = &mut f {
-            v.planes
-                .iter_mut()
-                .for_each(|p| p.data.truncate(p.stride * h as usize));
-        }
-        assert!(
-            matches!(enc.send_frame(&f), Err(Error::Unsupported(_))),
-            "{fmt:?} {w}x{h}"
+        let f = frame(fmt, w, h);
+        let (bytes, _) = encode(
+            &ctx,
+            &params(fmt, w, h, CodecOptions::new().set("lossless", "true")),
+            &f,
         );
+        let info = oxideav_avif::info(&bytes).expect("info");
+        assert_eq!((info.width, info.height), (w, h), "{fmt:?}");
+        let (vf, _) = decode(&ctx, &params(fmt, w, h, CodecOptions::new()), &bytes);
+        let src = planes_of(&f);
+        assert_eq!(vf.image_plane_count(), src.len(), "{fmt:?} {w}x{h}");
+        for (i, (got, want)) in vf.planes.iter().zip(src).enumerate() {
+            assert_eq!(got.data, want.data, "{fmt:?} {w}x{h} plane {i}");
+        }
+        // A chroma plane one row short is refused by data.
+        if h > 1 {
+            let mut short = frame(fmt, w, h);
+            if let Frame::Video(v) = &mut short {
+                let p = &mut v.planes[1];
+                p.data.truncate(p.data.len() - p.stride);
+            }
+            let mut enc = ctx
+                .codecs
+                .first_encoder(&params(fmt, w, h, CodecOptions::new()))
+                .expect("encoder");
+            assert!(
+                matches!(enc.send_frame(&short), Err(Error::InvalidData(_))),
+                "{fmt:?} {w}x{h}"
+            );
+        }
     }
     for (fmt, w, h) in [
         (PixelFormat::Yuv444P, 3, 1),
