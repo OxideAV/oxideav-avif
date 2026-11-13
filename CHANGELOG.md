@@ -115,6 +115,11 @@ start of the round built against the same oxideav-av1 0.1.24:
   `encode_rgb8` quality 60: 97 → 62 MiB; lossless `encode_rgb8`
   193 → 123 MiB, `encode_rgba8` 220 → 132 MiB (8 workers 295 →
   199 MiB); registry `Rgba` quality 60 134 → 76 MiB.
+- **A single coded item's planes move into the coder.** A picture
+  coded as one item is cut once from the caller's buffer and those
+  planes are handed to the AV1 coder (they were copied again for it):
+  12 MP 4:2:0 as one item (`grid=none`) 251 → 195 MiB on 1 worker,
+  298 → 258 MiB on 8.
 - **Image sequences hold no second copy.** `encode_all` /
   `encode_sequence` copied every frame into a `StillImage` and again
   into the coder's planes up front; frames are now read in place, one

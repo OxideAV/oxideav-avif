@@ -812,14 +812,14 @@ pub(crate) fn encode_source_auto(
     opts: &EncodeOptions,
 ) -> Result<Vec<u8>> {
     if keeps_single_item(src.width(), src.height(), src.chroma()) {
-        return encode_still(&still_of_source(src, colr, props)?, opts);
+        return encode_still_owned(still_of_source(src, colr, props)?, opts);
     }
     let single_only = props.identity_derivation.is_some() || props.gain_map.is_some();
     match elect_grid_for(src.width(), src.height(), src.has_alpha(), opts.grid)? {
         Some((columns, rows)) if !single_only => {
             encode_source_grid(src, colr, props, opts, columns, rows)
         }
-        _ => encode_still(&still_of_source(src, colr, props)?, opts),
+        _ => encode_still_owned(still_of_source(src, colr, props)?, opts),
     }
 }
 
@@ -1343,6 +1343,36 @@ pub fn encode_still_burst(images: &[StillImage], opts: &EncodeOptions) -> Result
 /// sequence profile coded (for the profile brand).
 fn still_muxer(img: &StillImage, opts: &EncodeOptions) -> Result<(AvifMuxer, u8)> {
     img.validate()?;
+    still_muxer_parts(img, None, opts)
+}
+
+/// The colour planes and the alpha plane of a picture, handed to the
+/// coder as they are (no further copy).
+type OwnedPlanes = ([Vec<u16>; 3], Option<Vec<u16>>);
+
+/// [`encode_still`] for a picture the caller no longer needs: its
+/// colour and alpha planes move into the coder instead of being
+/// copied for it. The file is the one [`encode_still`] writes.
+fn encode_still_owned(mut img: StillImage, opts: &EncodeOptions) -> Result<Vec<u8>> {
+    img.validate()?;
+    let planes = [
+        std::mem::take(&mut img.y),
+        std::mem::take(&mut img.u),
+        std::mem::take(&mut img.v),
+    ];
+    let alpha = img.alpha.take();
+    let (mux, max_profile) = still_muxer_parts(&img, Some((planes, alpha)), opts)?;
+    apply_profile_brand_mux(mux, max_profile).build()
+}
+
+/// [`still_muxer`] on a validated picture. With `owned`, `img` only
+/// describes the picture (extents, depth, layout, colour, properties,
+/// depth map, gain map) and the planes in `owned` are coded.
+fn still_muxer_parts(
+    img: &StillImage,
+    owned: Option<OwnedPlanes>,
+    opts: &EncodeOptions,
+) -> Result<(AvifMuxer, u8)> {
     let (pw, ph) = (item_extent(img.width), item_extent(img.height));
     if pw > STILL_MAX_CODED_DIM || ph > STILL_MAX_CODED_DIM {
         return Err(Error::unsupported(format!(
@@ -1350,7 +1380,27 @@ fn still_muxer(img: &StillImage, opts: &EncodeOptions) -> Result<(AvifMuxer, u8)
              {STILL_MAX_CODED_DIM}; use encode_still_grid",
         )));
     }
-    let primary = encode_primary(img, pw, ph, opts.colour_q_idx(), CodedTuning::of(opts))?;
+    let (owned_colour, owned_alpha) = match owned {
+        Some((colour, alpha)) => (Some(colour), alpha),
+        None => (None, None),
+    };
+    let primary = match owned_colour {
+        Some([y, u, v]) => encode_coded_item(
+            pw,
+            ph,
+            img.bit_depth,
+            img.chroma.to_av1(),
+            y,
+            u,
+            v,
+            opts.colour_q_idx(),
+            colr_is_full_range(img),
+            stream_colour_description(img),
+            CodedTuning::of(opts),
+            "primary",
+        )?,
+        None => encode_primary(img, pw, ph, opts.colour_q_idx(), CodedTuning::of(opts))?,
+    };
     let mut max_profile = primary.seq_profile;
 
     // ispe documents the coded extents (av1-avif §2.2.2) — the
@@ -1422,15 +1472,33 @@ fn still_muxer(img: &StillImage, opts: &EncodeOptions) -> Result<(AvifMuxer, u8)
             alternate_pixi: Some(vec![alt_depth; pixi_bits(img).len()]),
         });
     }
-    if let Some(alpha) = &img.alpha {
-        let coded_alpha = encode_alpha(
+    let coded_alpha = match (owned_alpha, &img.alpha) {
+        // av1-avif §4.1: monochrome, full range, the master's depth.
+        (Some(alpha), _) => Some(encode_coded_item(
+            pw,
+            ph,
+            img.bit_depth,
+            ChromaFormat::Monochrome,
+            alpha,
+            Vec::new(),
+            Vec::new(),
+            opts.alpha_plane_q_idx(),
+            true,
+            None,
+            CodedTuning::of(opts),
+            "alpha",
+        )?),
+        (None, Some(alpha)) => Some(encode_alpha(
             img,
             alpha,
             pw,
             ph,
             opts.alpha_plane_q_idx(),
             CodedTuning::of(opts),
-        )?;
+        )?),
+        (None, None) => None,
+    };
+    if let Some(coded_alpha) = coded_alpha {
         max_profile = max_profile.max(coded_alpha.seq_profile);
         mux = mux
             .with_alpha(

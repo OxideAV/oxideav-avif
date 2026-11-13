@@ -314,7 +314,7 @@ machine, peak RSS = the smallest of the runs:
 
 | input | shape | 1 worker | 4 workers | 8 workers | bytes | luma PSNR |
 |---|---|---|---|---|---|---|
-| 8-bit 4:2:0 | single item (`grid=none`) | 6.85 s / 251 MiB | 2.56 s / 293 MiB | 1.73 s / 298 MiB | 1 982 694 | 35.76 dB |
+| 8-bit 4:2:0 | single item (`grid=none`) | 5.82 s / 195 MiB | 2.13 s / 241 MiB | 1.49 s / 258 MiB | 1 982 694 | 35.76 dB |
 | 8-bit 4:2:0 | **512-pixel grid, 8 × 6 (`auto`)** | 6.99 s / **55 MiB** | 2.07 s / 84 MiB | **1.13 s / 110 MiB** | 2 038 332 (+2.8 %) | 35.77 dB |
 | 8-bit 4:2:0 | 1024-pixel grid, 4 × 3 | 6.33 s / 62 MiB | 1.88 s / 126 MiB | 1.31 s / 184 MiB | 2 014 884 (+1.6 %) | 35.96 dB |
 | 8-bit 4:2:0 | 256-pixel grid, 16 × 12 | 10.3 s / 51 MiB | 3.28 s / 66 MiB | 2.05 s / 77 MiB | 2 053 666 (+3.6 %) | 35.92 dB |
@@ -328,9 +328,10 @@ encoder's state for a 512-pixel tile ≈ 30 MiB (≈ 8 MiB per further
 worker: 55 → 110 MiB from 1 to 8); the coded tiles and the file ≈ 4 MiB.
 There is no whole-picture intermediate: every coded item is cut from
 the caller's buffer when its worker codes it (see "Reading the input in
-place"). The single item's 251 MiB is the AV1 encoder holding the whole
-4032 × 3024 picture's state, which no plumbing on this side changes
-(465 MiB at the previous measurement).
+place"). A single item is cut once and its planes are handed to the
+coder (moved, not copied a second time); its 195 MiB is the AV1 encoder
+holding the whole 4032 × 3024 picture's state, which no plumbing on
+this side changes (465 MiB at the previous measurement).
 
 Where `auto` switches (single item up to 1 MP): measured at 4 MP
 (2304 × 1728, the same picture scaled), single item against the
