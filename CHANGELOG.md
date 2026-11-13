@@ -39,8 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     to the 8-sample grid and cropped the selected one with a `clap`).
 - `tests/any_extent.rs`: 10 extents (1 × 1, odd, ×2, ×4, ×8, one axis
   off the grid, past one superblock) × 4:2:0 / 4:2:2 / 4:4:4 /
-  monochrome × 8 / 10 bits × with / without alpha — 140 stills and 70
-  four-frame sequences exact through this crate's decoder (samples 1..
+  monochrome × 8 / 10 bits × with / without alpha — 140 stills and 60
+  three-frame sequences exact through this crate's decoder (samples 1..
   inter-predicted, no `clap`), six layered items exact layer by layer,
   45 stills reproduced sample for sample by the black-box AVIF decoder
   and sized correctly by three more readers, 15 off-grid sequences

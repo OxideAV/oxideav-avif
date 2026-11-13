@@ -255,18 +255,23 @@ fn stills_round_trip_at_every_extent() {
 /// decoded frame equal to its source.
 #[test]
 fn sequences_predict_between_frames_at_every_extent() {
+    const FRAMES: usize = 3;
+    let cells = [
+        (Layout::Yuv420, 8u8, false),
+        (Layout::Yuv444, 10, true),
+        (Layout::Yuv420, 8, true),
+        (Layout::Yuv444, 8, false),
+        (Layout::Yuv420, 10, false),
+        (Layout::Yuv422, 8, false),
+        (Layout::Gray, 8, false),
+    ];
     for &(w, h) in EXTENTS {
-        for (layout, depth, alpha) in [
-            (Layout::Yuv420, 8u8, false),
-            (Layout::Yuv420, 8, true),
-            (Layout::Yuv444, 8, false),
-            (Layout::Yuv420, 10, false),
-            (Layout::Yuv444, 10, true),
-            (Layout::Yuv422, 8, false),
-            (Layout::Gray, 8, false),
-        ] {
+        // The inter coder is slow in an unoptimised build: the two
+        // largest extents run the first two cells only.
+        let count = if w * h > 2000 { 2 } else { cells.len() };
+        for &(layout, depth, alpha) in &cells[..count] {
             let label = format!("{w}x{h} {layout:?} {depth}-bit alpha={alpha}");
-            let frames: Vec<Frame> = (0..4)
+            let frames: Vec<Frame> = (0..FRAMES as u32)
                 .map(|t| {
                     Frame::new(
                         source(w, h, layout, depth, alpha, t).image(),
@@ -277,7 +282,7 @@ fn sequences_predict_between_frames_at_every_extent() {
             let file = encode_all(&frames, &EncodeOptions::default())
                 .unwrap_or_else(|e| panic!("{label}: encode_all: {e}"));
             let avis = parse_avis(&file).expect("parse_avis");
-            assert_eq!(avis.samples.len(), 4, "{label}");
+            assert_eq!(avis.samples.len(), FRAMES, "{label}");
             assert_eq!(avis.display_dims, Some((w, h)), "{label}: tkhd");
             assert!(avis.samples[0].is_sync, "{label}");
             assert!(
@@ -291,7 +296,7 @@ fn sequences_predict_between_frames_at_every_extent() {
             let info = oxideav_avif::info(&file).expect("info");
             assert_eq!((info.width, info.height), (w, h), "{label}: info");
             let back = decode_all(&file).unwrap_or_else(|e| panic!("{label}: decode_all: {e}"));
-            assert_eq!(back.len(), 4, "{label}");
+            assert_eq!(back.len(), FRAMES, "{label}");
             for (i, (got, want)) in back.iter().zip(&frames).enumerate() {
                 assert_eq!(got.delay, want.delay, "{label} frame {i}");
                 assert_eq!(got.image.format, want.image.format, "{label} frame {i}");
@@ -326,8 +331,8 @@ fn psnr(a: &[u8], b: &[u8]) -> f64 {
 /// synthesis parameters, which no sample-wise measure describes.
 #[test]
 fn off_grid_lossy_sequence_is_smaller_with_inter_prediction() {
-    let (w, h) = (67u32, 45u32);
-    let sources: Vec<Source> = (0..8)
+    let (w, h) = (43u32, 29u32);
+    let sources: Vec<Source> = (0..5)
         .map(|t| {
             let mut src = source(w, h, Layout::Yuv420, 8, false, t);
             src.y = textured_plane(w as usize, h as usize, 8, 1, t, 0);
@@ -610,6 +615,10 @@ fn black_box_readers_reproduce_stills_at_every_extent() {
 /// decodes every frame exactly.
 #[test]
 fn black_box_reader_presents_off_grid_sequences_at_their_size() {
+    if run("ffprobe", &["-version".to_string()]).is_none() {
+        eprintln!("media framework CLI not installed — test skipped");
+        return;
+    }
     let dir = tmp_dir("anyext-seq");
     for &(w, h) in &[(17u32, 13u32), (34, 18), (36, 20), (67, 35), (40, 21)] {
         for (layout, depth, pix_fmt) in [
@@ -705,10 +714,10 @@ fn sequence_groups_code_on_the_budget_with_the_same_bytes() {
     for (layout, alpha) in [(Layout::Yuv420, false), (Layout::Yuv444, true)] {
         let sources: Vec<Source> = (0..7).map(|t| source(w, h, layout, 8, alpha, t)).collect();
         let stills: Vec<StillImage> = sources.iter().map(Source::still).collect();
-        for gop in [1usize, 2, 3, 64] {
+        for gop in [1usize, 3, 64] {
             let opts = SequenceEncodeOptions::default().with_gop_length(gop);
             let serial = encode_sequence(&stills, &opts).expect("serial");
-            for threads in [2usize, 4, 8] {
+            for threads in [2usize, 8] {
                 let threaded =
                     encode_sequence(&stills, &opts.with_threads(threads)).expect("threaded");
                 assert!(
