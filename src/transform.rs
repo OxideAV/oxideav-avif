@@ -102,7 +102,7 @@ pub fn crop_top_left(
         )));
     }
     let mut out = Vec::with_capacity(planes);
-    for p in 0..planes {
+    for (p, src) in frame.planes.iter().enumerate() {
         let (pw, ph) = if plane_is_full_res(p) {
             (out_w, out_h)
         } else {
@@ -111,7 +111,6 @@ pub fn crop_top_left(
                 ((out_h + (1 << sy) - 1) >> sy).max(1),
             )
         };
-        let src = &frame.planes[p];
         let (plane_w, _plane_h) = plane_dims(format, width, height, p)?;
         let mut data = Vec::with_capacity((pw as usize) * (ph as usize) * unit);
         for row in 0..ph as usize {
