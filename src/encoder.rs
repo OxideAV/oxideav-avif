@@ -143,8 +143,9 @@ use oxideav_core::{
 
 use crate::api::{ColorInfo, EncodeOptions, EncodeSpeed, GridTiling, Metadata, exif_item_body};
 use crate::meta::Colr;
+use crate::source::{LossyRgb, PictureView, PlaneRef, TileSource};
 use crate::still::{
-    StillChroma, StillImage, StillProperties, encode_still_auto, identity_full_range_colr,
+    StillChroma, StillImage, StillProperties, encode_source_auto, identity_full_range_colr,
 };
 
 /// Every input layout the encoder accepts (the module docs' list) —
@@ -607,9 +608,12 @@ impl AvifEncoder {
         (!self.opts.is_colour_lossless()).then(|| (self.lossy_rgb_color(), self.opts.chroma))
     }
 
-    /// Convert one framework video frame into a [`StillImage`] per the
-    /// declared `pixel_format`.
-    fn frame_to_still(&self, vf: &VideoFrame) -> Result<StillImage> {
+    /// One framework video frame as the encode reads it, per the
+    /// declared `pixel_format`: a view of the frame's own planes (no
+    /// copy — the coder cuts each coded item from them), or the packed
+    /// RGB rows behind the Y′CbCr conversion at a lossy quality; plus
+    /// the item's `colr`.
+    fn frame_source<'a>(&self, vf: &'a VideoFrame) -> Result<FrameSource<'a>> {
         let width = self
             .params
             .width
@@ -621,55 +625,58 @@ impl AvifEncoder {
         let fmt = self
             .input_format
             .ok_or_else(|| Error::invalid("avif encode: CodecParameters.pixel_format required"))?;
-
         if width == 0 || height == 0 {
             return Err(Error::invalid(
                 "avif encode: dimensions must be at least 1x1",
             ));
         }
-        let img = match fmt {
-            PixelFormat::Yuv420P | PixelFormat::YuvJ420P => planar8(
-                vf,
-                width,
-                height,
-                StillChroma::Yuv420,
-                fmt == PixelFormat::YuvJ420P,
-            )?,
-            PixelFormat::Yuv422P | PixelFormat::YuvJ422P => planar8(
-                vf,
-                width,
-                height,
-                StillChroma::Yuv422,
-                fmt == PixelFormat::YuvJ422P,
-            )?,
-            PixelFormat::Yuv444P | PixelFormat::YuvJ444P => planar8(
-                vf,
-                width,
-                height,
-                StillChroma::Yuv444,
-                fmt == PixelFormat::YuvJ444P,
-            )?,
-            PixelFormat::Gray8 => planar8(vf, width, height, StillChroma::Monochrome, false)?,
-            PixelFormat::Yuv420P10Le => planar16(vf, width, height, 10, StillChroma::Yuv420)?,
-            PixelFormat::Yuv422P10Le => planar16(vf, width, height, 10, StillChroma::Yuv422)?,
-            PixelFormat::Yuv444P10Le => planar16(vf, width, height, 10, StillChroma::Yuv444)?,
-            PixelFormat::Yuv420P12Le => planar16(vf, width, height, 12, StillChroma::Yuv420)?,
-            PixelFormat::Yuv422P12Le => planar16(vf, width, height, 12, StillChroma::Yuv422)?,
-            PixelFormat::Yuv444P12Le => planar16(vf, width, height, 12, StillChroma::Yuv444)?,
-            PixelFormat::Gray10Le => planar16(vf, width, height, 10, StillChroma::Monochrome)?,
-            PixelFormat::Gray12Le => planar16(vf, width, height, 12, StillChroma::Monochrome)?,
-            PixelFormat::Rgb24 => packed_rgb(vf, width, height, 3, [0, 1, 2], self.lossy_rgb())?,
-            PixelFormat::Bgr24 => packed_rgb(vf, width, height, 3, [2, 1, 0], self.lossy_rgb())?,
-            PixelFormat::Rgba => packed_rgb(vf, width, height, 4, [0, 1, 2], self.lossy_rgb())?,
-            PixelFormat::Bgra => packed_rgb(vf, width, height, 4, [2, 1, 0], self.lossy_rgb())?,
-            PixelFormat::Yuva420P => yuva420(vf, width, height)?,
-            PixelFormat::Ya8 => ya8(vf, width, height)?,
-            PixelFormat::Gbrp8 => planar_gbr(vf, width, height, 8, false)?,
-            PixelFormat::Gbrap8 => planar_gbr(vf, width, height, 8, true)?,
-            PixelFormat::Gbrp10Le => planar_gbr(vf, width, height, 10, false)?,
-            PixelFormat::Gbrap10Le => planar_gbr(vf, width, height, 10, true)?,
-            PixelFormat::Gbrp12Le => planar_gbr(vf, width, height, 12, false)?,
-            PixelFormat::Gbrap12Le => planar_gbr(vf, width, height, 12, true)?,
+        use PixelFormat as P;
+        use StillChroma as C;
+        let planar = |depth: u8, chroma: StillChroma, alpha: bool| {
+            planar_view(vf, width, height, depth, chroma, alpha).map(FrameSource::view)
+        };
+        // The J-variants declare full-range samples with unspecified
+        // CICP: an nclx colr with H.273 code 2 in each field.
+        let full_range = Colr::Nclx {
+            colour_primaries: 2,
+            transfer_characteristics: 2,
+            matrix_coefficients: 2,
+            full_range: true,
+        };
+        let rgb = |bpp: usize, rgb_at: [usize; 3]| {
+            packed_rgb(vf, width, height, bpp, rgb_at, self.lossy_rgb())
+        };
+        let mut src = match fmt {
+            P::Yuv420P => planar(8, C::Yuv420, false)?,
+            P::Yuv422P => planar(8, C::Yuv422, false)?,
+            P::Yuv444P => planar(8, C::Yuv444, false)?,
+            P::YuvJ420P => planar(8, C::Yuv420, false)?.with_colr(full_range),
+            P::YuvJ422P => planar(8, C::Yuv422, false)?.with_colr(full_range),
+            P::YuvJ444P => planar(8, C::Yuv444, false)?.with_colr(full_range),
+            P::Gray8 => planar(8, C::Monochrome, false)?,
+            P::Yuv420P10Le => planar(10, C::Yuv420, false)?,
+            P::Yuv422P10Le => planar(10, C::Yuv422, false)?,
+            P::Yuv444P10Le => planar(10, C::Yuv444, false)?,
+            P::Yuv420P12Le => planar(12, C::Yuv420, false)?,
+            P::Yuv422P12Le => planar(12, C::Yuv422, false)?,
+            P::Yuv444P12Le => planar(12, C::Yuv444, false)?,
+            P::Gray10Le => planar(10, C::Monochrome, false)?,
+            P::Gray12Le => planar(12, C::Monochrome, false)?,
+            P::Rgb24 => rgb(3, [0, 1, 2])?,
+            P::Bgr24 => rgb(3, [2, 1, 0])?,
+            P::Rgba => rgb(4, [0, 1, 2])?,
+            P::Bgra => rgb(4, [2, 1, 0])?,
+            P::Yuva420P => planar(8, C::Yuv420, true)?,
+            P::Ya8 => ya8(vf, width, height)?,
+            // Planar RGB(A) (planes G, B, R [, A]) is the identity-
+            // matrix 4:4:4 item as it stands: Y = G, Cb = B, Cr = R
+            // (H.273 §8.3).
+            P::Gbrp8 => planar(8, C::Yuv444, false)?.with_colr(identity_full_range_colr()),
+            P::Gbrap8 => planar(8, C::Yuv444, true)?.with_colr(identity_full_range_colr()),
+            P::Gbrp10Le => planar(10, C::Yuv444, false)?.with_colr(identity_full_range_colr()),
+            P::Gbrap10Le => planar(10, C::Yuv444, true)?.with_colr(identity_full_range_colr()),
+            P::Gbrp12Le => planar(12, C::Yuv444, false)?.with_colr(identity_full_range_colr()),
+            P::Gbrap12Le => planar(12, C::Yuv444, true)?.with_colr(identity_full_range_colr()),
             other => {
                 return Err(Error::unsupported(format!(
                     "avif encode: pixel format {other:?} is not supported \
@@ -678,7 +685,8 @@ impl AvifEncoder {
                 )));
             }
         };
-        Ok(apply_color_signal(img, &self.params))
+        src.colr = apply_color_signal(src.colr.take(), &self.params);
+        Ok(src)
     }
 
     /// The container metadata of a frame: its ICC / Exif / XMP blobs
@@ -698,13 +706,13 @@ impl AvifEncoder {
 /// `colr` (see the module docs): the layout's own implications (`YuvJ*`
 /// full range, RGB identity) stay, every specified field of the signal
 /// is written, and with nothing specified the image is left as built.
-fn apply_color_signal(mut img: StillImage, params: &CodecParameters) -> StillImage {
+fn apply_color_signal(colr: Option<Colr>, params: &CodecParameters) -> Option<Colr> {
     let signal = params.color_signal;
     let range = params.resolved_color_range();
     if signal.is_unspecified() && range.is_unspecified() {
-        return img;
+        return colr;
     }
-    let (mut p, mut t, mut m, mut full) = match img.colr {
+    let (mut p, mut t, mut m, mut full) = match colr {
         Some(Colr::Nclx {
             colour_primaries,
             transfer_characteristics,
@@ -733,68 +741,39 @@ fn apply_color_signal(mut img: StillImage, params: &CodecParameters) -> StillIma
         ColorRange::Limited => full = false,
         _ => {}
     }
-    img.colr = Some(Colr::Nclx {
+    Some(Colr::Nclx {
         colour_primaries: p,
         transfer_characteristics: t,
         matrix_coefficients: m,
         full_range: full,
-    });
-    img
+    })
 }
 
-/// The colour signal an encoded item carries, from its `colr` —
-/// what [`Encoder::output_params`] announce.
-fn signal_of(img: &StillImage) -> ColorSignal {
-    crate::signal::color_signal_for(img.colr.as_ref())
+/// One input frame as the encode reads it: where its samples come
+/// from and the `colr` its item carries.
+struct FrameSource<'a> {
+    source: Box<dyn TileSource + 'a>,
+    colr: Option<Colr>,
 }
 
-/// The bytes `h` rows of `row_bytes` need at `stride` (the last row
-/// unpadded); 0 rows need none.
-fn plane_bytes(stride: usize, row_bytes: usize, h: usize) -> usize {
-    match h.checked_sub(1) {
-        Some(rows) => rows.saturating_mul(stride).saturating_add(row_bytes),
-        None => 0,
+impl<'a> FrameSource<'a> {
+    fn view(view: PictureView<'a>) -> Self {
+        Self {
+            source: Box::new(view),
+            colr: None,
+        }
     }
-}
 
-/// Extract one tightly-packed plane (`w × h` samples, 1 byte each)
-/// from a frame plane whose stride may exceed the row width.
-fn pack8(plane: &oxideav_core::frame::VideoPlane, w: usize, h: usize) -> Result<Vec<u16>> {
-    if plane.data.len() < plane_bytes(plane.stride, w, h) || plane.stride < w {
-        return Err(Error::invalid(format!(
-            "avif encode: plane too short (stride {}, need {w}x{h})",
-            plane.stride
-        )));
+    fn with_colr(mut self, colr: Colr) -> Self {
+        self.colr = Some(colr);
+        self
     }
-    let mut out = Vec::with_capacity(w * h);
-    for row in 0..h {
-        let s = row * plane.stride;
-        out.extend(plane.data[s..s + w].iter().map(|&b| b as u16));
-    }
-    Ok(out)
-}
 
-/// Extract one tightly-packed plane of little-endian 2-byte samples.
-fn pack16le(plane: &oxideav_core::frame::VideoPlane, w: usize, h: usize) -> Result<Vec<u16>> {
-    let row_bytes = w * 2;
-    if plane.data.len() < plane_bytes(plane.stride, row_bytes, h) || plane.stride < row_bytes {
-        return Err(Error::invalid(format!(
-            "avif encode: 16-bit plane too short (stride {}, need {w}x{h}x2)",
-            plane.stride
-        )));
+    /// The colour signal the encoded item carries, from its `colr` —
+    /// what [`Encoder::output_params`] announce.
+    fn signal(&self) -> ColorSignal {
+        crate::signal::color_signal_for(self.colr.as_ref())
     }
-    let mut out = Vec::with_capacity(w * h);
-    for row in 0..h {
-        let s = row * plane.stride;
-        out.extend(
-            plane.data[s..s + row_bytes]
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|c| u16::from_le_bytes([c[0], c[1]])),
-        );
-    }
-    Ok(out)
 }
 
 fn chroma_shift(chroma: StillChroma) -> (u32, u32) {
@@ -805,98 +784,78 @@ fn chroma_shift(chroma: StillChroma) -> (u32, u32) {
     }
 }
 
-fn planar8(
-    vf: &VideoFrame,
-    width: u32,
-    height: u32,
-    chroma: StillChroma,
-    full_range: bool,
-) -> Result<StillImage> {
-    let planes_needed = if chroma == StillChroma::Monochrome {
-        1
-    } else {
-        3
-    };
-    if vf.image_plane_count() != planes_needed {
-        return Err(Error::invalid(format!(
-            "avif encode: {chroma:?} expects {planes_needed} planes, got {}",
-            vf.image_plane_count()
-        )));
-    }
-    let (sx, sy) = chroma_shift(chroma);
-    let y = pack8(&vf.planes[0], width as usize, height as usize)?;
-    let (u, v) = if planes_needed == 3 {
-        let (cw, ch) = (
-            ((width + sx) >> sx) as usize,
-            ((height + sy) >> sy) as usize,
-        );
-        (pack8(&vf.planes[1], cw, ch)?, pack8(&vf.planes[2], cw, ch)?)
-    } else {
-        (Vec::new(), Vec::new())
-    };
-    let mut img = StillImage::yuv(width, height, 8, chroma, y, u, v)?;
-    if full_range {
-        // The J-variants declare full-range samples with unspecified
-        // CICP; carry that through as an nclx colr (H.273 code 2 =
-        // unspecified for each of the three fields).
-        img = img.with_colr(crate::meta::Colr::Nclx {
-            colour_primaries: 2,
-            transfer_characteristics: 2,
-            matrix_coefficients: 2,
-            full_range: true,
-        });
-    }
-    Ok(img)
-}
-
-fn planar16(
-    vf: &VideoFrame,
+/// A planar frame — Y [, Cb, Cr] [, A], 8-bit bytes or little-endian
+/// words — viewed in place: chroma planes at the rounded-up
+/// sub-sampled size, every plane with its own stride.
+fn planar_view<'a>(
+    vf: &'a VideoFrame,
     width: u32,
     height: u32,
     bit_depth: u8,
     chroma: StillChroma,
-) -> Result<StillImage> {
-    let planes_needed = if chroma == StillChroma::Monochrome {
+    alpha: bool,
+) -> Result<PictureView<'a>> {
+    let colour = if chroma == StillChroma::Monochrome {
         1
     } else {
         3
     };
+    let planes_needed = colour + usize::from(alpha);
     if vf.image_plane_count() != planes_needed {
         return Err(Error::invalid(format!(
-            "avif encode: {chroma:?} {bit_depth}-bit expects {planes_needed} planes, got {}",
+            "avif encode: {chroma:?} {bit_depth}-bit{} expects {planes_needed} planes, got {}",
+            if alpha { " with alpha" } else { "" },
             vf.image_plane_count()
         )));
     }
-    let (sx, sy) = chroma_shift(chroma);
-    let y = pack16le(&vf.planes[0], width as usize, height as usize)?;
-    let (u, v) = if planes_needed == 3 {
-        let (cw, ch) = (
-            ((width + sx) >> sx) as usize,
-            ((height + sy) >> sy) as usize,
-        );
-        (
-            pack16le(&vf.planes[1], cw, ch)?,
-            pack16le(&vf.planes[2], cw, ch)?,
-        )
-    } else {
-        (Vec::new(), Vec::new())
+    let (w, h) = (width as usize, height as usize);
+    let plane = |i: usize, pw: usize, ph: usize, what: &str| -> Result<PlaneRef<'a>> {
+        let p = &vf.planes[i];
+        Ok(if bit_depth == 8 {
+            PlaneRef::bytes(&p.data, p.stride, 1, 0, pw, ph, what)?
+        } else {
+            PlaneRef::words_le(&p.data, p.stride, 1, 0, pw, ph, what)?
+        })
     };
-    Ok(StillImage::yuv(width, height, bit_depth, chroma, y, u, v)?)
+    let (sx, sy) = chroma_shift(chroma);
+    let (cw, ch) = ((w + sx as usize) >> sx, (h + sy as usize) >> sy);
+    let cb_cr = if colour == 3 {
+        Some((plane(1, cw, ch, "Cb")?, plane(2, cw, ch, "Cr")?))
+    } else {
+        None
+    };
+    let a = if alpha {
+        Some(plane(colour, w, h, "alpha")?)
+    } else {
+        None
+    };
+    Ok(PictureView::new(
+        width,
+        height,
+        bit_depth,
+        chroma,
+        plane(0, w, h, "Y")?,
+        cb_cr,
+        a,
+    )?)
 }
 
 /// Packed RGB(A)/BGR(A): `rgb_at` gives the byte offsets of R, G, B
 /// within each `bpp`-byte pixel; a 4th byte (when `bpp == 4`) is the
 /// alpha channel. `lossy` = `Some((colour, chroma))` converts the
 /// picture to Y′CbCr in `colour` and codes it in `chroma` (at every
-/// extent); `None` keeps the byte-exact identity-matrix 4:4:4 coding.
-fn packed_rgb(
-    vf: &VideoFrame,
+/// extent) — rectangle by rectangle as the coder asks, straight from
+/// the packed rows; `None` keeps the byte-exact identity-matrix 4:4:4
+/// coding, whose planes *are* the channels (Y = G, Cb = B, Cr = R),
+/// read in place.
+fn packed_rgb<'a>(
+    vf: &'a VideoFrame,
     width: u32,
     height: u32,
     bpp: usize,
     rgb_at: [usize; 3],
     lossy: Option<(ColorInfo, StillChroma)>,
-) -> Result<StillImage> {
+) -> Result<FrameSource<'a>> {
     if vf.image_plane_count() != 1 {
         return Err(Error::invalid(format!(
             "avif encode: packed RGB expects 1 plane, got {}",
@@ -905,55 +864,43 @@ fn packed_rgb(
     }
     let plane = &vf.planes[0];
     let (w, h) = (width as usize, height as usize);
-    let row_bytes = w * bpp;
-    if plane.data.len() < plane_bytes(plane.stride, row_bytes, h) || plane.stride < row_bytes {
-        return Err(Error::invalid(format!(
-            "avif encode: packed plane too short (stride {}, need {w}x{h}x{bpp})",
-            plane.stride
-        )));
-    }
-    let img = match lossy {
-        // Straight from the packed rows into the coding planes: no
-        // packed copy, no 4:4:4 intermediate (the conversion is the
-        // same arithmetic as the contract path's, pinned in the tests).
+    match lossy {
         Some((color, chroma)) => {
-            packed_rgb_to_ycbcr(&plane.data, plane.stride, w, h, bpp, rgb_at, color, chroma)
+            let src = LossyRgb::new(
+                &plane.data,
+                plane.stride,
+                width,
+                height,
+                bpp,
+                rgb_at,
+                color,
+                chroma,
+            )?;
+            Ok(FrameSource {
+                colr: Some(src.color().to_colr()),
+                source: Box::new(src),
+            })
         }
-        // Identity matrix: the coding planes are the channels
-        // themselves (Y = G, Cb = B, Cr = R), filled straight from the
-        // packed rows.
         None => {
-            let n = w * h;
-            let (mut y, mut u, mut v) = (
-                Vec::with_capacity(n),
-                Vec::with_capacity(n),
-                Vec::with_capacity(n),
-            );
-            for row in 0..h {
-                let s = row * plane.stride;
-                for px in plane.data[s..s + row_bytes].chunks_exact(bpp) {
-                    v.push(u16::from(px[rgb_at[0]]));
-                    y.push(u16::from(px[rgb_at[1]]));
-                    u.push(u16::from(px[rgb_at[2]]));
-                }
-            }
-            StillImage::yuv(width, height, 8, StillChroma::Yuv444, y, u, v)?
-                .with_colr(identity_full_range_colr())
+            let channel = |offset: usize, what: &str| {
+                PlaneRef::bytes(&plane.data, plane.stride, bpp, offset, w, h, what)
+            };
+            let alpha = if bpp == 4 {
+                Some(channel(3, "alpha")?)
+            } else {
+                None
+            };
+            let view = PictureView::new(
+                width,
+                height,
+                8,
+                StillChroma::Yuv444,
+                channel(rgb_at[1], "G")?,
+                Some((channel(rgb_at[2], "B")?, channel(rgb_at[0], "R")?)),
+                alpha,
+            )?;
+            Ok(FrameSource::view(view).with_colr(identity_full_range_colr()))
         }
-    };
-    if bpp == 4 {
-        let mut alpha = Vec::with_capacity(w * h);
-        for row in 0..h {
-            let s = row * plane.stride;
-            alpha.extend(
-                plane.data[s..s + row_bytes]
-                    .chunks_exact(bpp)
-                    .map(|px| u16::from(px[3])),
-            );
-        }
-        Ok(img.with_alpha(alpha)?)
-    } else {
-        Ok(img)
     }
 }
 
@@ -1059,79 +1006,22 @@ pub(crate) fn packed_rgb_to_ycbcr(
 /// crate's decoder reports for the file): planar RGB for the identity
 /// matrix, `YuvJ*` for full-range 8-bit Y′CbCr, the storage label
 /// otherwise.
-fn coded_label(img: &StillImage) -> Option<PixelFormat> {
-    let (sx, sy) = img.chroma.subsampling();
+fn coded_label(src: &FrameSource<'_>) -> Option<PixelFormat> {
+    let chroma = src.source.chroma();
+    let (sx, sy) = chroma.subsampling();
     let layout = crate::image::AvifPixelFormat::from_layout(
-        img.bit_depth,
+        src.source.bit_depth(),
         sx as u8,
         sy as u8,
-        img.chroma == StillChroma::Monochrome,
-        img.alpha.is_some(),
+        chroma == StillChroma::Monochrome,
+        src.source.has_alpha(),
     )?;
-    Some(crate::signal::labelled_pixel_format(
-        layout,
-        &signal_of(img),
-    ))
+    Some(crate::signal::labelled_pixel_format(layout, &src.signal()))
 }
 
-/// Planar RGB(A) (`Gbrp*` / `Gbrap*`: planes G, B, R [, A]) → an
-/// identity-matrix 4:4:4 item (Y = G, Cb = B, Cr = R, H.273 §8.3) at
-/// `bit_depth`, the alpha plane as the auxiliary.
-fn planar_gbr(
-    vf: &VideoFrame,
-    width: u32,
-    height: u32,
-    bit_depth: u8,
-    alpha: bool,
-) -> Result<StillImage> {
-    let planes_needed = if alpha { 4 } else { 3 };
-    if vf.image_plane_count() != planes_needed {
-        return Err(Error::invalid(format!(
-            "avif encode: planar RGB{} {bit_depth}-bit expects {planes_needed} planes, got {}",
-            if alpha { "A" } else { "" },
-            vf.image_plane_count()
-        )));
-    }
-    let (w, h) = (width as usize, height as usize);
-    let pack = |i: usize| -> Result<Vec<u16>> {
-        if bit_depth == 8 {
-            pack8(&vf.planes[i], w, h)
-        } else {
-            pack16le(&vf.planes[i], w, h)
-        }
-    };
-    let (g, b, r) = (pack(0)?, pack(1)?, pack(2)?);
-    let img = StillImage::yuv(width, height, bit_depth, StillChroma::Yuv444, g, b, r)?
-        .with_colr(identity_full_range_colr());
-    if alpha {
-        Ok(img.with_alpha(pack(3)?)?)
-    } else {
-        Ok(img)
-    }
-}
-
-fn yuva420(vf: &VideoFrame, width: u32, height: u32) -> Result<StillImage> {
-    if vf.image_plane_count() != 4 {
-        return Err(Error::invalid(format!(
-            "avif encode: Yuva420P expects 4 planes, got {}",
-            vf.image_plane_count()
-        )));
-    }
-    let (w, h) = (width as usize, height as usize);
-    let (cw, ch) = (width.div_ceil(2) as usize, height.div_ceil(2) as usize);
-    let img = StillImage::yuv(
-        width,
-        height,
-        8,
-        StillChroma::Yuv420,
-        pack8(&vf.planes[0], w, h)?,
-        pack8(&vf.planes[1], cw, ch)?,
-        pack8(&vf.planes[2], cw, ch)?,
-    )?;
-    Ok(img.with_alpha(pack8(&vf.planes[3], w, h)?)?)
-}
-
-fn ya8(vf: &VideoFrame, width: u32, height: u32) -> Result<StillImage> {
+/// `Ya8`: one plane of interleaved gray / alpha bytes, read in place
+/// as a monochrome picture plus its alpha plane.
+fn ya8<'a>(vf: &'a VideoFrame, width: u32, height: u32) -> Result<FrameSource<'a>> {
     if vf.image_plane_count() != 1 {
         return Err(Error::invalid(format!(
             "avif encode: Ya8 expects 1 interleaved plane, got {}",
@@ -1140,32 +1030,19 @@ fn ya8(vf: &VideoFrame, width: u32, height: u32) -> Result<StillImage> {
     }
     let plane = &vf.planes[0];
     let (w, h) = (width as usize, height as usize);
-    let row_bytes = w * 2;
-    if plane.data.len() < plane_bytes(plane.stride, row_bytes, h) || plane.stride < row_bytes {
-        return Err(Error::invalid(format!(
-            "avif encode: Ya8 plane too short (stride {}, need {w}x{h}x2)",
-            plane.stride
-        )));
-    }
-    let mut y = Vec::with_capacity(w * h);
-    let mut a = Vec::with_capacity(w * h);
-    for row in 0..h {
-        let s = row * plane.stride;
-        for px in plane.data[s..s + row_bytes].as_chunks::<2>().0.iter() {
-            y.push(px[0] as u16);
-            a.push(px[1] as u16);
-        }
-    }
-    let img = StillImage::yuv(
+    // The alpha byte ends each pixel: checking it first refuses a
+    // plane that holds the last gray sample but not its alpha.
+    let alpha = PlaneRef::bytes(&plane.data, plane.stride, 2, 1, w, h, "Ya8")?;
+    let gray = PlaneRef::bytes(&plane.data, plane.stride, 2, 0, w, h, "Ya8")?;
+    Ok(FrameSource::view(PictureView::new(
         width,
         height,
         8,
         StillChroma::Monochrome,
-        y,
-        Vec::new(),
-        Vec::new(),
-    )?;
-    Ok(img.with_alpha(a)?)
+        gray,
+        None,
+        Some(alpha),
+    )?))
 }
 
 impl Encoder for AvifEncoder {
@@ -1196,15 +1073,23 @@ impl Encoder for AvifEncoder {
                 )));
             }
         };
-        let img = self.frame_to_still(vf)?.with_props(self.metadata_props(vf));
-        self.params.color_signal = signal_of(&img);
+        let src = self.frame_source(vf)?;
+        let props = self.metadata_props(vf);
+        self.params.color_signal = src.signal();
         // The output parameters carry the coded layout's label (what
         // the file decodes back as), not the input label: `Rgb24` is
         // coded as `Gbrp8` losslessly and as Y′CbCr at a lossy quality.
-        if let Some(label) = coded_label(&img) {
+        if let Some(label) = coded_label(&src) {
             self.params.pixel_format = Some(label);
         }
-        let bytes = encode_still_auto(&img, &self.encode_options())?;
+        // The coder cuts each coded item (a grid's tiles one at a
+        // time) straight from the frame's planes.
+        let bytes = encode_source_auto(
+            &*src.source,
+            src.colr.as_ref(),
+            &props,
+            &self.encode_options(),
+        )?;
         let mut pkt = Packet::new(0, TimeBase::new(1, 90_000), bytes);
         if let Some(pts) = vf.pts {
             pkt = pkt.with_pts(pts);

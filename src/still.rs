@@ -56,6 +56,7 @@ use crate::mux::{
     AvifGridMuxer, AvifMuxer, AvifOverlayMuxer, GridTile, IdentityDerivation, OverlayLayer,
     ToneMapItem,
 };
+use crate::source::TileSource;
 
 use oxideav_av1::encoder::scalable_gop::encode_spatial_layered_gop_yuv_with_q;
 use oxideav_av1::encoder::still::{
@@ -409,7 +410,8 @@ impl StillImage {
         Ok(img)
     }
 
-    /// 8-bit 4:2:0 constructor (even `width` / `height` required).
+    /// 8-bit 4:2:0 constructor (chroma planes of
+    /// `((width + 1) >> 1) × ((height + 1) >> 1)` samples).
     pub fn yuv420_8(width: u32, height: u32, y: &[u8], u: &[u8], v: &[u8]) -> Result<Self> {
         Self::yuv(
             width,
@@ -422,7 +424,8 @@ impl StillImage {
         )
     }
 
-    /// 8-bit 4:2:2 constructor (even `width` required).
+    /// 8-bit 4:2:2 constructor (chroma planes of
+    /// `((width + 1) >> 1) × height` samples).
     pub fn yuv422_8(width: u32, height: u32, y: &[u8], u: &[u8], v: &[u8]) -> Result<Self> {
         Self::yuv(
             width,
@@ -761,6 +764,9 @@ pub fn elect_grid_for(
 pub fn encode_still_auto(img: &StillImage, opts: &EncodeOptions) -> Result<Vec<u8>> {
     // The shapes a grid cannot carry stay single items (the tiling
     // refuses them by type otherwise).
+    if keeps_single_item(img.width, img.height, img.chroma) {
+        return encode_still(img, opts);
+    }
     let single_only = img.props.identity_derivation.is_some()
         || img.depth_map.is_some()
         || img.props.gain_map.is_some();
@@ -768,6 +774,82 @@ pub fn encode_still_auto(img: &StillImage, opts: &EncodeOptions) -> Result<Vec<u
         Some((columns, rows)) if !single_only => encode_still_grid(img, opts, columns, rows),
         _ => encode_still(img, opts),
     }
+}
+
+/// The even canvas a `grid` of `chroma` tiles needs for a
+/// `width × height` picture: MIAF §7.3.11.4.2 asks the output image of
+/// a grid to hold an integer number of samples in every plane, so a
+/// sub-sampled axis of odd length is rounded up by one (the canvas
+/// then carries one replicated column / row, cropped by a `clap`).
+pub(crate) fn grid_canvas(width: u32, height: u32, chroma: StillChroma) -> (u32, u32) {
+    if !chroma.has_chroma() {
+        return (width, height);
+    }
+    let (sx, sy) = chroma.subsampling();
+    (width + (width & sx), height + (height & sy))
+}
+
+/// A sub-sampled picture with an odd extent that fits one coded item
+/// stays one item whatever the `grid` policy says: as a grid it would
+/// need an even canvas and a `clap`, which readers present as 4:4:4
+/// (MIAF §7.3.6.7) — the single item is the picture as it is.
+fn keeps_single_item(width: u32, height: u32, chroma: StillChroma) -> bool {
+    grid_canvas(width, height, chroma) != (width, height)
+        && width <= STILL_MAX_CODED_DIM
+        && height <= STILL_MAX_CODED_DIM
+}
+
+/// [`encode_still_auto`] reading the samples through a
+/// [`TileSource`]: a picture coded as a `grid` is cut one tile at a
+/// time from the caller's buffers (no whole-picture copy), a picture
+/// coded as one item is materialised once. `colr` and `props` are the
+/// item's colour and pass-through properties. The file is the one
+/// [`encode_still_auto`] writes for the same samples.
+pub(crate) fn encode_source_auto(
+    src: &dyn TileSource,
+    colr: Option<&Colr>,
+    props: &StillProperties,
+    opts: &EncodeOptions,
+) -> Result<Vec<u8>> {
+    if keeps_single_item(src.width(), src.height(), src.chroma()) {
+        return encode_still(&still_of_source(src, colr, props)?, opts);
+    }
+    let single_only = props.identity_derivation.is_some() || props.gain_map.is_some();
+    match elect_grid_for(src.width(), src.height(), src.has_alpha(), opts.grid)? {
+        Some((columns, rows)) if !single_only => {
+            encode_source_grid(src, colr, props, opts, columns, rows)
+        }
+        _ => encode_still(&still_of_source(src, colr, props)?, opts),
+    }
+}
+
+/// The whole picture of `src` as a [`StillImage`] (one cut at the
+/// picture's own extents).
+pub(crate) fn still_of_source(
+    src: &dyn TileSource,
+    colr: Option<&Colr>,
+    props: &StillProperties,
+) -> Result<StillImage> {
+    let (w, h) = (src.width() as usize, src.height() as usize);
+    if w == 0 || h == 0 {
+        return Err(Error::invalid(
+            "avif still: dimensions must be at least 1x1",
+        ));
+    }
+    let [y, u, v] = src.colour(0, 0, w, h)?;
+    Ok(StillImage {
+        width: src.width(),
+        height: src.height(),
+        bit_depth: src.bit_depth(),
+        chroma: src.chroma(),
+        y,
+        u,
+        v,
+        alpha: src.alpha(0, 0, w, h)?,
+        depth_map: None,
+        colr: colr.cloned(),
+        props: props.clone(),
+    })
 }
 
 fn widen(p: &[u8]) -> Vec<u16> {
@@ -811,35 +893,6 @@ pub(crate) fn pad_plane(src: &[u16], w: usize, h: usize, pw: usize, ph: usize) -
         out.extend_from_slice(&src[base..base + w]);
         let edge = src[base + w - 1];
         out.extend(std::iter::repeat_n(edge, pw - w));
-    }
-    out
-}
-
-/// Copy the `tw × th` rectangle at `(x0, y0)` out of `src`
-/// (`w × h`, row-major), edge-replicating anything beyond the source
-/// extents (used by the grid splitter for right/bottom overflow
-/// tiles).
-fn extract_rect(
-    src: &[u16],
-    w: usize,
-    h: usize,
-    x0: usize,
-    y0: usize,
-    tw: usize,
-    th: usize,
-) -> Vec<u16> {
-    debug_assert!(src.len() == w * h && x0 < w && y0 < h);
-    let mut out = Vec::with_capacity(tw * th);
-    for row in 0..th {
-        let sr = (y0 + row).min(h - 1);
-        let base = sr * w;
-        let avail = w - x0;
-        let copy = avail.min(tw);
-        out.extend_from_slice(&src[base + x0..base + x0 + copy]);
-        if copy < tw {
-            let edge = src[base + w - 1];
-            out.extend(std::iter::repeat_n(edge, tw - copy));
-        }
     }
     out
 }
@@ -1080,8 +1133,13 @@ pub(crate) fn encode_coded_item(
 /// True when the image's `colr` property declares full-range `nclx`
 /// samples — the in-stream §5.5.2 `color_range` flag then mirrors it.
 pub(crate) fn colr_is_full_range(img: &StillImage) -> bool {
+    colr_full_range(img.colr.as_ref())
+}
+
+/// [`colr_is_full_range`] on the property itself.
+pub(crate) fn colr_full_range(colr: Option<&Colr>) -> bool {
     matches!(
-        img.colr,
+        colr,
         Some(Colr::Nclx {
             full_range: true,
             ..
@@ -1104,12 +1162,20 @@ pub(crate) fn colr_is_full_range(img: &StillImage) -> bool {
 /// BT.709 / sRGB / identity at limited range (§5.5.2 codes that triple
 /// without a `color_range` bit — it is full range by definition).
 pub(crate) fn stream_colour_description(img: &StillImage) -> Option<(u8, u8, u8)> {
+    colour_description_of(img.colr.as_ref(), img.chroma)
+}
+
+/// [`stream_colour_description`] for a `colr` over a `chroma` layout.
+pub(crate) fn colour_description_of(
+    colr: Option<&Colr>,
+    chroma: StillChroma,
+) -> Option<(u8, u8, u8)> {
     let Some(Colr::Nclx {
         colour_primaries,
         transfer_characteristics,
         matrix_coefficients,
         full_range,
-    }) = &img.colr
+    }) = colr
     else {
         return None;
     };
@@ -1122,10 +1188,10 @@ pub(crate) fn stream_colour_description(img: &StillImage) -> Option<(u8, u8, u8)
         return None;
     }
     if triple.2 == 0 {
-        if img.chroma != StillChroma::Yuv444 && img.chroma != StillChroma::Monochrome {
+        if chroma != StillChroma::Yuv444 && chroma != StillChroma::Monochrome {
             return None;
         }
-        if triple == (1, 13, 0) && !*full_range && img.chroma != StillChroma::Monochrome {
+        if triple == (1, 13, 0) && !*full_range && chroma != StillChroma::Monochrome {
             return None;
         }
     }
@@ -1414,55 +1480,80 @@ pub fn encode_still_grid(
     rows: u16,
 ) -> Result<Vec<u8>> {
     img.validate()?;
-    if img.props.identity_derivation.is_some() {
-        return Err(Error::unsupported(
-            "avif still: an identity derivation over a grid primary is not supported",
-        ));
-    }
     if img.depth_map.is_some() {
         return Err(Error::unsupported(
             "avif still: a depth map on the grid encode path is not supported",
         ));
     }
+    let view = crate::source::PictureView::of_still(img)?;
+    encode_source_grid(&view, img.colr.as_ref(), &img.props, opts, columns, rows)
+}
+
+/// [`encode_still_grid`] over a [`TileSource`]: every tile is cut from
+/// the source when its worker codes it.
+pub(crate) fn encode_source_grid(
+    img: &dyn TileSource,
+    colr: Option<&Colr>,
+    props: &StillProperties,
+    opts: &EncodeOptions,
+    columns: u16,
+    rows: u16,
+) -> Result<Vec<u8>> {
+    let (width, height) = (img.width(), img.height());
+    let (bit_depth, chroma, has_alpha) = (img.bit_depth(), img.chroma(), img.has_alpha());
+    if width == 0 || height == 0 {
+        return Err(Error::invalid(
+            "avif still: dimensions must be at least 1x1",
+        ));
+    }
+    if props.identity_derivation.is_some() {
+        return Err(Error::unsupported(
+            "avif still: an identity derivation over a grid primary is not supported",
+        ));
+    }
     if columns == 0 || rows == 0 {
         return Err(Error::invalid("avif still: grid needs at least 1x1 tiles"));
     }
-    let tile_w = coded_extent(img.width.div_ceil(columns as u32));
-    let tile_h = coded_extent(img.height.div_ceil(rows as u32));
+    let tile_w = coded_extent(width.div_ceil(columns as u32));
+    let tile_h = coded_extent(height.div_ceil(rows as u32));
     if tile_w > STILL_MAX_CODED_DIM || tile_h > STILL_MAX_CODED_DIM {
         return Err(Error::unsupported(format!(
             "avif still: {columns}x{rows} tiling of {}x{} needs {tile_w}x{tile_h} tiles, \
              beyond the per-tile bound {STILL_MAX_CODED_DIM}",
-            img.width, img.height
+            width, height
         )));
     }
     if tile_w < GRID_MIN_TILE_DIM || tile_h < GRID_MIN_TILE_DIM {
         return Err(Error::invalid(format!(
             "avif still: {columns}x{rows} tiling of {}x{} yields {tile_w}x{tile_h} tiles, \
              below the {GRID_MIN_TILE_DIM}-pixel grid-tile floor external readers enforce",
-            img.width, img.height
+            width, height
         )));
     }
     // Every tile must contribute visible pixels (HEIF §6.6.2.3.1: the
     // tiled extent covers the canvas, and trimming happens only on the
     // last row/column).
-    if (columns as u32 - 1) * tile_w >= img.width || (rows as u32 - 1) * tile_h >= img.height {
+    if (columns as u32 - 1) * tile_w >= width || (rows as u32 - 1) * tile_h >= height {
         return Err(Error::invalid(format!(
             "avif still: {columns}x{rows} tiling of {}x{} leaves fully-trimmed tiles \
              (tile extents {tile_w}x{tile_h})",
-            img.width, img.height
+            width, height
         )));
     }
 
-    let (w, h) = (img.width as usize, img.height as usize);
-    let (sx, sy) = img.chroma.subsampling();
-    let (cw, ch) = img.chroma_dims();
-    let mut muxer =
-        AvifGridMuxer::new(rows, columns, img.width, img.height).with_pixi(pixi_bits(img));
-    if let Some(colr) = &img.colr {
+    let pixi = vec![bit_depth; if chroma.has_chroma() { 3 } else { 1 }];
+    // A sub-sampled layout needs an even canvas (MIAF §7.3.11.4.2);
+    // the tiles already cover it (their size is a multiple of 8, the
+    // overflow is the picture's last column / row repeated), and a
+    // top-left `clap` on the grid restores the picture's extents.
+    let (canvas_w, canvas_h) = grid_canvas(width, height, chroma);
+    let mut muxer = AvifGridMuxer::new(rows, columns, canvas_w, canvas_h).with_pixi(pixi);
+    if (canvas_w, canvas_h) != (width, height) {
+        muxer = muxer.with_clap(top_left_clap(width, height, canvas_w, canvas_h));
+    }
+    if let Some(colr) = colr {
         muxer = muxer.with_colr(colr.clone());
     }
-    let props = &img.props;
     if let Some(exif) = exif_worth_writing(&props.exif) {
         muxer = muxer.with_exif(exif.clone());
     }
@@ -1506,40 +1597,30 @@ pub fn encode_still_grid(
         let (r, c) = (index / columns as usize, index % columns as usize);
         let x0 = c * tile_w as usize;
         let y0 = r * tile_h as usize;
-        let ty = extract_rect(&img.y, w, h, x0, y0, tile_w as usize, tile_h as usize);
-        let (tu, tv) = if img.chroma.has_chroma() {
-            let (tcx, tcy) = (x0 >> sx, y0 >> sy);
-            let (tcw, tch) = ((tile_w >> sx) as usize, (tile_h >> sy) as usize);
-            (
-                extract_rect(&img.u, cw as usize, ch as usize, tcx, tcy, tcw, tch),
-                extract_rect(&img.v, cw as usize, ch as usize, tcx, tcy, tcw, tch),
-            )
-        } else {
-            (Vec::new(), Vec::new())
-        };
+        let (tw, th) = (tile_w as usize, tile_h as usize);
+        let [ty, tu, tv] = img.colour(x0, y0, tw, th)?;
         let coded = encode_coded_item(
             tile_w,
             tile_h,
-            img.bit_depth,
-            img.chroma.to_av1(),
+            bit_depth,
+            chroma.to_av1(),
             ty,
             tu,
             tv,
             opts.colour_q_idx(),
-            colr_is_full_range(img),
-            stream_colour_description(img),
+            colr_full_range(colr),
+            colour_description_of(colr, chroma),
             per_tile,
             "grid tile",
         )?;
-        let alpha = match &img.alpha {
-            Some(alpha) => {
+        let alpha = match img.alpha(x0, y0, tw, th)? {
+            Some(ta) => {
                 // Alpha tiles: same geometry, monochrome, full range
                 // (av1-avif §4.1) — stitched by a hidden alpha `grid`.
-                let ta = extract_rect(alpha, w, h, x0, y0, tile_w as usize, tile_h as usize);
                 Some(encode_coded_item(
                     tile_w,
                     tile_h,
-                    img.bit_depth,
+                    bit_depth,
                     ChromaFormat::Monochrome,
                     ta,
                     Vec::new(),
@@ -1575,9 +1656,9 @@ pub fn encode_still_grid(
             });
         }
     }
-    if img.alpha.is_some() {
+    if has_alpha {
         muxer = muxer
-            .with_alpha_pixi(vec![img.bit_depth])
+            .with_alpha_pixi(vec![bit_depth])
             .premultiplied_alpha(opts.premultiplied_alpha);
     }
     muxer = match max_profile {

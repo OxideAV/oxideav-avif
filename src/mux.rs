@@ -1030,6 +1030,7 @@ pub struct AvifGridMuxer {
     pixi: Option<Vec<u8>>,
     colr: Option<Colr>,
     pasp: Option<Pasp>,
+    clap: Option<Clap>,
     irot: Option<Irot>,
     imir: Option<Imir>,
     mdcv: Option<Mdcv>,
@@ -1057,6 +1058,7 @@ impl AvifGridMuxer {
             pixi: None,
             colr: None,
             pasp: None,
+            clap: None,
             irot: None,
             imir: None,
             mdcv: None,
@@ -1100,6 +1102,14 @@ impl AvifGridMuxer {
     /// `pasp` on the grid item.
     pub fn with_pasp(mut self, pasp: Pasp) -> Self {
         self.pasp = Some(pasp);
+        self
+    }
+
+    /// `clap` on the grid item (essential; also put on the alpha grid,
+    /// whose samples are co-located with the colour grid's) — applied
+    /// before `irot` / `imir` (MIAF §7.3.6.7).
+    pub fn with_clap(mut self, clap: Clap) -> Self {
+        self.clap = Some(clap);
         self
     }
 
@@ -1230,6 +1240,9 @@ impl AvifGridMuxer {
         if let Some(amve) = &self.amve {
             grid_props.push(prop_amve(amve));
         }
+        if let Some(clap) = &self.clap {
+            grid_props.push(prop_clap(clap));
+        }
         if let Some(irot) = &self.irot {
             grid_props.push(prop_irot(irot));
         }
@@ -1277,7 +1290,7 @@ impl AvifGridMuxer {
             if let Some(bits) = &self.alpha_pixi {
                 aprops.push(prop_pixi(bits));
             }
-            push_transforms(&mut aprops, &None, &self.irot, &self.imir);
+            push_transforms(&mut aprops, &self.clap, &self.irot, &self.imir);
             let ag = w.add_grid(desc, &alpha_tile_ids, aprops)?;
             expect_id(ag, alpha_grid_id, "alpha grid")?;
             w.set_hidden(ag, true);

@@ -24,7 +24,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     4:2:2 picture with an odd sub-sampled extent (`Unsupported`); it is
     coded as it is, the chroma planes at the rounded-up size
     `(extent + 1) >> 1` — the layout the decoder already returned for
-    such files.
+    such files. Such a picture is one coded item whenever it fits the
+    single-item bound (4096 per axis), whatever the `grid` policy:
+    MIAF §7.3.11.4.2 asks a grid's output image to hold a whole number
+    of samples in every plane (a black-box AVIF decoder refuses a
+    4:2:0 grid with an odd output extent). Past the bound — and
+    through an explicit `encode_still_grid` — it is tiled over the
+    even canvas (one replicated column / row) and cropped back by a
+    top-left `clap` on the grid and on the alpha grid
+    (`AvifGridMuxer::with_clap`), which readers present as 4:4:4
+    (MIAF §7.3.6.7).
   - *Layered / progressive items at any size.* `encode_still_layered`
     codes every spatial layer at its own extents (it padded each layer
     to the 8-sample grid and cropped the selected one with a `clap`).
@@ -38,6 +47,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   presented at their size with square pixels and decoded exactly by
   the black-box media framework.
 
+- `EncodeOptions::all_intra` / `with_all_intra(true)`: `encode_all`
+  codes timed frames as KEY frames only (every sample a sync sample,
+  the `avio` brand) instead of KEY + P groups — the contract-level
+  switch for the trade measured in the README (four 160 × 120 frames at
+  quality 60: KEY + P 74.5 s / 3 864 B, KEY frames 0.13 s / 16 191 B on
+  one worker; the inter search of the AV1 coder is exhaustive).
+- `AvifImage::to_rgb8_threads(n)` / `to_rgba8_threads(n)`: the RGB
+  views on a worker budget — the bands of rows the conversion already
+  works in, one worker per stretch of bands, the bytes those of
+  `to_rgb8` / `to_rgba8` for every `n`.
 - **Every burst member through the registry decoder.** A packet whose
   primary belongs to a `brst` image burst queued the primary alone;
   the decoder now queues every member in group order (the pictures
@@ -56,6 +75,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   does not list the box (§9.1.2 allows boxes outside its table), no
   published text defines it and its code is unsettled, so the crate
   never writes it. `tests/alpha_information.rs`.
+
+### Performance
+
+Byte-identical files (93 still shapes — single items and grids, every
+registry layout with tight and padded strides, the one-call RGB / RGBA
+paths, `encode(&AvifImage)` — hashed before and after); 12 MP
+(4032 × 3024), peak RSS of one encode per process
+(`examples/path_bench`, `/usr/bin/time -l`), before = this crate at the
+start of the round built against the same oxideav-av1 0.1.24:
+
+- **The encoders read the caller's buffers in place.** Every encode
+  entry point used to build a whole-picture `StillImage` (`u16`
+  samples: 36 MiB for 12 MP 4:2:0, 73 MiB for RGB, + 24 MiB of alpha)
+  before the first tile was cut. A coded item is now cut straight from
+  the caller's samples when its worker codes it — 8-bit planes,
+  little-endian word planes, packed RGB(A) / gray + alpha channels,
+  any stride (`source::PictureView`) — and a lossy packed RGB picture
+  is converted to Y′CbCr tile by tile (`source::LossyRgb`, pinned
+  equal to the whole-picture conversion). Registry `Yuv420P` quality
+  60: 96 → 60 MiB on 1 worker, 148 → 111 MiB on 8; contract
+  `encode_rgb8` quality 60: 97 → 62 MiB; lossless `encode_rgb8`
+  193 → 123 MiB, `encode_rgba8` 220 → 132 MiB (8 workers 295 →
+  199 MiB); registry `Rgba` quality 60 134 → 76 MiB.
+- **Image sequences hold no second copy.** `encode_all` /
+  `encode_sequence` copied every frame into a `StillImage` and again
+  into the coder's planes up front; frames are now read in place, one
+  KEY + P group (or one KEY frame) per worker at a time.
+- **KEY + P groups are coded on the thread budget**
+  (`SequenceEncodeOptions::threads`, `EncodeOptions::threads` through
+  `encode_all`): whole groups in parallel, the file identical for
+  every budget (it was serial whatever the budget).
+- **RGB views.** `to_rgb8` / `to_rgba8` write each converted band
+  straight into its place in the output (they appended sample by
+  sample), and `to_rgba8_threads` spreads the bands over the budget:
+  12 MP contract decode + RGBA of a quality-60 RGBA file on 8 workers
+  0.308 → 0.092 s (the serial conversion was half of that wall).
 
 ### Fixed
 

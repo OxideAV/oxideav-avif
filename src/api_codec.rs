@@ -32,7 +32,8 @@ use crate::parser::{
     parse_header,
 };
 use crate::signal::color_signal_for;
-use crate::still::{StillImage, StillProperties, encode_still_auto};
+use crate::source::{LossyRgb, PictureView, PlaneRef};
+use crate::still::{StillImage, StillProperties, encode_source_auto};
 use oxideav_heif::{Chroma, HeifFrame};
 
 /// Framework errors (the AV1 decoder's, the composition layer's) as
@@ -964,9 +965,10 @@ fn plane_samples(
     Ok(out)
 }
 
-/// The still-encoder input for a picture: planes widened to `u16`,
-/// the `nclx` of its colour, metadata per the options.
-fn still_of(image: &AvifImage, opts: &EncodeOptions) -> Result<StillImage> {
+/// A picture's planes viewed in place as the coding planes (no copy):
+/// byte or little-endian word planes with their strides, a packed
+/// gray + alpha plane as two interleaved channels.
+fn view_of(image: &AvifImage) -> Result<PictureView<'_>> {
     if image.width == 0 || image.height == 0 {
         return Err(Error::invalid(
             "avif encode: dimensions must be at least 1x1",
@@ -992,7 +994,7 @@ fn still_of(image: &AvifImage, opts: &EncodeOptions) -> Result<StillImage> {
         )));
     }
     let (w, h) = (image.width as usize, image.height as usize);
-    let bps = format.bytes_per_sample();
+    let wide = format.bytes_per_sample() == 2;
     let mono = format.plane_count() == 1 || format.is_packed_ya();
     let (sx, sy) = format.chroma_subsampling();
     let chroma = if mono {
@@ -1004,40 +1006,63 @@ fn still_of(image: &AvifImage, opts: &EncodeOptions) -> Result<StillImage> {
             _ => StillChroma::Yuv444,
         }
     };
-    let (y, u, v, alpha) = if format.is_packed_ya() {
-        let packed = plane_samples(&image.planes[0], w * 2, h, bps, "packed YA")?;
-        let mut y = Vec::with_capacity(w * h);
-        let mut a = Vec::with_capacity(w * h);
-        for px in packed.as_chunks::<2>().0.iter() {
-            y.push(px[0]);
-            a.push(px[1]);
+    // Sample `offset` of `step`-sample pixels of plane `idx`.
+    let channel = |idx: usize,
+                   step: usize,
+                   offset: usize,
+                   pw: usize,
+                   ph: usize,
+                   what: &str|
+     -> Result<PlaneRef<'_>> {
+        let p = &image.planes[idx];
+        if wide {
+            PlaneRef::words_le(&p.data, p.stride, step, offset, pw, ph, what)
+        } else {
+            PlaneRef::bytes(&p.data, p.stride, step, offset, pw, ph, what)
         }
-        (y, Vec::new(), Vec::new(), Some(a))
-    } else {
-        let y = plane_samples(&image.planes[0], w, h, bps, "Y")?;
-        let (u, v) = if mono {
-            (Vec::new(), Vec::new())
-        } else {
-            let cw = w.div_ceil(1 << sx);
-            let ch = h.div_ceil(1 << sy);
-            (
-                plane_samples(&image.planes[1], cw, ch, bps, "Cb")?,
-                plane_samples(&image.planes[2], cw, ch, bps, "Cr")?,
-            )
-        };
-        let alpha = if format.has_alpha() {
-            let idx = image.planes.len() - 1;
-            Some(plane_samples(&image.planes[idx], w, h, bps, "alpha")?)
-        } else {
-            None
-        };
-        (y, u, v, alpha)
     };
-    let mut still = StillImage::yuv(image.width, image.height, bit_depth, chroma, y, u, v)?;
-    if let Some(a) = alpha {
-        still = still.with_alpha(a)?;
+    if format.is_packed_ya() {
+        let alpha = channel(0, 2, 1, w, h, "packed YA")?;
+        let gray = channel(0, 2, 0, w, h, "packed YA")?;
+        return PictureView::new(
+            image.width,
+            image.height,
+            bit_depth,
+            chroma,
+            gray,
+            None,
+            Some(alpha),
+        );
     }
-    still = still.with_colr(image.color.to_colr());
+    let cb_cr = if mono {
+        None
+    } else {
+        let cw = w.div_ceil(1 << sx);
+        let ch = h.div_ceil(1 << sy);
+        Some((
+            channel(1, 1, 0, cw, ch, "Cb")?,
+            channel(2, 1, 0, cw, ch, "Cr")?,
+        ))
+    };
+    let alpha = if format.has_alpha() {
+        Some(channel(image.planes.len() - 1, 1, 0, w, h, "alpha")?)
+    } else {
+        None
+    };
+    PictureView::new(
+        image.width,
+        image.height,
+        bit_depth,
+        chroma,
+        channel(0, 1, 0, w, h, "Y")?,
+        cb_cr,
+        alpha,
+    )
+}
+
+/// The pass-through properties of a picture per the options (Exif in
+/// its item framing, XMP, ICC).
+fn props_of(image: &AvifImage, opts: &EncodeOptions) -> StillProperties {
     let mut props = StillProperties::default();
     if opts.embed_exif {
         props.exif = image.metadata.exif.as_deref().map(exif_item_body);
@@ -1048,7 +1073,19 @@ fn still_of(image: &AvifImage, opts: &EncodeOptions) -> Result<StillImage> {
     if opts.embed_icc {
         props.icc = image.metadata.icc.clone();
     }
-    Ok(still.with_props(props))
+    props
+}
+
+/// The still-encoder input for a picture: planes widened to `u16`,
+/// the `nclx` of its colour, metadata per the options.
+fn still_of(image: &AvifImage, opts: &EncodeOptions) -> Result<StillImage> {
+    let still = crate::still::still_of_source(
+        &view_of(image)?,
+        Some(&image.color.to_colr()),
+        &props_of(image, opts),
+    )?;
+    still.validate()?;
+    Ok(still)
 }
 
 /// Encode `frames` as one file — the mirror of [`decode_all`]. Frames
@@ -1090,10 +1127,16 @@ pub fn encode_all(frames: &[Frame], opts: &EncodeOptions) -> Result<Vec<u8>> {
              frame a delay, or none for an image burst",
         ));
     }
-    let stills: Vec<StillImage> = frames
+    // The frames are read in place, each when its sample (or its
+    // KEY + P group) is coded.
+    let views: Vec<PictureView<'_>> = frames
         .iter()
-        .map(|f| still_of(&f.image, opts))
+        .map(|f| view_of(&f.image))
         .collect::<Result<_>>()?;
+    let sources: Vec<&dyn crate::source::TileSource> = views
+        .iter()
+        .map(|v| v as &dyn crate::source::TileSource)
+        .collect();
     let durations: Vec<u32> = frames
         .iter()
         .map(|f| {
@@ -1103,14 +1146,23 @@ pub fn encode_all(frames: &[Frame], opts: &EncodeOptions) -> Result<Vec<u8>> {
         })
         .collect();
     // KEY + P groups at every picture size (the samples are coded at
-    // the pictures' own extents, so the sample entry needs no `clap`).
+    // the pictures' own extents, so the sample entry needs no `clap`),
+    // KEY frames only on request.
     let seq_opts = crate::sequence::SequenceEncodeOptions::default()
+        .with_all_intra(opts.all_intra)
         .with_timescale(1000)
         .with_base_q_idx(opts.colour_q_idx())
         .with_alpha_q_idx(opts.alpha_plane_q_idx())
         .with_speed(opts.speed)
         .with_threads(opts.threads);
-    crate::sequence::encode_sequence_timed(&stills, &seq_opts, Some(&durations))
+    let first = &frames[0].image;
+    crate::sequence::encode_sequence_sources(
+        &sources,
+        Some(&first.color.to_colr()),
+        &props_of(first, opts),
+        &seq_opts,
+        Some(&durations),
+    )
 }
 
 /// Encode a picture as it is: its layout and depth (8 / 10 / 12-bit
@@ -1123,38 +1175,25 @@ pub fn encode_all(frames: &[Frame], opts: &EncodeOptions) -> Result<Vec<u8>> {
 /// encoder does not carry (sub-sampled chroma at odd extents), never a
 /// silent conversion.
 pub fn encode(image: &AvifImage, opts: &EncodeOptions) -> Result<Vec<u8>> {
-    let still = still_of(image, opts)?;
-    encode_still_auto(&still, opts)
-}
-
-/// RGB(A) bytes as the still-encoder input at the MIAF default colour
-/// (BT.709 primaries, sRGB transfer, BT.601 matrix, full range):
-/// converted to 4:4:4 Y′CbCr exactly (H.273 §8.3, round-to-nearest),
-/// then the chroma planes box-filtered to the requested layout
-/// (`(a + b + c + d + 2) >> 2` per 2×2 for 4:2:0, `(a + b + 1) >> 1`
-/// per pair for 4:2:2). Odd extents fall back to 4:4:4, which AV1
-/// sub-sampling cannot represent at this encoder's even-extent rule.
-fn still_of_rgb(
-    width: u32,
-    height: u32,
-    data: &[u8],
-    channels: usize,
-    opts: &EncodeOptions,
-) -> Result<StillImage> {
-    still_of_rgb_in(
-        width,
-        height,
-        data,
-        channels,
-        ColorInfo::miaf_default(),
-        opts.chroma,
+    // The coder cuts each coded item (a grid's tiles one at a time)
+    // straight from the picture's planes.
+    encode_source_auto(
+        &view_of(image)?,
+        Some(&image.color.to_colr()),
+        &props_of(image, opts),
+        opts,
     )
 }
 
-/// [`still_of_rgb`] converting with `color` (a `nclx` description whose
-/// matrix the converter has a kernel for; the result carries it as its
-/// `colr`) into `chroma` (odd extents fall back to 4:4:4) — the
-/// registry encoder's lossy packed-RGB path.
+/// RGB(A) bytes as a whole-picture still-encoder input: converted to
+/// Y′CbCr exactly (H.273 §8.3, round-to-nearest) with `color` (a
+/// `nclx` description whose matrix the converter has a kernel for; the
+/// result carries it as its `colr`), the chroma planes box-filtered to
+/// `chroma` (`(a + b + c + d + 2) >> 2` per 2×2 for 4:2:0,
+/// `(a + b + 1) >> 1` per pair for 4:2:2; the last column / row of an
+/// odd extent averages the samples the picture has). The reference
+/// the rectangle-wise source ([`LossyRgb`]) is pinned against, and
+/// the path of the monochrome target.
 pub(crate) fn still_of_rgb_in(
     width: u32,
     height: u32,
@@ -1313,12 +1352,81 @@ fn box_filter(plane: &[u16], w: usize, h: usize, sx: u32, sy: u32) -> Vec<u16> {
 ///   [`EncodeOptions::chroma`]); `opts.base_q_idx` /
 ///   [`EncodeOptions::with_quality`] set the quality.
 pub fn encode_rgb8(width: u32, height: u32, rgb: &[u8], opts: &EncodeOptions) -> Result<Vec<u8>> {
-    let still = if opts.is_colour_lossless() {
-        StillImage::rgb8(width, height, rgb)?
-    } else {
-        still_of_rgb(width, height, rgb, 3, opts)?
-    };
-    encode_still_auto(&still, opts)
+    encode_packed(width, height, rgb, 3, opts)
+}
+
+/// The one-call RGB / RGBA encode: the caller's bytes are read in
+/// place — as the G, B, R (and A) planes of the identity-matrix
+/// coding when the colour is lossless, through the Y′CbCr conversion
+/// rectangle by rectangle otherwise — so the encode holds no copy of
+/// the picture beyond the coded item in flight.
+fn encode_packed(
+    width: u32,
+    height: u32,
+    data: &[u8],
+    channels: usize,
+    opts: &EncodeOptions,
+) -> Result<Vec<u8>> {
+    let (w, h) = (width as usize, height as usize);
+    if width == 0 || height == 0 {
+        return Err(Error::invalid(
+            "avif encode: dimensions must be at least 1x1",
+        ));
+    }
+    if data.len() != w * h * channels {
+        return Err(Error::invalid(format!(
+            "avif encode: {width}x{height} with {channels} channels needs {} bytes, got {}",
+            w * h * channels,
+            data.len()
+        )));
+    }
+    let stride = w * channels;
+    let props = StillProperties::default();
+    if opts.is_colour_lossless() {
+        let channel =
+            |offset: usize, what: &str| PlaneRef::bytes(data, stride, channels, offset, w, h, what);
+        let alpha = if channels == 4 {
+            Some(channel(3, "alpha")?)
+        } else {
+            None
+        };
+        // H.273 identity matrix: Y = G, Cb = B, Cr = R.
+        let view = PictureView::new(
+            width,
+            height,
+            8,
+            StillChroma::Yuv444,
+            channel(1, "G")?,
+            Some((channel(2, "B")?, channel(0, "R")?)),
+            alpha,
+        )?;
+        let colr = crate::still::identity_full_range_colr();
+        return encode_source_auto(&view, Some(&colr), &props, opts);
+    }
+    if opts.chroma == StillChroma::Monochrome {
+        // A gray rendition of the RGB picture: the whole-picture
+        // converter (its luma only).
+        let still = still_of_rgb_in(
+            width,
+            height,
+            data,
+            channels,
+            ColorInfo::miaf_default(),
+            opts.chroma,
+        )?;
+        return crate::still::encode_still_auto(&still, opts);
+    }
+    let src = LossyRgb::new(
+        data,
+        stride,
+        width,
+        height,
+        channels,
+        [0, 1, 2],
+        ColorInfo::miaf_default(),
+        opts.chroma,
+    )?;
+    encode_source_auto(&src, Some(&src.color().to_colr()), &props, opts)
 }
 
 /// [`encode_rgb8`] for tightly packed 8-bit RGBA: the alpha channel
@@ -1326,12 +1434,7 @@ pub fn encode_rgb8(width: u32, height: u32, rgb: &[u8], opts: &EncodeOptions) ->
 /// at `opts.alpha_q_idx`, `prem` signalled per
 /// `opts.premultiplied_alpha`).
 pub fn encode_rgba8(width: u32, height: u32, rgba: &[u8], opts: &EncodeOptions) -> Result<Vec<u8>> {
-    let still = if opts.is_colour_lossless() {
-        StillImage::rgba8(width, height, rgba)?
-    } else {
-        still_of_rgb(width, height, rgba, 4, opts)?
-    };
-    encode_still_auto(&still, opts)
+    encode_packed(width, height, rgba, 4, opts)
 }
 
 /// [`encode`] into a writer.

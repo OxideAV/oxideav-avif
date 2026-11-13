@@ -695,3 +695,257 @@ fn black_box_reader_presents_off_grid_sequences_at_their_size() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// KEY + P groups are coded on the worker budget (whole groups in
+/// parallel): the file is the serial one for every budget and group
+/// length, and decodes to the source.
+#[test]
+fn sequence_groups_code_on_the_budget_with_the_same_bytes() {
+    let (w, h) = (37u32, 22u32);
+    for (layout, alpha) in [(Layout::Yuv420, false), (Layout::Yuv444, true)] {
+        let sources: Vec<Source> = (0..7).map(|t| source(w, h, layout, 8, alpha, t)).collect();
+        let stills: Vec<StillImage> = sources.iter().map(Source::still).collect();
+        for gop in [1usize, 2, 3, 64] {
+            let opts = SequenceEncodeOptions::default().with_gop_length(gop);
+            let serial = encode_sequence(&stills, &opts).expect("serial");
+            for threads in [2usize, 4, 8] {
+                let threaded =
+                    encode_sequence(&stills, &opts.with_threads(threads)).expect("threaded");
+                assert!(
+                    threaded == serial,
+                    "{layout:?} gop {gop} threads {threads}: bytes differ"
+                );
+            }
+            let avis = parse_avis(&serial).expect("parse_avis");
+            let sync: Vec<bool> = avis.samples.iter().map(|s| s.is_sync).collect();
+            let want: Vec<bool> = (0..7).map(|i| i % gop == 0).collect();
+            assert_eq!(sync, want, "{layout:?} gop {gop}: sync samples");
+            let back = decode_all(&serial).expect("decode_all");
+            for (i, (got, src)) in back.iter().zip(&sources).enumerate() {
+                assert!(
+                    got.image.planes == src.image().planes,
+                    "{layout:?} gop {gop} frame {i}"
+                );
+            }
+        }
+    }
+}
+
+/// What a `grid` of sub-sampled tiles does with an odd extent: MIAF
+/// §7.3.11.4.2 wants a whole number of samples in every plane of the
+/// grid's output image, so
+///
+/// * a picture that fits one coded item stays one item under every
+///   `grid` policy (exact, its own layout);
+/// * a picture past the single-item bound — or an explicit
+///   `encode_still_grid` — is tiled over the even canvas and cropped
+///   back by a top-left `clap` on the grid (and on the alpha grid),
+///   which readers present as 4:4:4 (MIAF §7.3.6.7): the luma and
+///   alpha are the source's, the chroma its co-sited upsampling.
+#[test]
+fn odd_subsampled_grids_use_an_even_canvas_and_a_clap() {
+    use oxideav_avif::{GridTiling, encode_still_grid};
+    // Fits one item: no grid, whatever the policy.
+    for grid in [GridTiling::Auto, GridTiling::MaxTile(128)] {
+        let src = source(131, 67, Layout::Yuv420, 8, true, 0);
+        let file = encode(&src.image(), &EncodeOptions::default().with_grid(grid)).unwrap();
+        let info = inspect(&file).unwrap();
+        assert!(!info.has_grid(), "{grid:?}: odd 4:2:0 stays a single item");
+        assert!(
+            decode(&file).unwrap().planes == src.image().planes,
+            "{grid:?}"
+        );
+    }
+    // An even picture of the same class is tiled as asked.
+    let even = source(132, 68, Layout::Yuv420, 8, false, 0);
+    let file = encode(
+        &even.image(),
+        &EncodeOptions::default().with_grid(GridTiling::MaxTile(128)),
+    )
+    .unwrap();
+    assert!(inspect(&file).unwrap().has_grid());
+    assert!(decode(&file).unwrap().planes == even.image().planes);
+
+    let dir = tmp_dir("anyext-grid");
+    let mut cases: Vec<(String, Source, Vec<u8>)> = Vec::new();
+    for (layout, depth, alpha) in [
+        (Layout::Yuv420, 8u8, false),
+        (Layout::Yuv420, 8, true),
+        (Layout::Yuv422, 10, false),
+    ] {
+        // An explicit 2 × 1 grid of a 131 × 67 picture.
+        let src = source(131, 67, layout, depth, alpha, 0);
+        let file = encode_still_grid(&src.still(), &EncodeOptions::default(), 2, 1).unwrap();
+        cases.push((
+            format!("explicit {layout:?} {depth}-bit alpha={alpha}"),
+            src,
+            file,
+        ));
+    }
+    // Past the single-item bound: the automatic policy has to tile.
+    let wide = source(4099, 65, Layout::Yuv420, 8, false, 0);
+    let file = encode(&wide.image(), &EncodeOptions::default().with_threads(4)).unwrap();
+    cases.push(("auto 4099x65".into(), wide, file));
+
+    for (label, src, file) in &cases {
+        let info = inspect(file).unwrap();
+        assert!(info.has_grid(), "{label}");
+        // The grid's own extents are the even canvas; the output
+        // image (after the clap) is the picture.
+        let (sx, sy) = src.layout.shifts();
+        assert_eq!(
+            (info.width, info.height),
+            (src.w + (src.w & sx), src.h + (src.h & sy)),
+            "{label}: canvas"
+        );
+        let shown = oxideav_avif::info(file).unwrap();
+        assert_eq!(
+            (shown.width, shown.height),
+            (src.w, src.h),
+            "{label}: output size"
+        );
+        assert!(
+            file.windows(4).any(|b| b == b"clap"),
+            "{label}: clap present"
+        );
+        let back = decode(file).unwrap_or_else(|e| panic!("{label}: {e}"));
+        assert_eq!((back.width, back.height), (src.w, src.h), "{label}");
+        let want = src.image();
+        // Luma (and alpha) exact; the chroma is presented at full
+        // resolution wherever the crop was odd on a sub-sampled axis.
+        assert!(back.planes[0] == want.planes[0], "{label}: luma");
+        if src.a.is_some() {
+            assert!(back.planes.last() == want.planes.last(), "{label}: alpha");
+        }
+        let bps = if src.depth == 8 { 1 } else { 2 };
+        let (sx, sy) = src.layout.shifts();
+        let cw = ((src.w + sx) >> sx) as usize;
+        let full_w = back.planes[1].stride / bps == src.w as usize;
+        let full_h = back.planes[1].data.len() / back.planes[1].stride == src.h as usize;
+        for (p, plane) in [(1usize, &src.u), (2, &src.v)] {
+            let got = &back.planes[p];
+            for y in 0..src.h as usize {
+                for x in 0..src.w as usize {
+                    let (gx, gy) = (
+                        if full_w { x } else { x >> sx },
+                        if full_h { y } else { y >> sy },
+                    );
+                    let at = gy * got.stride + gx * bps;
+                    let sample = if bps == 1 {
+                        u16::from(got.data[at])
+                    } else {
+                        u16::from_le_bytes([got.data[at], got.data[at + 1]])
+                    };
+                    assert_eq!(
+                        sample,
+                        plane[(y >> sy) * cw + (x >> sx)],
+                        "{label}: chroma plane {p} at ({x}, {y})"
+                    );
+                }
+            }
+        }
+        // The installed readers accept the file at the picture's size.
+        let path = dir.join("grid.avif");
+        std::fs::write(&path, file).expect("write");
+        for (program, args) in [
+            ("avifdec", vec!["--info".to_string(), s(&path)]),
+            (
+                "magick",
+                vec![
+                    "identify".to_string(),
+                    "-format".into(),
+                    "%w %h".into(),
+                    s(&path),
+                ],
+            ),
+            (
+                "sips",
+                vec![
+                    "-g".to_string(),
+                    "pixelWidth".into(),
+                    "-g".into(),
+                    "pixelHeight".into(),
+                    s(&path),
+                ],
+            ),
+        ] {
+            let Some(out) = run(program, &args) else {
+                continue;
+            };
+            assert!(
+                out.status.success(),
+                "{label}: {program} refused: {}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            if program != "avifdec" {
+                let text = String::from_utf8_lossy(&out.stdout);
+                let numbers: Vec<u32> = text
+                    .split(|c: char| !c.is_ascii_digit())
+                    .filter_map(|t| t.parse().ok())
+                    .collect();
+                assert!(
+                    numbers.windows(2).any(|p| p == [src.w, src.h]),
+                    "{label}: {program} reports {text:?}"
+                );
+            }
+        }
+        // And the black-box AVIF decoder decodes it (to PNG: the
+        // cropped picture is 4:4:4).
+        let png = dir.join("grid.png");
+        if let Some(out) = run("avifdec", &[s(&path), s(&png)]) {
+            assert!(
+                out.status.success(),
+                "{label}: AVIF decoder CLI refused: {}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `EncodeOptions::all_intra` on the contract path: timed frames as
+/// KEY frames only — every sample a sync sample, the `avio` brand, the
+/// same pictures back.
+#[test]
+fn encode_all_codes_key_frames_only_on_request() {
+    let frames: Vec<Frame> = (0..4)
+        .map(|t| {
+            Frame::new(
+                source(37, 22, Layout::Yuv420, 8, true, t).image(),
+                Some(Duration::from_millis(40)),
+            )
+        })
+        .collect();
+    let inter = encode_all(&frames, &EncodeOptions::default()).unwrap();
+    let intra = encode_all(&frames, &EncodeOptions::default().with_all_intra(true)).unwrap();
+    let sync = |file: &[u8]| -> Vec<bool> {
+        parse_avis(file)
+            .unwrap()
+            .samples
+            .iter()
+            .map(|s| s.is_sync)
+            .collect()
+    };
+    assert_eq!(sync(&inter), [true, false, false, false]);
+    assert_eq!(sync(&intra), [true; 4]);
+    assert!(intra.windows(4).any(|b| b == b"avio"));
+    assert!(!inter.windows(4).any(|b| b == b"avio"));
+    for file in [&inter, &intra] {
+        let back = decode_all(file).unwrap();
+        assert_eq!(back.len(), 4);
+        for (got, want) in back.iter().zip(&frames) {
+            assert!(got.image.planes == want.image.planes);
+        }
+    }
+    // The budget does not change the all-intra bytes either.
+    let threaded = encode_all(
+        &frames,
+        &EncodeOptions::default()
+            .with_all_intra(true)
+            .with_threads(4),
+    )
+    .unwrap();
+    assert!(threaded == intra);
+}

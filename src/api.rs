@@ -614,7 +614,7 @@ impl AvifImage {
     /// planes that do not cover `width × height` at `format`
     /// ([`Self::try_to_rgb8`] reports that as an error).
     pub fn to_rgb8(&self) -> Vec<u8> {
-        self.rgb_bytes_or_bt601(3)
+        self.rgb_bytes_or_bt601(3, 1)
             .expect("AvifImage::to_rgb8: planes inconsistent with width/height/format")
     }
 
@@ -625,27 +625,53 @@ impl AvifImage {
     ///
     /// As [`Self::to_rgb8`].
     pub fn to_rgba8(&self) -> Vec<u8> {
-        self.rgb_bytes_or_bt601(4)
+        self.rgb_bytes_or_bt601(4, 1)
             .expect("AvifImage::to_rgba8: planes inconsistent with width/height/format")
+    }
+
+    /// [`Self::to_rgb8`] on up to `threads` workers: the picture is
+    /// converted in bands of rows, each band by one worker writing its
+    /// own rows of the output. The bytes are those of [`Self::to_rgb8`]
+    /// for every `threads` (`0` and `1` are serial).
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::to_rgb8`].
+    pub fn to_rgb8_threads(&self, threads: usize) -> Vec<u8> {
+        self.rgb_bytes_or_bt601(3, threads)
+            .expect("AvifImage::to_rgb8_threads: planes inconsistent with width/height/format")
+    }
+
+    /// [`Self::to_rgba8`] on up to `threads` workers (see
+    /// [`Self::to_rgb8_threads`]).
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::to_rgb8`].
+    pub fn to_rgba8_threads(&self, threads: usize) -> Vec<u8> {
+        self.rgb_bytes_or_bt601(4, threads)
+            .expect("AvifImage::to_rgba8_threads: planes inconsistent with width/height/format")
     }
 
     /// Fallible, exact [`Self::to_rgb8`]: [`Error::Unsupported`] for a
     /// matrix without a kernel (no BT.601 fallback),
     /// [`Error::InvalidData`] for planes inconsistent with the layout.
     pub fn try_to_rgb8(&self) -> Result<Vec<u8>> {
-        self.rgb_bytes(3, self.color)
+        self.rgb_bytes(3, self.color, 1)
     }
 
     /// Fallible, exact [`Self::to_rgba8`] (see [`Self::try_to_rgb8`]).
     pub fn try_to_rgba8(&self) -> Result<Vec<u8>> {
-        self.rgb_bytes(4, self.color)
+        self.rgb_bytes(4, self.color, 1)
     }
 
     /// The exact conversion, else the BT.601 reading of a matrix the
     /// converter does not know.
-    fn rgb_bytes_or_bt601(&self, channels: usize) -> Result<Vec<u8>> {
-        match self.rgb_bytes(channels, self.color) {
-            Err(Error::Unsupported(_)) => self.rgb_bytes(channels, self.color.with_matrix(6)),
+    fn rgb_bytes_or_bt601(&self, channels: usize, threads: usize) -> Result<Vec<u8>> {
+        match self.rgb_bytes(channels, self.color, threads) {
+            Err(Error::Unsupported(_)) => {
+                self.rgb_bytes(channels, self.color.with_matrix(6), threads)
+            }
             other => other,
         }
     }
@@ -690,26 +716,32 @@ impl AvifImage {
     /// Identity-matrix 4:4:4 pictures at full range (the planes are
     /// G, B, R) are interleaved directly; everything else goes through
     /// the container crate's converter a band of rows at a time, so
-    /// the working set is the output plus one band — never a second
-    /// (16-bit) copy of the whole picture.
-    fn rgb_bytes(&self, channels: usize, color: ColorInfo) -> Result<Vec<u8>> {
+    /// the working set is the output plus one band per worker — never
+    /// a second (16-bit) copy of the whole picture. `threads` workers
+    /// share the bands; the bytes do not depend on it.
+    fn rgb_bytes(&self, channels: usize, color: ColorInfo, threads: usize) -> Result<Vec<u8>> {
         if !matches!(self.bit_depth, 8 | 10 | 12) {
             return Err(Error::invalid(format!(
                 "avif: bit_depth {} is not 8, 10 or 12",
                 self.bit_depth
             )));
         }
-        if let Some(out) = self.identity_rgb_bytes(channels, color)? {
+        if let Some(out) = self.identity_rgb_bytes(channels, color, threads)? {
             return Ok(out);
         }
-        self.banded_rgb_bytes(channels, color, RGB_BAND_ROWS)
+        self.banded_rgb_bytes(channels, color, RGB_BAND_ROWS, threads)
     }
 
     /// The direct path of [`Self::rgb_bytes`]: `Some` for a planar
     /// 4:4:4 picture under the H.273 identity matrix at full range —
     /// `R = Cr`, `G = Y`, `B = Cb` sample for sample (§8.3), deeper
     /// samples brought to 8 bits as `round(v × 255 / (2^d − 1))`.
-    fn identity_rgb_bytes(&self, channels: usize, color: ColorInfo) -> Result<Option<Vec<u8>>> {
+    fn identity_rgb_bytes(
+        &self,
+        channels: usize,
+        color: ColorInfo,
+        threads: usize,
+    ) -> Result<Option<Vec<u8>>> {
         let format = self.format;
         let planar_444 = !format.is_packed_ya()
             && format.plane_count() >= 3
@@ -745,50 +777,49 @@ impl AvifImage {
             &p.data[s..s + row_bytes]
         }
         let row_of = |p, y| row(p, y, row_bytes);
-        if bps == 1 {
-            for (y, dst) in out.chunks_exact_mut(w * channels).enumerate() {
-                let (rr, gr, br) = (row_of(r, y), row_of(g, y), row_of(b, y));
-                match (channels, alpha) {
-                    (4, Some(a)) => {
-                        let ar = row_of(a, y);
-                        for (x, px) in dst.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-                            px[0] = rr[x];
-                            px[1] = gr[x];
-                            px[2] = br[x];
-                            px[3] = ar[x];
-                        }
-                    }
-                    _ => {
-                        for (x, px) in dst.chunks_exact_mut(channels).enumerate() {
-                            px[0] = rr[x];
-                            px[1] = gr[x];
-                            px[2] = br[x];
-                        }
-                    }
-                }
-            }
-        } else {
-            let max = (1u32 << self.bit_depth) - 1;
-            let half = max / 2;
-            let to8 = |row: &[u8], x: usize| -> u8 {
-                let v = u32::from(u16::from_le_bytes([row[2 * x], row[2 * x + 1]]));
-                ((v.min(max) * 255 + half) / max) as u8
-            };
-            for (y, dst) in out.chunks_exact_mut(w * channels).enumerate() {
+        let max = (1u32 << self.bit_depth) - 1;
+        let half = max / 2;
+        let to8 = |row: &[u8], x: usize| -> u8 {
+            let v = u32::from(u16::from_le_bytes([row[2 * x], row[2 * x + 1]]));
+            ((v.min(max) * 255 + half) / max) as u8
+        };
+        // One band of output rows starting at luma row `first`.
+        let fill = |first: usize, band: &mut [u8]| -> Result<()> {
+            for (i, dst) in band.chunks_exact_mut(w * channels).enumerate() {
+                let y = first + i;
                 let (rr, gr, br) = (row_of(r, y), row_of(g, y), row_of(b, y));
                 let ar = alpha.map(|a| row_of(a, y));
-                for (x, px) in dst.chunks_exact_mut(channels).enumerate() {
-                    px[0] = to8(rr, x);
-                    px[1] = to8(gr, x);
-                    px[2] = to8(br, x);
-                    if channels == 4
-                        && let Some(ar) = ar
-                    {
-                        px[3] = to8(ar, x);
+                if bps == 1 {
+                    match (channels, ar) {
+                        (4, Some(ar)) => {
+                            for (x, px) in dst.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                                *px = [rr[x], gr[x], br[x], ar[x]];
+                            }
+                        }
+                        _ => {
+                            for (x, px) in dst.chunks_exact_mut(channels).enumerate() {
+                                px[0] = rr[x];
+                                px[1] = gr[x];
+                                px[2] = br[x];
+                            }
+                        }
+                    }
+                } else {
+                    for (x, px) in dst.chunks_exact_mut(channels).enumerate() {
+                        px[0] = to8(rr, x);
+                        px[1] = to8(gr, x);
+                        px[2] = to8(br, x);
+                        if channels == 4
+                            && let Some(ar) = ar
+                        {
+                            px[3] = to8(ar, x);
+                        }
                     }
                 }
             }
-        }
+            Ok(())
+        };
+        for_each_band(&mut out, w * channels, RGB_BAND_ROWS, threads, &fill)?;
         Ok(Some(out))
     }
 
@@ -802,6 +833,7 @@ impl AvifImage {
         channels: usize,
         color: ColorInfo,
         band_rows: usize,
+        threads: usize,
     ) -> Result<Vec<u8>> {
         let format = self.format;
         let (w, h) = (self.width as usize, self.height as usize);
@@ -824,10 +856,11 @@ impl AvifImage {
             3
         };
         let band_rows = band_rows.max(2) & !1;
-        let mut out = Vec::with_capacity(w * h * channels);
-        let mut row = 0usize;
-        while row < h {
-            let rows = band_rows.min(h - row);
+        // One band of output rows starting at luma row `row`: its rows
+        // of every plane, through the container's converter, narrowed
+        // to 8 bits into the band's bytes.
+        let convert = |row: usize, dst: &mut [u8]| -> Result<()> {
+            let rows = dst.len() / (w * channels);
             let mut planes = Vec::with_capacity(self.planes.len());
             for (i, plane) in self.planes.iter().enumerate() {
                 let chroma = (1..colour_planes).contains(&i);
@@ -878,18 +911,77 @@ impl AvifImage {
                     ((u32::from(v).min(max) * 255 + half) / max) as u8
                 }
             };
-            for px in rgb.data.chunks_exact(rgb.channels).take(n) {
-                out.push(to8(px[0]));
-                out.push(to8(px[1]));
-                out.push(to8(px[2]));
+            let alpha = rgb.channels >= 4;
+            for (px, out) in rgb
+                .data
+                .chunks_exact(rgb.channels)
+                .zip(dst.chunks_exact_mut(channels))
+            {
+                out[0] = to8(px[0]);
+                out[1] = to8(px[1]);
+                out[2] = to8(px[2]);
                 if channels == 4 {
-                    out.push(if rgb.channels >= 4 { to8(px[3]) } else { 255 });
+                    out[3] = if alpha { to8(px[3]) } else { 255 };
                 }
             }
-            row += rows;
-        }
+            Ok(())
+        };
+        let mut out = vec![0u8; w * h * channels];
+        for_each_band(&mut out, w * channels, band_rows, threads, &convert)?;
         Ok(out)
     }
+}
+
+/// Run `job(first_row, band)` over `out` cut into bands of `band_rows`
+/// rows of `row_bytes` bytes (the last one shorter), on up to `threads`
+/// scoped workers — each band is written by exactly one job, so the
+/// result does not depend on `threads`. The first failing band in row
+/// order is the error.
+fn for_each_band<F>(
+    out: &mut [u8],
+    row_bytes: usize,
+    band_rows: usize,
+    threads: usize,
+    job: &F,
+) -> Result<()>
+where
+    F: Fn(usize, &mut [u8]) -> Result<()> + Sync,
+{
+    let band_bytes = (row_bytes * band_rows).max(1);
+    let bands = out.len().div_ceil(band_bytes);
+    let workers = threads.clamp(1, bands.max(1));
+    if workers == 1 {
+        for (i, band) in out.chunks_mut(band_bytes).enumerate() {
+            job(i * band_rows, band)?;
+        }
+        return Ok(());
+    }
+    // Consecutive runs of bands per worker (each worker walks its own
+    // stretch of the picture in memory order).
+    let per_worker = bands.div_ceil(workers);
+    let results: Vec<Result<()>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = out
+            .chunks_mut(band_bytes * per_worker)
+            .enumerate()
+            .map(|(wi, stretch)| {
+                scope.spawn(move || {
+                    for (i, band) in stretch.chunks_mut(band_bytes).enumerate() {
+                        job((wi * per_worker + i) * band_rows, band)?;
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| {
+                h.join().unwrap_or_else(|_| {
+                    Err(Error::invalid("avif: an RGB conversion worker panicked"))
+                })
+            })
+            .collect()
+    });
+    results.into_iter().collect()
 }
 
 /// Luma rows per band of the RGB conversion: 64 rows of a 12 MP
@@ -1233,8 +1325,8 @@ pub struct EncodeOptions {
     /// stored as given.
     pub premultiplied_alpha: bool,
     /// Chroma layout of [`crate::encode_rgb8`] / [`crate::encode_rgba8`]
-    /// (default 4:2:0; odd extents fall back to 4:4:4, see those
-    /// functions). [`crate::encode`] keeps the image's own layout.
+    /// (default 4:2:0, at every extent — an odd one has the rounded-up
+    /// chroma planes). [`crate::encode`] keeps the image's own layout.
     pub chroma: StillChroma,
     /// Embed `metadata.exif` as an `Exif` item (default `true`).
     pub embed_exif: bool,
@@ -1269,6 +1361,15 @@ pub struct EncodeOptions {
     /// converting to Y′CbCr, so the decoded picture equals the source
     /// sample for sample. See [`Self::with_lossless`].
     pub lossless: bool,
+    /// Image sequences only ([`crate::encode_all`] on timed frames):
+    /// code every sample as a KEY frame (every sample a sync sample,
+    /// `avio` brand) instead of KEY + P groups. Default `false` — the
+    /// samples of a group predict from the previous one, which is far
+    /// smaller on real motion and far slower to code (the inter search
+    /// of the AV1 coder is exhaustive; see the README's sequence
+    /// timings). KEY frames are searched at [`Self::speed`] and coded
+    /// on [`Self::threads`] workers, one sample per worker.
+    pub all_intra: bool,
 }
 
 impl Default for EncodeOptions {
@@ -1285,6 +1386,7 @@ impl Default for EncodeOptions {
             threads: 1,
             grid: GridTiling::Auto,
             lossless: false,
+            all_intra: false,
         }
     }
 }
@@ -1359,6 +1461,13 @@ impl EncodeOptions {
     /// in whichever order they are set.
     pub fn with_lossless(mut self, lossless: bool) -> Self {
         self.lossless = lossless;
+        self
+    }
+
+    /// Setter: replace `all_intra` (image sequences as KEY frames
+    /// only).
+    pub fn with_all_intra(mut self, all_intra: bool) -> Self {
+        self.all_intra = all_intra;
         self
     }
 
@@ -1756,12 +1865,21 @@ mod tests {
                     for channels in [3usize, 4] {
                         let want = img.rgb_bytes_whole(channels, *colour).unwrap();
                         let label = format!("{format:?} {w}x{h} colour {c} x{channels}");
-                        assert!(img.rgb_bytes(channels, *colour).unwrap() == want, "{label}");
-                        for band in [2usize, 6, 64] {
+                        for threads in [0usize, 1, 2, 3, 8] {
                             assert!(
-                                img.banded_rgb_bytes(channels, *colour, band).unwrap() == want,
-                                "{label} band {band}"
+                                img.rgb_bytes(channels, *colour, threads).unwrap() == want,
+                                "{label} threads {threads}"
                             );
+                        }
+                        for band in [2usize, 6, 64] {
+                            for threads in [1usize, 3, 16] {
+                                assert!(
+                                    img.banded_rgb_bytes(channels, *colour, band, threads)
+                                        .unwrap()
+                                        == want,
+                                    "{label} band {band} threads {threads}"
+                                );
+                            }
                         }
                         cells += 1;
                     }
@@ -1769,15 +1887,19 @@ mod tests {
             }
         }
         assert_eq!(cells, 14 * 5 * 6 * 2);
+        // The public views on a budget are the serial ones.
+        let big = noise_picture(64, 200, F::Yuva420P, 8, 4, 9);
+        assert!(big.to_rgba8_threads(4) == big.to_rgba8());
+        assert!(big.to_rgb8_threads(3) == big.to_rgb8());
         // The identity path is taken where it applies, and only there.
         let rgb = noise_picture(9, 4, F::Yuva444P, 8, 3, 1);
         assert!(
-            rgb.identity_rgb_bytes(4, ColorInfo::identity_full_range())
+            rgb.identity_rgb_bytes(4, ColorInfo::identity_full_range(), 1)
                 .unwrap()
                 .is_some()
         );
         assert!(
-            rgb.identity_rgb_bytes(4, ColorInfo::miaf_default())
+            rgb.identity_rgb_bytes(4, ColorInfo::miaf_default(), 1)
                 .unwrap()
                 .is_none()
         );

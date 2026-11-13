@@ -76,7 +76,7 @@ fn frame(fmt: PixelFormat, w: u32, h: u32) -> VideoFrame {
     let depth = depth_of(fmt);
     let mut out = Vec::new();
     for (pi, &(sx, sy)) in planes.iter().enumerate() {
-        let (pw, ph) = ((w >> sx) as usize, (h >> sy) as usize);
+        let (pw, ph) = (((w + sx) >> sx) as usize, ((h + sy) >> sy) as usize);
         let stride = pw * channels * bps;
         let mut data = Vec::with_capacity(stride * ph);
         for y in 0..ph {
@@ -424,6 +424,47 @@ fn every_written_shape_is_accepted_by_the_installed_readers() {
             w: 1200,
             h: 900,
             options: vec![("grid", "256")],
+            blobs: false,
+        },
+        // Sub-sampled chroma at odd extents (chroma planes rounded up).
+        Case {
+            name: "yuv420_odd",
+            fmt: PixelFormat::Yuv420P,
+            w: 67,
+            h: 45,
+            options: vec![],
+            blobs: false,
+        },
+        Case {
+            name: "yuv422p10_odd",
+            fmt: PixelFormat::Yuv422P10Le,
+            w: 33,
+            h: 17,
+            options: vec![],
+            blobs: false,
+        },
+        Case {
+            name: "rgb24_lossy_odd_420",
+            fmt: PixelFormat::Rgb24,
+            w: 67,
+            h: 45,
+            options: vec![],
+            blobs: false,
+        },
+        Case {
+            name: "rgba_lossy_odd_420",
+            fmt: PixelFormat::Rgba,
+            w: 45,
+            h: 67,
+            options: vec![("quality", "70")],
+            blobs: false,
+        },
+        Case {
+            name: "grid_odd_420",
+            fmt: PixelFormat::Yuva420P,
+            w: 1201,
+            h: 899,
+            options: vec![],
             blobs: false,
         },
     ];

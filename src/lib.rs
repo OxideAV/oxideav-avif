@@ -190,6 +190,8 @@ pub mod sequence;
 #[cfg(feature = "registry")]
 pub mod signal;
 #[cfg(feature = "registry")]
+mod source;
+#[cfg(feature = "registry")]
 pub mod still;
 
 pub use alpha::{

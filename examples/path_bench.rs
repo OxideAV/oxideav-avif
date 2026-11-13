@@ -8,13 +8,19 @@
 //! cargo run --release --example path_bench -- encode \
 //!     --api contract|registry --raw photo.rgb24 --size 4032x3024 \
 //!     --fmt rgb24|rgba|yuv420p [--lossless] [--quality 60] [--threads 8] \
-//!     [--out out.avif]
+//!     [--frames N [--all-intra]] [--out out.avif]
 //! cargo run --release --example path_bench -- decode \
 //!     --api contract|registry --in out.avif [--threads 8] [--rgba]
 //! ```
 //!
-//! `--rgba` (decode) also converts the decoded picture to packed RGBA,
-//! the buffer a contract caller usually wants.
+//! `--frames N` (contract encode of `yuv420p`) codes an `avis` image
+//! sequence of `N` frames through `encode_all`: the picture panned two
+//! columns per frame, 40 ms each — KEY + P groups, or KEY frames only
+//! with `--all-intra`.
+//!
+//! `--rgba` (decode) also converts the decoded picture to packed RGBA
+//! (`to_rgba8_threads` on the same budget), the buffer a contract
+//! caller usually wants.
 
 use std::time::Instant;
 
@@ -40,6 +46,8 @@ struct Args {
     quality: Option<u8>,
     threads: usize,
     rgba: bool,
+    frames: usize,
+    all_intra: bool,
 }
 
 fn parse_args() -> Args {
@@ -68,6 +76,8 @@ fn parse_args() -> Args {
             "--quality" => a.quality = Some(it.next().expect("--quality N").parse().expect("N")),
             "--threads" => a.threads = it.next().expect("--threads N").parse().expect("N"),
             "--rgba" => a.rgba = true,
+            "--frames" => a.frames = it.next().expect("--frames N").parse().expect("N"),
+            "--all-intra" => a.all_intra = true,
             other => panic!("unknown argument {other}"),
         }
     }
@@ -106,6 +116,36 @@ fn encode(a: &Args) {
                 let t = Instant::now();
                 let out =
                     oxideav_avif::encode_rgba8(a.width, a.height, &raw, &opts).expect("encode");
+                (t.elapsed().as_secs_f64(), out)
+            }
+            "yuv420p" if a.frames > 1 => {
+                // Frame `t`: every plane panned (cyclically) by 2 luma
+                // columns per frame.
+                let planes = yuv420_planes(raw, w, h);
+                let frames: Vec<oxideav_avif::Frame> = (0..a.frames)
+                    .map(|t| {
+                        let panned = planes
+                            .iter()
+                            .enumerate()
+                            .map(|(p, (stride, data))| {
+                                let shift = (if p == 0 { 2 * t } else { t }) % stride;
+                                let mut out = Vec::with_capacity(data.len());
+                                for row in data.chunks_exact(*stride) {
+                                    out.extend_from_slice(&row[shift..]);
+                                    out.extend_from_slice(&row[..shift]);
+                                }
+                                AvifPlane::new(*stride, out)
+                            })
+                            .collect();
+                        let img =
+                            AvifImage::new(a.width, a.height, AvifPixelFormat::Yuv420P, panned)
+                                .expect("image");
+                        oxideav_avif::Frame::new(img, Some(std::time::Duration::from_millis(40)))
+                    })
+                    .collect();
+                let t = Instant::now();
+                let opts = opts.with_all_intra(a.all_intra);
+                let out = oxideav_avif::encode_all(&frames, &opts).expect("encode_all");
                 (t.elapsed().as_secs_f64(), out)
             }
             "yuv420p" => {
@@ -192,7 +232,7 @@ fn decode(a: &Args) {
         let t = Instant::now();
         let img = oxideav_avif::decode_with(&file, &opts).expect("decode");
         let (what, sum) = if a.rgba {
-            let rgba = img.to_rgba8();
+            let rgba = img.to_rgba8_threads(a.threads);
             (
                 format!("{}x{} rgba8", img.width, img.height),
                 rgba.iter().map(|&b| u64::from(b)).sum::<u64>(),

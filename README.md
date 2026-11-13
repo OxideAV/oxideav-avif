@@ -113,7 +113,7 @@ by name. Decode yields the storage layout; `color.matrix == 0`
 
 | Encode | Layout written |
 |---|---|
-| `encode(&AvifImage)` | the image's own layout and depth at any extent (sub-sampled chroma at an odd size has the rounded-up plane, `(extent + 1) >> 1`); alpha as the AV1-coded alpha auxiliary item |
+| `encode(&AvifImage)` | the image's own layout and depth at any extent (sub-sampled chroma at an odd size has the rounded-up plane, `(extent + 1) >> 1`, and stays one coded item up to 4096 per axis — see "Encode budget"); alpha as the AV1-coded alpha auxiliary item |
 | `encode_rgb8` / `encode_rgba8`, lossless (`with_lossless(true)`, `with_quality(100)`, the default `base_q_idx = 0`) | the bytes as RGB: identity matrix (`matrix_coefficients = 0`), 4:4:4, full range, AV1 lossless — `decode_rgb8` / `decode_rgba8` return exactly the input, alpha included |
 | `encode_rgb8` / `encode_rgba8`, any other quality | 8-bit Y′CbCr 4:2:0 (`EncodeOptions::chroma`, at odd extents too), MIAF default colour (BT.709 / sRGB / BT.601, full range), alpha as the auxiliary |
 | `encode(&AvifImage::from_rgb8(..)?)` | identity-matrix 4:4:4 at every quality — byte-exact RGB when lossless |
@@ -292,6 +292,17 @@ honoured as given (`grid=256` on 12 MP is 192 tiles and opens
 everywhere; `grid=128` with alpha is 1 538 items, which three of the
 five installed readers refuse). `elect_grid_for` is the election
 table.
+
+A grid's output image must hold a whole number of samples in every
+plane (MIAF §7.3.11.4.2 — a black-box AVIF decoder refuses a 4:2:0 grid
+with an odd output extent), so a sub-sampled picture with an odd extent
+on a sub-sampled axis is **one coded item** whenever it fits the
+single-item bound (4096 per axis), whatever `grid` says: the file is
+the picture as it is, exact when lossless. Past the bound — and through
+an explicit `encode_still_grid` — it is tiled over the even canvas (one
+replicated column / row) and cropped back by a top-left `clap` on the
+grid and the alpha grid, which readers present as 4:4:4 (MIAF
+§7.3.6.7).
 
 Same picture as above at `quality` 60, `/usr/bin/time -l` around
 `examples/encode_budget` (the process holds the source frame and
