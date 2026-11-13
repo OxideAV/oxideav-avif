@@ -115,3 +115,14 @@ name = "registry_encoder_options"
 path = "fuzz_targets/registry_encoder_options.rs"
 test = false
 doc = false
+
+# r488 — every encode path at fuzz-chosen extents (odd, off the
+# 8-sample grid, one sample wide): still / image sequence (KEY + P) /
+# layered item / burst through the registry decoder, layout × depth ×
+# alpha × quantiser from the input; lossless must round-trip exactly.
+# Fully in-tree; never skips.
+[[bin]]
+name = "any_extent_paths"
+path = "fuzz_targets/any_extent_paths.rs"
+test = false
+doc = false

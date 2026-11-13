@@ -118,7 +118,7 @@ by name. Decode yields the storage layout; `color.matrix == 0`
 | `encode_rgb8` / `encode_rgba8`, any other quality | 8-bit Y′CbCr 4:2:0 (`EncodeOptions::chroma`, at odd extents too), MIAF default colour (BT.709 / sRGB / BT.601, full range), alpha as the auxiliary |
 | `encode(&AvifImage::from_rgb8(..)?)` | identity-matrix 4:4:4 at every quality — byte-exact RGB when lossless |
 | canvases past 4096 coded pixels per axis | `grid` tiling (`encode_still_auto`) |
-| `encode_all(&[Frame], &EncodeOptions)` | the mirror of `decode_all`: delay-less frames → the primary plus a `brst` image burst (`encode_still_burst`; per-member colour / ICC / alpha / `clap`, Exif / XMP on the primary), timed frames → an `avis` image sequence (`encode_sequence` at timescale 1000, each frame's delay in ms; alpha as the alpha auxiliary track, frame 0's ICC / Exif / XMP as the sequence's; KEY + P groups at every picture size, the sample entry at the pictures' own size with no `clap`); all frames share frame 0's geometry, depth and layout; `decode_all(encode_all(f)) == f` at the lossless default |
+| `encode_all(&[Frame], &EncodeOptions)` | the mirror of `decode_all`: delay-less frames → the primary plus a `brst` image burst (`encode_still_burst`; per-member colour / ICC / alpha / `clap`, Exif / XMP on the primary), timed frames → an `avis` image sequence (`encode_sequence` at timescale 1000, each frame's delay in ms; alpha as the alpha auxiliary track, frame 0's ICC / Exif / XMP as the sequence's; KEY + P groups at every picture size — KEY frames only with `EncodeOptions::all_intra` — the sample entry at the pictures' own size with no `clap`); all frames share frame 0's geometry, depth and layout; `decode_all(encode_all(f)) == f` at the lossless default |
 
 `decode_all` returns every sample of an `avis` image sequence (with
 its `delay`), the entities of the primary's `brst` burst group, else
@@ -211,8 +211,10 @@ workers and the workers a grid's tiles are coded on; the layout
 follows the picture size — `TILE_LAYOUT_THREADS` — so the bytes are
 the same at any count), `grid` (`GridTiling::Auto` default / `Single`
 / `MaxTile(edge)`: how `encode` / `encode_still_auto` split a picture
-into coded items — see "Encode budget" below). `StillEncodeOptions`
-is the deprecated alias.
+into coded items — see "Encode budget" below), `all_intra` (image
+sequences as KEY frames only instead of KEY + P groups — see "Image
+sequences: bytes against time"). `StillEncodeOptions` is the
+deprecated alias.
 
 `DecodeOptions` (`Default` = lenient, `Some(16384)` × `Some(16384)`,
 `Some(1 << 28)` pixels, `Some(1 << 30)` input bytes; `None` =
@@ -304,88 +306,148 @@ replicated column / row) and cropped back by a top-left `clap` on the
 grid and the alpha grid, which readers present as 4:4:4 (MIAF
 §7.3.6.7).
 
-Same picture as above at `quality` 60, `/usr/bin/time -l` around
-`examples/encode_budget` (the process holds the source frame and
-nothing else before the encode starts); r477 = the single item the
-registry wrote before this round:
+Same picture as above (decoded to 8-bit 4:2:0 by a black-box decoder)
+at `quality` 60, `/usr/bin/time -l` around `examples/encode_budget`
+(the process holds the source frame and nothing else before the encode
+starts); wall = median of 3, measured next to other builds on the same
+machine, peak RSS = the smallest of the runs:
 
 | input | shape | 1 worker | 4 workers | 8 workers | bytes | luma PSNR |
 |---|---|---|---|---|---|---|
-| 8-bit 4:2:0 | single item (r477, `grid=none`) | 7.99 s / 465 MiB | 2.97 s / 553 MiB | 2.20 s / 607 MiB | 1 982 694 | 35.76 dB |
-| 8-bit 4:2:0 | **512-pixel grid, 8 × 6 (`auto`)** | 7.77 s / 92 MiB | 2.08 s / 116 MiB | **1.21 s / 162 MiB** | 2 038 848 (+2.8 %) | 35.77 dB |
-| 8-bit 4:2:0 | 1024-pixel grid, 4 × 3 | 7.25 s / 114 MiB | 2.03 s / 200 MiB | 1.43 s / 299 MiB | 2 015 004 (+1.6 %) | 35.96 dB |
-| 8-bit 4:2:0 | 256-pixel grid, 16 × 12 | 10.8 s / 86 MiB | 3.10 s / 104 MiB | 1.88 s / 122 MiB | 2 056 152 (+3.7 %) | 35.92 dB |
-| packed `Rgb24` (lossy → 4:2:0) | single item (r477) | — | — | 2.24 s / 684 MiB | 1 909 479 | 35.79 dB |
-| packed `Rgb24` | 512 grid, r477 conversion | 7.37 s / 288 MiB | — | 1.26 s / 361 MiB | 1 958 495 | — |
-| packed `Rgb24` | **512 grid, one-pass conversion** | 7.37 s / 91 MiB | — | **1.24 s / 161 MiB** | 1 958 495 | — |
-| 10-bit 4:2:0 | 512 grid (`auto`) | 7.57 s / 101 MiB | 2.22 s / 136 MiB | 1.27 s / 165 MiB | 2 072 085 | — |
-| packed `Rgba` (alpha) | 1024 grid, 4 × 3 + alpha (`auto` under the former 90-tile cap) | 8.59 s / 149 MiB | 2.38 s / 262 MiB | 1.74 s / 330 MiB | 1 940 633 | — |
+| 8-bit 4:2:0 | single item (`grid=none`) | 6.85 s / 251 MiB | 2.56 s / 293 MiB | 1.73 s / 298 MiB | 1 982 694 | 35.76 dB |
+| 8-bit 4:2:0 | **512-pixel grid, 8 × 6 (`auto`)** | 6.99 s / **55 MiB** | 2.07 s / 84 MiB | **1.13 s / 110 MiB** | 2 038 332 (+2.8 %) | 35.77 dB |
+| 8-bit 4:2:0 | 1024-pixel grid, 4 × 3 | 6.33 s / 62 MiB | 1.88 s / 126 MiB | 1.31 s / 184 MiB | 2 014 884 (+1.6 %) | 35.96 dB |
+| 8-bit 4:2:0 | 256-pixel grid, 16 × 12 | 10.3 s / 51 MiB | 3.28 s / 66 MiB | 2.05 s / 77 MiB | 2 053 666 (+3.6 %) | 35.92 dB |
+| packed `Rgb24` (lossy → 4:2:0) | 512 grid (`auto`) | 7.06 s / 61 MiB | 2.17 s / 87 MiB | 1.50 s / 108 MiB | 1 950 548 | 35.77 dB |
+| packed `Rgba` (lossy, alpha) | 512 grid + alpha grid (`auto`) | 9.25 s / 74 MiB | 3.08 s / 100 MiB | 1.74 s / 125 MiB | 1 960 939 | — |
+| packed `Rgb24`, lossless | 512 grid (`auto`) | 3.68 s / 116 MiB | 1.03 s / 151 MiB | 0.68 s / 188 MiB | 29 394 211 | exact |
 
-Where the memory goes (12 MP 8-bit 4:2:0, 512 grid): the source frame
-18 MiB; the `StillImage` the registry builds from it 36 MiB (`u16`
-samples — the one copy left on the planar path); one tile's cut
-planes 0.75 MiB per worker; the AV1 encoder's state ≈ 30 MiB for the
-first worker and ≈ 10 MiB per further worker (92 → 162 MiB from 1 to
-8). The single item's 465 MiB is the AV1 encoder holding the whole
-4032 × 3024 picture's state, which no plumbing on this side changes.
-The packed-RGB path converts straight from the frame's rows into the
-coding planes (H.273 §8.3 per pixel, the chroma of a sub-sampled
-layout box-filtered from the rounded 4:4:4 values — sample-identical
-to the contract path's conversion, pinned in the tests); the r477
-path kept a packed copy, a 16-bit RGB copy and a 4:4:4 intermediate.
+Where the memory goes (12 MP 8-bit 4:2:0, 512 grid, 1 worker): the
+caller's frame 18 MiB; one tile's cut planes 0.75 MiB; the AV1
+encoder's state for a 512-pixel tile ≈ 30 MiB (≈ 8 MiB per further
+worker: 55 → 110 MiB from 1 to 8); the coded tiles and the file ≈ 4 MiB.
+There is no whole-picture intermediate: every coded item is cut from
+the caller's buffer when its worker codes it (see "Reading the input in
+place"). The single item's 251 MiB is the AV1 encoder holding the whole
+4032 × 3024 picture's state, which no plumbing on this side changes
+(465 MiB at the previous measurement).
 
-### Both paths, encode and decode
+### Reading the input in place
 
-`examples/path_bench` runs one encode or one decode per process
-through the contract API (`encode_rgb8` / `encode_rgba8` / `encode`,
-`decode_with` + `to_rgba8`) or the registry path, so the wall clock it
-prints and the process peak (`/usr/bin/time -l`) belong to that one
-operation. Same 12 MP picture (3024 × 4032 after orientation), `fast`
-(the default and fastest effort), quality 60 or lossless, 1 and 8
-workers; "before" is this crate at the start of the round (r486), the
-files are **byte-identical** before and after:
+Every encode entry point used to build a whole-picture `StillImage`
+first (`u16` samples: 36 MiB for 12 MP 4:2:0, 73 MiB for RGB, 24 MiB
+more for alpha). A coded item is now cut straight from the caller's
+samples — 8-bit planes, little-endian word planes, the channels of
+packed RGB(A) / gray + alpha rows, any stride — and a lossy packed RGB
+picture is converted to Y′CbCr tile by tile (H.273 §8.3 per pixel,
+box-filtered chroma; a tile starting on an even column / row holds
+whole chroma cells, so the tile-wise conversion is the whole-picture
+one, pinned in the tests). The files are **byte-identical** (93 shapes
+hashed before and after: single items and grids, every registry layout
+with tight and padded strides, the one-call RGB / RGBA paths,
+`encode(&AvifImage)`).
 
-| operation (12 MP) | peak RSS before → after, 1 worker | 8 workers | wall, 8 workers (min of 5, interleaved) |
+`examples/path_bench` runs one encode or one decode per process, so
+the wall clock it prints and the process peak (`/usr/bin/time -l`)
+belong to that one operation. Same 12 MP picture, `fast` (the default
+and fastest effort), quality 60 or lossless; "before" is this crate at
+the start of the round built against the same oxideav-av1 0.1.24; wall
+= median of 5 (1 for the single-worker encodes), on a machine shared
+with other builds — read differences under ~15 % as noise:
+
+| encode (12 MP) | peak RSS before → after, 1 worker | 8 workers | wall, 1 worker | wall, 8 workers |
+|---|---|---|---|---|
+| registry `Yuv420P`, quality 60 | 96 → **60 MiB** | 148 → 111 MiB | 8.0 → 8.1 s | 1.79 → 1.38 s |
+| contract `encode(&AvifImage)` 4:2:0, quality 60 | 96 → **61 MiB** | 145 → 112 MiB | 9.3 → 8.6 s | 2.21 → 1.33 s |
+| registry `Rgb24`, quality 60 | 95 → **61 MiB** | 144 → 107 MiB | 8.6 → 12.5 s (one run each) | 1.80 → 1.61 s |
+| contract `encode_rgb8`, quality 60 | 97 → **62 MiB** | 147 → 114 MiB | 9.7 → 9.8 s | 1.60 → 1.76 s |
+| registry `Rgba`, quality 60 | 134 → **76 MiB** | 184 → 121 MiB | 14.8 → 10.8 s (one run each) | 2.38 → 1.78 s |
+| contract `encode_rgba8`, quality 60 | 133 → **75 MiB** | 184 → 121 MiB | 9.1 → 9.6 s | 1.83 → 1.72 s |
+| registry `Rgb24`, lossless | 189 → **121 MiB** | 251 → 186 MiB | 4.3 → 4.8 s | 0.69 → 0.73 s |
+| contract `encode_rgb8`, lossless | 193 → **123 MiB** | 258 → 187 MiB | 4.3 → 4.1 s | 0.88 → 0.72 s |
+| registry `Rgba`, lossless | 223 → **136 MiB** | 283 → 189 MiB | 4.7 → 4.7 s | 0.97 → 1.35 s |
+| contract `encode_rgba8`, lossless | 220 → **132 MiB** | 295 → 199 MiB | 7.6 → 7.3 s | 0.84 → 0.80 s |
+
+1 MP (1200 × 900, one coded item under `auto`, so the picture is cut
+once): quality 60 0.84–0.95 s on 1 worker / 0.20–0.25 s on 8, lossless
+0.32–0.43 s / 0.06–0.09 s, contract and registry alike; peak RSS
+16–24 MiB on 1 worker (registry `Yuv420P` 20 → 16 MiB, `encode_rgb8`
+lossless 29 → 21 MiB), 40–53 MiB on 8.
+
+| decode (12 MP) | 1 worker | 8 workers | peak RSS 1 / 8 workers |
 |---|---|---|---|
-| contract `encode_rgb8`, quality 60 | 256 → **93 MiB** | 307 → 140 MiB | 1.86 → 1.73 s |
-| contract `encode_rgba8`, quality 60 | 308 → **133 MiB** | 354 → 177 MiB | — |
-| contract decode + `to_rgba8`, lossy RGB file | 214 → **111 MiB** | 232 → 135 MiB | 0.176 → 0.167 s |
-| contract decode + `to_rgba8`, lossy RGBA file | 319 → **185 MiB** | 339 → 208 MiB | 0.223 → 0.209 s |
-| contract decode + `to_rgba8`, lossless RGB file | 330 → **190 MiB** | 360 → 231 MiB | 0.390 → 0.326 s |
-| contract decode + `to_rgba8`, lossless RGBA file | 401 → **264 MiB** | 430 → 304 MiB | — |
-| registry decode, 4:2:0 quality 60 | 99 → **65 MiB** | 117 → 88 MiB | 0.092 → 0.085 s |
-| registry decode, lossy RGBA file | 178 → 140 MiB | 202 → 161 MiB | — |
-| registry decode, lossless RGB file | 213 → 145 MiB | 238 → 187 MiB | 0.496 → 0.446 s (RGBA) |
-| registry encode, lossless `Rgb24` | 187 → 174 MiB | 260 → 243 MiB | 0.97 → 0.97 s |
-| registry encode, quality 60 (`Yuv420P` / `Rgb24` / `Rgba`) | 87 / 91 / 128 MiB, unchanged | 139 / 141 / 185 MiB | 1.31 → 1.38 s (noise) |
+| registry or contract, quality-60 4:2:0 file → planes | 0.60–0.65 s | 0.08 s | 66 / 90 MiB |
+| contract + RGBA, quality-60 4:2:0 file | 0.79 → 0.88 s (noise) | **0.173 → 0.101 s** | 112 / 135 MiB |
+| registry or contract, quality-60 RGBA file → planes | 0.47–0.69 s | 0.08 s | 137 / 160 MiB |
+| contract + RGBA, quality-60 RGBA file | 0.52 → 0.53 s | **0.161 → 0.097 s** | 183 / 206 MiB |
+| lossless RGB file → planes | 2.0–2.1 s | 0.34–0.38 s | 155 / 190 MiB |
+| contract + RGBA, lossless RGB file | 2.14 s | 0.38 → 0.35 s | 202 / 236 MiB |
+| lossless RGBA file → planes | 2.1–2.3 s | 0.49–0.57 s | 224 / 264 MiB |
 
-What changed: `encode_rgb8` / `encode_rgba8` convert the caller's bytes
-to the coding planes in one pass (the registry's converter — no 16-bit
-RGB copy, no 4:4:4 intermediate); a decoded item's planes move through
-the composition layer instead of being cloned at each hand-over, and an
-item used once in the graph is no longer memoised (a 48-tile grid kept
-every tile twice, and the canvas twice); `to_rgb8` / `to_rgba8`
-interleave an identity-matrix picture directly and convert everything
-else 64 rows at a time (a whole-picture 16-bit RGBA intermediate
-before); lossless packed RGB goes straight into the coding planes.
-1 MP (1200 × 900): `encode_rgb8` quality 60 37 → 24 MiB, lossless
-decode + `to_rgba8` 40 → 23 MiB and 0.219 → 0.210 s.
+Decode is unchanged this round apart from the RGB view: `to_rgb8` /
+`to_rgba8` write every converted band into its place in the output, and
+`to_rgb8_threads(n)` / `to_rgba8_threads(n)` spread the bands over a
+worker budget (the serial conversion was half of the 8-worker wall of a
+decode + RGBA). 1 MP: 0.043–0.05 s on 1 worker / 0.011–0.016 s on 8
+(quality 60), 0.16–0.21 s / 0.035–0.05 s (lossless).
 
-Where the time is (1 worker, sampling profiles of the same runs): the
-AV1 codec holds 89–93 % of every encode and decode — lossless decode
-2.1 s: symbol decoding 49 % (`read_symbol` 36 %, `renormalize` 13 %)
-and coefficient reading 23 %; lossless encode 6.6 s: `write_symbol`
-44 %, CDF update 13 %; quality-60 encode 6.7–7.8 s: CDEF filtering
-13 %, forward DCT 10 %, loop-restoration search 14 %. On the contract
-decode of a lossy file the container crate's Y′CbCr → RGB converter is
-8 % and this crate's packing 6 %. For scale at 8 workers: quality-60
-encode 1.3–1.7 s, lossless encode 1.0–1.1 s, decode 0.085 s (lossy,
-planes) / 0.17 s (lossy, to RGBA) / 0.33–0.45 s (lossless); 1 MP:
-encode 0.23 s / 0.13 s (lossless), decode 0.025 s / 0.05 s (lossless).
-What is left on this side is the `StillImage` the encoders build from
-the caller's buffer (`u16` samples: 36 MiB for 12 MP 4:2:0, 73 MiB for
-RGB) — cutting grid tiles straight from the caller's rows would remove
-it.
+Where the time is (1 worker, sampling profiles of the same runs, share
+of the samples by the crate the leaf function belongs to):
+
+| run (12 MP, 1 worker) | AV1 codec | allocator / `memmove` under it | this crate | container crate |
+|---|---|---|---|---|
+| quality-60 encode, 4:2:0 planes | 87.2 % | 12.2 % | < 0.1 % | 0 |
+| quality-60 encode, packed RGBA | 86.5 % | 12.6 % | 0.5 % (the Y′CbCr conversion) | 0 |
+| lossless encode, packed RGB | 87.1 % | 12.3 % | 0.4 % (cutting tiles) | 0 |
+| quality-60 decode → planes | 95.1 % | 4.8 % | 0 | 0 |
+| quality-60 RGBA decode + `to_rgba8` | 75.2 % | 5.4 % | 7.2 % (narrowing to 8-bit RGBA) | 12.2 % (Y′CbCr → RGB) |
+| lossless decode + `to_rgba8` | 97.8 % | 2.2 % | < 0.1 % | 0 |
+
+Inside the codec: quality-60 encode — CDEF filtering 15 %,
+loop-restoration search 6 % + box filter 4 %, coefficient writing 6 %,
+chroma-from-luma 4 %; lossless encode — symbol writing 36 %
+(`write_symbol` 24 %, `write_bool` 12 %), coefficient writing 22 %;
+quality-60 decode — CDEF 21 %, coefficient reading 19 %, symbol reading
+18 %, inverse transform 11 %; lossless decode — coefficient reading
+29 %, symbol reading 50 % (`read_symbol` 29 %, `read_bool` 21 %).
+
+### Image sequences: bytes against time
+
+`encode_all` codes timed frames as KEY + P groups of up to 64 samples
+at every picture size (frames are read in place, one group per worker
+at a time; whole groups run in parallel on `threads`, the file is the
+serial one for every budget). The P frames come from the AV1 crate's
+inter coder, whose search is exhaustive and has no effort setting —
+`speed` reaches KEY frames only — so the choice between the two shapes
+is a choice between bytes and time. One worker, the picture panned two
+columns per frame (`path_bench --frames N [--all-intra]`):
+
+| sequence | KEY + P (default) | KEY frames only (`all_intra`) |
+|---|---|---|
+| 160 × 120, 4 frames, quality 60 | 74.5 s, 3 864 B | 0.13 s, 16 191 B |
+| 160 × 120, 4 frames, lossless | 2.05 s, 20 728 B | 0.025 s, 81 479 B |
+| 320 × 240, 8 frames, quality 60 | 985 s, 9 939 B | 0.63 s, 94 791 B |
+| 320 × 240, 8 frames, lossless | 18.4 s, 70 155 B | 0.10 s, 570 564 B |
+
+All of the KEY + P time is inside the AV1 inter coder (its P-frame
+partition search; the same four-frame encode took 99 s with
+oxideav-av1 0.1.23). `EncodeOptions::with_all_intra(true)` /
+`SequenceEncodeOptions::all_intra` is the fast shape: 4–10 × the bytes
+on this (ideal for prediction) content, two to three orders of
+magnitude less time, and its samples are coded on `threads` workers.
+On noisy content the inter coder may also code a denoised picture plus
+film-grain synthesis parameters (seen at widths that are multiples of
+32, `base_q_idx` ≥ 80): the output then matches the source perceptually,
+not sample-wise.
+
+Groups on the budget, 130 lossless frames of 160 × 120 (three groups:
+64 + 64 + 2), before → after this round, the file byte-identical
+(116 693 B) before, after and across budgets:
+
+| workers | wall | peak RSS |
+|---|---|---|
+| 1 | 74.7 → 71.2 s | 38 → 28 MiB (frames read in place) |
+| 8 | 74.0 → **34.9 s** (the longest group bounds it) | 38 → 39 MiB (three groups in flight) |
 
 ## Interop
 
@@ -479,6 +541,8 @@ its co-sited luma samples), bring 10 / 12-bit samples to 8 bits as
 `round(v × 255 / (2^d − 1))`, and read a matrix without a kernel
 (reserved / unspecified / constant-luminance / ICtCp / YCgCo) as
 BT.601 — `try_to_rgb8` reports `Unsupported` instead.
+`to_rgb8_threads(n)` / `to_rgba8_threads(n)` run the same conversion on
+`n` workers (bands of rows, the bytes identical for every `n`).
 
 `AvifImage::metadata`: `icc` (an ICC `colr`), `exif` (from the TIFF
 header on — the HEIF A.2.1 offset word is stripped on decode and
@@ -506,9 +570,12 @@ Enforced before any pixel allocation, as `Error::LimitExceeded`: the
 `DecodeOptions` bounds above, plus the crate's own caps — a 32 MiB
 per-item AV1 payload, `MAX_GRID_CANVAS_PIXELS` / `MAX_OVERLAY_CANVAS_PIXELS`
 (`1 << 28`), `MAX_ITEM_DECODES` (4096 item decodes per file),
-`MAX_DERIVATION_DEPTH`. Hostile input returns `Error`, never panics
-(fuzzed: `contract_api`, `derived_graph_decode`, and the
-cross-decoder harnesses under `fuzz/`).
+`MAX_DERIVATION_DEPTH`, the burst budget
+(`BURST_PIXEL_BUDGET_FACTOR`). Hostile input returns `Error`, never
+panics (fuzzed: `contract_api`, `derived_graph_decode` — alpha
+information properties and burst groups included — `any_extent_paths`,
+`registry_encoder_options`, and the cross-decoder harnesses under
+`fuzz/`).
 
 ## Layering
 
@@ -631,7 +698,7 @@ passes `audit_mif1`. At this layer the AV1 bitstream is taken
 | Alpha auxiliary | `auxl` + `auxC` detection + attachment at every depth (`Gray8→Ya8`, `Gray10/12→Ya16Le`, `Yuv→YuvA` incl. `*10Le`/`*12Le`) + av1-avif §4.1 same-bit-depth `shall` enforced before attachment and audited at the container layer |
 | Post-transforms | `clap` → `irot` → `imir` in `ipma` order (HEIF §6.3), at 8/10/12-bit and on the packed `Ya8`/`Ya16Le` layouts; an odd clean aperture on subsampled chroma promotes to 4:4:4 (MIAF §7.3.6.7); the standalone `apply_*` entry points refuse a layout change their `(frame, width, height)` result cannot carry |
 | Layered image items | `a1lx` / `lsel` / `a1op` written by `AvifMuxer::{with_layered_index, with_layer_selector, with_operating_point}` and `encode_still_layered` (2..=4 AV1 spatial layers in one temporal unit, per-layer byte sizes from an OBU walk, `ispe`/`clap` of the selected layer — av1-avif §2.2.2 / §2.3); the decoder drains every shown frame, renders the `lsel` layer (or the top one) and decodes non-default `a1op` operating points |
-| AVIS image sequences | **encode** (`encode_sequence` over the container's `SequenceWriter`: `ftyp` `avis`/`msf1`/`av01` (+`avio`), cover still whose primary aliases sample 0, `moov`/`trak` with `pict` handler, `av01` sample entry + `av1C`/`colr`/`clap` + `ccst`, `stts`/`stss`/`stsc`/`stsz`/`stco`; all-intra (samples coded on `SequenceEncodeOptions::threads` workers with identical bytes) or KEY + P groups, both at the picture's own extents whatever they are (no padding, no `clap`: sample entry, `tkhd` and decoded frame state one size); **alpha as an alpha auxiliary track** — `auxv` handler, `auxl` reference, alpha `auxi`, monochrome full-range KEY frames time-parallel to the pictures, `alpha_q_idx` (lossless by default); `loop_count` as the MIAF Annex A.2 edit list; frame 0's ICC (`colr` in the sample entry) / Exif / XMP (items of the track's `meta`) written and put back on every decoded frame; lossless sequences — RGBA included — decode exact through this crate, the external AVIF decoder and ffmpeg) + sample-table walk by the container (`parse_avis` over `oxideav_heif::sequence::parse_movie`; ISO/IEC 14496-12's mandatory `mvhd` / `tkhd` / `mdhd` / `hdlr` / `stts` enforced) + `inspect_avis` aggregator + §3 / §8.2 / §8.3 audits + `edts/elst` edit list (ISO/IEC 14496-12 §8.6.6) + `mdhd` media-timescale plumb + `prft` ProducerReferenceTimeBox (§8.16.5, v0/v1 NTP→Unix, top-level walk) on `AvisMeta::producer_reference_times` + `ssix` SubsegmentIndexBox (§8.16.4, v0; per-subsegment `(level: u8, range_size: u24)` leva-level byte-range partitions for partial-subsegment access, top-level walk) on `AvisMeta::subsegment_indexes` |
+| AVIS image sequences | **encode** (`encode_sequence` over the container's `SequenceWriter`: `ftyp` `avis`/`msf1`/`av01` (+`avio`), cover still whose primary aliases sample 0, `moov`/`trak` with `pict` handler, `av01` sample entry + `av1C`/`colr`/`clap` + `ccst`, `stts`/`stss`/`stsc`/`stsz`/`stco`; all-intra (samples coded on `SequenceEncodeOptions::threads` workers with identical bytes) or KEY + P groups, both at the picture's own extents whatever they are (no padding, no `clap`: sample entry, `tkhd` and decoded frame state one size); **alpha as an alpha auxiliary track** — `auxv` handler, `auxl` reference, alpha `auxi`, monochrome full-range KEY frames time-parallel to the pictures, `alpha_q_idx` (lossless by default); `loop_count` as the MIAF Annex A.2 edit list; frame 0's ICC (`colr` in the sample entry) / Exif / XMP (items of the track's `meta`) written and put back on every decoded frame; lossless sequences — RGBA included — decode exact through this crate, the external AVIF decoder and a black-box media framework) + sample-table walk by the container (`parse_avis` over `oxideav_heif::sequence::parse_movie`; ISO/IEC 14496-12's mandatory `mvhd` / `tkhd` / `mdhd` / `hdlr` / `stts` enforced) + `inspect_avis` aggregator + §3 / §8.2 / §8.3 audits + `edts/elst` edit list (ISO/IEC 14496-12 §8.6.6) + `mdhd` media-timescale plumb + `prft` ProducerReferenceTimeBox (§8.16.5, v0/v1 NTP→Unix, top-level walk) on `AvisMeta::producer_reference_times` + `ssix` SubsegmentIndexBox (§8.16.4, v0; per-subsegment `(level: u8, range_size: u24)` leva-level byte-range partitions for partial-subsegment access, top-level walk) on `AvisMeta::subsegment_indexes` |
 | Sample grouping | `sbgp` (SampleToGroupBox, ISO/IEC 14496-12:2015 §8.9.2, v0/v1) + `csgp` (CompactSampleToGroupBox, :2020 §8.9.5 — 4/8/16/32-bit packed field widths, pattern expansion, `traf` fragment-local msb) + `sgpd` (§8.9.3, v0/v1/v2 default index) which now also **retains + slices per-entry `VisualSampleGroupEntry` payloads** (v1 `default_length` fixed-size or self-describing `description_length`) into `SampleGroupDescription::entries`; typed decoders for the HEIF §6.8.6 bracketing entries (`BracketingEntry`: `aebr` auto-exposure / `wbbr` white-balance / `fobr` focus incl. infinity / `afbr` flash-exposure / `dobr` depth-of-field via `bracketing_entries()`) and the §6.8.1.2.2 `eqiv` `VisualEquivalenceEntry` (`time_offset` + 8.8 `timescale_multiplier`, `equivalence_entries()`); per-sample group-index lookup via `SampleToGroup::group_index_for_sample`, surfaced on `AvisMeta::{sample_to_groups, sample_group_descriptions}` |
 
 ## Constructing the crate's types

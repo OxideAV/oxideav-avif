@@ -76,6 +76,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   published text defines it and its code is unsettled, so the crate
   never writes it. `tests/alpha_information.rs`.
 
+- **Fuzz.** New target `any_extent_paths`: a still, an image sequence
+  (KEY + P), a layered item, a burst through the registry decoder and
+  an explicit grid at fuzz-chosen extents (1..=48 per axis, 64..=199
+  for grids — odd, off the 8-sample grid, one sample wide), layout ×
+  depth × alpha × quantiser from the input; a lossless request must
+  decode back sample for sample. `derived_graph_decode` now also
+  synthesises alpha information properties of any flags / length on
+  the alpha auxiliaries and `brst` groups over fuzz-chosen entities,
+  drains every queued frame and holds `decode_all_with` to the burst
+  budget. Bounded foreground runs on the final code (2 GiB RSS cap, no
+  finding): `any_extent_paths` 240 s + 150 s / 6.8 k runs (each run
+  codes a picture or a short sequence), `contract_api` 110 s / 14.4 k,
+  `registry_encoder_options` 110 s / 32.0 k, `derived_graph_decode`
+  150 s / 13.0 k.
+
 ### Performance
 
 Byte-identical files (93 still shapes — single items and grids, every
@@ -105,7 +120,9 @@ start of the round built against the same oxideav-av1 0.1.24:
 - **KEY + P groups are coded on the thread budget**
   (`SequenceEncodeOptions::threads`, `EncodeOptions::threads` through
   `encode_all`): whole groups in parallel, the file identical for
-  every budget (it was serial whatever the budget).
+  every budget (it was serial whatever the budget). 130 lossless
+  frames of 160 × 120 (groups of 64 + 64 + 2) on 8 workers: 74.0 →
+  34.9 s; on 1 worker 38 → 28 MiB.
 - **RGB views.** `to_rgb8` / `to_rgba8` write each converted band
   straight into its place in the output (they appended sample by
   sample), and `to_rgba8_threads` spreads the bands over the budget:

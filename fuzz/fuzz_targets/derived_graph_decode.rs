@@ -5,9 +5,12 @@
 //! fuzz-chosen `dimg` / `auxl` / `prem` edges (cycles, self references,
 //! counts that disagree with descriptors, off-canvas and overlapping
 //! placements, oversize canvases, `lsel` / `a1op` selectors, `clap` /
-//! `irot` / `imir` chains) around one valid pre-encoded AV1 tile — and
-//! push it through the recursive derived-image decoder, `inspect`, and
-//! the derivation-graph walker. The invariant is "no panic, bounded
+//! `irot` / `imir` chains, a draft alpha information property of any
+//! flags / length on the alpha auxiliaries, a `brst` image-burst group
+//! over fuzz-chosen entities) around one valid pre-encoded AV1 tile —
+//! and push it through the recursive derived-image decoder (every
+//! queued frame drained), the contract's `decode_all_with` under tight
+//! limits, `inspect`, and the derivation-graph walker. The invariant is "no panic, bounded
 //! memory": every hostile shape must surface as an `Err`.
 
 use libfuzzer_sys::fuzz_target;
@@ -251,6 +254,31 @@ fuzz_target!(|data: &[u8]| {
     }
     let pitm = b.u8() as u16 % n as u16 + 1;
 
+    // Trailing knobs (read last, so earlier inputs keep their meaning).
+    let extra = b.u8();
+    if extra & 1 != 0 {
+        // An alpha information property on every alpha auxiliary:
+        // fuzz-chosen flags (pre-multiplication mode, the float flag,
+        // reserved bits) over a body of 0 / 2 / 4 / 8 value bytes —
+        // the sizes the flags do and do not ask for.
+        let flags = u32::from(b.u8()) | (u32::from(b.u8() & 1) << 16);
+        let len = [0usize, 2, 4, 8][usize::from((extra >> 2) & 3)];
+        let body: Vec<u8> = (0..len).map(|_| b.u8()).collect();
+        let essential = extra & 16 != 0;
+        for it in items.iter_mut() {
+            if it.props.iter().any(|(p, _)| p.get(4..8) == Some(b"auxC")) {
+                it.props.push((full(b"alpx", 0, flags, &body), essential));
+            }
+        }
+    }
+    let burst: Vec<u32> = if extra & 2 != 0 {
+        (0..b.u8() % 12)
+            .map(|_| u32::from(b.u8()) % (n as u32 + 2))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     // ---- assemble ----
     let mut mdat = Vec::new();
     let mut offsets = Vec::with_capacity(items.len());
@@ -286,6 +314,15 @@ fuzz_target!(|data: &[u8]| {
                 iref.extend_from_slice(&boxed(&r.kind, &e));
             }
             body.extend_from_slice(&full(b"iref", 0, 0, &iref));
+        }
+        if !burst.is_empty() {
+            // EntityToGroupBox: group_id, num_entities_in_group, ids.
+            let mut group = 1000u32.to_be_bytes().to_vec();
+            group.extend_from_slice(&(burst.len() as u32).to_be_bytes());
+            for id in &burst {
+                group.extend_from_slice(&id.to_be_bytes());
+            }
+            body.extend_from_slice(&boxed(b"grpl", &full(b"brst", 0, 0, &group)));
         }
         let mut ipco = Vec::new();
         let mut ipma = (items.len() as u32).to_be_bytes().to_vec();
@@ -333,8 +370,27 @@ fuzz_target!(|data: &[u8]| {
     // ---- exercise ----
     let _ = oxideav_avif::inspect(&file);
     let _ = oxideav_avif::derivation_graph(&file);
+    // The contract path under tight limits: a burst is bounded as a
+    // whole (four times the per-picture bound).
+    let limits = oxideav_avif::DecodeOptions::default()
+        .with_max_width(Some(2048))
+        .with_max_height(Some(2048))
+        .with_max_pixels(Some(1 << 18));
+    if let Ok(frames) = oxideav_avif::decode_all_with(&file, &limits) {
+        let total: u64 = frames
+            .iter()
+            .map(|f| u64::from(f.image.width) * u64::from(f.image.height))
+            .sum();
+        assert!(total <= 4 << 18, "burst past its budget: {total} pixels");
+    }
     let mut dec = AvifDecoder::new(CodecId::new(oxideav_avif::CODEC_ID_STR));
     let pkt = Packet::new(0, TimeBase::new(1, 1), file);
     let _ = dec.send_packet(&pkt);
-    let _ = dec.receive_frame();
+    // Every queued frame (a burst queues one per member) and every
+    // shape-change event in between.
+    for _ in 0..64 {
+        if dec.receive_frame().is_err() {
+            break;
+        }
+    }
 });
