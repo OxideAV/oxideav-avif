@@ -1169,11 +1169,13 @@ pub fn encode_all(frames: &[Frame], opts: &EncodeOptions) -> Result<Vec<u8>> {
 /// 4:2:0 / 4:2:2 / 4:4:4 / monochrome, alpha as the AV1-coded alpha
 /// auxiliary item, an identity-matrix picture as the RGB it holds),
 /// its colour as the `colr` `nclx`, its metadata as `Exif` / XMP
-/// items and an ICC `colr` (per [`EncodeOptions`]). A canvas beyond
-/// 4096 coded pixels per axis is tiled as a `grid`. Lossless at the
-/// default `base_q_idx = 0`. [`Error::Unsupported`] for a layout this
-/// encoder does not carry (sub-sampled chroma at odd extents), never a
-/// silent conversion.
+/// items and an ICC `colr` (per [`EncodeOptions`]), at any extent
+/// (the chroma planes of a sub-sampled layout have the rounded-up
+/// size, `(extent + 1) >> 1`). A canvas beyond 4096 coded pixels per
+/// axis is tiled as a `grid` (over the even canvas with a `clap` when
+/// a sub-sampled extent is odd — readers present that as 4:4:4).
+/// Lossless at the default `base_q_idx = 0`; never a silent
+/// conversion.
 pub fn encode(image: &AvifImage, opts: &EncodeOptions) -> Result<Vec<u8>> {
     // The coder cuts each coded item (a grid's tiles one at a time)
     // straight from the picture's planes.
@@ -1348,7 +1350,7 @@ fn box_filter(plane: &[u16], w: usize, h: usize, sx: u32, sy: u32) -> Vec<u16> {
 ///   input. `opts.chroma` does not apply.
 /// * **Lossy** — any other quality: converted to Y′CbCr at the MIAF
 ///   default colour signalling (BT.709 / sRGB / BT.601, full range) in
-///   `opts.chroma` — 4:2:0 by default, 4:4:4 at odd extents (see
+///   `opts.chroma` — 4:2:0 by default, at odd extents too (see
 ///   [`EncodeOptions::chroma`]); `opts.base_q_idx` /
 ///   [`EncodeOptions::with_quality`] set the quality.
 pub fn encode_rgb8(width: u32, height: u32, rgb: &[u8], opts: &EncodeOptions) -> Result<Vec<u8>> {

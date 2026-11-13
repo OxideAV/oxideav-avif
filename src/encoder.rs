@@ -25,7 +25,7 @@
 //!   (byte-exact; see [`crate::still::StillImage::rgb8`]); at a lossy
 //!   quality converted to Y′CbCr (the signalled matrix, else the MIAF
 //!   default BT.601, at the signalled range, else full) and coded in
-//!   the `chroma` layout (4:2:0 by default, 4:4:4 at odd extents) —
+//!   the `chroma` layout (4:2:0 by default, at odd extents too) —
 //!   the coding a lossy RGB picture is expected to land on (the
 //!   identity matrix spends bits on the un-decorrelated planes). The
 //!   alpha channel becomes an alpha auxiliary item either way.
@@ -103,8 +103,8 @@
 //! * `alpha_q` — `base_q_idx` for the alpha auxiliary; wins over
 //!   `quality` for that plane.
 //! * `chroma` — `420` (default) / `422` / `444`: the Y′CbCr layout a
-//!   packed RGB(A) / BGR(A) frame is coded in at a lossy quality (odd
-//!   extents promote to 4:4:4). Planar frames keep their own layout.
+//!   packed RGB(A) / BGR(A) frame is coded in at a lossy quality (at
+//!   every extent). Planar frames keep their own layout.
 //! * `premultiplied` — `true` to emit the `prem` iref declaring
 //!   premultiplied alpha (default `false`).
 //! * `speed` — `fast` (default) / `balanced` / `thorough`: the AV1
@@ -428,7 +428,7 @@ impl CodecOptionsStruct for AvifEncoderOptions {
             name: "chroma",
             kind: OptionKind::Enum(&["420", "422", "444"]),
             default: OptionValue::String(String::new()),
-            help: "Y'CbCr layout a packed RGB(A) / BGR(A) frame is coded in at a lossy quality (default 420; odd extents promote to 444); lossless RGB keeps the identity-matrix 4:4:4 coding",
+            help: "Y'CbCr layout a packed RGB(A) / BGR(A) frame is coded in at a lossy quality (default 420, at every extent); lossless RGB keeps the identity-matrix 4:4:4 coding",
         },
         OptionField {
             name: "premultiplied",
