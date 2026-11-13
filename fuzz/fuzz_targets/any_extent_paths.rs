@@ -2,7 +2,8 @@
 
 //! Every encode path at fuzz-chosen extents (1..=48 per axis — odd,
 //! off the 8-sample grid, one sample wide): a still, an image
-//! sequence (KEY + P groups), a spatially layered item, an image
+//! sequence (KEY + P groups; up to 32 × 32 lossless, 12 × 12 lossy —
+//! the inter search is slow), a spatially layered item, an image
 //! burst through the registry decoder, an explicit `grid` (64..=199
 //! per axis, 1..=3 tiles per axis — a sub-sampled layout at an odd
 //! extent is tiled over the even canvas and cropped by a `clap`).
@@ -229,9 +230,20 @@ fuzz_target!(|data: &[u8]| {
                 assert!(back.planes == pic.planes, "lossless still differs");
             }
         }
-        // An image sequence: KEY + P groups at the picture's size.
+        // An image sequence: KEY + P groups at the picture's size. The
+        // lossy inter search is exhaustive (seconds per small P frame
+        // in this build), so a lossy sequence is two frames of at most
+        // 12 × 12 and a lossless one two or three of at most 32 × 32.
         1 => {
-            let count = 2 + usize::from(data[5] % 3);
+            let (w, h, count) = if lossless {
+                (
+                    (w - 1) % 32 + 1,
+                    (h - 1) % 32 + 1,
+                    2 + usize::from(data[5] % 2),
+                )
+            } else {
+                ((w - 1) % 12 + 1, (h - 1) % 12 + 1, 2)
+            };
             let frames: Vec<Frame> = (0..count)
                 .map(|_| {
                     Frame::new(

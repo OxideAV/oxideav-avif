@@ -86,8 +86,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the alpha auxiliaries and `brst` groups over fuzz-chosen entities,
   drains every queued frame and holds `decode_all_with` to the burst
   budget. Bounded foreground runs on the final code (2 GiB RSS cap, no
-  finding): `any_extent_paths` 240 s + 150 s / 6.8 k runs (each run
-  codes a picture or a short sequence), `contract_api` 110 s / 14.4 k,
+  finding): `any_extent_paths` 240 s + 150 s + 120 s / 11.1 k runs
+  (each run codes a picture or a short sequence; sequences are bounded
+  to 32 × 32 lossless and 12 × 12 lossy, the inter search costing
+  seconds per small P frame), `contract_api` 110 s / 14.4 k,
   `registry_encoder_options` 110 s / 32.0 k, `derived_graph_decode`
   150 s / 13.0 k.
 
