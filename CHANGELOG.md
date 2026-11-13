@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.19](https://github.com/OxideAV/oxideav-avif/compare/v0.0.18...v0.0.19) - 2026-11-13
+
+### Other
+
+- a single coded item's planes move into the AV1 coder (cut once from the caller's buffer, no second copy); byte-identical, 12 MP single item 251 -> 195 MiB
+- encode / encode_rgb8 / registry chroma option describe the any-extent behaviour
+- where the automatic grid switches — single item against the 512-pixel grid measured at 1.8 MP and 4 MP; the 1 MP rows are a 3 x 2 grid
+- any_extent sequence matrix sized for unoptimised builds (three frames, the two largest extents on two cells, a smaller lossy case); black-box sequence leg probes its reader before encoding
+- any_extent_paths bounds its sequences (32 x 32 lossless, 12 x 12 lossy, two or three frames) — the inter search costs seconds per small P frame
+- fuzz target any_extent_paths (still / sequence / layered / burst / explicit grid at any extent), derived_graph_decode synthesises alpha information properties and bursts; README — r488 measurements (encode budget, in-place input before -> after, decode, profile shares, sequence bytes against time)
+- encoders read the caller's buffers in place (tiles cut from 8-bit / word / packed rows, lossy RGB converted tile by tile; byte-identical files, 12 MP peak RSS 96 -> 60 MiB planar, 193 -> 123 MiB lossless RGB), sequences read frames in place and code KEY + P groups on the thread budget, EncodeOptions::all_intra, odd sub-sampled pictures stay single items (even-canvas grid + clap past the bound), RGB views on a thread budget
+- every burst member through the registry decoder (burst bounded as a whole); draft alpha information property read on alpha items and alpha tracks — plane normalised to the opacity convention, pre-multiplication modes reported
+- every picture size on every encode path — image sequences as KEY + P groups at their own extents (no all-intra fallback, no clap), sub-sampled chroma at odd extents, layered items at any size; floors oxideav-av1 0.1.24 / oxideav-heif 0.0.15
+- crop walks the frame's planes directly (clippy needless_range_loop); output unchanged
+
 ### Added
 
 - **Every picture size on every encode path** (oxideav-av1 ≥ 0.1.24,
