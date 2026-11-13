@@ -332,6 +332,16 @@ place"). The single item's 251 MiB is the AV1 encoder holding the whole
 4032 × 3024 picture's state, which no plumbing on this side changes
 (465 MiB at the previous measurement).
 
+Where `auto` switches (single item up to 1 MP): measured at 4 MP
+(2304 × 1728, the same picture scaled), single item against the
+512-pixel grid — quality 60: 2.16 s / 91 MiB against 3.40 s / 32 MiB on
+1 worker, 0.56 s / 118 MiB against 0.63 s / 71 MiB on 8, the single
+item 4.2 % smaller (1.1 % at 1.8 MP, where it is 0.91 s / 43 MiB
+against 1.38 s / 24 MiB); lossless RGB: the same time and bytes within
+0.3 %, 194 MiB against 41 MiB. A lossy picture of a few megapixels is
+faster and smaller as one item (`grid=none`) at about three times the
+memory; `auto` keeps the lower-memory shape.
+
 ### Reading the input in place
 
 Every encode entry point used to build a whole-picture `StillImage`
@@ -368,8 +378,8 @@ with other builds — read differences under ~15 % as noise:
 | registry `Rgba`, lossless | 223 → **136 MiB** | 283 → 189 MiB | 4.7 → 4.7 s | 0.97 → 1.35 s |
 | contract `encode_rgba8`, lossless | 220 → **132 MiB** | 295 → 199 MiB | 7.6 → 7.3 s | 0.84 → 0.80 s |
 
-1 MP (1200 × 900, one coded item under `auto`, so the picture is cut
-once): quality 60 0.84–0.95 s on 1 worker / 0.20–0.25 s on 8, lossless
+1 MP (1200 × 900 — just past the single-item threshold, a 3 × 2 grid
+under `auto`): quality 60 0.84–0.95 s on 1 worker / 0.20–0.25 s on 8, lossless
 0.32–0.43 s / 0.06–0.09 s, contract and registry alike; peak RSS
 16–24 MiB on 1 worker (registry `Yuv420P` 20 → 16 MiB, `encode_rgb8`
 lossless 29 → 21 MiB), 40–53 MiB on 8.
