@@ -669,6 +669,9 @@ pub(crate) struct AlphaTrack {
     pub dts: Vec<u64>,
     /// The alpha track's `mdhd` timescale.
     pub timescale: u32,
+    /// The sample entry's alpha information box, if it carries one
+    /// (draft status — see [`crate::alpha::alpha_information`]).
+    pub information: Option<oxideav_heif::props::AlphaInformation>,
 }
 
 /// The `av01` alpha auxiliary track linked to `master_id` (HEIF
@@ -712,6 +715,7 @@ fn alpha_track_for(movie: &sequence::Movie, master_id: u32) -> Option<AlphaTrack
                 .collect(),
             dts: t.samples.iter().map(|s| s.dts).collect(),
             timescale: t.timescale,
+            information: entry.alpha_information(),
         })
     })
 }

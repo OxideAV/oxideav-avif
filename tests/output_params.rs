@@ -566,3 +566,96 @@ fn container_prediction_matches_the_decoded_description() {
     }
     assert!(checked >= 12, "{checked} fixtures");
 }
+
+/// A file whose primary belongs to a `brst` image burst hands every
+/// member to the registry consumer, in group order — the same pictures
+/// the contract's `decode_all` returns — and a member of another shape
+/// is announced like any other mid-stream change.
+#[test]
+fn burst_file_emits_every_member_through_the_registry() {
+    use oxideav_avif::{EncodeOptions, encode_still_burst};
+    let ctx = registry();
+    let member = |w: u32, h: u32, chroma: StillChroma, seed: u32| -> StillImage {
+        let (sx, sy) = match chroma {
+            StillChroma::Yuv420 => (1, 1),
+            _ => (0, 0),
+        };
+        let (cw, ch) = ((w + sx) >> sx, (h + sy) >> sy);
+        let plane = |n: u32, k: u32| -> Vec<u16> {
+            (0..n).map(|i| ((i * k + seed * 31) % 251) as u16).collect()
+        };
+        StillImage::yuv(
+            w,
+            h,
+            8,
+            chroma,
+            plane(w * h, 7),
+            plane(cw * ch, 5),
+            plane(cw * ch, 3),
+        )
+        .unwrap()
+    };
+    let members = [
+        member(16, 16, StillChroma::Yuv420, 1),
+        member(16, 16, StillChroma::Yuv420, 2),
+        member(21, 9, StillChroma::Yuv420, 3),
+        member(21, 9, StillChroma::Yuv444, 4),
+    ];
+    let file = encode_still_burst(&members, &EncodeOptions::default()).unwrap();
+    let want = oxideav_avif::decode_all(&file).unwrap();
+    assert_eq!(want.len(), members.len());
+
+    let mut dec = decoder(&ctx);
+    dec.send_packet(&packet(&file)).unwrap();
+    let mut pictures = Vec::new();
+    let mut events = Vec::new();
+    loop {
+        match dec.receive_frame() {
+            Ok(Frame::Video(v)) => pictures.push((v, shape(&dec.output_params().unwrap()))),
+            Ok(Frame::StreamParams(p)) => events.push((pictures.len(), shape(&p))),
+            Ok(other) => panic!("unexpected frame {other:?}"),
+            Err(oxideav_core::Error::NeedMore) => break,
+            Err(e) => panic!("receive_frame: {e}"),
+        }
+    }
+    assert_eq!(pictures.len(), members.len());
+    for (i, ((vf, described), frame)) in pictures.iter().zip(&want).enumerate() {
+        assert_eq!(
+            (described.0, described.1),
+            (frame.image.width, frame.image.height),
+            "member {i}"
+        );
+        for (got, exp) in vf.planes.iter().zip(&frame.image.planes) {
+            assert_eq!(got.data, exp.data, "member {i}");
+        }
+    }
+    // Lossless: the members are the sources.
+    for (i, ((vf, _), src)) in pictures.iter().zip(&members).enumerate() {
+        let y: Vec<u16> = vf.planes[0].data.iter().map(|&b| u16::from(b)).collect();
+        assert_eq!(y, src.y, "member {i} luma");
+    }
+    // Two changes: the size at member 2, the layout at member 3.
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!((events[0].0, events[0].1.0, events[0].1.1), (2, 21, 9));
+    assert_eq!(events[1].0, 3);
+    assert_eq!(dec.output_params_generation(), 2);
+
+    // The burst is bounded as a whole (its members are returned
+    // together): six 256-pixel members under a 256-pixel per-picture
+    // bound exceed four times that bound, four do not.
+    let six: Vec<StillImage> = (0..6)
+        .map(|i| member(16, 16, StillChroma::Yuv420, i))
+        .collect();
+    let exact = oxideav_avif::DecodeOptions::default().with_max_pixels(Some(256));
+    let big = encode_still_burst(&six, &EncodeOptions::default()).unwrap();
+    assert!(matches!(
+        oxideav_avif::decode_all_with(&big, &exact),
+        Err(oxideav_avif::Error::LimitExceeded(_))
+    ));
+    let small = encode_still_burst(&six[..4], &EncodeOptions::default()).unwrap();
+    assert_eq!(
+        oxideav_avif::decode_all_with(&small, &exact).unwrap().len(),
+        4
+    );
+    assert_eq!(oxideav_avif::decode_all(&big).unwrap().len(), 6);
+}

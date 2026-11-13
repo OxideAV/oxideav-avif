@@ -125,6 +125,9 @@ const DADJ: BoxType = b(b"dadj");
 const STAG: BoxType = b(b"stag");
 /// HEIF Amd 2:2026 §6.11.3 — Tiled Image Configuration.
 const TILC: BoxType = b(b"tilC");
+/// The draft alpha information property (see
+/// [`crate::alpha::alpha_information`] for its status).
+const ALPX: BoxType = b(b"alpx");
 
 /// HEIF §6.6.2.2 — image overlay derived-image type.
 pub const ITEM_TYPE_IOVL: BoxType = b(b"iovl");
@@ -3948,6 +3951,9 @@ impl Meta {
                 // An unknown property carried as `Other` and flagged
                 // essential is exactly the case the spec guards against.
                 Some(Property::Other(t, _)) => out.push(*t),
+                // The alpha information property is honoured by the
+                // decode path (the alpha plane is normalised with it).
+                Some(Property::Container(hprops::Property::Alpx(_))) => {}
                 // A container-typed property this crate does not act
                 // on (the HEIF Amd 1 / Amd 2 set) is readable but not
                 // honoured by the AVIF decode path; essential ⇒ report.
@@ -4024,11 +4030,12 @@ const CONTAINER_TYPED: &[FourCc] = &[
 ];
 
 /// Properties typed by the container crate that AVIF carries opaque
-/// ([`Property::Container`]): the HEIF Amd 1:2025 / Amd 2:2026 set. A
+/// ([`Property::Container`]): the HEIF Amd 1:2025 / Amd 2:2026 set and
+/// the draft alpha information property. A
 /// body the container refuses is kept raw as [`Property::Other`] — an
 /// unreadable descriptive property never fails the file, its index
 /// must stay valid for the `ipma` associations around it.
-const CONTAINER_OPAQUE: &[FourCc] = &[REVE, NDWT, CEXG, DADJ, STAG, TILC];
+const CONTAINER_OPAQUE: &[FourCc] = &[REVE, NDWT, CEXG, DADJ, STAG, TILC, ALPX];
 
 /// FullBox properties this crate only accepts at `version = 0` (the
 /// value their HEIF definitions fix); the container layer reads any

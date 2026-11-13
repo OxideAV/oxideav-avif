@@ -55,6 +55,43 @@ pub fn find_alpha_item_id(meta: &Meta, primary_id: u32) -> Option<u32> {
     None
 }
 
+/// The alpha information property (`alpx`) associated with
+/// `alpha_item_id`, if any: which sample values of the alpha plane
+/// mean opaque and transparent, and whether the colour is
+/// pre-multiplied.
+///
+/// **Draft status.** The property is the `AlphaInformationBox` of the
+/// working text of ISO/IEC 14496-12 (clause 12.11.5.2 of the DAM 2
+/// "carriage of depth and alpha" material) as the container crate
+/// reads it ([`oxideav_heif::props::AlphaInformation`]); no published
+/// edition defines it and its four-character code is not settled.
+/// av1-avif does not list it — §9.1.2 lets boxes outside its table be
+/// present in the `meta` hierarchy and lets readers ignore them — so
+/// this crate *reads* it (the decoder brings the plane to the HEIF
+/// §6.9.1 convention, 0 transparent … maximum opaque, and
+/// [`is_premultiplied`] reports its modes 1 / 2) and never writes it.
+pub fn alpha_information(
+    meta: &Meta,
+    alpha_item_id: u32,
+) -> Option<oxideav_heif::props::AlphaInformation> {
+    match meta.property_for(alpha_item_id, &b(b"alpx")) {
+        Some(Property::Container(oxideav_heif::props::Property::Alpx(info))) => Some(*info),
+        _ => None,
+    }
+}
+
+/// The colour of `master_id` is pre-multiplied by its alpha auxiliary
+/// `alpha_id`: a `prem` item reference between the two (HEIF §6.9.1),
+/// or an alpha information property on the auxiliary whose
+/// `premultiplication_mode` says so (see [`alpha_information`]).
+pub fn is_premultiplied(meta: &Meta, master_id: u32, alpha_id: u32) -> bool {
+    meta.irefs.iter().any(|e| {
+        &e.reference_type == b"prem"
+            && ((e.from_id == alpha_id && e.to_ids.contains(&master_id))
+                || (e.from_id == master_id && e.to_ids.contains(&alpha_id)))
+    }) || alpha_information(meta, alpha_id).is_some_and(|info| info.is_premultiplied())
+}
+
 /// The gray layout an alpha plane must use to attach to `color_format`
 /// (av1-avif §4.1: same bit depth as the master).
 pub(crate) fn expected_alpha_format(color_format: PixelFormat) -> Result<PixelFormat> {

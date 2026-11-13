@@ -531,7 +531,8 @@ where
                         Some(a) => {
                             let dts = pts.unwrap_or(0).max(0) as u64;
                             let alpha_frame = a.at(file, dts, media_timescale)?;
-                            let pair = Some((&alpha_frame, &a.config));
+                            let pair =
+                                Some((&alpha_frame, &a.config, a.track.information.as_ref()));
                             sequence_picture(frame, &seq, opts, &presentation, pair)?
                         }
                         None => sequence_picture(frame, &seq, opts, &presentation, None)?,
@@ -558,7 +559,7 @@ where
                 Some(a) => {
                     let dts = pts.unwrap_or(0).max(0) as u64;
                     let alpha_frame = a.at(file, dts, media_timescale)?;
-                    let pair = Some((&alpha_frame, &a.config));
+                    let pair = Some((&alpha_frame, &a.config, a.track.information.as_ref()));
                     sequence_picture(frame, &seq, opts, &presentation, pair)?
                 }
                 None => sequence_picture(frame, &seq, opts, &presentation, None)?,
@@ -740,7 +741,11 @@ fn sequence_picture(
     seq: &SequenceDecode,
     opts: &DecodeOptions,
     presentation: &crate::avis::Presentation,
-    alpha: Option<(&VideoFrame, &Av1CodecConfig)>,
+    alpha: Option<(
+        &VideoFrame,
+        &Av1CodecConfig,
+        Option<&oxideav_heif::props::AlphaInformation>,
+    )>,
 ) -> Result<AvifImage> {
     let vf = match frame {
         oxideav_core::Frame::Video(v) => v,
@@ -768,8 +773,8 @@ fn sequence_picture(
             w,
             h,
         )?;
-        if let Some((alpha, config)) = alpha {
-            decoded = crate::decoder::attach_alpha_sample(decoded, alpha, config)
+        if let Some((alpha, config, information)) = alpha {
+            decoded = crate::decoder::attach_alpha_sample(decoded, alpha, config, information)
                 .map_err(from_core_err)?;
         }
         let shown = crate::decoder::present_sample(decoded, presentation).map_err(from_core_err)?;
@@ -844,6 +849,22 @@ pub fn decode_all_with(bytes: &[u8], opts: &DecodeOptions) -> Result<Vec<Frame>>
         })?;
         return Ok(frames);
     }
+    let (images, _) = decode_still_pictures(bytes, opts)?;
+    Ok(images
+        .into_iter()
+        .map(|image| Frame::new(image, None))
+        .collect())
+}
+
+/// Every picture a still file shows, in order — the entities of the
+/// primary's `brst` image-burst group (HEIF §6.8.9; the primary among
+/// them, decoded once), else the primary alone — plus the primary's
+/// container description. The shared core of [`decode_all_with`] and
+/// the registry decoder's packet path.
+pub(crate) fn decode_still_pictures(
+    bytes: &[u8],
+    opts: &DecodeOptions,
+) -> Result<(Vec<AvifImage>, crate::inspect::AvifInfo)> {
     let decoded = decode_primary(bytes, opts)?;
     let hdr = parse_header(bytes)?;
     let primary_id = hdr
@@ -852,19 +873,47 @@ pub fn decode_all_with(bytes: &[u8], opts: &DecodeOptions) -> Result<Vec<Frame>>
         .ok_or_else(|| Error::invalid("avif: missing pitm"))?;
     let burst = burst_members(&hdr.meta, primary_id);
     if burst.len() < 2 {
-        return Ok(vec![Frame::new(decoded.image, None)]);
+        return Ok((vec![decoded.image], decoded.info));
     }
-    let mut frames = Vec::with_capacity(burst.len());
+    // A burst is bounded as a whole: its members are all returned at
+    // once, so a group naming one large item many times must not
+    // multiply the per-picture bound without limit.
+    if burst.len() > crate::decoder::MAX_ITEM_DECODES as usize {
+        return Err(Error::limit(format!(
+            "avif: image burst of {} members, more than the {} allowed",
+            burst.len(),
+            crate::decoder::MAX_ITEM_DECODES
+        )));
+    }
+    let budget = opts
+        .max_pixels
+        .map(|m| m.saturating_mul(BURST_PIXEL_BUDGET_FACTOR));
+    let mut total = 0u64;
+    let mut primary = Some(decoded.image);
+    let mut images = Vec::with_capacity(burst.len());
     for id in burst {
-        let image = if id == primary_id {
-            decoded.image.clone()
-        } else {
-            picture_of(&hdr, id, opts, None, (None, None))?
+        let image = match primary.take_if(|_| id == primary_id) {
+            Some(image) => image,
+            None => picture_of(&hdr, id, opts, None, (None, None))?,
         };
-        frames.push(Frame::new(image, None));
+        total = total.saturating_add(u64::from(image.width) * u64::from(image.height));
+        if let Some(max) = budget
+            && total > max
+        {
+            return Err(Error::limit(format!(
+                "avif: image burst holds more than {max} pixels in all \
+                 ({BURST_PIXEL_BUDGET_FACTOR} x DecodeOptions::max_pixels)"
+            )));
+        }
+        images.push(image);
     }
-    Ok(frames)
+    Ok((images, decoded.info))
 }
+
+/// The pictures of one `brst` image burst may hold this many times
+/// [`DecodeOptions::max_pixels`] together (`None` = unlimited): the
+/// members of a burst are decoded and returned at once.
+pub const BURST_PIXEL_BUDGET_FACTOR: u64 = 4;
 
 /// [`decode`] from a reader (read to end first — AVIF item offsets are
 /// absolute, so the whole file is needed).

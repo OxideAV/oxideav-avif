@@ -1173,11 +1173,7 @@ pub fn gain_map_metadata(
 /// auxiliary, in either direction (HEIF 3rd ed. §6.9.1 master →
 /// auxiliary; 2017-edition readers saw alpha → master).
 fn prem_between(meta: &Meta, master: u32, alpha: u32) -> bool {
-    meta.irefs.iter().any(|e| {
-        &e.reference_type == b"prem"
-            && ((e.from_id == alpha && e.to_ids.contains(&master))
-                || (e.from_id == master && e.to_ids.contains(&alpha)))
-    })
+    crate::alpha::is_premultiplied(meta, master, alpha)
 }
 
 fn decode_av1c_flags(av1c: &[u8]) -> (Option<u8>, bool, Option<(bool, bool)>) {

@@ -38,6 +38,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   presented at their size with square pixels and decoded exactly by
   the black-box media framework.
 
+- **Every burst member through the registry decoder.** A packet whose
+  primary belongs to a `brst` image burst queued the primary alone;
+  the decoder now queues every member in group order (the pictures
+  `decode_all` returns), each with its own description — a member of
+  another size or layout bumps the generation and is announced by a
+  `Frame::StreamParams` event like any other change.
+- **Alpha information property, read side (draft status).** An `alpx`
+  property on an alpha auxiliary item, or the box in an `av01` alpha
+  track's sample entry (oxideav-heif 0.0.15), is honoured: the alpha
+  plane is brought to the HEIF §6.9.1 convention through its
+  `opaque_value` / `transparent_value`, its pre-multiplication modes
+  are reported (`AvifInfo::premultiplied_alpha`, the new
+  `is_premultiplied`, overlay rendering), and an essential one no
+  longer counts as an unsupported essential property.
+  `alpha_information(meta, alpha_item_id)` returns the record. av1-avif
+  does not list the box (§9.1.2 allows boxes outside its table), no
+  published text defines it and its code is unsettled, so the crate
+  never writes it. `tests/alpha_information.rs`.
+
+### Fixed
+
+- **A burst is bounded as a whole.** `decode_all` decoded and returned
+  every entity of a `brst` group with only the per-picture limits, so a
+  group naming one large item many times multiplied them without
+  bound. The members together may hold `BURST_PIXEL_BUDGET_FACTOR` (4)
+  × `DecodeOptions::max_pixels` and number at most `MAX_ITEM_DECODES`;
+  past that the file is `LimitExceeded`. The primary of a burst is no
+  longer copied on its way out.
+
 ### Changed
 
 - **Lossy `encode_rgb8` / `encode_rgba8` and the registry's packed

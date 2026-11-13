@@ -122,7 +122,11 @@ by name. Decode yields the storage layout; `color.matrix == 0`
 
 `decode_all` returns every sample of an `avis` image sequence (with
 its `delay`), the entities of the primary's `brst` burst group, else
-the primary alone. `AvifImage::new` / `from_rgb8` / `from_rgba8` are
+the primary alone; the registry decoder queues the same pictures for
+one packet (every burst member in group order, a member of another
+shape announced like any mid-stream change). A burst is bounded as a
+whole — `BURST_PIXEL_BUDGET_FACTOR` (4) × `DecodeOptions::max_pixels`
+across its members, at most `MAX_ITEM_DECODES` of them. `AvifImage::new` / `from_rgb8` / `from_rgba8` are
 `Result`s that refuse a zero dimension or a buffer that does not match
 the geometry with `InvalidData`.
 
@@ -639,13 +643,36 @@ are `#[doc(hidden)]` — reachable, outside the semver contract.
 `AvifFrame` / `AvifPlane` / `AvifPixelFormat` and `StillChroma` stay
 plain (the sample model AV1 closes).
 
+## Alpha information (draft)
+
+The working text of ISO/IEC 14496-12 (DAM 2, carriage of depth and
+alpha) adds an alpha information box — which sample values of an alpha
+plane mean opaque and transparent, and whether the colour is
+pre-multiplied — that `oxideav-heif` 0.0.15 reads as the `alpx` item
+property / sample-entry box. **No published edition defines it and its
+four-character code is not settled.** av1-avif does not list it; §9.1.2
+lets boxes outside its table be present in the `meta` hierarchy (and
+lets a reader ignore them). This crate therefore *reads* it and never
+writes it:
+
+| Where | Effect |
+|---|---|
+| on the alpha auxiliary item | the decoded alpha plane is brought to the HEIF §6.9.1 convention (0 transparent … maximum opaque) through `opaque_value` / `transparent_value` — the draft's defaults change nothing; essential or not, the item decodes |
+| in an `av01` alpha track's sample entry | the same for every alpha sample of the sequence |
+| `premultiplication_mode` 1 / 2 | reported like a `prem` reference: `AvifInfo::premultiplied_alpha`, `is_premultiplied(meta, master, alpha)`, pre-multiplied rendering inside an `iovl` |
+| `alpha_information(meta, alpha_item_id)` | the record itself (`oxideav_heif::props::AlphaInformation`) |
+
+`tests/alpha_information.rs` assembles such files with the container
+writer around payloads this crate coded.
+
 ## Low-overhead files
 
 AVIF (av1-avif, 2025-10) defines no low-overhead profile: `mif3` /
 `mini` (HEIF Amd 2:2026 Annex O) are not AVIF brands or boxes, so this
 crate's brand rule refuses them. `oxideav-heif` reads and writes
 `mini` files (an AV1-coded one expands to an `avif`-equivalent
-`meta`), which is where a `.hmg` / `image/hif2` file opens.
+`meta`, native alpha as the draft alpha information property above),
+which is where a `.hmg` / `image/hif2` file opens.
 
 ## Container-level use
 

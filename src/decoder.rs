@@ -405,21 +405,26 @@ impl AvifDecoder {
     pub fn decode_file(&mut self, file: &[u8]) -> Result<AvifInfo> {
         // The contract implementation does the work; this adapter only
         // re-labels the result for the framework.
-        let decoded =
-            crate::api_codec::decode_primary(file, &self.effective_options()).map_err(core_err)?;
-        let format = decoded.image.format;
-        let signal = color_signal_for(Some(&decoded.image.color.to_colr()));
-        let shape = OutputShape {
-            width: decoded.image.width,
-            height: decoded.image.height,
-            pixel_format: labelled_pixel_format(format, &signal),
-            color_signal: signal,
-            frame_rate: None,
-        };
-        let out = VideoFrame::from(decoded.image);
-        self.pending.push_back((Frame::Video(out), shape));
-        self.info = Some(decoded.info.clone());
-        Ok(decoded.info)
+        // A file whose primary belongs to a `brst` image burst queues
+        // every member in group order (each with its own shape — a
+        // change between members is announced like any other).
+        let (images, info) =
+            crate::api_codec::decode_still_pictures(file, &self.effective_options())
+                .map_err(core_err)?;
+        for image in images {
+            let signal = color_signal_for(Some(&image.color.to_colr()));
+            let shape = OutputShape {
+                width: image.width,
+                height: image.height,
+                pixel_format: labelled_pixel_format(image.format, &signal),
+                color_signal: signal,
+                frame_rate: None,
+            };
+            self.pending
+                .push_back((Frame::Video(VideoFrame::from(image)), shape));
+        }
+        self.info = Some(info.clone());
+        Ok(info)
     }
 
     pub fn info(&self) -> Option<&AvifInfo> {
@@ -1005,7 +1010,13 @@ fn decode_item_output_inner(
         if alpha_transformed {
             image = apply_item_transforms(hdr, item_id, image)?;
         }
-        let alpha = alpha_as_gray(&alpha, image.width, image.height)?;
+        let mut alpha = alpha_as_gray(&alpha, image.width, image.height)?;
+        // An alpha information property on the auxiliary states which
+        // sample values mean opaque / transparent; the plane is brought
+        // to the §6.9.1 convention (0 … maximum) before it is attached.
+        if let Some(info) = crate::alpha::alpha_information(&hdr.meta, alpha_id) {
+            compose::normalise_alpha(&mut alpha, &info);
+        }
         if alpha.format.bit_depth != image.format.bit_depth {
             return Err(Error::invalid(format!(
                 "avif alpha: alpha item {alpha_id} is {}-bit but master item {item_id} is \
@@ -1066,12 +1077,18 @@ pub(crate) fn attach_alpha_sample(
     master: ItemImage,
     alpha: &VideoFrame,
     config: &Av1CodecConfig,
+    information: Option<&oxideav_heif::props::AlphaInformation>,
 ) -> Result<ItemImage> {
     let (fmt, w, h) = infer_av1_pixmap(alpha, config)?;
     let layout = from_core_pix(fmt)?;
     let frame = core_to_avif_frame(alpha.clone());
     let alpha = to_heif(&frame, layout, config.bit_depth(), w, h).map_err(core_err)?;
-    let alpha = alpha_as_gray(&alpha, master.width, master.height)?;
+    let mut alpha = alpha_as_gray(&alpha, master.width, master.height)?;
+    // The alpha sample entry's alpha information box, when present,
+    // maps the samples to the §6.9.1 convention.
+    if let Some(info) = information {
+        compose::normalise_alpha(&mut alpha, info);
+    }
     if alpha.format.bit_depth != master.format.bit_depth {
         return Err(Error::invalid(format!(
             "avis alpha: the alpha sequence is {}-bit but the master is {}-bit — an \
@@ -1448,12 +1465,16 @@ fn decode_tone_map_item(
 /// True when `item_id`'s colour samples are signalled pre-multiplied
 /// by its alpha auxiliary — a `prem` item reference in either
 /// direction (HEIF 2017 §6.10.1.1 alpha → master; HEIF 2025 §6.9.1
-/// master → auxiliary).
+/// master → auxiliary) — or an alpha information property on its
+/// alpha auxiliary that says so ([`crate::alpha::alpha_information`]).
 fn is_premultiplied(hdr: &AvifHeader<'_>, item_id: u32) -> bool {
     hdr.meta
         .irefs
         .iter()
         .any(|e| e.reference_type == PREM && (e.from_id == item_id || e.to_ids.contains(&item_id)))
+        || find_alpha_item_id(&hdr.meta, item_id)
+            .and_then(|alpha| crate::alpha::alpha_information(&hdr.meta, alpha))
+            .is_some_and(|info| info.is_premultiplied())
 }
 
 /// Decode an `iovl` derived item: parse the descriptor, decode every

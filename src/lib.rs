@@ -192,7 +192,9 @@ pub mod signal;
 #[cfg(feature = "registry")]
 pub mod still;
 
-pub use alpha::{ALPHA_URN_PREFIX, composite_alpha, find_alpha_item_id};
+pub use alpha::{
+    ALPHA_URN_PREFIX, alpha_information, composite_alpha, find_alpha_item_id, is_premultiplied,
+};
 pub use api::{
     AvifImage, ColorInfo, ColorRange, DecodeOptions, EncodeOptions, EncodeSpeed, Frame, GridTiling,
     ImageInfo, Metadata, PixelFormat, Plane, RgbImage, RgbaImage, StillChroma, info, probe,
@@ -262,8 +264,9 @@ pub use transform::{apply_clap, apply_imir, apply_irot, crop_top_left};
 
 #[cfg(feature = "registry")]
 pub use api_codec::{
-    decode, decode_all, decode_all_with, decode_from, decode_rgb8, decode_rgba8, decode_with,
-    encode, encode_all, encode_rgb8, encode_rgba8, encode_to, stream_params,
+    BURST_PIXEL_BUDGET_FACTOR, decode, decode_all, decode_all_with, decode_from, decode_rgb8,
+    decode_rgba8, decode_with, encode, encode_all, encode_rgb8, encode_rgba8, encode_to,
+    stream_params,
 };
 
 #[cfg(feature = "registry")]
